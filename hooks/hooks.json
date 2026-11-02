@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook", "timeout": 10}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
+                  "input": {"event": "UserPromptSubmit", "session_id": "${session_id}", "prompt": "${prompt}", "transcript_path": "${transcript_path}"}}]}
+    ],
+    "SubagentStart": [
+      {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
+                  "input": {"event": "SubagentStart", "session_id": "${session_id}", "agent_id": "${agent_id}", "agent_type": "${agent_type}", "transcript_path": "${transcript_path}"}}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "*",
+       "hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
+                  "input": {"event": "PreToolUse", "session_id": "${session_id}", "agent_id": "${agent_id}", "tool_name": "${tool_name}", "transcript_path": "${transcript_path}", "cwd": "${cwd}", "tool_prompt": "${tool_input.prompt}", "tool_input": "${tool_input}"}}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "Bash|PowerShell|Read|Grep|Glob|Edit|Write",
+       "hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
+                  "input": {"event": "PostToolUse", "session_id": "${session_id}", "agent_id": "${agent_id}", "tool_name": "${tool_name}", "transcript_path": "${transcript_path}", "cwd": "${cwd}", "tool_input": "${tool_input}", "tool_response": "${tool_response}"}}]}
+    ],
+    "PreCompact": [
+      {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
+                  "input": {"event": "PreCompact", "session_id": "${session_id}", "trigger": "${trigger}", "transcript_path": "${transcript_path}"}}]}
+    ]
+  }
+}

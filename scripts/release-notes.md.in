@@ -1,0 +1,51 @@
+# atlas @VERSION@
+
+Released @DATE@. Full documentation: the [wiki](https://github.com/@REPO@/wiki).
+
+## Highlights
+
+@HIGHLIGHTS@
+
+**You do not need Obsidian.** A vault is any folder of Markdown files; Obsidian is optional, as a reader
+for the same folders. Only the cross-vault links `make_link` writes (`obsidian://open`) need Obsidian to
+open; elsewhere they are plain text.
+
+@UPGRADE@
+
+## Install
+
+In Claude Code:
+
+```
+/plugin marketplace add @REPO@
+/plugin install atlas@atlas
+```
+
+Restart Claude Code. On its first start the server writes a starter configuration and downloads the
+embedding model in the background; `atlas --setup` does the same in the foreground and reports each step.
+An installed atlas updates itself at session start to this release (signed, checked against its SHA-256).
+See [Install and setup](https://github.com/@REPO@/wiki/Install-and-setup) for configuration, projects and
+uninstalling.
+
+## Prebuilt binaries in this release
+
+| Platform | File | SHA-256 |
+|---|---|---|
+@BINARIES@
+
+@MISSING@
+
+## Model files
+
+Downloaded at setup, never stored in the repository. Each is checked against the SHA-256 pinned in the
+configuration before it is used.
+
+| Id | File | Size | SHA-256 |
+|---|---|---|---|
+@MODELS@
+
+@DETAILS@
+
+Full changelog: [Changelog](https://github.com/@REPO@/wiki/Changelog) on the wiki.
+
+atlas is licensed under the Apache License 2.0. See LICENSE and NOTICE.

@@ -1,0 +1,16 @@
+{
+  "name": "atlas",
+  "description": "atlas: a local index and memory store for Claude Code agents.",
+  "owner": {
+    "name": "Brandon White"
+  },
+  "plugins": [
+    {
+      "name": "atlas",
+      "source": "./",
+      "description": "A local index and memory store for agents: identifier lookup, section search, a code index, append-only memory, relevance-gated recall and a context-cap hook.",
+      "license": "Apache-2.0",
+      "category": "productivity"
+    }
+  ]
+}

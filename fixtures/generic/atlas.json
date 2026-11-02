@@ -1,0 +1,15 @@
+{
+  "db": "state/atlas.sqlite",
+  "vaults": [{"name": "notes", "path": "Notes"}],
+  "sources": [
+    {"name": "handbook", "root": "handbook", "include": ["*.md"], "chunk": {"top_level_items": true}},
+    {"name": "memory", "root": "memory", "include": ["*.md"], "id_keys": ["name"], "names_kind": "memory"}
+  ],
+  "ids": [
+    {"name": "ticket", "regex": "\\bTK-[0-9]{3}\\b"},
+    {"name": "pr", "regex": "(?:^|[^A-Za-z0-9_&/])(?P<id>#[0-9]{1,5})\\b"},
+    {"name": "work", "regex": "\\b[A-Z][A-Z0-9]+(?:-[A-Z][A-Z0-9]+)+\\b"}
+  ],
+  "wikilinks": true,
+  "watch": true
+}

@@ -1,0 +1,1 @@
+atlas is licensed under the Apache License 2.0. This wiki is generated from the repository's `wiki/` folder at each release; edits made here are replaced by the next release. Report vulnerabilities privately, as `SECURITY.md` describes.

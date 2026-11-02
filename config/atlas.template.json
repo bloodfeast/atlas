@@ -1,0 +1,17 @@
+{
+  "vaults": [{"name": "notes", "path": "notes"}],
+  "sources": [],
+  "ids": [],
+  "models": {
+    "auto_download": true,
+    "files": [
+      {
+        "id": "embed",
+        "file": "bge-small-en-v1.5-int8.atm",
+        "url": "https://github.com/bloodfeast/atlas/releases/download/models-1/bge-small-en-v1.5-int8.atm",
+        "sha256": "92b959ac76dee92c10b00566944865030e0942d2a3fe9e5bc450ec7956131671",
+        "size": 34752139
+      }
+    ]
+  }
+}

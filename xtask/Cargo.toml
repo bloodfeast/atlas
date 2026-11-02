@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2021"
+description = "Development tasks for atlas (cargo xtask ...). Never shipped."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# Only what atlas itself uses: the atlas library (with the `dev` feature
+# that `cargo xtask` builds atlas with; its JSON and SHA-256) and its SQLite.
+atlas = { path = "..", features = ["dev"] }
+rusqlite = { version = "0.40", features = ["bundled"] }

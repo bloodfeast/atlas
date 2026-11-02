@@ -1,0 +1,41 @@
+# The public repository's checks: the whole workspace's tests, in release,
+# on Linux, Windows and macOS. No secrets and a read-only token. Tests that
+# need something outside the repository (the private leak denylist, a real
+# configuration, the embedding model) skip themselves when it is absent, as
+# they do on any machine without it.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Only the public repository runs it: the development repository
+    # carries the same file and verifies locally.
+    if: github.repository == 'bloodfeast/atlas'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml names the toolchain; rustup installs it on the
+      # first cargo call.
+      - name: Test
+        run: cargo test --workspace --release --locked
+        env:
+          CARGO_TERM_COLOR: always
+          CARGO_BUILD_JOBS: 4

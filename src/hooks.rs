@@ -1,0 +1,1023 @@
+//! The Claude Code hooks: relevance-gated recall and the context cap.
+//!
+//! All hook logic is here, behind [`Hooks::handle`], which takes a
+//! [`HookEvent`] and returns a [`HookAnswer`]. Transports are thin adapters
+//! around it: the `hook` MCP tool (Claude Code `mcp_tool` hooks, answered on
+//! the server's hook worker thread), and `atlas --hook` (a command hook
+//! reading the event JSON on stdin). A pipe would be one more adapter.
+//!
+//! What the hooks can see was measured (`docs/design/atlas-c.md`, section 1):
+//! inside a subagent `transcript_path` is the parent's; the subagent's own
+//! transcript is `<parent without .jsonl>/subagents/agent-<agent_id>.jsonl`;
+//! a subagent's brief never passes through `UserPromptSubmit`; the context
+//! size is the last assistant message's input, cache and output tokens.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+
+use crate::error::Result;
+use crate::json::Value;
+use crate::embed::Model;
+use crate::memory::recall;
+use crate::memory::vectors::{self, RecVecs};
+use crate::memory::settings::Settings;
+use crate::memory::{Draft, MemoryStore};
+
+/// One hook event, from either transport.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HookEvent {
+    /// `UserPromptSubmit`, `SubagentStart`, `PreToolUse`, `PreCompact`, ...
+    pub event: String,
+    /// The session.
+    pub session_id: String,
+    /// The subagent, empty in the main session.
+    pub agent_id: String,
+    /// The subagent's type.
+    pub agent_type: String,
+    /// The transcript the hook input names (the parent's, in a subagent).
+    pub transcript_path: String,
+    /// The prompt (UserPromptSubmit).
+    pub prompt: String,
+    /// The tool (PreToolUse).
+    pub tool_name: String,
+    /// The tool input's `prompt` (the brief, when the tool spawns an agent).
+    pub tool_prompt: String,
+    /// What started a compaction.
+    pub trigger: String,
+    /// What started the session (SessionStart: startup, resume, clear,
+    /// compact).
+    pub source: String,
+    /// The session's working directory.
+    pub cwd: String,
+    /// The whole tool input (PreToolUse, PostToolUse), `Null` when absent.
+    pub tool_input: Value,
+    /// The whole tool result (PostToolUse), `Null` when absent.
+    pub tool_response: Value,
+}
+
+/// An object field that arrives either as an object (a command hook's
+/// input) or as its JSON text (an `mcp_tool` hook substitutes `${path}` of
+/// an object as JSON text, measured 2026-10-31). Anything else is `Null`.
+fn object_field(v: &Value, k: &str) -> Value {
+    match v.get(k) {
+        Some(o @ Value::Object(_)) => o.clone(),
+        Some(Value::String(t)) if t.starts_with('{') => crate::json::parse(t).ok().filter(|p| p.as_object().is_some()).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+impl HookEvent {
+    /// Reads an event from either an MCP `hook` call's arguments (flat
+    /// fields) or Claude Code's hook input JSON (`hook_event_name`,
+    /// `tool_input.prompt`).
+    pub fn from_value(v: &Value) -> HookEvent {
+        // A `${path}` the hook input lacked may arrive unsubstituted; it means empty.
+        let s = |k: &str| v.get(k).and_then(Value::as_str).filter(|x| !(x.starts_with("${") && x.ends_with('}'))).unwrap_or("").to_string();
+        let event = match s("event") {
+            e if !e.is_empty() => e,
+            _ => s("hook_event_name"),
+        };
+        let tool_prompt = match s("tool_prompt") {
+            p if !p.is_empty() => p,
+            _ => v.pointer("/tool_input/prompt").and_then(Value::as_str).filter(|x| !x.starts_with("${")).unwrap_or("").to_string(),
+        };
+        HookEvent {
+            event,
+            session_id: s("session_id"),
+            agent_id: s("agent_id"),
+            agent_type: s("agent_type"),
+            transcript_path: s("transcript_path"),
+            prompt: s("prompt"),
+            tool_name: s("tool_name"),
+            tool_prompt,
+            trigger: s("trigger"),
+            source: s("source"),
+            cwd: s("cwd"),
+            tool_input: object_field(v, "tool_input"),
+            tool_response: object_field(v, "tool_response"),
+        }
+    }
+}
+
+/// What a hook tells Claude Code.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HookAnswer {
+    /// Text added to the model's context.
+    pub context: String,
+    /// Deny the tool call, with this reason (PreToolUse only).
+    pub deny: Option<String>,
+    /// The replacement tool input (PreToolUse `updatedInput`).
+    pub updated_input: Option<Value>,
+    /// The replacement tool result (PostToolUse `updatedToolOutput`), in
+    /// the tool's own output shape.
+    pub updated_output: Option<Value>,
+}
+
+impl HookAnswer {
+    /// The hook JSON Claude Code acts on, or an empty string for "nothing"
+    /// (plain text is not injected, so empty is a no-op).
+    pub fn to_json(&self, event: &str) -> String {
+        if self.deny.is_none() && self.context.is_empty() && self.updated_input.is_none() && self.updated_output.is_none() {
+            return String::new();
+        }
+        crate::json::object(self.context.len() + 128, |w| {
+            let inner = crate::json::object(self.context.len() + 96, |h| {
+                h.field("hookEventName", event);
+                if let Some(r) = &self.deny {
+                    h.field("permissionDecision", "deny").field("permissionDecisionReason", r);
+                }
+                if !self.context.is_empty() {
+                    h.field("additionalContext", &self.context);
+                }
+                if let Some(u) = &self.updated_input {
+                    h.field("updatedInput", u);
+                }
+                if let Some(u) = &self.updated_output {
+                    h.field("updatedToolOutput", u);
+                }
+            });
+            w.field("hookSpecificOutput", &crate::json::parse(&inner).unwrap_or(Value::Null));
+        })
+    }
+}
+
+/// The subagent's own transcript, derived from the parent's path and the
+/// agent id (measured: Claude Code 2.1.314).
+pub fn subagent_transcript(parent: &str, agent_id: &str) -> PathBuf {
+    let base = parent.strip_suffix(".jsonl").unwrap_or(parent);
+    let id = agent_id.strip_prefix("agent-").unwrap_or(agent_id);
+    Path::new(base).join("subagents").join(format!("agent-{id}.jsonl"))
+}
+
+/// The last assistant message's usage in a transcript: its message id and
+/// `input + cache_creation + cache_read + output` tokens (equal to Claude
+/// Code's own context figure). Read backwards from the end, in 64 KiB steps,
+/// at most 16 MiB.
+///
+/// # Errors
+///
+/// I/O errors opening or reading the file.
+pub fn last_usage(path: &Path) -> std::io::Result<Option<(String, u64)>> {
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut end = len;
+    let mut carry: Vec<u8> = Vec::new();
+    let step = 64 * 1024u64;
+    while end > 0 && len - end < 16 * 1024 * 1024 {
+        let start = end.saturating_sub(step);
+        let mut buf = vec![0u8; (end - start) as usize];
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf)?;
+        buf.extend_from_slice(&carry);
+        // Whole lines only: the first partial line is carried to the next step.
+        let first_nl = if start == 0 { None } else { buf.iter().position(|b| *b == b'\n') };
+        let (head, body) = match first_nl {
+            Some(i) => (buf[..i].to_vec(), &buf[i + 1..]),
+            None => (Vec::new(), &buf[..]),
+        };
+        for line in body.rsplit(|b| *b == b'\n') {
+            if line.len() < 16 || !contains(line, b"\"usage\"") || !contains(line, b"\"assistant\"") {
+                continue;
+            }
+            let Ok(v) = crate::json::parse_bytes(line) else { continue };
+            let Some(m) = v.get("message") else { continue };
+            let Some(u) = m.get("usage") else { continue };
+            let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let ctx = n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens") + n("output_tokens");
+            let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            return Ok(Some((id, ctx)));
+        }
+        carry = head;
+        end = start;
+    }
+    Ok(None)
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The first user message of a transcript (a subagent's brief), at most
+/// 64 KiB of text.
+pub fn first_user_text(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().take(200) {
+        if !line.contains("\"user\"") {
+            continue;
+        }
+        let v = crate::json::parse(line).ok()?;
+        if v.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let c = v.pointer("/message/content")?;
+        let s = match c {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a.iter().filter_map(|x| x.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
+            _ => continue,
+        };
+        return Some(s.chars().take(65_536).collect());
+    }
+    None
+}
+
+/// The tool that may still run past the context cap.
+pub fn is_handoff_tool(name: &str) -> bool {
+    name == "handoff" || name.ends_with("__handoff")
+}
+
+/// The tools that may still run past the context cap: the handoff tool, and
+/// Claude Code's `ToolSearch`, which only loads tool schemas. MCP tools are
+/// deferred there, so without it an agent at the cap cannot load `handoff`
+/// (seen live: the deny reached `ToolSearch` before the handoff call).
+pub fn passes_cap(name: &str) -> bool {
+    is_handoff_tool(name) || name == "ToolSearch"
+}
+
+/// The first line of a recall injection.
+pub const POINTER_HEAD: &str = "atlas recall (related records; read one with recall key=KEY):
+";
+
+/// The longest title a pointer carries, in characters.
+const POINTER_TITLE: usize = 90;
+
+/// One recalled record as a pointer line: its key and a one-line title
+/// (about 30 tokens). A memory title's markdown link becomes its text; a
+/// record without a title uses its body's first line.
+pub fn pointer(h: &crate::memory::Head) -> String {
+    format!("- {}: {}
+", h.key, pointer_title(h))
+}
+
+/// A record's one-line title as a pointer carries it (see [`pointer`]).
+pub fn pointer_title(h: &crate::memory::Head) -> String {
+    let mut t = h.title.trim().trim_start_matches("- ").trim().to_string();
+    if t.is_empty() {
+        t = h.body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").trim_start_matches("- ").to_string();
+    }
+    // `[Text](file.md) - description` reads as `Text - description`.
+    if let (Some(0), Some(close)) = (t.find('['), t.find("](")) {
+        if let Some(end) = t[close..].find(')') {
+            t = format!("{}{}", &t[1..close], &t[close + end + 1..]);
+        }
+    }
+    // A pointer is one line: a title's line breaks must not start another.
+    if t.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']) {
+        t = t.replace(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'], " ");
+    }
+    if t.chars().count() > POINTER_TITLE {
+        t = t.chars().take(POINTER_TITLE - 3).collect::<String>() + "...";
+    }
+    t.trim().to_string()
+}
+
+/// One record (or lane) a hook injected, with the scores it passed the
+/// gate on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Injected {
+    /// The record key, or `lane:NAME`.
+    pub key: String,
+    /// The negated bm25 (none for a lane).
+    pub fts: Option<f64>,
+    /// The cosine with the prompt (none for a lane or a record without a
+    /// vector, or without a model).
+    pub cos: Option<f32>,
+    /// Bytes of the injected text for it (the pointer line, or the lane).
+    pub bytes: usize,
+}
+
+/// One token-log row for a hook answer.
+struct LogRow {
+    tool: String,
+    returned: usize,
+    keys: Vec<Injected>,
+    /// The session, the subagent (empty in the main session) and the
+    /// transcript the injection lands in, for `hook_inject`.
+    session: String,
+    agent: String,
+    transcript: String,
+    /// A subagent start: (session, agent), logged as a "brief without
+    /// atlas" row beside the answer's own.
+    brief: Option<(String, String)>,
+}
+
+/// The semantic side of the recall gate: the model, the record vectors,
+/// and the background embedding of records that have none yet.
+struct Sem {
+    model: Arc<Model>,
+    vecs: Option<RecVecs>,
+    embedding: Option<Arc<AtomicBool>>,
+    scratch: crate::embed::bert::Scratch,
+}
+
+/// Hook state for one server process (or one `--hook` run).
+pub struct Hooks {
+    sem: Option<Sem>,
+    model_tried: bool,
+    settings: Settings,
+    store: MemoryStore,
+    briefs: HashMap<String, VecDeque<String>>,
+    injected: HashMap<String, HashSet<String>>,
+    pending_recall: HashSet<String>,
+    agent_lane: HashMap<String, (String, String)>,
+    warned: HashMap<PathBuf, u64>,
+    usage_cache: HashMap<PathBuf, (u64, Option<(String, u64)>)>,
+    log: Option<mpsc::Sender<LogRow>>,
+    router: crate::hook_rewrite::Router,
+    /// Where the one-time settings offer reads and records its state.
+    offer: Option<crate::claude_settings::Paths>,
+    /// The store's record count, at the stamp it was read.
+    records: Option<((i64, u64), i64)>,
+    /// Files an Edit or Write changed, re-indexed by [Hooks::after].
+    edited: Vec<String>,
+    /// Opens the index store over the vaults and sources (R7: an edited
+    /// note or source file is re-indexed at once); None re-indexes code only.
+    index_opener: Option<StoreOpener>,
+    index: Option<crate::store::Store>,
+    /// The folders atlas indexes, for the first-run project offer; None
+    /// makes no offer.
+    project_roots: Option<Vec<PathBuf>>,
+    /// The configured projects, for the project offer of a project-scoped
+    /// configuration (it replaces the folder offer there).
+    offer_ctx: Option<crate::claude_settings::OfferCtx>,
+    /// The repository each session works in (see [`crate::project::Tracker`]).
+    tracker: crate::project::Tracker,
+    /// The session of the event being handled.
+    session: String,
+    /// Its working directory.
+    cwd: String,
+}
+
+/// The repository a record is about, lowercased: its `repo:` frontmatter,
+/// else the `repo` the tree configuration maps its `branch:` to. `None`
+/// for an untagged record.
+pub fn repo_tag(meta: &str, tree: Option<&crate::memory::tree::TreeSpec>) -> Option<String> {
+    use crate::memory::export::unquote;
+    use crate::memory::import::front_value;
+    if let Some(r) = front_value(meta, "repo").map(unquote).filter(|r| !r.is_empty()) {
+        return Some(r.to_lowercase());
+    }
+    let b = front_value(meta, "branch").map(unquote)?;
+    tree?.branches.iter().find(|x| x.name == b)?.repo.as_ref().map(|r| r.to_lowercase())
+}
+
+/// Opens the index store the hook worker re-indexes edited notes and
+/// source files through (given by the server, which knows the vaults).
+pub type StoreOpener = Box<dyn Fn() -> Result<crate::store::Store> + Send>;
+
+impl Hooks {
+    /// Opens the hook state: its own store connection, and a token-log
+    /// thread writing to the index database.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Db`] if the store cannot be opened.
+    pub fn open(settings: Settings) -> Result<Hooks> {
+        let store = MemoryStore::open(&settings.store)?;
+        let log = start_log(&settings);
+        let router = crate::hook_rewrite::Router::new(&settings);
+        let offer = crate::claude_settings::Paths::detect_in(None, &settings.index_db, settings.user_state.as_deref());
+        Ok(Hooks {
+            sem: None,
+            model_tried: false,
+            settings,
+            store,
+            briefs: HashMap::new(),
+            injected: HashMap::new(),
+            pending_recall: HashSet::new(),
+            agent_lane: HashMap::new(),
+            warned: HashMap::new(),
+            usage_cache: HashMap::new(),
+            log,
+            router,
+            offer,
+            records: None,
+            edited: Vec::new(),
+            index_opener: None,
+            index: None,
+            project_roots: None,
+            offer_ctx: None,
+            tracker: crate::project::Tracker::default(),
+            session: String::new(),
+            // Until an event names one: the folder the server runs in.
+            cwd: std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(),
+        })
+    }
+
+    /// Gives the hook state the index store's opener, so an edited note or
+    /// source file is re-indexed at once (see [Hooks::after]).
+    pub fn set_index_opener(&mut self, f: Option<StoreOpener>) {
+        self.index_opener = f;
+        self.index = None;
+    }
+
+    /// Work that waits until the hook's answer is sent: re-indexing the files
+    /// an Edit, Write or MultiEdit changed (R7). A file under a code root gets
+    /// its code rows rewritten from the line scan; a Markdown file under a
+    /// vault or source is rescanned. Fails open: an error is logged as a miss
+    /// and nothing else happens; the edit itself was never held.
+    pub fn after(&mut self) {
+        for path in std::mem::take(&mut self.edited) {
+            if let Err(e) = self.reindex(&path) {
+                eprintln!("atlas reindex {path}: {e}");
+                self.router.miss_text(&format!("reindex {path}"), &e);
+            }
+        }
+    }
+
+    fn reindex(&mut self, path: &str) -> Result<()> {
+        if path.ends_with(".rs") || path.ends_with(".wgsl") {
+            self.router.reindex_code(path)?;
+            return Ok(());
+        }
+        if !path.ends_with(".md") {
+            return Ok(());
+        }
+        let Some(open) = &self.index_opener else { return Ok(()) };
+        if self.index.is_none() {
+            self.index = Some(open()?);
+        }
+        let Some(store) = self.index.as_mut() else { return Ok(()) };
+        // Compared canonical: a root may be stored in another spelling
+        // (`\\?\`, case, separators, a link) than the tool wrote the path in.
+        let p = crate::project::path_key(Path::new(path));
+        let under = |root: &Path| crate::project::key_within(&p, &crate::project::path_key(root));
+        if store.vaults().all().iter().any(|v| under(&v.root)) {
+            store.rescan()?;
+        }
+        let names: Vec<String> = store.sources().iter().filter(|s| under(&s.root)).map(|s| s.name.clone()).collect();
+        if !names.is_empty() {
+            let only: Vec<&str> = names.iter().map(String::as_str).collect();
+            store.rescan_sources(Some(&only))?;
+        }
+        Ok(())
+    }
+
+    /// Turns on the one-time offer to add the session's folder as a source,
+    /// given the folders atlas already indexes.
+    pub fn set_project_roots(&mut self, roots: Option<Vec<PathBuf>>) {
+        self.project_roots = roots;
+    }
+
+    /// Turns on the project offer of a project-scoped configuration.
+    pub fn set_offer_ctx(&mut self, ctx: Option<crate::claude_settings::OfferCtx>) {
+        self.offer_ctx = ctx;
+    }
+
+    /// The repository a session works in: the one its tool calls touched
+    /// most recently and most, else the one holding its folder.
+    pub fn active_repo(&self, session: &str, cwd: &str) -> Option<String> {
+        let g = self.settings.graph.as_ref()?;
+        self.tracker.active(g, session, cwd)
+    }
+
+    /// Points the one-time settings offer at other files (tests use a
+    /// scratch home), or turns it off with `None`.
+    pub fn set_offer_paths(&mut self, p: Option<crate::claude_settings::Paths>) {
+        self.offer = p;
+    }
+
+    /// Loads what the first recall would (the term frequencies), so the
+    /// first hook answers warm.
+    pub fn warm(&mut self) {
+        let _ = self.store.rarest(&[], 0);
+        let _ = self.store.lanes();
+        self.load_model();
+    }
+
+    /// Loads the embedding model, if the file exists, and starts embedding
+    /// the records that have no vector for it. Without a model the gate is
+    /// lexical.
+    fn load_model(&mut self) {
+        if self.model_tried {
+            return;
+        }
+        // Absent: looked for again on the next event (one stat), so a model
+        // downloaded while the server runs is picked up without a restart.
+        // A verified download is renamed into place whole, so a file that
+        // exists is complete.
+        if !self.settings.model.is_file() {
+            return;
+        }
+        self.model_tried = true;
+        match Model::load(&self.settings.model) {
+            Ok(m) => {
+                let model = Arc::new(m);
+                let pending = vectors::pending(&self.store, &model.id, 1).map(|p| !p.is_empty()).unwrap_or(false);
+                let embedding = pending.then(|| vectors::spawn_embedder(self.settings.store.clone(), model.clone(), self.settings.embed_threads));
+                self.sem = Some(Sem { model, vecs: None, embedding, scratch: Default::default() });
+            }
+            Err(e) => eprintln!("atlas recall model: {e}"),
+        }
+    }
+
+    /// The record vectors, reloaded when the store changed; a background
+    /// embedding is restarted when records without a vector appear.
+    fn refresh_vectors(&mut self) -> Result<()> {
+        self.load_model();
+        let Some(sem) = self.sem.as_mut() else { return Ok(()) };
+        let stale = match &sem.vecs {
+            None => true,
+            Some(v) => v.stale(&self.store)?,
+        };
+        if stale {
+            sem.vecs = Some(RecVecs::load(&self.store, &sem.model.id, sem.model.dim)?);
+        }
+        // Only on a change: an embedder that failed is not restarted on every prompt.
+        let idle = sem.embedding.as_ref().is_none_or(|d| d.load(Ordering::Acquire));
+        if stale && idle && sem.vecs.as_ref().is_some_and(|v| v.missing > 0) {
+            sem.embedding = Some(vectors::spawn_embedder(self.settings.store.clone(), sem.model.clone(), self.settings.embed_threads));
+        }
+        Ok(())
+    }
+
+    /// The store this hook state reads.
+    pub fn store(&self) -> &MemoryStore {
+        &self.store
+    }
+
+    /// Answers one event. Never fails: an error becomes an empty answer (a
+    /// hook must not break the session), reported on stderr.
+    pub fn handle(&mut self, ev: &HookEvent) -> HookAnswer {
+        match self.try_handle(ev) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("atlas hook {}: {e}", ev.event);
+                HookAnswer::default()
+            }
+        }
+    }
+
+    fn try_handle(&mut self, ev: &HookEvent) -> Result<HookAnswer> {
+        let mut a = HookAnswer::default();
+        let mut keys = Vec::new();
+        self.session = ev.session_id.clone();
+        if !ev.cwd.is_empty() {
+            self.cwd = ev.cwd.clone();
+        }
+        if matches!(ev.event.as_str(), "PreToolUse" | "PostToolUse") {
+            if let Some(g) = self.settings.graph.clone() {
+                self.tracker.touch_input(&g, &ev.session_id, &ev.tool_input);
+            }
+        }
+        match ev.event.as_str() {
+            "UserPromptSubmit" => {
+                if ev.prompt.starts_with("<task-notification>") {
+                    a.context = self.notification(&ev.prompt)?;
+                } else {
+                    let (t, k) = self.recall(&ev.session_id, &ev.prompt)?;
+                    a.context = t;
+                    keys = k;
+                }
+            }
+            "SubagentStart" => {
+                let brief = self.briefs.get_mut(&ev.session_id).and_then(VecDeque::pop_front);
+                match brief {
+                    Some(b) => {
+                        self.note_lane(&ev.agent_id, &b);
+                        let (t, k) = self.recall(&ev.agent_id, &b)?;
+                        a.context = t;
+                        keys = k;
+                    }
+                    None => {
+                        self.pending_recall.insert(ev.agent_id.clone());
+                    }
+                }
+            }
+            "PreToolUse" => {
+                let sub = !ev.agent_id.is_empty();
+                if sub || self.settings.cap.main_session {
+                    let path = if sub { subagent_transcript(&ev.transcript_path, &ev.agent_id) } else { PathBuf::from(&ev.transcript_path) };
+                    self.cap(ev, &path, &mut a)?;
+                }
+                if a.deny.is_none() {
+                    if (ev.tool_name == "Agent" || ev.tool_name == "Task") && !ev.tool_prompt.is_empty() {
+                        self.briefs.entry(ev.session_id.clone()).or_default().push_back(ev.tool_prompt.clone());
+                    }
+                    if sub && self.pending_recall.remove(&ev.agent_id) {
+                        let path = subagent_transcript(&ev.transcript_path, &ev.agent_id);
+                        if let Some(b) = first_user_text(&path) {
+                            self.note_lane(&ev.agent_id, &b);
+                            let (t, k) = self.recall(&ev.agent_id, &b)?;
+                            if !t.is_empty() {
+                                if !a.context.is_empty() {
+                                    a.context.push('\n');
+                                }
+                                a.context.push_str(&t);
+                            }
+                            keys = k;
+                        }
+                    }
+                }
+                if a.deny.is_none() {
+                    // Routing fails open: an error leaves the call as it is.
+                    match self.router.pre_tool_use(ev) {
+                        Ok(u) => a.updated_input = u,
+                        Err(e) => self.router.miss(ev, &e),
+                    }
+                }
+            }
+            "PostToolUse" => {
+                // R7: a file an edit changed is re-indexed once the answer is out.
+                if matches!(ev.tool_name.as_str(), "Edit" | "Write" | "MultiEdit") {
+                    let f = ev.tool_input.get("file_path").and_then(Value::as_str).unwrap_or("");
+                    if !f.is_empty() && !self.edited.iter().any(|x| x == f) {
+                        self.edited.push(f.to_string());
+                    }
+                }
+                match self.router.post_tool_use(ev) {
+                    Ok(Some(u)) => a.updated_output = Some(u),
+                    // A result that passes whole is annotated from the code index.
+                    Ok(None) => match self.router.annotate(ev) {
+                        Ok((u, note)) => {
+                            a.updated_output = u;
+                            a.context = note;
+                        }
+                        Err(e) => self.router.miss(ev, &e),
+                    },
+                    Err(e) => self.router.miss(ev, &e),
+                }
+            }
+            // Nothing, except once: the settings offer (at most 60 tokens).
+            "SessionStart" => {
+                if let Some(line) = self.offer.as_ref().and_then(crate::claude_settings::session_start_line) {
+                    a.context = line;
+                }
+                // Once per folder: whether to add this project as a source
+                // (or, with projects, its repositories as a project).
+                let mut lines: Vec<String> = Vec::new();
+                match (self.offer.as_ref(), self.offer_ctx.as_ref()) {
+                    (Some(p), Some(ctx)) if ctx.scoped => {
+                        lines.extend(crate::claude_settings::repos_line(p, Path::new(&ev.cwd), ctx));
+                        lines.extend(crate::claude_settings::unmapped_line(p, ctx));
+                    }
+                    (Some(p), _) => {
+                        if let Some(roots) = self.project_roots.as_ref() {
+                            lines.extend(crate::claude_settings::project_line(p, Path::new(&ev.cwd), roots));
+                        }
+                    }
+                    _ => {}
+                }
+                for line in lines {
+                    if !a.context.is_empty() {
+                        a.context.push(' ');
+                    }
+                    a.context.push_str(&line);
+                }
+            }
+            "PreCompact" => {
+                let ctx = last_usage(Path::new(&ev.transcript_path)).ok().flatten().map_or(0, |(_, c)| c);
+                let lane = format!("session:{}", ev.session_id);
+                let d = Draft {
+                    title: format!("compaction ({}) at {ctx} context tokens", if ev.trigger.is_empty() { "unknown" } else { &ev.trigger }),
+                    meta: format!("transcript: {}\n", ev.transcript_path),
+                    body: String::new(),
+                    reason: "context compaction checkpoint written by the PreCompact hook".into(),
+                    author: "hook".into(),
+                    client: "atlas-hook".into(),
+                    provenance: None,
+                    time: None,
+                };
+                let mut w = self.store.writer()?;
+                let key = w.next_key(&format!("journal:{lane}:"), 4)?;
+                w.create(&key, "journal", "note", &lane, &d, None)?;
+                w.commit()?;
+            }
+            _ => {}
+        }
+        if matches!(ev.event.as_str(), "UserPromptSubmit" | "SubagentStart") || !a.context.is_empty() || a.deny.is_some() || a.updated_input.is_some() || a.updated_output.is_some() {
+            let returned = a.to_json(&ev.event).len();
+            if let Some(l) = &self.log {
+                let brief = (ev.event == "SubagentStart").then(|| (ev.session_id.clone(), ev.agent_id.clone()));
+                // The injection lands in the subagent's own transcript, when in one.
+                let transcript = if ev.agent_id.is_empty() || ev.transcript_path.is_empty() {
+                    ev.transcript_path.clone()
+                } else {
+                    subagent_transcript(&ev.transcript_path, &ev.agent_id).to_string_lossy().into_owned()
+                };
+                let _ = l.send(LogRow {
+                    tool: format!("hook:{}", ev.event),
+                    returned,
+                    keys,
+                    brief,
+                    session: ev.session_id.clone(),
+                    agent: ev.agent_id.clone(),
+                    transcript,
+                });
+            }
+        }
+        Ok(a)
+    }
+
+    /// Every candidate the gate scores for a text (passing or not), in the
+    /// hook's order, with the same model and query cut: what a replay of a
+    /// past injection needs to score it (`--hook-report`).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Db`].
+    pub fn scores(&mut self, text: &str) -> Result<Vec<recall::Candidate>> {
+        let r = self.settings.recall.clone();
+        self.refresh_vectors()?;
+        let qv = self.sem.as_mut().map(|s| s.model.embed_query_cut(text, r.query_tokens, &mut s.scratch));
+        let sem = match (&self.sem, &qv) {
+            (Some(s), Some(q)) => s.vecs.as_ref().map(|vecs| recall::Semantic { vecs, query: q, isa: s.model.isa }),
+            _ => None,
+        };
+        let gate = r.gate(sem.is_some());
+        recall::candidates(&self.store, text, &gate, sem.as_ref())
+    }
+
+    fn recall(&mut self, scope: &str, text: &str) -> Result<(String, Vec<Injected>)> {
+        let r = self.settings.recall.clone();
+        let mut out = String::new();
+        let mut keys = Vec::new();
+        // A lane the text names gets its journal first.
+        for l in self.store.lanes()? {
+            if l.lane.starts_with("session:") || !crate::memory::contains_word(text, &l.lane) {
+                continue;
+            }
+            let seen = self.injected.entry(scope.to_string()).or_default();
+            if !seen.insert(format!("lane:{}", l.lane)) {
+                continue;
+            }
+            let before = out.len();
+            out.push_str(&recall::lane(&self.store, &l.lane, self.settings.bytes_for(r.lane_budget_tokens))?);
+            keys.push(Injected { key: format!("lane:{}", l.lane), fts: None, cos: None, bytes: out.len() - before });
+        }
+        // A repository the text names gets its line from the project graph:
+        // what it is, what it talks to and depends on, what uses it.
+        if let Some(g) = self.settings.graph.clone() {
+            for r in g.named_in(text) {
+                let seen = self.injected.entry(scope.to_string()).or_default();
+                if !seen.insert(format!("repo:{}", r.name)) {
+                    continue;
+                }
+                if let Some(line) = g.describe(&r.name) {
+                    let before = out.len();
+                    out.push_str(&format!("atlas project {}: {line}\n", g.name));
+                    keys.push(Injected { key: format!("repo:{}", r.name), fts: None, cos: None, bytes: out.len() - before });
+                }
+            }
+        }
+        let skip = self.injected.get(scope).cloned().unwrap_or_default();
+        self.refresh_vectors()?;
+        let qv = self.sem.as_mut().map(|s| s.model.embed_query_cut(text, r.query_tokens, &mut s.scratch));
+        let sem = match (&self.sem, &qv) {
+            (Some(s), Some(q)) => s.vecs.as_ref().map(|vecs| recall::Semantic { vecs, query: q, isa: s.model.isa }),
+            _ => None,
+        };
+        let mut gate = r.gate(sem.is_some());
+        // The calibrated bm25 floor follows the store's size.
+        let stamp = self.store.stamp()?;
+        let records = match self.records {
+            Some((s, n)) if s == stamp => n,
+            _ => {
+                let n: i64 = self.store.conn().query_row("SELECT COUNT(*) FROM records_fts", [], |x| x.get(0))?;
+                self.records = Some((stamp, n));
+                n
+            }
+        };
+        gate.fts_floor *= crate::memory::settings::floor_scale(records);
+        // Pointers, not bodies: the body is one `recall key=` away.
+        let budget = self.settings.bytes_for(r.budget_tokens);
+        let mut lines = String::new();
+        let mut chosen = Vec::new();
+        let mut more = 0usize;
+        let mut passed: Vec<recall::Candidate> = recall::candidates(&self.store, text, &gate, sem.as_ref())?.into_iter().filter(|c| c.pass && !skip.contains(&c.head.key)).collect();
+        // With a model, the prompt's best cosine sets the bar: a record more
+        // than `cos_margin` below it is a word match, not the topic. Best
+        // meaning first; records without a vector keep their fused place.
+        // The relevance floor (tuned on hit data, `--hook-report --tune-floor`):
+        // below it a record is not injected at all.
+        passed.retain(|c| c.cos.is_none_or(|x| x >= r.inject_floor));
+        if let Some(best) = passed.iter().filter_map(|c| c.cos).reduce(f32::max) {
+            passed.retain(|c| c.cos.is_none_or(|x| x >= best - r.cos_margin));
+            passed.sort_by(|a, b| b.cos.unwrap_or(f32::MIN).total_cmp(&a.cos.unwrap_or(f32::MIN)));
+        }
+        // Records about the active repository, then its neighbours, first:
+        // a record is about the repository its tag names (see `repo_tag`);
+        // a record without a tag gets no boost.
+        if let Some(g) = self.settings.graph.clone() {
+            if let Some(active) = self.tracker.active(&g, &self.session, &self.cwd) {
+                let active = active.to_lowercase();
+                let near: Vec<String> = g.neighbours(&active).iter().map(|n| n.to_lowercase()).collect();
+                let tree = self.settings.tree.clone();
+                let rank = |c: &recall::Candidate| -> u8 {
+                    match repo_tag(&c.head.meta, tree.as_ref()) {
+                        Some(t) if t == active => 0,
+                        Some(t) if near.contains(&t) => 1,
+                        _ => 2,
+                    }
+                };
+                passed.sort_by_key(|c| rank(c));
+            }
+        }
+        for cand in passed {
+            let one = pointer(&cand.head);
+            if POINTER_HEAD.len() + lines.len() + one.len() + 32 > budget {
+                more += 1;
+                continue;
+            }
+            lines.push_str(&one);
+            chosen.push(Injected { key: cand.head.key, fts: Some(cand.fts), cos: cand.cos, bytes: one.len() });
+        }
+        if !chosen.is_empty() {
+            out.push_str(POINTER_HEAD);
+            out.push_str(&lines);
+            if more > 0 {
+                out.push_str(&format!("+{more} more: recall {{query}}\n"));
+            }
+            let seen = self.injected.entry(scope.to_string()).or_default();
+            for k in chosen {
+                seen.insert(k.key.clone());
+                keys.push(k);
+            }
+        }
+        Ok((out, keys))
+    }
+
+    fn note_lane(&mut self, agent_id: &str, brief: &str) {
+        if let Ok(lanes) = self.store.lanes() {
+            if let Some(l) = lanes.iter().find(|l| !l.lane.starts_with("session:") && crate::memory::contains_word(brief, &l.lane)) {
+                self.agent_lane.insert(agent_id.to_string(), (l.lane.clone(), crate::memory::now()));
+            }
+        }
+    }
+
+    fn notification(&mut self, prompt: &str) -> Result<String> {
+        let id = prompt.split("<task-id>").nth(1).and_then(|r| r.split("</task-id>").next()).unwrap_or("").trim().to_string();
+        let Some((lane, start)) = self.agent_lane.get(&id).cloned() else { return Ok(String::new()) };
+        let fresh = self.store.lane(&lane)?.iter().any(|h| h.time >= start);
+        Ok(if fresh { String::new() } else { format!("atlas: agent {id} finished with no journal entry for lane {lane} since it started; check its report against the journal.\n") })
+    }
+
+    fn cap(&mut self, ev: &HookEvent, path: &Path, a: &mut HookAnswer) -> Result<()> {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let usage = match self.usage_cache.get(path) {
+            Some((l, u)) if *l == len => u.clone(),
+            _ => {
+                let u = last_usage(path).ok().flatten();
+                self.usage_cache.insert(path.to_path_buf(), (len, u.clone()));
+                u
+            }
+        };
+        let Some((_, ctx)) = usage else { return Ok(()) };
+        let c = self.settings.cap.clone();
+        let lane = self.agent_lane.get(&ev.agent_id).map(|(l, _)| l.clone()).unwrap_or_else(|| format!("agent:{}", ev.agent_id));
+        if ctx >= c.block_tokens {
+            if !passes_cap(&ev.tool_name) {
+                a.deny = Some(format!(
+                    "atlas context cap: this agent's context is {ctx} tokens (cap {}). Every tool is blocked except the atlas `handoff` tool: write your handoff now (lane {lane}); a fresh agent continues from it.",
+                    c.block_tokens
+                ));
+                if self.warned.get(path).copied().unwrap_or(0) < c.block_tokens {
+                    self.warned.insert(path.to_path_buf(), c.block_tokens);
+                    self.cap_entry(&lane, ctx, "blocked")?;
+                }
+            }
+        } else if ctx >= c.warn_tokens {
+            let last = self.warned.get(path).copied().unwrap_or(0);
+            if last == 0 || ctx >= last + c.warn_every {
+                self.warned.insert(path.to_path_buf(), ctx);
+                a.context = format!(
+                    "atlas context cap: this agent's context is {ctx} tokens (warn {}, block {}). Finish the current step, commit, push, and write your handoff with the atlas `handoff` tool (lane {lane}).",
+                    c.warn_tokens, c.block_tokens
+                );
+                if last == 0 {
+                    self.cap_entry(&lane, ctx, "warned")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cap_entry(&mut self, lane: &str, ctx: u64, what: &str) -> Result<()> {
+        let d = Draft {
+            title: format!("context cap {what} at {ctx} tokens"),
+            meta: String::new(),
+            body: String::new(),
+            reason: format!("context cap {what}, recorded by the PreToolUse hook"),
+            author: "hook".into(),
+            client: "atlas-hook".into(),
+            provenance: None,
+            time: None,
+        };
+        let mut w = self.store.writer()?;
+        let key = w.next_key(&format!("journal:{lane}:"), 4)?;
+        w.create(&key, "journal", "cap", lane, &d, None)?;
+        w.commit()
+    }
+}
+
+/// The token-log thread: one row per hook answer in the index database's
+/// `token_log`, with the counterfactual computed by a fixed rule
+/// ([`crate::tokens::record_read`]): for each injected memory, its whole
+/// file (meta and body); for each other record, its text plus 40 lines
+/// either side of it in its export (the window a reader opens); for a lane,
+/// every record of the lane. A subagent start also logs the size of the
+/// rulebook at that moment to `brief_log` (the "brief without atlas").
+fn start_log(s: &Settings) -> Option<mpsc::Sender<LogRow>> {
+    let db = s.index_db.clone();
+    let store = s.store.clone();
+    let reference = s.brief_reference.clone();
+    let (tx, rx) = mpsc::channel::<LogRow>();
+    std::thread::Builder::new()
+        .name("atlas-hook-log".into())
+        .spawn(move || {
+            // Nothing is opened until the first row, so a server's start-up
+            // does not contend with this thread for the database.
+            let Ok(first) = rx.recv() else { return };
+            let Ok(conn) = rusqlite::Connection::open(&db) else { return };
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
+            if conn.execute_batch(crate::tokens::TOKEN_TABLE).is_err() {
+                return;
+            }
+            let Ok(mem) = MemoryStore::open(&store) else { return };
+            for r in std::iter::once(first).chain(rx) {
+                let reads: Vec<usize> = r.keys.iter().map(|k| crate::tokens::record_read(&mem, &k.key)).collect();
+                let cf = (!r.keys.is_empty()).then_some(crate::tokens::Counterfactual { grep: 0, read: reads.iter().sum() });
+                let _ = crate::tokens::log_row(&conn, &r.tool, r.returned, cf);
+                let hook = r.tool.strip_prefix("hook:").unwrap_or(&r.tool);
+                for (k, read) in r.keys.iter().zip(&reads) {
+                    let _ = crate::hook_hits::log_injection(&conn, hook, &r.session, &r.agent, &r.transcript, k, *read);
+                }
+                if let (Some((session, agent)), Some(p)) = (&r.brief, &reference) {
+                    if let Ok(m) = std::fs::metadata(p) {
+                        let _ = crate::tokens::log_brief(&conn, session, agent, m.len());
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_the_subagent_transcript() {
+        let p = subagent_transcript("/h/p/abc.jsonl", "a1b2");
+        assert_eq!(p, Path::new("/h/p/abc").join("subagents").join("agent-a1b2.jsonl"));
+        assert_eq!(subagent_transcript("/h/p/abc.jsonl", "agent-a1b2"), p);
+    }
+
+    #[test]
+    fn answers_are_hook_json_or_nothing() {
+        assert_eq!(HookAnswer::default().to_json("UserPromptSubmit"), "");
+        let a = HookAnswer { context: "x".into(), ..HookAnswer::default() };
+        assert_eq!(a.to_json("SubagentStart"), r#"{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"x"}}"#);
+        let d = HookAnswer { deny: Some("no".into()), ..HookAnswer::default() };
+        assert_eq!(d.to_json("PreToolUse"), r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"no"}}"#);
+        let o = HookAnswer { updated_output: Some(crate::json!({"stdout": "s"})), ..HookAnswer::default() };
+        assert_eq!(o.to_json("PostToolUse"), r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":{"stdout":"s"}}}"#);
+        let i = HookAnswer { updated_input: Some(crate::json!({"command": "c"})), ..HookAnswer::default() };
+        assert_eq!(i.to_json("PreToolUse"), r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"command":"c"}}}"#);
+    }
+
+    #[test]
+    fn reads_tool_objects_from_either_transport() {
+        // An mcp_tool hook substitutes an object as its JSON text; a command
+        // hook gets the object itself. An unsubstituted or non-object value
+        // is Null.
+        let text = crate::json!({"event": "PostToolUse", "tool_input": "{\"command\":\"ls\"}", "tool_response": "${tool_response}"});
+        let ev = HookEvent::from_value(&text);
+        assert_eq!(ev.tool_input, crate::json!({"command": "ls"}));
+        assert_eq!(ev.tool_response, Value::Null);
+        let obj = crate::json!({"hook_event_name": "PostToolUse", "tool_response": {"stdout": "x"}, "cwd": "/w"});
+        let ev = HookEvent::from_value(&obj);
+        assert_eq!(ev.event, "PostToolUse");
+        assert_eq!(ev.tool_response, crate::json!({"stdout": "x"}));
+        assert_eq!(ev.cwd, "/w");
+    }
+
+    #[test]
+    fn reads_the_last_usage_from_the_end() {
+        let dir = std::env::temp_dir().join(format!("atlas-usage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        let mut text = String::new();
+        let rec = |id: &str, i: u64| {
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"id\":\"{id}\",\"usage\":{{\"input_tokens\":2,\"cache_creation_input_tokens\":{i},\"cache_read_input_tokens\":100,\"output_tokens\":5}}}}}}\n"
+            )
+        };
+        text.push_str(&rec("m1", 10));
+        // Padding past one read step, so the scan crosses a chunk boundary.
+        for _ in 0..2000 {
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"padding padding padding padding padding\"}}\n");
+        }
+        text.push_str(&rec("m2", 1000));
+        text.push_str(&rec("m2", 1000));
+        text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"tool result\"}}\n");
+        std::fs::write(&p, &text).unwrap();
+        assert_eq!(last_usage(&p).unwrap(), Some(("m2".to_string(), 1107)));
+        std::fs::write(&p, rec("m1", 10) + &"{\"type\":\"user\"}\n".repeat(3000)).unwrap();
+        assert_eq!(last_usage(&p).unwrap(), Some(("m1".to_string(), 117)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -1,0 +1,74 @@
+{
+  "version": 2,
+  "about": "Settings atlas offers at install and lets you change at any time. Claude Code settings are opt-in, explained, diffed, backed up and reversible; atlas's own switches are on by default and explained at install. Values were measured on real sessions; see 'basis'.",
+  "settings": [
+    {
+      "id": "subagent-cache-1h",
+      "kind": "setting",
+      "key": "subagentPromptCacheTtl",
+      "value": "1h",
+      "min_version": "2.1.242",
+      "short": "1h subagent cache",
+      "title": "Keep subagents' prompt cache for an hour",
+      "what": "Subagents normally keep their prompt cache for 5 minutes. When one waits longer than that (a build, a test run), its whole context is written to the cache again on the next turn.",
+      "cost": "Cache writes cost 2x the input price instead of 1.25x, but the full re-writes after idle waits stop.",
+      "basis": "69 builder lanes: 130 M of 155 M cache-write tokens were full re-writes after 5-60 min idles; about -20% lane cost.",
+      "docs": "https://code.claude.com/docs/en/prompt-caching.md",
+      "choices": ["5m", "1h"],
+      "default_note": "Claude Code default: 5m"
+    },
+    {
+      "id": "goal-checkin-120",
+      "kind": "env",
+      "key": "CLAUDE_CODE_GOAL_CHECKIN_MINUTES",
+      "value": "120",
+      "short": "goal check-ins",
+      "title": "Fewer goal check-ins while background work runs",
+      "what": "With a /goal set, Claude Code wakes the session to check on background work after 30 min, then 1 h, then every 2 h. Each wake re-reads the whole conversation. This makes it 2 h, then 4 h, then every 8 h. Results from finished work still wake the session as before.",
+      "cost": "You hear about stuck background work later. Setting 0 turns check-ins off but also turns off automatic retries after transient errors, so atlas offers 120 and warns before 0.",
+      "basis": "Long sessions process 0.7-1.8 G tokens; each wake at 300k context costs about 300k tokens of cache reads.",
+      "docs": "https://code.claude.com/docs/en/goal.md",
+      "range": {"min": 0, "max": 1440, "integer": true},
+      "warn": {"0": "0 turns check-ins off AND turns off automatic retries after transient errors."},
+      "default_note": "Claude Code default: 30"
+    },
+    {
+      "id": "routing",
+      "kind": "flag",
+      "key": "routing",
+      "type": "bool",
+      "value": true,
+      "short": "routing",
+      "title": "Route large tool results through atlas",
+      "what": "atlas's hooks keep a large shell, build, Read or Grep result on disk and hand the model a short digest plus a handle; it pulls exact slices by handle when it needs them. Small results pass through untouched, and any hook error passes the call through as it was.",
+      "cost": "A digest can hide a line the model then has to slice for (one more tool call). The full output stays on disk under the handle.",
+      "basis": "Long-session attribution: shell reads are 36% and build/test output 6% of weighted tokens; those results enter the context whole without routing.",
+      "default_note": "atlas default: on"
+    },
+    {
+      "id": "update",
+      "kind": "atlas",
+      "key": "update.enabled",
+      "type": "bool",
+      "value": true,
+      "short": "auto-update",
+      "title": "Update atlas at session start",
+      "what": "Before the server starts, atlas checks the latest release (at most once an hour), verifies its signature and swaps it in. Offline, or on any error, the installed version starts.",
+      "cost": "Up to about 10 s at a session start that finds a new release; past that the current version starts and the update finishes for the next start.",
+      "basis": "Releases are signed (ed25519, public key built in); a bad or missing signature is refused.",
+      "default_note": "atlas default: on; set update-pin to stay on one version"
+    },
+    {
+      "id": "update-pin",
+      "kind": "atlas",
+      "key": "update.pin",
+      "type": "version",
+      "short": "update pin",
+      "title": "Stay on one atlas version",
+      "what": "Pins atlas to the named version: the updater installs it if needed and never moves past it.",
+      "cost": "No fixes or improvements arrive until the pin is removed.",
+      "basis": "For a known-good build, or a machine that must not change.",
+      "default_note": "atlas default: no pin (latest release)"
+    }
+  ]
+}

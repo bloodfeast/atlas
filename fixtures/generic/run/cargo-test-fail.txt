@@ -1,0 +1,43 @@
+   Compiling sample v0.1.0 (C:\work\sample)
+warning: unused variable: `x`
+ --> src\lib.rs:2:30
+  |
+2 | pub fn unused_helper() { let x = 1; }
+  |                              ^ help: if this is intentional, prefix it with an underscore: `_x`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sample` (lib) generated 1 warning (run `cargo fix --lib -p sample` to apply 1 suggestion)
+warning: `sample` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running unittests src\lib.rs (C:/work/target\debug\deps\sample-0c397b863d7a06b2.exe)
+
+running 4 tests
+test tests::slow ... ignored
+test tests::adds ... ok
+test tests::panics_here ... FAILED
+test tests::adds_wrong ... FAILED
+
+failures:
+
+---- tests::panics_here stdout ----
+
+thread 'tests::panics_here' (3492) panicked at src\lib.rs:8:32:
+the widget count went negative
+
+---- tests::adds_wrong stdout ----
+
+thread 'tests::adds_wrong' (26092) panicked at src\lib.rs:7:31:
+assertion `left == right` failed
+  left: 3
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::adds_wrong
+    tests::panics_here
+
+test result: FAILED. 1 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

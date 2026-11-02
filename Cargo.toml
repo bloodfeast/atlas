@@ -1,0 +1,43 @@
+[package]
+name = "atlas"
+version = "0.1.0"
+edition = "2021"
+description = "A local, stdio-only MCP index and memory store for agents over Obsidian vaults and read-only Markdown sources: identifiers, sections, a code index, semantic recall. No network at query time."
+authors = ["Brandon White"]
+license = "Apache-2.0"
+readme = "README.md"
+publish = false
+
+# The workspace: atlas, and the dev-only `xtask` crate (`cargo xtask ...`,
+# never shipped). Its own table also keeps cargo from attaching this crate to
+# a workspace in a parent folder. Plain `cargo build` and `cargo test` build
+# atlas alone.
+[workspace]
+members = [".", "xtask"]
+default-members = ["."]
+
+[lib]
+name = "atlas"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atlas"
+path = "src/main.rs"
+
+[features]
+# The measuring modes (--bench, --judge, --symbol-bench, --recall-scores and
+# the options only they read). Off by default and in release builds; `cargo
+# xtask` turns it on for the benches and verify-macos.
+dev = []
+
+[dependencies]
+# Two named exceptions to the no-dependency rule, everything else owned
+# (JSON, regular expressions, change notification and the vector scans:
+# src/json.rs, src/regex.rs, src/platform, src/scan.rs):
+# - SQLite, bundled: the durable store.
+# - ed25519-compact, default features off (no dependencies of its own): the
+#   signature check on release manifests (src/update.rs). Curve arithmetic
+#   is not hand-written.
+rusqlite = { version = "0.40", features = ["bundled"] }
+ed25519-compact = { version = "2.6", default-features = false }
+

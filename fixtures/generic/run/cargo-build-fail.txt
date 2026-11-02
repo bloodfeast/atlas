@@ -1,0 +1,32 @@
+   Compiling sample v0.1.0 (C:\work\sample)
+error[E0425]: cannot find value `missing_name` in this scope
+ --> src\lib.rs:1:45
+  |
+1 | pub fn add(a: u32, b: u32) -> u32 { a + b + missing_name }
+  |                                             ^^^^^^^^^^^^ not found in this scope
+
+error[E0308]: mismatched types
+ --> src\lib.rs:2:28
+  |
+2 | pub fn other() -> String { 5 }
+  |                   ------   ^ expected `String`, found integer
+  |                   |
+  |                   expected `String` because of return type
+  |
+help: try using a conversion method
+  |
+2 | pub fn other() -> String { 5.to_string() }
+  |                             ++++++++++++
+
+warning: unused variable: `x`
+ --> src\lib.rs:3:30
+  |
+3 | pub fn unused_helper() { let x = 1; }
+  |                              ^ help: if this is intentional, prefix it with an underscore: `_x`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+Some errors have detailed explanations: E0308, E0425.
+For more information about an error, try `rustc --explain E0308`.
+warning: `sample` (lib) generated 1 warning
+error: could not compile `sample` (lib) due to 2 previous errors; 1 warning emitted
