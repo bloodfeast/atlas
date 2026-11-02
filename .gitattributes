@@ -1,1 +1,3 @@
 * text=auto eol=lf
+# The development repository's release workflow never reaches the public one.
+.github/workflows/release-pr.yml export-ignore

@@ -82,7 +82,10 @@ in a meta repository, and be named by a `projects[].file` entry):
 A repository is listed by `path` (relative to the file), by `remote`, or both; the remote is identity only,
 read from `.git/config` and never fetched. Its checkout is the `checkouts` entry for its remote, else its path; a
 repository found neither way is reported once at session start and left out. Each located repository is a
-source (its Markdown) and a code root (Rust, WGSL, and `.proto` files, see [[Code index]]).
+source (its Markdown) and a code root (Rust, WGSL, and `.proto` files, see [[Code index]]). A folder already
+configured as a source or a code root is not added twice: the repository uses the configured one. Its
+Markdown source also leaves out the files another source or vault already indexes (a `docs` source inside
+it, the `intent` file), so each file is indexed once.
 
 `role` and `talks_to` are optional: a prompt that names a repository gets one line from the graph (its role,
 what it talks to and depends on, what uses it), `lookup NAME` answers the same, and recall puts records about

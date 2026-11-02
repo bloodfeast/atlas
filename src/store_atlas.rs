@@ -202,6 +202,11 @@ pub struct AtlasSetup {
     pub watch: bool,
     /// How long a watched root goes before it is walked anyway.
     pub rescan_interval: Duration,
+    /// The index file of each source that lists names, as (source, path
+    /// below its root): a memory folder's `MEMORY.md` lists the memories
+    /// and is not one, so its stem is no name (else every "memory" in the
+    /// corpus would be an identifier). From the memory exports' `index`.
+    pub name_indexes: Vec<(String, String)>,
 }
 
 impl Default for AtlasSetup {
@@ -214,6 +219,7 @@ impl Default for AtlasSetup {
             refresh_limit: crate::config::DEFAULT_REFRESH_LIMIT,
             watch: false,
             rescan_interval: Duration::from_secs(crate::config::DEFAULT_RESCAN_INTERVAL_S),
+            name_indexes: Vec::new(),
         }
     }
 }
@@ -243,6 +249,15 @@ impl AtlasSetup {
             )?);
         }
         let wikilinks = c.wikilinks.unwrap_or(true);
+        // A memory export syncs from the source of its name; its index file
+        // is that source's list of the names, not a name.
+        let name_indexes = c
+            .memory
+            .iter()
+            .flat_map(|m| m.exports.iter())
+            .filter(|x| x.shape == "memory" && c.sources.iter().any(|s| s.name == x.name && s.names_kind.is_some()))
+            .filter_map(|x| Some((x.name.clone(), x.index.clone()?)))
+            .collect();
         Ok(AtlasSetup {
             sources,
             rules: Rules::new(&c.ids, wikilinks)?,
@@ -251,7 +266,14 @@ impl AtlasSetup {
             refresh_limit: c.refresh_limit(),
             watch: c.watch.unwrap_or(true),
             rescan_interval: Duration::from_secs(c.rescan_interval_s.map(|n| n as u64).unwrap_or(crate::config::DEFAULT_RESCAN_INTERVAL_S)),
+            name_indexes,
         })
+    }
+
+    /// Whether `rel` is the index file of names source `source` (see
+    /// [`AtlasSetup::name_indexes`]).
+    pub fn is_name_index(&self, source: &str, rel: &str) -> bool {
+        self.name_indexes.iter().any(|(s, p)| s == source && p.eq_ignore_ascii_case(rel))
     }
 }
 
@@ -738,7 +760,7 @@ impl Atlas {
         for s in &self.setup.sources {
             if let Some(kind) = &s.names_kind {
                 if let Ok(files) = s.walk() {
-                    for f in files {
+                    for f in files.iter().filter(|f| !self.setup.is_name_index(&s.name, &f.rel)) {
                         names.insert(stem_of(&f.rel), kind);
                     }
                 }
@@ -751,7 +773,7 @@ impl Atlas {
     pub(super) fn fingerprint(&self, vaults: &Vaults) -> String {
         let mut s = String::from(ATLAS_SCHEMA);
         s.push_str(&format!("{:?}", self.setup.specs));
-        s.push_str(&format!("|wl={}|vk={:?}", self.setup.rules.wikilinks, self.setup.vault_id_keys));
+        s.push_str(&format!("|wl={}|vk={:?}|ni={:?}", self.setup.rules.wikilinks, self.setup.vault_id_keys, self.setup.name_indexes));
         for v in vaults.all() {
             s.push_str(&format!("|v:{}={}", v.name, v.root.display()));
         }
@@ -1509,9 +1531,12 @@ impl Store {
         for (rel, m, s) in &diff.touched {
             touch_doc(&tx, name, rel, *m, *s)?;
         }
+        // The index file of a names source defines no name of its own.
+        let index_dr = DocRules { names_kind: None, ..dr };
         for (rel, bytes, mtime) in &loaded {
             let text = String::from_utf8_lossy(bytes);
-            index_doc(&tx, &self.atlas.setup.rules, &self.atlas.names, &dr, rel, &text, *mtime, bytes.len() as i64, &sha256::hex(bytes))?;
+            let dr = if self.atlas.setup.is_name_index(name, rel) { &index_dr } else { &dr };
+            index_doc(&tx, &self.atlas.setup.rules, &self.atlas.names, dr, rel, &text, *mtime, bytes.len() as i64, &sha256::hex(bytes))?;
             stats.parsed += 1;
         }
         tx.commit()?;
@@ -2118,7 +2143,7 @@ impl Store {
             out.push(SourceInfo {
                 name: v.name.clone(),
                 kind: "vault",
-                root: v.root.display().to_string(),
+                root: crate::paths::strip_verbatim(v.root.clone()).display().to_string(),
                 include: Vec::new(),
                 files: self.doc_count(&v.name)?,
                 sections: sections(&v.name)?,
@@ -2130,7 +2155,7 @@ impl Store {
             out.push(SourceInfo {
                 name: s.name.clone(),
                 kind: "source",
-                root: s.root.display().to_string(),
+                root: crate::paths::strip_verbatim(s.root.clone()).display().to_string(),
                 include: s.include.clone(),
                 files: self.doc_count(&s.name)?,
                 sections: sections(&s.name)?,

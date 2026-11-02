@@ -265,9 +265,10 @@ pub fn linked_repos(text: &str) -> Vec<String> {
 }
 
 /// Files under `root` that name a public repository other than `want`
-/// (README.md, SECURITY.md, the CI workflow and every wiki page).
+/// (README.md, SECURITY.md, the CI and release workflows and every wiki
+/// page).
 pub fn link_mismatches(root: &std::path::Path, want: &str) -> R<Vec<String>> {
-    let mut files: Vec<std::path::PathBuf> = ["README.md", "SECURITY.md", ".github/workflows/ci.yml"].iter().map(|f| root.join(f)).collect();
+    let mut files: Vec<std::path::PathBuf> = ["README.md", "SECURITY.md", ".github/workflows/ci.yml", ".github/workflows/release.yml"].iter().map(|f| root.join(f)).collect();
     if let Ok(rd) = std::fs::read_dir(root.join("wiki")) {
         let mut w: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
         w.sort();
@@ -295,11 +296,30 @@ pub struct Report {
     pub rulesets: usize,
     /// Collaborators listed.
     pub collaborators: usize,
+    /// What a token without the owner's view could not see (always empty
+    /// for [`check`]); the owner's full check covers it later.
+    pub unseen: Vec<String>,
 }
 
 /// The whole guard (see the module docs). `dev_remote` is this checkout's
 /// `origin` URL.
 pub fn check(api: &dyn Api, want: &str, dev_remote: Option<&str>, remotes: &[&str]) -> R<Report> {
+    check_with(api, want, dev_remote, remotes, true)
+}
+
+/// The guard as a token without admin rights sees it (the release app's
+/// installation token in `cargo xtask release --pr`): GitHub leaves
+/// `bypass_actors` out of a ruleset answer for such a token, and may refuse
+/// it the collaborator list. Those two parts are reported in
+/// [`Report::unseen`] instead of refused; everything else is checked as in
+/// [`check`], and a `bypass_actors` that is present is still checked. The
+/// owner's `cargo xtask release sign` makes the full check before anything
+/// is published.
+pub fn check_unprivileged(api: &dyn Api, want: &str, dev_remote: Option<&str>, remotes: &[&str]) -> R<Report> {
+    check_with(api, want, dev_remote, remotes, false)
+}
+
+fn check_with(api: &dyn Api, want: &str, dev_remote: Option<&str>, remotes: &[&str], owner: bool) -> R<Report> {
     check_remotes(want, remotes)?;
     let path = format!("repos/{want}");
     let info = parse_info(&api.get(&path).map_err(|e| format!("{want} was not found on GitHub ({e}): create the public repo first"))?)?;
@@ -309,18 +329,33 @@ pub fn check(api: &dyn Api, want: &str, dev_remote: Option<&str>, remotes: &[&st
     let list = json(&lp, &api.get(&lp)?)?;
     let list = list.as_array().ok_or(format!("gh api {lp}: not a list"))?;
     let mut full = Vec::new();
+    let mut unseen = Vec::new();
     for r in list {
         let id = r.get("id").and_then(Value::as_i64).ok_or(format!("gh api {lp}: a ruleset without an id"))?;
         let rp = format!("repos/{want}/rulesets/{id}");
         let v = json(&rp, &api.get(&rp)?)?;
-        check_bypass(want, &v)?;
+        if owner || v.get("bypass_actors").is_some() {
+            check_bypass(want, &v)?;
+        } else {
+            unseen.push(format!("the bypass list of ruleset {:?}", v.get("name").and_then(Value::as_str).unwrap_or("?")));
+        }
         full.push(v);
     }
     check_required(want, &full)?;
     let cp = format!("repos/{want}/collaborators?affiliation=all&per_page=100");
-    let collab = json(&cp, &api.get(&cp)?)?;
-    check_collaborators(want, &info.owner, &collab)?;
-    Ok(Report { rulesets: list.len(), collaborators: collab.as_array().map_or(0, Vec::len) })
+    let collab = match api.get(&cp) {
+        Ok(body) => Some(json(&cp, &body)?),
+        Err(_) if !owner => {
+            unseen.push("the collaborator list".into());
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(c) = &collab {
+        check_collaborators(want, &info.owner, c)?;
+    }
+    let collaborators = collab.as_ref().and_then(Value::as_array).map_or(0, Vec::len);
+    Ok(Report { rulesets: list.len(), collaborators, unseen })
 }
 
 #[cfg(test)]
@@ -450,6 +485,26 @@ mod tests {
         let root = crate::release::repo_root();
         assert_eq!(link_mismatches(&root, crate::release::DEFAULT_PUBLIC_REPO).unwrap(), Vec::<String>::new());
         assert!(linked_repos(&std::fs::read_to_string(root.join("README.md")).unwrap()).len() > 5);
+    }
+
+    #[test]
+    fn an_unprivileged_token_reports_what_it_cannot_see() {
+        // The app's token: no bypass lists and no collaborator list.
+        let mut m = good();
+        m.insert("repos/acme/tool/rulesets/11".into(), format!(r#"{{"id": 11, "name": "main", {MAIN_RULES}}}"#));
+        m.remove("repos/acme/tool/collaborators?affiliation=all&per_page=100");
+        assert!(run(m.clone()).unwrap_err().contains("lists no bypass_actors"), "the owner's check still refuses");
+        let r = check_unprivileged(&Map(m.clone()), "acme/tool", None, &[]).unwrap();
+        assert_eq!(r.unseen, [r#"the bypass list of ruleset "main""#, "the collaborator list"]);
+        // A bypass list it can see is still checked, and so is everything else.
+        let mut bad = m.clone();
+        bad.insert(
+            "repos/acme/tool/rulesets/12".into(),
+            format!(r#"{{"id": 12, "name": "tags", "bypass_actors": [{{"actor_id": 9, "actor_type": "Integration"}}], {TAG_RULES}}}"#),
+        );
+        assert!(check_unprivileged(&Map(bad), "acme/tool", None, &[]).unwrap_err().contains("Integration 9"));
+        m.insert("repos/acme/tool".into(), r#"{"full_name": "acme/tool", "private": true, "owner": {"login": "acme", "type": "User"}}"#.into());
+        assert!(check_unprivileged(&Map(m), "acme/tool", None, &[]).unwrap_err().contains("is private"));
     }
 
     #[test]

@@ -995,3 +995,146 @@ fn a_project_reached_through_a_link_resolves_routes_and_is_offered_once() {
     assert_eq!(h.active_repo("s", &cwd).as_deref(), Some("auth"), "a touch through the link routes to its repo");
     assert_eq!(h.active_repo("other", &acme.join("billing").to_string_lossy()).as_deref(), Some("billing"));
 }
+
+/// A repository whose folder is already a configured source or code root
+/// reuses it; its Markdown source leaves out what other sources index; a
+/// repository with no prior coverage is added as before; and recall still
+/// puts the records of the repository holding the touched files first.
+#[test]
+fn a_repo_reuses_configured_roots_and_indexes_each_file_once() {
+    let t = Temp::new("proj-dedup");
+    let r = t.path();
+    let alpha = r.join("alpha");
+    repo(&alpha, "https://git.example/acme/alpha.git");
+    write(&alpha.join("docs").join("guide.md"), "# Guide\n\nThe deployment guide for alpha.\n");
+    write(&alpha.join("docs").join("deep").join("more.md"), "# More\n\nMore of the guide.\n");
+    write(&alpha.join("notes").join("plan.md"), "# Plan\n\nThe alpha plan.\n");
+    write(&alpha.join("INTENT.md"), "# Intent\n\n- Every rule is a line.\n");
+    write(&alpha.join("src").join("lib.rs"), "pub fn alpha_entry() {}\n");
+    let beta = r.join("beta");
+    repo(&beta, "https://git.example/acme/beta.git");
+    write(&beta.join("src").join("lib.rs"), "pub fn beta_entry() {}\n");
+    let gamma = r.join("gamma");
+    repo(&gamma, "https://git.example/acme/gamma.git");
+    write(&gamma.join("guide.md"), "# Gamma guide\n\nText.\n");
+    let cfg = r.join("atlas.json");
+    write(
+        &cfg,
+        r#"{"projects_dir": "state", "watch": false,
+            "projects": [{"name": "acme", "roots": ["."],
+              "repos": [{"name": "alpha", "path": "alpha", "talks_to": ["beta"]}, {"name": "beta", "path": "beta"}, {"name": "gamma", "path": "gamma"}],
+              "intent": "alpha/INTENT.md",
+              "sources": [{"name": "docs", "root": "alpha/docs", "include": ["**/*.md"]}, {"name": "gamma-md", "root": "gamma", "include": ["*.md"]}],
+              "code": {"roots": [{"name": "alpha-src", "root": "alpha"}]}}]}"#,
+    );
+    let c = Config::load(&cfg).unwrap();
+    project::clear_cache();
+    let res = project::resolve(&c, &alpha.join("src"), None).unwrap();
+    let e = &res.config;
+    let roots_at = |dir: &Path| -> Vec<String> {
+        let k = project::path_key(dir);
+        e.code.as_ref().unwrap().roots.iter().filter(|x| project::path_key(&x.root) == k).map(|x| x.name.clone()).collect()
+    };
+    let sources_at = |dir: &Path| -> Vec<String> {
+        let k = project::path_key(dir);
+        e.sources.iter().filter(|x| project::path_key(&x.root) == k).map(|x| x.name.clone()).collect()
+    };
+    // The configured code root is reused; gamma's configured source is too.
+    assert_eq!(roots_at(&alpha), vec!["alpha-src"]);
+    assert_eq!(sources_at(&gamma), vec!["gamma-md"]);
+    assert_eq!(roots_at(&gamma), vec!["gamma-code"], "a source at the folder is no code root");
+    // alpha's Markdown source leaves out the docs source's files and the intent file.
+    let a = e.sources.iter().find(|x| x.name == "alpha").expect("alpha source");
+    assert!(a.exclude.iter().any(|g| g == "docs/**/*.md"), "{:?}", a.exclude);
+    assert!(a.exclude.iter().any(|g| g == "INTENT.md"), "{:?}", a.exclude);
+    // beta, with nothing configured at its folder, is exactly as before.
+    let b = e.sources.iter().find(|x| x.name == "beta").expect("beta source");
+    assert_eq!(
+        (b.root.as_path(), b.include.clone(), b.exclude.clone()),
+        (beta.as_path(), vec!["**/*.md".to_string()], vec!["target/**".to_string(), "node_modules/**".into(), "vendor/**".into()])
+    );
+    assert_eq!(roots_at(&beta), vec!["beta-code"]);
+    assert_eq!(sources_at(&beta), vec!["beta"]);
+
+    // Indexed: every Markdown file once.
+    let mut s = server_for(e);
+    s.store_mut().rescan_sources(None).unwrap();
+    let info = s.store_mut().list_sources().unwrap();
+    let files = |n: &str| info.iter().find(|x| x.name == n).map(|x| x.files).unwrap_or_else(|| panic!("no source {n}"));
+    assert_eq!(
+        (files("alpha"), files("docs"), files("intent"), files("gamma-md"), files("beta")),
+        (2, 2, 1, 2, 1),
+        "README and plan; the guides; INTENT.md; gamma's two; beta's README"
+    );
+    let total: usize = info.iter().filter(|x| x.kind == "source").map(|x| x.files).sum();
+    assert_eq!(total, 8, "eight Markdown files, each indexed once");
+
+    // The repository of a file under a reused root is the one holding it,
+    // so touching it makes that repository active and its records first.
+    let g = res.graph.clone();
+    let p = |dir: &Path, rel: &[&str]| rel.iter().fold(dir.to_path_buf(), |d, x| d.join(x)).to_string_lossy().into_owned();
+    assert_eq!(g.repo_of(&p(&alpha, &["docs", "guide.md"])).map(|x| x.name.as_str()), Some("alpha"));
+    assert_eq!(g.repo_of(&p(&alpha, &["src", "lib.rs"])).map(|x| x.name.as_str()), Some("alpha"));
+    assert_eq!(g.repo_of(&p(&gamma, &["guide.md"])).map(|x| x.name.as_str()), Some("gamma"));
+    let mut settings = settings_for(e);
+    settings.graph = Some(Arc::new(g));
+    {
+        let mut store = atlas::memory::MemoryStore::open(&settings.store).unwrap();
+        let mut w = store.writer().unwrap();
+        for (key, repo) in [("rollout-gamma", "gamma"), ("rollout-alpha", "alpha")] {
+            let d = atlas::memory::Draft {
+                title: format!("- [Rollout]({key}.md) - staged rollout policy in {repo}"),
+                meta: format!("---\nname: {key}\nrepo: {repo}\n---\n"),
+                body: format!("\nThe staged rollout policy in {repo} waits a day between rings.\n"),
+                reason: "seeding the dedup boost test".into(),
+                author: "t".into(),
+                client: "t".into(),
+                ..atlas::memory::Draft::default()
+            };
+            w.create(key, "memory", "feedback", "", &d, None).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let mut h = Hooks::open(settings).unwrap();
+    h.set_offer_paths(None);
+    for (dir, rel) in [(&gamma, &["guide.md"][..]), (&alpha, &["docs", "guide.md"]), (&alpha, &["src", "lib.rs"]), (&alpha, &["docs", "deep", "more.md"])] {
+        h.handle(&HookEvent { event: "PreToolUse".into(), session_id: "s".into(), tool_name: "Read".into(), tool_input: json!({"file_path": p(dir, rel)}), ..HookEvent::default() });
+    }
+    assert_eq!(h.active_repo("s", "").as_deref(), Some("alpha"));
+    let ans = h.handle(&HookEvent { event: "UserPromptSubmit".into(), session_id: "s".into(), prompt: "how long does the staged rollout policy wait between rings".into(), ..HookEvent::default() });
+    let ia = ans.context.find("rollout-alpha").unwrap_or_else(|| panic!("{}", ans.context));
+    let ig = ans.context.find("rollout-gamma").unwrap_or_else(|| panic!("{}", ans.context));
+    assert!(ia < ig, "the active repo's record first: {}", ans.context);
+}
+
+/// `--config PATH` before a subcommand word is that subcommand's
+/// configuration: `atlas --config C settings migrate-projects NAME` moves C
+/// into a project (it was read as the `settings on|off` switch).
+#[test]
+fn a_leading_config_reaches_the_settings_subcommand() {
+    let t = Temp::new("proj-lead-cfg");
+    let r = t.path();
+    let cfg = r.join("cfg").join("atlas.json");
+    write(&r.join("cfg").join("notes").join("a.md"), "# A\n");
+    write(&cfg, r#"{"db": "state/atlas.sqlite", "vaults": [{"name": "notes", "path": "notes"}]}"#);
+    let claude = r.join("claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_atlas"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["settings", "migrate-projects", "alpha"])
+        .env("CLAUDE_CONFIG_DIR", &claude)
+        .env("ATLAS_HOME", r.join("home-atlas"))
+        .env("HOME", r)
+        .env("USERPROFILE", r)
+        .env_remove("ATLAS_CONFIG")
+        .env_remove("ATLAS_PROJECT")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("expected on or off"), "{text}");
+    let c = Config::load(&cfg).unwrap();
+    assert_eq!(c.user.projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["alpha"], "{text}");
+}

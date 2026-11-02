@@ -8,6 +8,9 @@
 //! cargo xtask pack-embedder MODEL_DIR OUT.atm [--int8] [--query-prefix TEXT] [--ucd UCD_DIR]
 //! cargo xtask release --build-only
 //! cargo xtask release --remote URL [--push | --dry-run] [--allow-missing] [--skip-tests]
+//! cargo xtask release --pr --remote URL [--expect vX.Y.Z] [--dry-run]
+//! cargo xtask release assets --dir DIR --notes FILE [--expect vX.Y.Z]
+//! cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
 //! cargo xtask verify-macos
 //! cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
 //! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
@@ -37,7 +40,8 @@
 //!   (see `pack_embedder.rs`).
 //! * `release` builds the binaries and makes the public release commit
 //!   and the wiki commit, after checking the public repository on GitHub
-//!   (see `release.rs`, `wiki.rs` and `public_repo.rs`).
+//!   (see `release.rs`, `wiki.rs` and `public_repo.rs`); `--pr`, `assets`
+//!   and `sign` are the CI release (see `release_ci.rs`).
 //! * `verify-macos` runs the suite, the fixture checks and the benches and
 //!   prints what to paste back (see `verify_macos.rs`).
 //! * `coverage` runs the tests with rustc's coverage instrumentation and
@@ -54,6 +58,7 @@ mod pack_embedder;
 mod public_repo;
 mod py;
 mod release;
+mod release_ci;
 mod tar;
 mod ucd;
 mod usage;
@@ -70,6 +75,9 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
        cargo xtask pack-embedder MODEL_DIR OUT.atm [--int8] [--query-prefix TEXT] [--ucd UCD_DIR]
        cargo xtask release --build-only
        cargo xtask release --remote URL [--push | --dry-run] [--allow-missing] [--skip-tests]
+       cargo xtask release --pr --remote URL [--expect vX.Y.Z] [--dry-run]
+       cargo xtask release assets --dir DIR --notes FILE [--expect vX.Y.Z]
+       cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
        cargo xtask verify-macos
        cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
        cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]

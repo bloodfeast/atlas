@@ -25,6 +25,12 @@
 //!     sign: it refuses --push and ignores ATLAS_SIGN_KEY.
 //! ```
 //!
+//! This is the manual release. The CI release (`--pr`, `assets`, `sign`:
+//! a pull request to the public repository, its build on GitHub's runners,
+//! the owner's signature and publish) is in `release_ci.rs`; both share the
+//! checks, the export, the leak check, the notes, the manifest writer
+//! ([`manifest_json`]) and the signing.
+//!
 //! Targets and where they come from:
 //!
 //! * x86_64-pc-windows-msvc: built on Windows (bin/atlas.exe)
@@ -94,7 +100,7 @@ use std::process::{Command, Stdio};
 pub const USAGE: &str = "usage: cargo xtask release --build-only
        cargo xtask release --remote URL [--push | --dry-run] [--allow-missing] [--skip-tests]";
 
-const TARGETS: [&str; 5] =
+pub(crate) const TARGETS: [&str; 5] =
     ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"];
 
 /// The build script run inside WSL: the Linux binary, from the same archive.
@@ -123,7 +129,7 @@ fi
 
 type R<T = ()> = Result<T, String>;
 
-fn say(m: &str) {
+pub(crate) fn say(m: &str) {
     println!("release: {m}");
 }
 
@@ -137,18 +143,18 @@ struct Opts {
     remote: Option<String>,
 }
 
-fn env(k: &str) -> Option<String> {
+pub(crate) fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())
 }
 
 /// `command -v NAME`: the first match on PATH.
-fn which(name: &str) -> Option<PathBuf> {
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     let exts: &[&str] = if cfg!(windows) { &["", ".exe", ".cmd", ".bat"] } else { &[""] };
     std::env::split_paths(&std::env::var_os("PATH")?).find_map(|d| exts.iter().map(|e| d.join(format!("{name}{e}"))).find(|p| p.is_file()))
 }
 
 /// Runs a command; its stdout on success, else a message with its stderr.
-fn output(c: &mut Command) -> R<String> {
+pub(crate) fn output(c: &mut Command) -> R<String> {
     let o = c.stdin(Stdio::null()).output().map_err(|e| format!("{c:?}: {e}"))?;
     if !o.status.success() {
         return Err(format!("{c:?} failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
@@ -157,18 +163,18 @@ fn output(c: &mut Command) -> R<String> {
 }
 
 /// Runs a command for its status, its output shown.
-fn status(c: &mut Command) -> R<bool> {
+pub(crate) fn status(c: &mut Command) -> R<bool> {
     Ok(c.stdin(Stdio::null()).status().map_err(|e| format!("{c:?}: {e}"))?.success())
 }
 
 /// Files in a folder in the order `ls` gave them under en_US.UTF-8, which
 /// release.sh ran under: letters and digits first, then punctuation, so
 /// `atlas.exe` sorts between `atlas-aarch64-*` and `atlas-x86_64-*`.
-fn collate_key(s: &str) -> (String, String) {
+pub(crate) fn collate_key(s: &str) -> (String, String) {
     (s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect(), s.to_string())
 }
 
-fn ls(dir: &Path) -> R<Vec<String>> {
+pub(crate) fn ls(dir: &Path) -> R<Vec<String>> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -178,19 +184,19 @@ fn ls(dir: &Path) -> R<Vec<String>> {
     Ok(v)
 }
 
-fn copy(from: &Path, to: &Path) -> R {
+pub(crate) fn copy(from: &Path, to: &Path) -> R {
     std::fs::copy(from, to).map(|_| ()).map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))
 }
 
-fn sha256_file(p: &Path) -> R<String> {
+pub(crate) fn sha256_file(p: &Path) -> R<String> {
     Ok(atlas::sha256::hex(&std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?))
 }
 
-fn size_of(p: &Path) -> R<u64> {
+pub(crate) fn size_of(p: &Path) -> R<u64> {
     Ok(std::fs::metadata(p).map_err(|e| format!("{}: {e}", p.display()))?.len())
 }
 
-fn rm_rf(p: &Path) -> R {
+pub(crate) fn rm_rf(p: &Path) -> R {
     match std::fs::remove_dir_all(p) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -198,15 +204,15 @@ fn rm_rf(p: &Path) -> R {
     }
 }
 
-fn mkdir(p: &Path) -> R {
+pub(crate) fn mkdir(p: &Path) -> R {
     std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
-fn write(p: &Path, b: impl AsRef<[u8]>) -> R {
+pub(crate) fn write(p: &Path, b: impl AsRef<[u8]>) -> R {
     std::fs::write(p, b).map_err(|e| format!("{}: {e}", p.display()))
 }
 
-fn read_text(p: &Path) -> R<String> {
+pub(crate) fn read_text(p: &Path) -> R<String> {
     std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
@@ -221,7 +227,7 @@ fn native(p: &Path) -> String {
     }
 }
 
-fn bin_name(t: &str) -> String {
+pub(crate) fn bin_name(t: &str) -> String {
     if t.contains("-windows-") {
         "atlas.exe".into()
     } else {
@@ -229,24 +235,31 @@ fn bin_name(t: &str) -> String {
     }
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Whether a file's first bytes are what its name says (see [`check_bin`]);
+/// the bytes in hex when not.
+pub(crate) fn magic_ok(f: &str, b: &[u8]) -> Result<(), String> {
+    let magic = hex(&b[..b.len().min(4)]);
+    let ok = (f == "atlas" && magic.starts_with("2321"))
+        || (f.ends_with(".exe") && magic.starts_with("4d5a"))
+        || (f.ends_with("-linux-gnu") && magic == "7f454c46")
+        || (f.ends_with("-apple-darwin") && (magic == "cffaedfe" || magic == "cafebabe"));
+    if ok {
+        Ok(())
+    } else {
+        Err(magic)
+    }
 }
 
 /// Each file in `dir` is what its name says: the launcher a script, a
 /// Windows binary a PE image, the others ELF or Mach-O.
 fn check_bin(dir: &Path) -> R {
     for f in ls(dir)? {
-        let mut head = [0u8; 4];
         let b = std::fs::read(dir.join(&f)).map_err(|e| format!("{}: {e}", dir.join(&f).display()))?;
-        let n = b.len().min(4);
-        head[..n].copy_from_slice(&b[..n]);
-        let magic = hex(&head[..n]);
-        let ok = (f == "atlas" && magic.starts_with("2321"))
-            || (f.ends_with(".exe") && magic.starts_with("4d5a"))
-            || (f.ends_with("-linux-gnu") && magic == "7f454c46")
-            || (f.ends_with("-apple-darwin") && (magic == "cffaedfe" || magic == "cafebabe"));
-        if !ok {
+        if let Err(magic) = magic_ok(&f, &b) {
             return Err(format!("{}/{f} is not the file its name says (starts {magic})", dir.display()));
         }
     }
@@ -257,7 +270,7 @@ fn check_bin(dir: &Path) -> R {
 }
 
 /// `sed -e '/./,$!d'`: drop the lines before the first non-empty one.
-fn drop_leading_blank(s: &str) -> String {
+pub(crate) fn drop_leading_blank(s: &str) -> String {
     let lines: Vec<&str> = s.split('\n').collect();
     let first = lines.iter().position(|l| !l.is_empty()).unwrap_or(lines.len());
     lines[first..].join("\n")
@@ -265,7 +278,7 @@ fn drop_leading_blank(s: &str) -> String {
 
 /// The `## vX.Y.Z` section of the changelog, without leading blank lines or
 /// trailing newlines (what `$(awk ... | sed ...)` captured).
-fn changelog_section(text: &str, tag: &str) -> String {
+pub(crate) fn changelog_section(text: &str, tag: &str) -> String {
     let want = format!("## {tag}");
     let mut on = false;
     let mut out = Vec::new();
@@ -284,7 +297,7 @@ fn changelog_section(text: &str, tag: &str) -> String {
 }
 
 /// `sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1`
-fn cargo_version(text: &str) -> Option<String> {
+pub(crate) fn cargo_version(text: &str) -> Option<String> {
     text.lines().find_map(|l| {
         let rest = l.strip_prefix("version = \"")?;
         let q = rest.rfind('"')?;
@@ -293,7 +306,7 @@ fn cargo_version(text: &str) -> Option<String> {
 }
 
 /// `sed -n 's/^ *"version": *"\(.*\)",*$/\1/p' plugin.json | head -1`
-fn plugin_version(text: &str) -> Option<String> {
+pub(crate) fn plugin_version(text: &str) -> Option<String> {
     text.lines().find_map(|l| {
         let rest = l.trim_start_matches(' ').strip_prefix("\"version\":")?.trim_start_matches(' ').strip_prefix('"')?;
         let body = rest.trim_end_matches(',');
@@ -302,7 +315,7 @@ fn plugin_version(text: &str) -> Option<String> {
 }
 
 /// A `pub const NAME: &str = "<64 hex>";` in src/update.rs.
-fn key_const(text: &str, name: &str) -> Option<String> {
+pub(crate) fn key_const(text: &str, name: &str) -> Option<String> {
     text.lines().find_map(|l| {
         let rest = l.strip_prefix(&format!("pub const {name}: &str = \""))?;
         let (k, tail) = rest.split_at_checked(64)?;
@@ -313,7 +326,7 @@ fn key_const(text: &str, name: &str) -> Option<String> {
 /// The model pins of config/atlas.template.json, as `(key, value)` pairs in
 /// file order: lines `"file"`, `"sha256"`, `"size"` or `"id"` with a plain
 /// value.
-fn model_lines(text: &str) -> Vec<(String, String)> {
+pub(crate) fn model_lines(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| {
             let l = l.trim_start_matches(' ');
@@ -329,7 +342,7 @@ fn model_lines(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn files_under(root: &Path, rel: &Path, out: &mut Vec<String>) -> R {
+pub(crate) fn files_under(root: &Path, rel: &Path, out: &mut Vec<String>) -> R {
     for e in std::fs::read_dir(root.join(rel)).map_err(|e| format!("{}: {e}", root.join(rel).display()))? {
         let e = e.map_err(|e| e.to_string())?;
         let r = rel.join(e.file_name());
@@ -346,7 +359,7 @@ fn files_under(root: &Path, rel: &Path, out: &mut Vec<String>) -> R {
 /// every path against every term, both normalised first (see
 /// `leak.rs`, the matcher `tests/leak_check.rs` shares). Only a term's
 /// number and the place are ever reported.
-fn leak_check(tree: &Path, denylist: &Path) -> R<(usize, usize, Vec<String>)> {
+pub(crate) fn leak_check(tree: &Path, denylist: &Path) -> R<(usize, usize, Vec<String>)> {
     let mut files = Vec::new();
     files_under(tree, Path::new(""), &mut files)?;
     files.sort_by_key(|s| collate_key(s));
@@ -389,7 +402,7 @@ fn has_text(s: &str) -> bool {
 
 /// The changelog rule (see the module docs): `Ok` when the section can be
 /// released, else what is missing.
-fn check_section(section: &str, tag: &str) -> R {
+pub(crate) fn check_section(section: &str, tag: &str) -> R {
     if section.trim().is_empty() {
         return Err(format!("no {tag} section in CHANGELOG.md: every release gets a user-facing section (see the Releasing page)"));
     }
@@ -427,19 +440,19 @@ fn notes_parts(section: &str) -> (String, String, String) {
 }
 
 /// Today's date, UTC, or ATLAS_RELEASE_DATE.
-fn release_date() -> String {
+pub(crate) fn release_date() -> String {
     env("ATLAS_RELEASE_DATE").unwrap_or_else(|| atlas::discussion::utc_now()[..10].to_string())
 }
 
 /// What the notes are filled with.
-struct Notes<'a> {
-    tag: &'a str,
-    date: &'a str,
-    repo: &'a str,
-    changes: &'a str,
-    binaries: &'a str,
-    missing: &'a str,
-    models: &'a str,
+pub(crate) struct Notes<'a> {
+    pub(crate) tag: &'a str,
+    pub(crate) date: &'a str,
+    pub(crate) repo: &'a str,
+    pub(crate) changes: &'a str,
+    pub(crate) binaries: &'a str,
+    pub(crate) missing: &'a str,
+    pub(crate) models: &'a str,
 }
 
 /// The release notes from the template: whole-line placeholders replaced by
@@ -448,7 +461,7 @@ struct Notes<'a> {
 ///
 /// Blocks: @CHANGES@ (the whole section), @HIGHLIGHTS@, @UPGRADE@ and
 /// @DETAILS@ (see [`notes_parts`]), @BINARIES@, @MISSING@, @MODELS@.
-fn fill_notes(template: &str, n: &Notes) -> String {
+pub(crate) fn fill_notes(template: &str, n: &Notes) -> String {
     let (hi, up, rest) = notes_parts(n.changes);
     let rest = if rest.is_empty() { rest } else { format!("<details>\n<summary>Everything in {}</summary>\n\n{rest}\n\n</details>", n.tag) };
     let mut out = String::new();
@@ -484,7 +497,7 @@ fn fill_notes(template: &str, n: &Notes) -> String {
     out
 }
 
-fn platform_name(f: &str) -> &str {
+pub(crate) fn platform_name(f: &str) -> &str {
     match f {
         "atlas.exe" => "Windows x86_64 (also runs on Windows on Arm)",
         "atlas-x86_64-unknown-linux-gnu" => "Linux x86_64 (glibc)",
@@ -495,10 +508,26 @@ fn platform_name(f: &str) -> &str {
     }
 }
 
+/// Whether a publish can sign, checked before anything is built: openssl
+/// is on PATH and ATLAS_SIGN_KEY names a file this user can open (its
+/// contents are not read here; openssl reads it when signing).
+pub(crate) fn signing_ready(key: Option<&str>, openssl: Option<&Path>) -> R {
+    if openssl.is_none() {
+        return Err("publishing signs the manifest and needs openssl on PATH".into());
+    }
+    let key = key.ok_or("publishing needs ATLAS_SIGN_KEY (the release signing key)")?;
+    let p = Path::new(key);
+    if !p.is_file() {
+        return Err("ATLAS_SIGN_KEY is not a file".into());
+    }
+    std::fs::File::open(p).map_err(|e| format!("ATLAS_SIGN_KEY is not readable: {e}"))?;
+    Ok(())
+}
+
 /// Signs the manifest with openssl: writes `<manifest>.sig`, the raw 64-byte
 /// ed25519 signature, after checking the key's public half is the one built
 /// into atlas, and verifies it. Only the public half is ever derived.
-fn sign_manifest(key: &Path, trusted: &str, manifest: &Path) -> R {
+pub(crate) fn sign_manifest(key: &Path, trusted: &str, manifest: &Path) -> R {
     let openssl = which("openssl").ok_or("signing needs openssl")?;
     if !key.is_file() {
         return Err("ATLAS_SIGN_KEY is not a file".into());
@@ -549,10 +578,10 @@ fn sign_manifest(key: &Path, trusted: &str, manifest: &Path) -> R {
     Ok(())
 }
 
-struct Ctx {
-    stage: PathBuf,
-    cargo_home: PathBuf,
-    sysroot: String,
+pub(crate) struct Ctx {
+    pub(crate) stage: PathBuf,
+    pub(crate) cargo_home: PathBuf,
+    pub(crate) sysroot: String,
 }
 
 impl Ctx {
@@ -560,7 +589,7 @@ impl Ctx {
     /// locations) are rewritten, so no build machine's folders reach a user.
     /// The sysroot too: with rust-src installed, std's panic locations name
     /// the local toolchain folder instead of /rustc/<hash>.
-    fn rustflags(&self, target: &str) -> String {
+    pub(crate) fn rustflags(&self, target: &str) -> String {
         let mut f = [
             format!("--remap-path-prefix={}=atlas", native(&self.stage.join("src"))),
             format!("--remap-path-prefix={}=cargo", native(&self.cargo_home)),
@@ -692,6 +721,10 @@ pub fn repo_root() -> PathBuf {
 
 /// Runs the release.
 pub fn run(args: Vec<String>) -> R {
+    // The CI modes (`--pr`, `assets`, `sign`) live in release_ci.rs.
+    if crate::release_ci::wants(&args) {
+        return crate::release_ci::run(args);
+    }
     let o = parse(args)?;
     let root = repo_root();
     // As the script's `cd`: a relative --remote or stage folder is read from the root.
@@ -742,6 +775,11 @@ pub fn run(args: Vec<String>) -> R {
             Ok(r) => say(&format!("public repo check: {public_repo} is public, user-owned, {} ruleset(s) with admin-only bypass (main and v* tags as required), no admin among {} collaborator(s) but the owner", r.rulesets, r.collaborators)),
             Err(e) if o.push && to_github => return Err(format!("public repo check: {e}")),
             Err(e) => say(&format!("public repo check: {e} (a publish would stop here)")),
+        }
+        // Signing, before the tests and builds: a publish that cannot sign
+        // fails here, not at the end.
+        if o.push && to_github {
+            signing_ready(env("ATLAS_SIGN_KEY").as_deref(), which("openssl").as_deref())?;
         }
     }
 
@@ -845,13 +883,7 @@ pub fn run(args: Vec<String>) -> R {
     say(&format!("leak check: {n} terms, {nfiles} files, no hits"));
 
     say("notes");
-    let mut binaries = String::new();
-    for f in ls(&stage.join("bin"))? {
-        if f == "atlas" {
-            continue;
-        }
-        binaries.push_str(&format!("| {} | bin/{f} | `{}` |\n", platform_name(&f), sha256_file(&stage.join("bin").join(&f))?));
-    }
+    let binaries = binaries_table(&stage.join("bin"))?;
     let missing_text = if missing.is_empty() {
         String::new()
     } else {
@@ -860,40 +892,24 @@ pub fn run(args: Vec<String>) -> R {
     mkdir(&stage.join("assets"))?;
     let model_dir = env("ATLAS_MODEL_DIR").map(PathBuf::from);
     let mut models = String::new();
-    let (mut mid, mut mfile, mut msha, mut msize) = (String::new(), String::new(), String::new(), String::new());
-    let mut emit = |mid: &str, mfile: &str, msha: &str, msize: &str| -> R {
-        if mfile.is_empty() {
-            return Ok(());
-        }
-        models.push_str(&format!("| {mid} | {mfile} | {msize} | `{msha}` |\n"));
+    for m in model_rows(&read_text(&root.join("config/atlas.template.json"))?) {
+        let (mfile, msha, msize) = (&m.file, &m.sha256, &m.size);
+        models.push_str(&m.row());
         if let Some(dir) = &model_dir {
             let src = dir.join(mfile);
             if !src.is_file() {
                 return Err(format!("model {mfile} is not in ATLAS_MODEL_DIR"));
             }
-            if size_of(&src)?.to_string() != msize {
+            if size_of(&src)?.to_string() != *msize {
                 return Err(format!("model {mfile}: size does not match its pin"));
             }
-            if sha256_file(&src)? != msha {
+            if sha256_file(&src)? != *msha {
                 return Err(format!("model {mfile}: sha256 does not match its pin"));
             }
             copy(&src, &stage.join("assets").join(mfile))?;
             say(&format!("model {mfile} verified against its pin and staged"));
         }
-        Ok(())
-    };
-    for (k, v) in model_lines(&read_text(&root.join("config/atlas.template.json"))?) {
-        match k.as_str() {
-            "id" => {
-                emit(&mid, &mfile, &msha, &msize)?;
-                (mid, mfile, msha, msize) = (v, String::new(), String::new(), String::new());
-            }
-            "file" => mfile = v,
-            "sha256" => msha = v,
-            _ => msize = v,
-        }
     }
-    emit(&mid, &mfile, &msha, &msize)?;
     if model_dir.is_none() {
         say("ATLAS_MODEL_DIR not set: model assets not staged (they are a separate, version-independent release)");
     }
@@ -922,24 +938,13 @@ pub fn run(args: Vec<String>) -> R {
     let release_dir = stage.join("release");
     rm_rf(&release_dir)?;
     mkdir(&release_dir)?;
-    let mut entries = Vec::new();
     for f in ls(&stage.join("bin"))? {
-        let t = match f.as_str() {
-            "atlas" => continue,
-            "atlas.exe" => "x86_64-pc-windows-msvc".to_string(),
-            s if s.starts_with("atlas-") => s["atlas-".len()..].to_string(),
-            _ => return Err(format!("bin/{f}: no target for it")),
-        };
-        let p = stage.join("bin").join(&f);
-        copy(&p, &release_dir.join(&f))?;
-        entries.push(format!(
-            "{{\"target\":\"{t}\",\"file\":\"{f}\",\"url\":\"https://github.com/{public_repo}/releases/download/{tag}/{f}\",\"sha256\":\"{}\",\"size\":{}}}",
-            sha256_file(&p)?,
-            size_of(&p)?
-        ));
+        if f != "atlas" {
+            copy(&stage.join("bin").join(&f), &release_dir.join(&f))?;
+        }
     }
     let manifest = release_dir.join("manifest.json");
-    write(&manifest, format!("{{\"version\":\"{version}\",\"files\":[{}]}}", entries.join(",")))?;
+    write(&manifest, manifest_json(&version, &public_repo, &stage.join("bin"))?)?;
     match env("ATLAS_SIGN_KEY") {
         Some(_) if o.dry_run => say("manifest not signed (--dry-run never signs; ATLAS_SIGN_KEY ignored)"),
         Some(key) => {
@@ -1013,9 +1018,12 @@ pub fn run(args: Vec<String>) -> R {
     let mut addrs: Vec<String> = output(&mut pubc(&["log", "--format=%ae%n%ce"]))?.lines().map(str::to_string).collect();
     addrs.sort();
     addrs.dedup();
-    let addresses = addrs.join("\n");
-    if addresses != public_email {
-        return Err(format!("the public history carries another address: {}", addrs.iter().map(|a| format!("{a} ")).collect::<String>()));
+    let addresses = addrs.join(" ");
+    // GitHub's own addresses come with releases merged through a pull
+    // request (see release_ci.rs); any other is refused.
+    let other: Vec<&String> = addrs.iter().filter(|a| !crate::release_ci::address_allowed(a, &public_email)).collect();
+    if !other.is_empty() {
+        return Err(format!("the public history carries another address: {}", other.iter().map(|a| format!("{a} ")).collect::<String>()));
     }
     let tagger = output(&mut pubc(&["for-each-ref", "--format=%(taggeremail)", &format!("refs/tags/{tag}")]))?;
     if tagger.trim() != format!("<{public_email}>") {
@@ -1080,11 +1088,90 @@ pub fn run(args: Vec<String>) -> R {
     Ok(())
 }
 
+/// The target a release binary's file name stands for: `atlas.exe` is
+/// Windows x86_64, `atlas-<target>` the rest.
+pub(crate) fn target_of(file: &str) -> Option<&str> {
+    match file {
+        "atlas.exe" => Some("x86_64-pc-windows-msvc"),
+        f => f.strip_prefix("atlas-").filter(|t| !t.is_empty()),
+    }
+}
+
+/// The release manifest (the format `atlas::update::parse_manifest` reads
+/// and the updater verifies): the version and, for each binary in `bins`
+/// (the launcher `atlas` skipped), its target, file name, download URL in
+/// the `v<version>` release of `repo`, SHA-256 and size, in `ls` order.
+/// The one writer: the `--push` release and `cargo xtask release assets`
+/// both call it, and the signature covers these exact bytes.
+pub(crate) fn manifest_json(version: &str, repo: &str, bins: &Path) -> R<String> {
+    let mut entries = Vec::new();
+    for f in ls(bins)? {
+        if f == "atlas" {
+            continue;
+        }
+        let t = target_of(&f).ok_or(format!("bin/{f}: no target for it"))?;
+        let p = bins.join(&f);
+        entries.push(format!(
+            "{{\"target\":\"{t}\",\"file\":\"{f}\",\"url\":\"https://github.com/{repo}/releases/download/v{version}/{f}\",\"sha256\":\"{}\",\"size\":{}}}",
+            sha256_file(&p)?,
+            size_of(&p)?
+        ));
+    }
+    Ok(format!("{{\"version\":\"{version}\",\"files\":[{}]}}", entries.join(",")))
+}
+
+/// The notes' binaries table rows: platform, file and SHA-256 of each
+/// binary in `bins` (the launcher skipped).
+pub(crate) fn binaries_table(bins: &Path) -> R<String> {
+    let mut out = String::new();
+    for f in ls(bins)? {
+        if f != "atlas" {
+            out.push_str(&format!("| {} | bin/{f} | `{}` |\n", platform_name(&f), sha256_file(&bins.join(&f))?));
+        }
+    }
+    Ok(out)
+}
+
+/// One model pin of config/atlas.template.json.
+pub(crate) struct ModelRow {
+    pub(crate) id: String,
+    pub(crate) file: String,
+    pub(crate) sha256: String,
+    pub(crate) size: String,
+}
+
+impl ModelRow {
+    /// Its line in the notes' model table.
+    pub(crate) fn row(&self) -> String {
+        format!("| {} | {} | {} | `{}` |\n", self.id, self.file, self.size, self.sha256)
+    }
+}
+
+/// The model pins in file order (an `id` starts each; one without a file
+/// is skipped).
+pub(crate) fn model_rows(template: &str) -> Vec<ModelRow> {
+    let mut out: Vec<ModelRow> = Vec::new();
+    for (k, v) in model_lines(template) {
+        if k == "id" {
+            out.push(ModelRow { id: v, file: String::new(), sha256: String::new(), size: String::new() });
+            continue;
+        }
+        let Some(m) = out.last_mut() else { continue };
+        match k.as_str() {
+            "file" => m.file = v,
+            "sha256" => m.sha256 = v,
+            _ => m.size = v,
+        }
+    }
+    out.retain(|m| !m.file.is_empty());
+    out
+}
+
 /// Files the public repository must carry; the export is refused without
 /// them (an export-ignore rule or a lost file would drop them silently).
-pub const PUBLIC_FILES: &[&str] = &[".github/workflows/ci.yml", ".github/CODEOWNERS", "SECURITY.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "wiki/Home.md"];
+pub const PUBLIC_FILES: &[&str] = &[".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/CODEOWNERS", "SECURITY.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "wiki/Home.md"];
 
-fn check_public_files(tree: &Path) -> R {
+pub(crate) fn check_public_files(tree: &Path) -> R {
     let gone: Vec<&str> = PUBLIC_FILES.iter().copied().filter(|f| !tree.join(f).is_file()).collect();
     if gone.is_empty() {
         Ok(())
@@ -1102,6 +1189,23 @@ fn home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_is_checked_before_the_build() {
+        let dir = std::env::temp_dir().join(format!("atlas-xtask-sign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("test-key.pem");
+        std::fs::write(&key, "not a key").unwrap();
+        let tool = dir.join("openssl");
+        let k = key.to_str().unwrap();
+        assert!(signing_ready(Some(k), Some(&tool)).is_ok());
+        assert!(signing_ready(Some(k), None).unwrap_err().contains("openssl"));
+        assert!(signing_ready(None, Some(&tool)).unwrap_err().contains("ATLAS_SIGN_KEY"));
+        let missing = dir.join("absent.pem");
+        assert!(signing_ready(missing.to_str(), Some(&tool)).unwrap_err().contains("not a file"));
+        assert!(signing_ready(dir.to_str(), Some(&tool)).unwrap_err().contains("not a file"), "a folder is no key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn changelog_section_is_the_tagged_one() {

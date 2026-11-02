@@ -10,6 +10,28 @@ wiki's Changelog page. A section has these parts, in this order, and leaves out 
 
 `cargo xtask release` refuses to release a version whose section is missing, empty or has no highlights.
 
+## v0.1.1
+
+A fix release.
+
+### Highlights
+
+- **Each file is indexed once in a multi-repository project.** A repository whose folder is already
+  configured as a source or a code root no longer gets a second one, and its Markdown source leaves out the
+  files another source already indexes (a `docs` source inside it, the project's `INTENT.md`). Search
+  answers no longer list the same section twice, and recall still puts records about the active repository
+  first.
+- **`atlas --config PATH settings ...` works.** `--config` and `--project` before a subcommand (`settings`,
+  `run`, `slice`, `grammar`, `ruling`, `entry`) now apply to it; before, `atlas --config PATH settings
+  migrate-projects NAME` failed with "expected on or off".
+- **Plain paths in output.** `atlas --memory-tree` and the `list_sources` tool print Windows paths as
+  `C:\...`, without the `\\?\` prefix.
+
+### Features
+
+- `cargo xtask release --push` checks that openssl is on PATH and that `ATLAS_SIGN_KEY` names a readable file
+  before it runs the tests and builds, so a publish that cannot sign fails in seconds, not at the end.
+
 ## v0.1.0
 
 The first public release.

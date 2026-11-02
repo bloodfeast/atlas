@@ -716,8 +716,10 @@ fn other_memory_dirs(c: &Config, active: Option<&str>) -> Vec<PathBuf> {
 /// A configuration without `projects` comes back unchanged. Otherwise the
 /// user-level vaults, sources, identifier patterns and code roots are kept
 /// and the project's are added; the project's repositories become sources
-/// (their Markdown) and code roots (their Rust, WGSL and `.proto` files);
-/// its memory folder and rules file become synced sources; the user memory
+/// (their Markdown) and code roots (their Rust, WGSL and `.proto` files),
+/// except where a configured source or code root already has the
+/// repository's folder as its root, and a repository's source leaves out
+/// the files another source or vault indexes; its memory folder and rules file become synced sources; the user memory
 /// folder becomes the `user` source in every project; and the database and
 /// memory store are the project's own (`db`, else
 /// `<projects_dir>/<name>/atlas.sqlite` with the store beside it).
@@ -733,6 +735,8 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
     let active = active(c, cwd, named)?;
     let mut e = c.clone();
     let mut graph = Graph::default();
+    // The sources added for repositories, by index into `e.sources`.
+    let mut repo_sources: Vec<usize> = Vec::new();
     let state = state_dir(c, active.as_ref().map_or(NO_PROJECT, |a| a.spec.name.as_str()));
     let mut memory = c.memory.clone().map(|m| MemorySpec { snapshot_hours: m.snapshot_hours, snapshot_cap_mb: m.snapshot_cap_mb, ..MemorySpec::default() }).unwrap_or_default();
     e.db = Some(state.join("atlas.sqlite"));
@@ -766,20 +770,32 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
         taken.extend(e.code.iter().flat_map(|k| k.roots.iter().map(|r| r.name.clone())));
         for r in &repos {
             let Some(path) = &r.path else { continue };
-            let sname = unique(&r.name, &taken);
-            taken.insert(sname.clone());
-            e.sources.push(SourceSpec {
-                name: sname,
-                root: path.clone(),
-                include: vec!["**/*.md".into()],
-                exclude: vec!["target/**".into(), "node_modules/**".into(), "vendor/**".into()],
-                chunk: Default::default(),
-                id_keys: None,
-                names_kind: None,
-            });
-            let cname = unique(&format!("{}-code", r.name), &taken);
-            taken.insert(cname.clone());
-            e.code.get_or_insert_with(CodeSpec::default).roots.push(CodeRootSpec { name: cname, root: path.clone(), build_scripts: false });
+            // A folder already configured as a source or code root is not
+            // added again: the repository reuses it (recall finds the
+            // repository of any record by the folder holding it, see
+            // `Graph::repo_of`, so the reused root keeps the boost).
+            let key = path_key(path);
+            let has_source = e.sources.iter().map(|s| &s.root).chain(e.vaults.iter().map(|v| &v.path)).any(|p| path_key(p) == key);
+            if !has_source {
+                let sname = unique(&r.name, &taken);
+                taken.insert(sname.clone());
+                repo_sources.push(e.sources.len());
+                e.sources.push(SourceSpec {
+                    name: sname,
+                    root: path.clone(),
+                    include: vec!["**/*.md".into()],
+                    exclude: vec!["target/**".into(), "node_modules/**".into(), "vendor/**".into()],
+                    chunk: Default::default(),
+                    id_keys: None,
+                    names_kind: None,
+                });
+            }
+            let has_code = e.code.iter().flat_map(|k| k.roots.iter()).any(|x| path_key(&x.root) == key);
+            if !has_code {
+                let cname = unique(&format!("{}-code", r.name), &taken);
+                taken.insert(cname.clone());
+                e.code.get_or_insert_with(CodeSpec::default).roots.push(CodeRootSpec { name: cname, root: path.clone(), build_scripts: false });
+            }
         }
         let has_export = |m: &MemorySpec, n: &str| m.exports.iter().any(|x| x.name == n);
         if let Some(dir) = &p.memory_dir {
@@ -821,6 +837,7 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
         memory.user_scope_from = other_memory_dirs(c, active.as_ref().map(|a| a.spec.name.as_str()));
         memory.user_memory = Some(dir.clone());
     }
+    exclude_covered(&mut e, &repo_sources);
     memory.user_state = user_state_dir(c);
     memory.tree = project_tree(c, &memory, active.as_ref().map(|a| &a.spec));
     if e.vaults.is_empty() {
@@ -838,6 +855,62 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
     e.memory = Some(memory);
     e.check_names()?;
     Ok(Resolved { config: e, active, graph })
+}
+
+/// Keeps a repository's Markdown source off the files another source or
+/// vault already indexes: each one rooted inside the repository's folder
+/// becomes excludes on the repository source (its includes under its
+/// folder; a vault's whole folder), so a file is indexed once, by the
+/// source configured for it. A folder under a dot folder needs nothing: a
+/// source never walks dot folders.
+fn exclude_covered(e: &mut Config, repo_sources: &[usize]) {
+    for &i in repo_sources {
+        let key = path_key(&e.sources[i].root);
+        let mut add: Vec<String> = Vec::new();
+        let others = e.sources.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, s)| (&s.root, Some(&s.include))).chain(e.vaults.iter().map(|v| (&v.path, None)));
+        for (root, include) in others {
+            let k = path_key(root);
+            // The same folder (the intent file at the repository's top), or
+            // one inside it.
+            let rel = if k == key {
+                ""
+            } else {
+                let Some(rel) = k.strip_prefix(&key).and_then(|r| r.strip_prefix('/')) else { continue };
+                rel
+            };
+            if rel.split('/').any(|c| c.starts_with('.')) || rel.contains(['*', '?']) {
+                continue;
+            }
+            // `path_key` lowercases on Windows; the glob is case-insensitive.
+            match (include, rel.is_empty()) {
+                (Some(globs), true) => add.extend(globs.iter().cloned()),
+                (Some(globs), false) => {
+                    // A glob without `/` matches the file name at any depth
+                    // the source walks: every depth of a `**` source, else
+                    // as deep as its deepest glob reaches.
+                    let deep = globs.iter().any(|g| g.contains("**"));
+                    let depth = globs.iter().map(|g| g.matches('/').count()).max().unwrap_or(0);
+                    for g in globs {
+                        if g.contains('/') {
+                            add.push(format!("{rel}/{g}"));
+                        } else if deep {
+                            add.push(format!("{rel}/**/{g}"));
+                        } else {
+                            add.extend((0..=depth).map(|d| format!("{rel}/{}{g}", "*/".repeat(d))));
+                        }
+                    }
+                }
+                (None, true) => {}
+                (None, false) => add.push(format!("{rel}/**")),
+            }
+        }
+        let ex = &mut e.sources[i].exclude;
+        for g in add {
+            if g.len() <= 256 && !ex.contains(&g) {
+                ex.push(g);
+            }
+        }
+    }
 }
 
 /// A project's memory tree: its own `memory.tree`, else the user-level one
