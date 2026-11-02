@@ -318,6 +318,9 @@ pub struct CodeRecall {
     pub scan_only: usize,
     /// Definitions grep found and the index lacks entirely.
     pub misses: Vec<CodeMiss>,
+    /// Roots never indexed (`atlas --code-index` builds them): not
+    /// checked, as the `symbol` tool reports them "not indexed yet".
+    pub unindexed: Vec<String>,
 }
 
 /// The ground-truth patterns: grep-style regexes over one line. Rust items
@@ -329,7 +332,8 @@ const WGSL_DEF_RE: &str = r"^(?:\s*(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*(fn|struct)\
 
 /// Compares the code index with a grep of every `.rs` and `.wgsl` file of
 /// the configured roots: every definition grep finds must be a definition
-/// row at the same line with the same name.
+/// row at the same line with the same name. A root with no index yet
+/// is listed in [`CodeRecall::unindexed`] and not checked.
 ///
 /// # Arguments
 ///
@@ -345,7 +349,12 @@ pub fn code_check(conn: &rusqlite::Connection, roots: &[crate::code::CodeRoot]) 
     let rust_re = crate::regex::Regex::new(RUST_DEF_RE).map_err(|e| crate::error::Error::InvalidArgument(e.to_string()))?;
     let wgsl_re = crate::regex::Regex::new(WGSL_DEF_RE).map_err(|e| crate::error::Error::InvalidArgument(e.to_string()))?;
     let mut rep = CodeRecall::default();
+    let built = crate::code::root_records(conn)?;
     for root in roots {
+        if !built.contains_key(&root.name) {
+            rep.unindexed.push(root.name.clone());
+            continue;
+        }
         // (path, line, name) -> scan-only?
         let mut have: HashMap<(String, u32, String), bool> = HashMap::new();
         {

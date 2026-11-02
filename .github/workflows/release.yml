@@ -1,0 +1,235 @@
+# The public repository's release build. A release reaches main as a pull
+# request from the development repository (branch release/vX.Y.Z, opened by
+# the release app). When it merges, Cargo.toml's version changes on main;
+# this workflow then builds the five binaries on GitHub's hosted runners,
+# writes manifest.json (`cargo xtask release assets`) and creates a DRAFT
+# release vX.Y.Z on the merge commit with the notes, the binaries and the
+# manifest. A draft creates no tag: the owner checks, signs and publishes it
+# from his machine (`cargo xtask release sign vX.Y.Z`), and the publish makes
+# the tag. No secrets; the default token is read-only except where a job
+# says otherwise.
+name: release
+
+on:
+  push:
+    branches: [main]
+    # A release always changes the version; the binaries commit `release
+    # sign` adds touches bin/ only and so never starts this.
+    paths: [Cargo.toml]
+  # A rebuild by hand (delete the old draft first).
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  # The release build environment, as `cargo xtask release` builds: symbols
+  # stripped, the update check compiled in, and (in each build step) every
+  # build-machine path remapped.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  ATLAS_RELEASE_BUILD: 1
+
+jobs:
+  plan:
+    # Only the public repository runs it: the development repository
+    # carries the same file and opens the pull request instead.
+    if: github.repository == 'bloodfeast/atlas'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version without a release
+        id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if ! printf '%s\n' "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Cargo.toml's version '$version' is not X.Y.Z"
+            exit 1
+          fi
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
+            echo "$tag is already released: nothing to build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Debian 11 (glibc 2.31): the binaries must run on what v0.1.0 ran on.
+    container: debian:bullseye
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Build tools
+        run: |
+          # Debian 11 is archived: its packages come from archive.debian.org.
+          printf '%s\n' 'deb http://archive.debian.org/debian bullseye main' 'deb http://archive.debian.org/debian-security bullseye-security main' > /etc/apt/sources.list
+          rm -f /etc/apt/sources.list.d/*
+          apt-get -o Acquire::Check-Valid-Until=false update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates curl gcc libc6-dev binutils git >/dev/null
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          url="https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init"
+          curl -sSfL --proto '=https' --tlsv1.2 -o /tmp/rustup-init "$url"
+          curl -sSfL --proto '=https' --tlsv1.2 -o /tmp/rustup-init.sha256 "$url.sha256"
+          echo "$(cut -d' ' -f1 /tmp/rustup-init.sha256)  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y -q --profile minimal --default-toolchain none --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          sysroot=$(rustc --print sysroot)
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export CARGO_ENCODED_RUSTFLAGS="$(printf '%s\037%s\037%s' "--remap-path-prefix=$GITHUB_WORKSPACE=atlas" "--remap-path-prefix=$cargo_home=cargo" "--remap-path-prefix=$sysroot=rust")"
+          cargo build --release --locked --target "$TARGET"
+          mkdir -p dist
+          cp "target/$TARGET/release/atlas" "dist/atlas-$TARGET"
+      - name: glibc floor
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          max=$(objdump -T "dist/atlas-$TARGET" | grep -o 'GLIBC_2\.[0-9][0-9]*' | sed 's/GLIBC_2\.//' | sort -n | tail -1)
+          echo "highest GLIBC_2.x symbol version: 2.$max"
+          if [ "$max" -gt 31 ]; then
+            echo "::error::atlas-$TARGET needs GLIBC_2.$max; the floor is 2.31"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/atlas-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        shell: bash
+        env:
+          TARGET: x86_64-pc-windows-msvc
+        run: |
+          set -eu
+          sysroot=$(rustc --print sysroot)
+          cargo_home=$(cygpath -w "${CARGO_HOME:-$HOME/.cargo}")
+          workspace=$(cygpath -w "$GITHUB_WORKSPACE")
+          export CARGO_ENCODED_RUSTFLAGS="$(printf '%s\037%s\037%s\037%s' "--remap-path-prefix=$workspace=atlas" "--remap-path-prefix=$cargo_home=cargo" "--remap-path-prefix=$sysroot=rust" "-Clink-arg=/PDBALTPATH:%_PDB%")"
+          cargo build --release --locked --target "$TARGET"
+          mkdir -p dist
+          cp "target/$TARGET/release/atlas.exe" dist/atlas.exe
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-x86_64-pc-windows-msvc
+          path: dist/atlas.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    # Apple Silicon; the Intel binary is cross-built on it.
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        shell: bash
+        run: |
+          set -eu
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          sysroot=$(rustc --print sysroot)
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export CARGO_ENCODED_RUSTFLAGS="$(printf '%s\037%s\037%s' "--remap-path-prefix=$GITHUB_WORKSPACE=atlas" "--remap-path-prefix=$cargo_home=cargo" "--remap-path-prefix=$sysroot=rust")"
+          mkdir -p dist
+          for TARGET in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --target "$TARGET"
+            cp "target/$TARGET/release/atlas" "dist/atlas-$TARGET"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-apple-darwin
+          path: dist/atlas-*-apple-darwin
+          if-no-files-found: error
+          retention-days: 7
+
+  draft:
+    needs: [plan, linux, windows, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      # Creating the draft release and uploading its assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - name: Manifest and notes
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: cargo xtask release assets --dir dist --notes "$RUNNER_TEMP/notes.md" --expect "$TAG"
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::a release $TAG already exists; delete the draft to rebuild"
+            exit 1
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" --title "atlas $TAG" --notes-file "$RUNNER_TEMP/notes.md" dist/*
+          # A draft makes no tag; the owner's publish does (the v* ruleset
+          # lets no one else). Stop loudly if that ever changes.
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            echo "::error::creating the draft created the tag $TAG"
+            exit 1
+          fi
+          echo "draft $TAG on $GITHUB_SHA: sign and publish it with cargo xtask release sign $TAG"

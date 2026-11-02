@@ -737,3 +737,55 @@ fn section_and_grep_are_the_cheapest_reads() {
     assert!(text.contains("no matches"), "{text}");
     assert!(s.call("grep", &json!({"pattern": "("})).is_err());
 }
+
+/// A memory folder's index file (`MEMORY.md`, the memory export's `index`)
+/// lists the memories and is not one: its stem is no name, so the word
+/// "memory" in every document is no identifier. And the recall check on a
+/// database whose code roots were never indexed reports them as not
+/// indexed and carries on, as the `symbol` tool does.
+#[test]
+fn the_memory_index_is_no_name_and_an_unbuilt_code_index_is_reported() {
+    let t = Temp::new("a-memidx");
+    let root = t.path();
+    let mem = root.join("memory");
+    write(&mem.join("MEMORY.md"), "- [Alpha slug](alpha-slug.md) - the alpha rule\n");
+    write(&mem.join("alpha-slug.md"), "---\nname: alpha-slug\n---\nAlpha rule.\n");
+    write(&root.join("handbook").join("guide.md"), "# Memory\n\n| Memory | 41 KB |\n|---|---|\n\n- Memory: the bank tables.\n\nSee alpha-slug.\n");
+    write(&root.join("app").join("src").join("lib.rs"), "pub fn alpha() {}\n");
+    write(&root.join("Notes").join("Note.md"), "# Note\n");
+    let cfg = json!({
+        "db": "state/atlas.sqlite",
+        "watch": false,
+        "vaults": [{"name": "notes", "path": "Notes"}],
+        "sources": [
+            {"name": "handbook", "root": "handbook", "include": ["*.md"]},
+            {"name": "memory", "root": "memory", "include": ["*.md"], "id_keys": ["name"], "names_kind": "memory"}
+        ],
+        "code": {"roots": [{"name": "app", "root": "app"}]},
+        "memory": {
+            "store": "state/memory.sqlite",
+            "export_dir": "out",
+            "exports": [{"name": "memory", "shape": "memory", "path": "memory", "index": "MEMORY.md"}]
+        }
+    });
+    let path = root.join("atlas.json");
+    fs::write(&path, atlas::json::to_string_pretty(&cfg)).unwrap();
+    let c = Config::load(&path).unwrap();
+    assert_eq!(AtlasSetup::from_config(&c).unwrap().name_indexes, vec![("memory".to_string(), "MEMORY.md".to_string())]);
+    let mut s = open(&path);
+    let store = s.store_mut();
+    let l = store.lookup("memory", 1000, atlas::store::DefText::None).unwrap();
+    // The file is a note like any other (its stem, by wikilink), not a
+    // name: the word in the handbook's heading, row and item is no hit.
+    assert!(l.mentions.is_empty(), "the index's stem is no name: {l:?}");
+    assert_eq!(l.definitions.iter().map(|h| (h.path.as_str(), h.kind.as_str())).collect::<Vec<_>>(), vec![("MEMORY.md", "note")], "{l:?}");
+    let l = store.lookup("alpha-slug", 1000, atlas::store::DefText::None).unwrap();
+    assert!(l.definitions.iter().any(|h| h.source == "memory" && h.path == "alpha-slug.md"), "{l:?}");
+    assert!(l.mentions.iter().any(|h| h.source == "handbook"), "{l:?}");
+
+    let out = std::process::Command::new(bin()).arg("--config").arg(&path).arg("--recall-check").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("misses: 0 identifier, 0 phrase"), "{text}");
+    assert!(text.contains("code recall: not indexed yet, not checked: app"), "{text}");
+}

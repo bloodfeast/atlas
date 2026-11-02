@@ -128,7 +128,7 @@ fn memory_tree(setup: &Setup, dir: Option<PathBuf>, check_only: bool) -> Result<
     let mut embed = tree::embedder(&m.model, m.embed_threads);
     let (churn, _) = tree::rebuild(&dir, &export.index, spec, &mut *embed, !check_only).map_err(|e| e.to_string())?;
     let verb = if check_only { "would change" } else { "changed" };
-    println!("memory tree {}: {verb}: {} ({:.0} ms)", dir.display(), churn.line(), t0.elapsed().as_secs_f64() * 1e3);
+    println!("memory tree {}: {verb}: {} ({:.0} ms)", atlas::paths::strip_verbatim(dir.clone()).display(), churn.line(), t0.elapsed().as_secs_f64() * 1e3);
     for f in &churn.written {
         println!("  write {f}");
     }
@@ -235,8 +235,60 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
     Ok(())
 }
 
-/// The bare words recognised as `argv[1]`.
+/// The bare words recognised as `argv[1]`, or after leading
+/// [`LEADING_OPTIONS`].
 const SUBCOMMANDS: &[&str] = &["run", "slice", "settings", "grammar", "ruling", "entry"];
+
+/// The options (each with one value) that may come before a subcommand
+/// word and apply to it.
+const LEADING_OPTIONS: &[&str] = &["--config", "--project"];
+
+/// Splits a subcommand off the command line: the word after any leading
+/// `--config PATH` and `--project NAME`, and everything after the word.
+/// `argv` keeps the leading options for the option loop. `None` (and
+/// `argv` untouched) when there is no subcommand word there.
+fn split_subcommand(argv: &mut Vec<String>) -> Option<(String, Vec<String>)> {
+    let mut i = 0;
+    while i + 1 < argv.len() && LEADING_OPTIONS.contains(&argv[i].as_str()) {
+        i += 2;
+    }
+    if !argv.get(i).is_some_and(|w| SUBCOMMANDS.contains(&w.as_str())) {
+        return None;
+    }
+    let rest = argv.split_off(i + 1);
+    let word = argv.pop()?;
+    Some((word, rest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_subcommand;
+
+    fn split(args: &[&str]) -> (Vec<String>, Option<(String, Vec<String>)>) {
+        let mut v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let sub = split_subcommand(&mut v);
+        (v, sub)
+    }
+
+    #[test]
+    fn a_subcommand_takes_the_leading_config_and_project() {
+        let (lead, sub) = split(&["--config", "c.json", "settings", "migrate-projects", "alpha"]);
+        assert_eq!(lead, vec!["--config", "c.json"]);
+        assert_eq!(sub, Some(("settings".into(), vec!["migrate-projects".into(), "alpha".into()])));
+        let (lead, sub) = split(&["--project", "p", "--config", "c.json", "run", "--", "x"]);
+        assert_eq!(lead, vec!["--project", "p", "--config", "c.json"]);
+        assert_eq!(sub.unwrap().0, "run");
+        let (lead, sub) = split(&["settings", "list"]);
+        assert!(lead.is_empty());
+        assert_eq!(sub, Some(("settings".into(), vec!["list".into()])));
+        // Not a subcommand: the option loop sees every argument.
+        for args in [&["--config", "c.json", "--rescan"][..], &["--config"], &["--rescan", "settings", "off", "update"], &["--config", "settings"]] {
+            let (lead, sub) = split(args);
+            assert!(sub.is_none(), "{args:?}");
+            assert_eq!(lead.len(), args.len());
+        }
+    }
+}
 
 /// What the command line resolved to.
 pub(crate) struct Setup {
@@ -316,11 +368,11 @@ fn run() -> Result<ExitCode, String> {
         let rest = argv.split_off(1);
         return if w == "digest" { atlas::digest::cli(rest) } else { atlas::crop::cli(rest) };
     }
-    if argv.first().is_some_and(|w| SUBCOMMANDS.contains(&w.as_str())) {
+    if let Some((word, rest)) = split_subcommand(&mut argv) {
         // Everything after the word is the subcommand's own; the
-        // configuration comes from ATLAS_CONFIG or beside the binary.
-        let rest = argv.split_off(1);
-        mode = Mode::Sub(argv.remove(0), rest);
+        // configuration comes from `--config` or `--project` before the
+        // word, else ATLAS_CONFIG or beside the binary.
+        mode = Mode::Sub(word, rest);
     }
     let mut args = argv.into_iter().peekable();
     while let Some(a) = args.next() {
@@ -775,6 +827,9 @@ fn run() -> Result<ExitCode, String> {
                 );
                 for m in &c.misses {
                     println!("code miss: {} {} at {}:{}:{}", m.keyword, m.name, m.root, m.path, m.line);
+                }
+                if !c.unindexed.is_empty() {
+                    println!("code recall: not indexed yet, not checked: {} (run atlas --code-index)", c.unindexed.join(", "));
                 }
                 complete &= c.misses.is_empty();
             }
