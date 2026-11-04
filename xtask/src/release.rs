@@ -881,6 +881,7 @@ pub fn run(args: Vec<String>) -> R {
         return Err(format!("{} leak(s) in the exported tree ({})", leaks.len(), tree.display()));
     }
     say(&format!("leak check: {n} terms, {nfiles} files, no hits"));
+    crate::release_ci::secret_gate(&tree.join("bin"), "the release binaries")?;
 
     say("notes");
     let binaries = binaries_table(&stage.join("bin"))?;

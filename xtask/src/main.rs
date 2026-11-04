@@ -66,6 +66,7 @@ mod public_repo;
 mod py;
 mod release;
 mod release_ci;
+mod secret_scan;
 mod tar;
 mod ucd;
 mod usage;

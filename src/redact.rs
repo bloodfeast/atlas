@@ -35,8 +35,25 @@ use std::sync::OnceLock;
 /// What a redacted line reads as.
 pub const REDACTED: &str = "[redacted]";
 
-/// Prefixes of provider tokens (matched case-sensitively at a token start).
-const PREFIXES: &[&str] = &["sk-", "sk_live_", "sk_test_", "rk_live_", "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "xoxb-", "xoxp-", "xoxa-", "xoxs-", "glpat-", "AIza", "hf_", "npm_", "pypi-", "dop_v1_", "SG.", "ya29."];
+/// Prefixes of provider tokens (matched case-sensitively at a token start),
+/// space-separated in one literal with a space at each end.
+///
+/// Not an array of literals: the linker packs `&str` literals end to end,
+/// so `["sk_test_", "rk_live_", ...]` became one run in v0.2.0's rodata,
+/// `sk_test_` followed by thirty-odd token characters, and GitHub push
+/// protection refused the release binary as a leaked key. Here a space
+/// follows every prefix, so no prefix in the binary can start a key-shaped
+/// run. `tests/secret_scan.rs` scans the built binary to hold that.
+const PREFIX_TABLE: &str = " sk- sk_live_ sk_test_ rk_live_ ghp_ gho_ ghs_ ghu_ ghr_ github_pat_ xoxb- xoxp- xoxa- xoxs- glpat- AIza hf_ npm_ pypi- dop_v1_ SG. ya29. ";
+
+/// AWS access key id prefixes, stored as [`PREFIX_TABLE`] is.
+const AWS_TABLE: &str = " AKIA ASIA ";
+
+/// [`PREFIX_TABLE`]'s prefixes, split once.
+fn prefixes() -> &'static [&'static str] {
+    static LIST: OnceLock<Vec<&'static str>> = OnceLock::new();
+    LIST.get_or_init(|| PREFIX_TABLE.split_ascii_whitespace().collect())
+}
 
 /// Words that make a nearby long run, or an assignment, a secret.
 const WORDS: &[&str] = &["key", "token", "secret", "password", "passwd", "credential", "auth", "bearer", "private"];
@@ -82,11 +99,11 @@ fn has_word(lower: &str) -> bool {
 
 /// Whether a token (split on anything but key characters) is key-shaped.
 fn key_token(t: &str) -> bool {
-    if PREFIXES.iter().any(|p| t.starts_with(p) && t.len() >= p.len() + 12) {
+    if prefixes().iter().any(|p| t.starts_with(p) && t.len() >= p.len() + 12) {
         return true;
     }
     // AWS access key ids.
-    if (t.starts_with("AKIA") || t.starts_with("ASIA")) && t.len() == 20 && t[4..].bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
+    if AWS_TABLE.split_ascii_whitespace().any(|p| t.starts_with(p)) && t.len() == 20 && t[4..].bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
         return true;
     }
     // A JWT: three base64url parts, the first a JSON header.
@@ -209,6 +226,15 @@ pub fn redact_with(text: &str, deny: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_tables_keep_a_space_after_every_prefix() {
+        for t in [PREFIX_TABLE, AWS_TABLE] {
+            assert!(t.starts_with(' ') && t.ends_with(' ') && !t.contains("  "), "{t:?}");
+        }
+        assert_eq!(prefixes().len(), 22);
+        assert!(prefixes().contains(&"sk_test_") && prefixes().contains(&"ya29."));
+    }
 
     #[test]
     fn redacts_key_shaped_lines_and_keeps_the_rest() {

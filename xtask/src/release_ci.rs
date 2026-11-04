@@ -16,8 +16,10 @@
 //!     with each binary's SHA-256 to FILE.
 //! cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
 //!     On the owner's machine: downloads the draft release's manifest and
-//!     binaries, checks each SHA-256 and size against the manifest and the
-//!     leak denylist against every file, commits the binaries to the public
+//!     binaries, checks each SHA-256 and size against the manifest, the
+//!     leak denylist against every file and every file for secret-shaped
+//!     runs (`secret_scan.rs`, the shapes push protection refuses; in a dry
+//!     run as well), commits the binaries to the public
 //!     main as bin/ (the plugin install is a git clone), signs the manifest
 //!     with ATLAS_SIGN_KEY, uploads manifest.json.sig, pushes main and the
 //!     wiki, and publishes the draft on the binaries commit, which creates
@@ -146,6 +148,30 @@ fn leak_gate(dir: &Path, denylist: &Path, what: &str) -> R {
         return Err(format!("{} leak(s) in {what} ({})", leaks.len(), dir.display()));
     }
     say(&format!("leak check of {what}: {n} terms, {nfiles} files, no hits"));
+    Ok(())
+}
+
+/// Scans a folder's files for secret-shaped runs (`secret_scan.rs`), the
+/// shapes push protection refuses; refuses on a hit, naming the file, the
+/// byte offset and the rule, never the bytes. Runs before anything is
+/// pushed, in a dry run as well.
+pub(crate) fn secret_gate(dir: &Path, what: &str) -> R {
+    let mut files = Vec::new();
+    crate::release::files_under(dir, Path::new(""), &mut files)?;
+    files.sort();
+    let named: Vec<(String, Vec<u8>)> = files.into_iter().map(|f| std::fs::read(dir.join(&f)).map(|b| (f.clone(), b)).map_err(|e| format!("{f}: {e}"))).collect::<R<_>>()?;
+    let hits = crate::secret_scan::scan_files(&named);
+    if !hits.is_empty() {
+        for h in &hits {
+            eprintln!("release: secret scan: {what}: {h}");
+        }
+        return Err(format!(
+            "{} secret-shaped run(s) in {what} ({}): GitHub push protection would refuse the push. Find the literal that forms each run (a key prefix the linker packed against other text, or a real key) and break it up, then rebuild",
+            hits.len(),
+            dir.display()
+        ));
+    }
+    say(&format!("secret scan of {what}: {} files, no secret-shaped runs", named.len()));
     Ok(())
 }
 
@@ -699,6 +725,7 @@ pub fn sign(s: &Sign) -> R<Signed> {
     say(&format!("assets: {} binaries match the manifest (sha256 and size)", m.files.len()));
     let _ = std::fs::remove_file(dir.join("manifest.json.sig"));
     leak_gate(&dir, &s.denylist, "the release assets")?;
+    secret_gate(&dir, "the release assets")?;
 
     // The public main must be the draft's commit, or the binaries commit on
     // it from an earlier run of this step.
@@ -1178,6 +1205,27 @@ mod tests {
         let e = sign(&signer(&fx, &rel, true, None)).unwrap_err();
         assert!(e.contains("1 leak(s) in the release assets"), "{e}");
         assert!(!e.to_lowercase().contains(&term()), "the term is never printed: {e}");
+        assert!(!uploaded(&fx));
+        let _ = std::fs::remove_dir_all(&fx.d);
+    }
+
+    #[test]
+    fn sign_refuses_a_secret_shaped_run_in_a_binary_even_in_a_dry_run() {
+        let fx = fixture("sign-secret");
+        let assets = fx.stub.join("release-v1.2.3/assets");
+        let f = assets.join("atlas-aarch64-unknown-linux-gnu");
+        let mut b = std::fs::read(&f).unwrap();
+        // v0.2.0's packed prefixes, assembled here so no source holds the run.
+        b.extend_from_slice(format!("\0{}{}{}\0", "sk_test", "_rk_live_", "modelssourcequote").as_bytes());
+        std::fs::write(&f, b).unwrap();
+        std::fs::remove_file(assets.join("manifest.json")).unwrap();
+        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets).unwrap()).unwrap();
+        relist(&fx);
+        let rel = StubReleases(fx.stub.clone());
+        let e = sign(&signer(&fx, &rel, true, None)).unwrap_err();
+        assert!(e.starts_with("1 secret-shaped run(s) in the release assets") && e.contains("push protection would refuse"), "{e}");
+        assert!(!e.contains("modelssourcequote"), "the run is never printed: {e}");
+        assert!(!fx.d.join("stage").join("public").exists(), "it stops before the public clone");
         assert!(!uploaded(&fx));
         let _ = std::fs::remove_dir_all(&fx.d);
     }
