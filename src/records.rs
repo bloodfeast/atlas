@@ -247,20 +247,24 @@ fn parse(args: Vec<String>, multi: &[&str], single: &[&str]) -> Result<Parsed, S
         let name = a.strip_prefix("--").map(str::to_string);
         match name {
             Some(n) if multi.contains(&n.as_str()) => {
-                let mut any = false;
-                while let Some(v) = it.peek().filter(|v| !v.starts_with("--")) {
-                    // The text is the last word(s): --defines takes words
-                    // until the next flag, so give the text after `--`
-                    // or after another flag.
+                // A list flag takes words until the next flag or a word with
+                // a space in it (the text, as a quoted argument is). When the
+                // list runs to the end with no text given yet, its last word
+                // is the text: `--defines A B "the text"` and
+                // `--defines A text` both work, as does `-- TEXT`.
+                let mut taken = 0;
+                while let Some(v) = it.peek().filter(|v| !v.starts_with("--") && (taken == 0 || !v.contains(char::is_whitespace))) {
                     flags.push((n.clone(), v.clone()));
-                    any = true;
+                    taken += 1;
                     it.next();
-                    if n != "defines" && n != "ref" {
-                        break;
-                    }
                 }
-                if !any {
+                if taken == 0 {
                     return Err(format!("--{n} needs a value"));
+                }
+                if taken > 1 && it.peek().is_none() && words.is_empty() {
+                    if let Some((_, v)) = flags.pop() {
+                        words.push(v);
+                    }
                 }
             }
             Some(n) if single.contains(&n.as_str()) => {
@@ -293,7 +297,7 @@ fn today() -> (String, String) {
 ///
 /// A message for the user.
 pub fn cli(word: &str, args: Vec<String>, store: &mut Store, mem: &Settings, config: Option<&Path>) -> Result<ExitCode, String> {
-    let usage = "usage: atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--date YYYY-MM-DD] -- TEXT\n       atlas entry --title TITLE [--ref REF ...] [--date YYYY-MM-DD] [--time HH:MM] -- TEXT";
+    let usage = "usage: atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--date YYYY-MM-DD] [--] TEXT\n       atlas entry --title TITLE [--ref REF ...] [--date YYYY-MM-DD] [--time HH:MM] [--] TEXT\n(a --defines or --ref list ends at the next flag or a word with a space; run to the end, its last word is TEXT)";
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{usage}");
         return Ok(if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS });

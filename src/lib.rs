@@ -23,7 +23,9 @@
 #![deny(unsafe_code)]
 
 pub mod baseline;
+pub mod checkpoint;
 pub mod chunk;
+pub mod compact;
 pub mod claude_settings;
 pub mod code;
 pub mod code_index;
@@ -43,6 +45,8 @@ pub mod hook_rewrite;
 pub mod hooks;
 pub mod index;
 pub mod json;
+pub mod langs;
+pub mod lex;
 pub mod links;
 pub mod markdown;
 pub mod memory;
@@ -56,11 +60,13 @@ pub mod proto;
 pub mod protobuf;
 pub mod protocol;
 pub mod recall;
+pub mod redact;
 pub mod records;
 pub mod regex;
 pub mod registry;
 pub mod run;
 pub mod scan;
+pub mod scanner;
 pub mod scip;
 pub mod semantic;
 pub mod sha256;
@@ -72,5 +78,6 @@ pub mod update;
 pub mod watch;
 pub mod wgsl;
 pub mod tools;
+pub mod transcripts;
 
 pub use error::{Error, Result};

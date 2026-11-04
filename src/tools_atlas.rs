@@ -187,7 +187,7 @@ impl Server {
         // A repository of the active project: its line from the project graph.
         let repo = self.memory.as_ref().and_then(|m| m.settings.graph.as_ref()).and_then(|g| g.describe(id));
         // Not registered: the code index may define it (a `.proto` message,
-        // an rpc and its callers, a Rust or WGSL item).
+        // an rpc and its callers, a code item in any indexed language).
         let code_lim = crate::code::Limits { defs: 8, refs: 24, impls: 4 };
         let code_ans = if found || self.code.is_none() {
             None

@@ -155,7 +155,7 @@ impl Fx {
 pub const TEST_REASON: &str = "integration test fixture write";
 
 pub fn takes_reason(tool: &str) -> bool {
-    atlas::tools::tool_list().iter().any(|t| t["name"] == tool && t["inputSchema"]["properties"].get("reason").is_some())
+    atlas::tools::full_tool_list().iter().any(|t| t["name"] == tool && t["inputSchema"]["properties"].get("reason").is_some())
 }
 
 fn with_reason(tool: &str, mut args: Value) -> Value {

@@ -470,7 +470,8 @@ fn find_items<'a>(items: &'a [Item], name: &str) -> Vec<&'a Item> {
 /// Numbered lines of the ranges, capped at `cap` bytes, with a
 /// "truncated" line naming the next range when cut.
 fn render(id: &str, lines: &[&str], ranges: &[(usize, usize)], note: &str, cap: usize) -> String {
-    let total: usize = ranges.iter().map(|(a, b)| b + 1 - a).sum();
+    // An empty range (b < a) counts no lines.
+    let total: usize = ranges.iter().map(|(a, b)| (b + 1).saturating_sub(*a)).sum();
     let mut out = String::from(note);
     let mut shown = 0;
     let mut prev_end = 0;
@@ -522,6 +523,9 @@ pub fn parse_sel(words: &[String]) -> std::result::Result<Sel, String> {
             "--lines" | "-l" => {
                 let v = val()?;
                 let (a, b) = parse_range(&v).ok_or_else(|| format!("--lines {v:?}: expected A-B"))?;
+                if b < a {
+                    return Err(format!("--lines {v:?}: the range runs backwards (A must be at most B)"));
+                }
                 sel = Some(Sel::Lines(a, b));
             }
             "--item" | "--symbol" | "-i" => sel = Some(Sel::Item(val()?)),
@@ -582,6 +586,15 @@ pub fn cli(args: Vec<String>, db: &std::path::Path, lean: Option<&crate::json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_backwards_line_range_is_refused() {
+        let words = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
+        let e = parse_sel(&words("--lines 5-1")).unwrap_err();
+        assert!(e.contains("runs backwards"), "{e}");
+        assert!(parse_sel(&words("--lines 1-5")).is_ok());
+        assert!(parse_sel(&words("--lines 5-5")).is_ok());
+    }
 
     #[test]
     fn ranges_parse() {

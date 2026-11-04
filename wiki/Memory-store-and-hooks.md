@@ -7,13 +7,15 @@ it. The design and the measured hook behaviour it rests on are in `docs/design/a
 - **Append-only, enforced by SQLite.** Triggers refuse any UPDATE or DELETE of `versions` and any DELETE of
   `records`; a record's head only moves forward. Each version carries the SHA-256 of its text and a per-record hash
   chain, and imported text its provenance (source, file, line, file sha). Every committed batch is also appended to
-  `<store>.jsonl`, a plain-text copy.
+  `<store>.jsonl`, a plain-text copy, under the batch's write lock and before its commit: the store records where
+  the committed lines end, so lines a crash left past it (appended, never committed) are cut off by the next
+  write, and the copy always holds exactly the committed batches, in commit order.
 - **A reversal is a supersede.** The old record stays, recallable, marked `superseded by <key>`, and stays in its
   export with one marker line.
 
 | Tool | Writes | What it does |
 |---|---|---|
-| `remember` | yes | a memory (key = file name), rule or decision; an existing key gains a version and needs `expected_sha` |
+| `remember` | yes | a memory (key = file name), rule or decision; an existing key gains a version and needs `expected_sha` (the head's sha, or its first 12 or more hex digits, as the ok line prints 16); a rule is one list item (a body without a leading `- ` is written as `- DATE AUTHOR: text`, later lines indented; blank lines or a second item are refused) |
 | `recall` | | by `key` (`history: true` for every version), by `query` (FTS5, best first, within `budget_tokens`: the leading records whole (the best, and a second within 0.8 of its score), the rest as pointers, one line each with key, score and title; a body is one `recall {key}` away), or `lane` |
 | `supersede` | yes | replaces `old` records with a new one placed right after the first |
 | `journal` | yes | a lane entry: `brief`, `decision`, `measurement` (conditions in `meta`), `commit`, `question`, `answered` (`refs: ["answers:<key>"]`), `next`, `note` |
@@ -93,11 +95,14 @@ the answer does not depend on which snapshots have been folded.
 
 `hooks/hooks.json` wires Claude Code `mcp_tool` hooks to the plugin's own server, so no process starts per hook; the
 server answers `hook` calls on a worker thread of their own, never behind a slow tool call. `atlas --hook` answers the
-same events as a command hook (the event JSON on stdin).
+same events as a command hook (the event JSON on stdin), one process per event, with one exception: a subagent's
+brief (the Agent call's prompt) is held by the server between the `PreToolUse` that carries it and the
+`SubagentStart` that injects its recall, so as a command hook `SubagentStart` has no brief and injects no lane
+recall. Use the `mcp_tool` hooks for subagent recall.
 
 - **Recall** (`UserPromptSubmit` in the main session; `SubagentStart` for subagents, whose brief is taken from the
   parent's `Agent` tool call): a lane the text names gets its journal first; then the gated records, whole, in
-  fused order (reciprocal rank over FTS5 and the vectors), within `recall.budget_tokens` (600). A record passes
+  fused order (reciprocal rank over FTS5 and the vectors), within `recall.budget_tokens` (150). A record passes
   lexically when its FTS5 score clears the floor and it contains `recall.min_terms` (3) of the prompt's words; with
   the embedding model (`semantic.model`) loaded the floor is `recall.hybrid_fts_floor` and the record's cosine with
   the prompt's first `recall.query_tokens` (32) tokens must also clear `recall.cos_floor`, and a cosine at or above
@@ -105,11 +110,67 @@ same events as a command hook (the event JSON on stdin).
   embedded once per version on a background thread (cached in the store's `rec_vec` table); until a record has a
   vector it is judged lexically. Nothing clears the gate: nothing is injected. A record is injected once per
   session. The floors are set by `cargo xtask calibrate-recall` from `--recall-scores` output, never by hand.
+- **Context selection** (`recall.select`, on by default): what clears the gate is cut to what the prompt needs.
+  A record whose words the record injected before it holds (`dup_overlap`, 0.90, one way) at a cosine of
+  `dup_cos` (0.82) or more is sent as `- KEY: near-duplicate of OTHER`, so the rule kept in INTENT, a memory
+  file and a restore point is sent once. A pointer carries the clause of its record that holds the most prompt
+  words (after a dated lead such as `2026-10-30 Brandon:`), up to `trim_chars` (90), in place of its first line;
+  a lane brief keeps its handoff, brief, open questions and next step whole and cuts older entries to their
+  matching clauses (`lane_chars`, 180), with a `+N trimmed above` line. Every piece of an excerpt is an exact
+  substring of the record, joined by ` ... `, so a quote of it is the record's own text and `recall {key}` reads
+  it whole. A record the lane brief shows is not pointed to again. Clauses are chosen by the prompt's words, not
+  by embedding each clause: measured at about 48 ms a clause with the bge int8 model on the development machine,
+  with cosines that did not separate the answer from an off-topic clause.
 - **Context cap** (`PreToolUse`, subagents only unless `cap.main_session`): the size is the last assistant
   message's input, cache and output tokens in the subagent's own transcript
   (`<parent>/subagents/agent-<id>.jsonl`). At `cap.warn_tokens` (450,000) the agent is told to finish, commit, push
   and write its handoff; at `cap.block_tokens` (500,000) every tool but `handoff` is denied. Both are journal
   entries.
+- **Compaction (experimental, off by default):** everything in this item and the next three, except the
+  transcript source, runs only with `"compact": {"enabled": true}` in atlas's configuration. Off, PreCompact only
+  forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript); SessionStart
+  injects no card or ref report and offers no Compact instructions.
+- **Compaction** (`PreCompact`, then `SessionStart` with `source: compact`): PreCompact writes a checkpoint
+  journal entry in lane `session:<id>` and sets the session's lookups aside. After the compaction the hook reads
+  the summary Claude Code wrote (the transcript's `isCompactSummary` record), resolves every content-addressed
+  ref in it (`key@hash`, `src:path:a-b@hash`; see [[Tools reference]]), and injects one line per changed or
+  dangling ref, nothing when all resolve. Each compaction is a `compact_log` row (`preTokens`, `postTokens`,
+  summary size, refs, changed, dangling, the hook's own time). A main-session lookup (a Read, Grep, Glob or MCP
+  lookup with the same target) made before the compaction and again after it is a `compact:miss` row.
+  `--token-report` ends with the totals; `atlas --compact-report --transcripts DIR` replays recorded sessions and
+  prints the same numbers, never transcript text. Design: `docs/design/compaction.md`.
+- **Checkpoint and card:** the PreCompact checkpoint is a `journal` entry of kind `checkpoint` whose body is ref
+  lines: `since` (the previous checkpoint), `lanes` (each active lane and its current step), `open` (unanswered
+  questions), `owed` (`next` entries no commit followed), `rulings` (rules written since), then the in-task state
+  read from the transcript since the last compaction: `files` touched, `tools` (the last six calls, each with its
+  result's `turn:<session8>:<line>@hash` ref), `pending` (a call still running) and `intent` (the last line of
+  visible assistant text). Thinking blocks are never read; every transcript-derived line passes secret redaction
+  (`src/redact.rs`: denied file names, key-shaped tokens, `.env`-style assignments, the `ATLAS_LEAK_DENYLIST`
+  terms). After the compaction SessionStart injects the newest checkpoint as a card headed by its own ref, within
+  `compact.card_tokens` (default 400), before the ref report.
+- **Which lanes the card lists:** with a project active (a configuration with `projects`), the store is the
+  project's own, so the card lists its lanes and rulings. With no project the store may hold every project's
+  lanes, so the card keeps to the session's own lane (the previous checkpoint) plus the transcript side. An
+  unknown segment start (an empty or unreadable transcript) is the 24 hours before the compaction, never all
+  time.
+- **Transcript not yet written:** a session forked and compacted at once can fire PreCompact before Claude Code
+  has written its transcript. PreCompact re-reads it for up to 1.5 s; if it still holds no turn it reads the
+  session it was forked from, the only other transcript in the same folder written in the last ten minutes
+  (named in the checkpoint's `tail_from:` meta line). With no such single sibling the checkpoint's title says
+  `transcript unread` and its body has an `unread:` line, never a silent `at 0 context tokens`.
+- **Transcript source (`memory.transcripts`, off by default):** PreCompact queues the session transcript, indexed
+  once the answer is out (a command hook does it after printing): one turn per record's visible text, redacted,
+  each row tagged with its project (the transcript's folder) so no other project's server serves it. The ref check
+  after a compaction resolves `turn:` refs against the transcripts beside the session's own.
+- **Deferral (`compact.defer`, off by default):** PreCompact with `trigger: auto` answers `decision: block` while
+  the transcript's last assistant record is a tool call (a chain is running), unless the context is within the
+  ceiling's margin of the window (three times the largest per-request growth, at least 40,000 tokens). A manual
+  `/compact` is never blocked. Each deferral is a `compact:defer` token-log row. It stays off until a live check
+  confirms Claude Code offers a blocked compaction again.
+- **Compact instructions:** `atlas settings compact-md [DIR] [--yes]` shows the block for `DIR/CLAUDE.md`
+  (default the current folder) and its diff, asks, and writes it with a backup; `atlas settings undo` removes only
+  the block (and the file, when atlas created it). SessionStart offers it once per project folder (a repository
+  root or a folder with a `CLAUDE.md`); `atlas settings offer` asks it for the current folder.
 - **Token ledger:** every hook answer is a `token_log` row (`hook:<event>`), empty ones included, with the
   counterfactual of reading the injected records without atlas.
 
@@ -121,6 +182,9 @@ Two commands write records with explicit fields, so atlas never has to infer wha
 atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--date YYYY-MM-DD] TEXT
 atlas entry --title TITLE [--ref REF ...] [--date YYYY-MM-DD] [--time HH:MM] TEXT
 ```
+
+A `--defines` or `--ref` list takes words until the next flag or a quoted text (a word with a space); when it
+runs to the end, its last word is the text. `-- TEXT` always marks the text.
 
 A ruling renders `- DATE BY: TEXT` and, when it defines identifiers, the marker `<!-- atlas defines: ID ... -->`
 after it (invisible when the Markdown is rendered); the registry reads the marker as a definition above every

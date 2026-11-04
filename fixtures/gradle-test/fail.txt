@@ -1,0 +1,53 @@
+Picked up JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=80.0 -XX:+UseContainerSupport
+
+Welcome to Gradle 7.6.1!
+
+Here are the highlights of this release:
+ - Added support for Java 19.
+ - Introduced `--rerun` flag for individual task rerun.
+ - Improved dependency block for test suites to be strongly typed.
+ - Added a pluggable system for Java toolchains provisioning.
+
+For more details see https://docs.gradle.org/7.6.1/release-notes.html
+
+To honour the JVM settings for this build a single-use Daemon process will be forked. See https://docs.gradle.org/7.6.1/userguide/gradle_daemon.html#sec:disabling_the_daemon.
+Daemon will be stopped at the end of the build 
+> Task :compileJava
+> Task :processResources NO-SOURCE
+> Task :classes
+> Task :compileTestJava
+> Task :processTestResources NO-SOURCE
+> Task :testClasses
+
+> Task :test FAILED
+Picked up JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=80.0 -XX:+UseContainerSupport
+
+ShapesTest > kindIsMissing() FAILED
+    java.lang.IllegalArgumentException at ShapesTest.java:26
+
+ShapesTest > areaIsWrong() FAILED
+    org.opentest4j.AssertionFailedError at ShapesTest.java:21
+
+5 tests completed, 2 failed, 1 skipped
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':test'.
+> There were failing tests. See the report at: file:///work/build/reports/tests/test/index.html
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights.
+
+* Get more help at https://help.gradle.org
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 8.0.
+
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+See https://docs.gradle.org/7.6.1/userguide/command_line_interface.html#sec:command_line_warnings
+
+BUILD FAILED in 16s
+3 actionable tasks: 3 executed

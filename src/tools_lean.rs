@@ -200,6 +200,36 @@ impl Server {
 /// # Errors
 ///
 /// Never; an unreadable document is skipped.
+/// The most of one line `grep` prints, in bytes.
+const MAX_GREP_LINE: usize = 400;
+
+/// A line cut to [`MAX_GREP_LINE`] bytes (on character boundaries) around
+/// the match at byte `at` when there is one, with `...` where text was left
+/// out and the line's full length named.
+fn capped_line(line: &str, at: Option<usize>) -> std::borrow::Cow<'_, str> {
+    if line.len() <= MAX_GREP_LINE {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let floor = |mut i: usize| {
+        while !line.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let from = floor(at.unwrap_or(0).saturating_sub(MAX_GREP_LINE / 4).min(line.len() - MAX_GREP_LINE));
+    let to = floor((from + MAX_GREP_LINE).min(line.len()));
+    let mut s = String::with_capacity(MAX_GREP_LINE + 48);
+    if from > 0 {
+        s.push_str("...");
+    }
+    s.push_str(&line[from..to]);
+    if to < line.len() {
+        s.push_str("...");
+    }
+    s.push_str(&format!(" [line of {} bytes cut]", line.len()));
+    std::borrow::Cow::Owned(s)
+}
+
 fn grep_docs(docs: &[(String, String)], re: &crate::regex::Regex, ctx: usize, read: &mut dyn FnMut(&str, &str) -> Option<Vec<u8>>) -> Result<(String, usize, usize)> {
     let mut out = String::new();
     let (mut matches, mut files) = (0usize, 0usize);
@@ -228,7 +258,8 @@ fn grep_docs(docs: &[(String, String)], re: &crate::regex::Regex, ctx: usize, re
             };
             for (j, line) in lines.iter().enumerate().take(to + 1).skip(start) {
                 let sep = if hit.binary_search(&j).is_ok() { ':' } else { '-' };
-                out.push_str(&format!("{s}/{p}{sep}{}{sep}{line}\n", j + 1));
+                let shown = capped_line(line, if sep == ':' { re.find(line).map(|m| m.start()) } else { None });
+                out.push_str(&format!("{s}/{p}{sep}{}{sep}{shown}\n", j + 1));
             }
             last = Some(to.max(last.unwrap_or(0)));
             matches += 1;

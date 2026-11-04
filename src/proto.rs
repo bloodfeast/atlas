@@ -19,11 +19,18 @@
 //! `option ...;`), `reserved`, `extensions` and `import` lines define
 //! nothing.
 //!
-//! [`mention_rows`] adds call sites: in a root's other source files, a word
-//! that is a known rpc's name (as written, in lowerCamel or in snake_case)
-//! is a reference of kind `call (mention)`. The rpc names come from every
-//! root of the project, so a gateway's `client.GetInvoice(...)` answers
-//! "who calls GetInvoice" for the billing service's proto.
+//! [`link_rows`] links each rpc to the code generated for it in every
+//! language of [`crate::langs`] (stubs, by each row's [`crate::langs::Grpc`]
+//! conventions), to the calls made through those stubs (exact, from SCIP
+//! references) and to the server types implementing it (by SCIP impl edges
+//! or a type's header). [`mention_rows`] adds the call sites no index
+//! resolved: in a root's other source files, a word in code (not in a
+//! comment or a string, not a definition's name, not where SCIP has a
+//! reference, not in generated code) that is a known rpc's name (as
+//! written, in lowerCamel or in snake_case) is a reference of kind `call
+//! (mention)`: a client of a `.proto` loaded at run time. The rpc names come
+//! from every root of the project, so a gateway's `client.GetInvoice(...)`
+//! answers "who calls GetInvoice" for the billing service's proto.
 
 use std::collections::{HashMap, HashSet};
 
@@ -441,14 +448,34 @@ pub fn proto_rows(texts: &[(String, String)], rows: &mut crate::code::Rows, file
 pub const MENTION_KIND: &str = "call (mention)";
 
 /// Adds rpc call sites found in source files (see [`mentions`]); a file
-/// with none adds no row.
-pub fn mention_rows(texts: &[(String, String)], rpcs: &HashSet<String>, rows: &mut crate::code::Rows, files: &mut HashMap<String, u32>) {
+/// with none adds no row. Generated files ([`crate::langs::is_generated`])
+/// are not searched: their stubs are linked to the rpc instead
+/// ([`link_rows`]). A word where `taken` holds a row (a definition, or a
+/// SCIP reference: the index says what the word is) is no mention, nor is one
+/// in a comment or a string of a language of [`crate::langs`] (its
+/// scanner's blanking).
+pub fn mention_rows(
+    texts: &[(String, String)],
+    rpcs: &HashSet<String>,
+    taken: &HashSet<(u32, u32, u32)>,
+    rows: &mut crate::code::Rows,
+    files: &mut HashMap<String, u32>,
+) {
     let m = spelling_map(rpcs);
     if m.is_empty() {
         return;
     }
     for (p, t) in texts {
-        let found = mentions(t, &m);
+        if crate::langs::is_generated(p) {
+            continue;
+        }
+        let mut found = match crate::langs::of_path(p) {
+            Some(l) => mentions(&crate::scanner::of(l).blank(t).0, &m),
+            None => mentions(t, &m),
+        };
+        if let Some(&f) = files.get(p.as_str()) {
+            found.retain(|(_, line, col)| !taken.contains(&(f, *line, *col)));
+        }
         if found.is_empty() {
             continue;
         }
@@ -475,6 +502,391 @@ pub fn indexed_rpcs(conn: &rusqlite::Connection, root: &str, own: bool) -> crate
     let mut st = conn.prepare(&sql)?;
     let v = st.query_map([root], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<HashSet<String>>>()?;
     Ok(v)
+}
+
+/// The kind of an rpc stub link row ([`link_rows`]).
+pub const STUB_KIND: &str = "rpc stub";
+/// The kind of an rpc implementation link row ([`link_rows`]).
+pub const SERVER_KIND: &str = "rpc server";
+/// The kind of a reference to an rpc's stub: an exact call site.
+pub const CALL_KIND: &str = "rpc";
+
+/// An rpc's name in one of a [`crate::langs::Grpc`] row's forms: `{S}` the
+/// service, `{Rpc}` the rpc as written, `{rpc}` lowerCamel, `{rpc_}`
+/// snake_case.
+fn fill(template: &str, service: &str, rpc: &str) -> String {
+    let (lower, snake) = camel_and_snake(rpc);
+    template.replace("{S}", service).replace("{Rpc}", rpc).replace("{rpc_}", &snake).replace("{rpc}", &lower)
+}
+
+/// An rpc's lowerCamel and snake_case spellings.
+fn camel_and_snake(rpc: &str) -> (String, String) {
+    let mut c = rpc.chars();
+    let lower: String = c.next().map(|f| f.to_lowercase().chain(c).collect()).unwrap_or_default();
+    let mut snake = String::new();
+    for (k, ch) in rpc.chars().enumerate() {
+        if ch.is_uppercase() {
+            if k > 0 {
+                snake.push('_');
+            }
+            snake.extend(ch.to_lowercase());
+        } else {
+            snake.push(ch);
+        }
+    }
+    (lower, snake)
+}
+
+/// The folder of a `/`-separated path (empty at the root).
+fn folder(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |x| x.0)
+}
+
+/// The identifier words of a line.
+fn words(line: &str) -> impl Iterator<Item = &str> {
+    line.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty())
+}
+
+/// The words of a type's header (its definition line up to the line that
+/// opens its body) and of its body lines that are a type name alone (a Go
+/// embedded field: `pb.UnimplementedCartServiceServer`, its last part).
+///
+/// # Arguments
+///
+/// * `lines` - the file's lines.
+/// * `start` - the definition's line, 0-based.
+/// * `end` - its last line, 0-based.
+fn base_words<'a>(lines: &[&'a str], start: usize, end: usize) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut header = true;
+    for l in lines.iter().take(end.max(start) + 1).skip(start).take(400) {
+        if header {
+            out.extend(words(l));
+            let t = l.trim_end();
+            header = !(t.contains('{') || t.ends_with(':'));
+        } else {
+            let t = l.trim().trim_start_matches('*').trim_end_matches(';').trim();
+            if !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                out.push(t.rsplit('.').next().unwrap_or(t));
+            }
+        }
+    }
+    out
+}
+
+/// One language row's names, each to the rpcs (indices) it names.
+#[derive(Default)]
+struct Names {
+    /// Stub method names.
+    stubs: HashMap<String, Vec<usize>>,
+    /// Implementation method names.
+    servers: HashMap<String, Vec<usize>>,
+    /// Server base type names, to services.
+    bases: HashMap<String, HashSet<String>>,
+}
+
+impl Names {
+    fn of(g: &crate::langs::Grpc, rpcs: &[(String, String)]) -> Names {
+        let mut t = Names::default();
+        for (i, (rpc, svc)) in rpcs.iter().enumerate() {
+            for (list, out) in [(g.stubs, &mut t.stubs), (g.servers, &mut t.servers)] {
+                for tpl in list {
+                    let v = out.entry(fill(tpl, svc, rpc)).or_default();
+                    if v.last() != Some(&i) {
+                        v.push(i);
+                    }
+                }
+            }
+            for tpl in g.bases {
+                t.bases.entry(fill(tpl, svc, rpc)).or_default().insert(svc.clone());
+            }
+        }
+        t
+    }
+}
+
+/// Links each rpc of a `.proto` service to the code generated for it and
+/// the code that implements it, by the conventions of each language's row
+/// ([`crate::langs::Grpc`]):
+///
+/// * Stubs: a definition in a generated file (`demo_grpc.pb.go`,
+///   `demo_pb2_grpc.py`, `CartGrpc.cs`, `CartServiceGrpc.java`) named as
+///   the row names an rpc's stub (`GetCart`, `getCart`, `GetCartAsync`),
+///   in a type or a file named after the rpc's service, gets an impl row
+///   under the rpc's name, of kind [`STUB_KIND`], one per file, side
+///   (client or server) and rpc: `client stub CartServiceClient::GetCart`.
+/// * Call sites: a reference outside generated code to such a stub (the
+///   same name and container: the symbol SCIP resolved it to) is of kind
+///   [`CALL_KIND`]; one spelled otherwise (`getCart`) is also stored under
+///   the rpc's name, with its caller.
+/// * Implementations: a type that extends, implements or embeds a
+///   generated server type (`CartServiceBase`,
+///   `UnimplementedCartServiceServer`, `CartServiceServicer`,
+///   `CartServiceImplBase`), by a SCIP impl edge (followed through
+///   hand-written base classes) or by its header or an embedded field, has
+///   its methods named after its service's rpcs linked: an impl row of
+///   kind [`SERVER_KIND`] under the rpc's name, `CartService for
+///   CartService::GetCart`. Methods are looked for in the type's folder (a
+///   Go type's methods are in its package's files).
+///
+/// # Arguments
+///
+/// * `rows` - the root's rows, extended here.
+/// * `rpcs` - every known rpc: (name, its service's short name).
+/// * `texts` - source text by path below the root, for type headers.
+/// * `foreign` - definitions other code roots hold that may be stubs
+///   ([`foreign_stubs`]): (name, container, path). A reference of this root
+///   into one (a cross-root reference, [`crate::code::Rows::linked`]) is a
+///   call site as a reference into its own stubs is; no stub row is made
+///   here (the defining root has it).
+pub fn link_rows(rows: &mut crate::code::Rows, rpcs: &[(String, String)], texts: &HashMap<&str, &str>, foreign: &[(String, String, String)]) {
+    use crate::code::{Occ, IMPLEMENTS, SECT_DEF, SECT_IMPL, SECT_REF};
+    if rpcs.is_empty() {
+        return;
+    }
+    let mut rpcs: Vec<(String, String)> = rpcs.to_vec();
+    rpcs.sort();
+    rpcs.dedup();
+    let rpcs = rpcs;
+    // Per file: its language's names, and whether it is generated.
+    let mut names: Vec<Names> = Vec::new();
+    let mut of_row: HashMap<&'static str, usize> = HashMap::new();
+    let mut file_names: Vec<Option<usize>> = Vec::with_capacity(rows.files.len());
+    let mut generated: Vec<bool> = Vec::with_capacity(rows.files.len());
+    for (p, _) in &rows.files {
+        let lang = crate::langs::of_path(p).filter(|l| l.grpc.is_some());
+        file_names.push(lang.map(|l| {
+            *of_row.entry(l.name).or_insert_with(|| {
+                names.push(Names::of(l.grpc.as_ref().expect("filtered"), &rpcs));
+                names.len() - 1
+            })
+        }));
+        generated.push(crate::langs::is_generated(p));
+    }
+    // Stubs in another root's generated code: (name, container) to the rpc.
+    let mut foreign_of: HashMap<(&str, &str), usize> = HashMap::new();
+    for (name, container, path) in foreign {
+        let Some(lang) = crate::langs::of_path(path).filter(|l| l.grpc.is_some() && crate::langs::is_generated(path)) else { continue };
+        let row = *of_row.entry(lang.name).or_insert_with(|| {
+            names.push(Names::of(lang.grpc.as_ref().expect("filtered"), &rpcs));
+            names.len() - 1
+        });
+        let Some(cands) = names[row].stubs.get(name) else { continue };
+        let stem = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+        let cont = container.to_ascii_lowercase();
+        if let Some(&i) = cands.iter().find(|&&i| {
+            let s = rpcs[i].1.to_ascii_lowercase();
+            cont.contains(&s) || stem.contains(&s)
+        }) {
+            foreign_of.entry((name.as_str(), container.as_str())).or_insert(i);
+        }
+    }
+    let names_of = |file: u32| file_names[file as usize].map(|n| &names[n]);
+    let mut new: Vec<Occ> = Vec::new();
+    // Stubs: (name, container) to the rpc.
+    let mut stub_of: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut linked: HashSet<(u32, bool, usize)> = HashSet::new();
+    for o in rows.occ.iter().filter(|o| o.sect == SECT_DEF && generated[o.file as usize]) {
+        let Some(n) = names_of(o.file) else { continue };
+        let Some(cands) = n.stubs.get(&o.name) else { continue };
+        let path = rows.files[o.file as usize].0.as_str();
+        let stem = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+        let cont = o.container.to_ascii_lowercase();
+        for &i in cands {
+            let svc = &rpcs[i].1;
+            let s = svc.to_ascii_lowercase();
+            if !(cont.contains(&s) || stem.contains(&s)) {
+                continue;
+            }
+            stub_of.entry((o.name.as_str(), o.container.as_str())).or_insert(i);
+            let server = n.bases.get(&o.container).is_some_and(|v| v.contains(svc));
+            if linked.insert((o.file, server, i)) {
+                let side = if server { "server" } else { "client" };
+                let at = if o.container.is_empty() { o.name.clone() } else { format!("{}::{}", o.container, o.name) };
+                new.push(Occ {
+                    name: rpcs[i].0.clone(),
+                    sect: SECT_IMPL,
+                    file: o.file,
+                    line: o.line,
+                    col: o.col,
+                    kind: STUB_KIND.into(),
+                    container: format!("{side} stub {at}"),
+                    within: String::new(),
+                });
+            }
+        }
+    }
+    rows.stats.rpc_stubs += new.len();
+    // Call sites.
+    let calls: Vec<(usize, usize)> = rows
+        .occ
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.sect == SECT_REF && o.kind.is_empty() && !generated[o.file as usize])
+        .filter_map(|(k, o)| {
+            let key = (o.name.as_str(), o.container.as_str());
+            stub_of.get(&key).or_else(|| foreign_of.get(&key)).map(|&i| (k, i))
+        })
+        .collect();
+    for (k, i) in calls {
+        let o = &mut rows.occ[k];
+        o.kind = CALL_KIND.into();
+        rows.stats.rpc_calls += 1;
+        if o.name != rpcs[i].0 {
+            new.push(Occ { name: rpcs[i].0.clone(), ..o.clone() });
+        }
+    }
+    // Impl edges inside generated code under an rpc's name (a Go client
+    // struct's method for its interface's) are the stubs' own plumbing:
+    // the stub rows stand for them.
+    if rows.stats.rpc_stubs > 0 {
+        let rpc_names: HashSet<&str> = rpcs.iter().map(|r| r.0.as_str()).collect();
+        rows.occ.retain(|o| !(o.sect == SECT_IMPL && o.kind == IMPLEMENTS && generated[o.file as usize] && rpc_names.contains(o.name.as_str())));
+    }
+    // Implementing types: (type, folder) to the services it serves, from
+    // impl edges and type headers, then through edges from those types.
+    let mut serves: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    let mut edges: Vec<(String, String, String)> = Vec::new();
+    for o in rows.occ.iter().filter(|o| o.sect == SECT_IMPL && o.kind == IMPLEMENTS && !generated[o.file as usize]) {
+        let Some((base, imp)) = o.container.split_once(" for ") else { continue };
+        if base.contains("::") || imp != o.name {
+            continue;
+        }
+        let dir = folder(&rows.files[o.file as usize].0).to_string();
+        if let Some(v) = names_of(o.file).and_then(|n| n.bases.get(base)) {
+            serves.entry((imp.to_string(), dir.clone())).or_default().extend(v.iter().cloned());
+        }
+        edges.push((base.to_string(), imp.to_string(), dir));
+    }
+    let mut file_lines: HashMap<u32, Option<Vec<&str>>> = HashMap::new();
+    for o in rows.occ.iter().filter(|o| o.sect == SECT_DEF && !generated[o.file as usize]) {
+        let kw = o.kind.split(' ').next().unwrap_or("");
+        if !matches!(kw, "class" | "struct" | "type" | "record" | "object" | "interface") {
+            continue;
+        }
+        let Some(n) = names_of(o.file).filter(|n| !n.bases.is_empty()) else { continue };
+        let path = rows.files[o.file as usize].0.as_str();
+        // A file's lines, when a word of it names a server base type.
+        let Some(lines) = file_lines
+            .entry(o.file)
+            .or_insert_with(|| texts.get(path).filter(|t| t.lines().any(|l| words(l).any(|w| n.bases.contains_key(w)))).map(|t| t.lines().collect()))
+        else {
+            continue;
+        };
+        let start = o.line.saturating_sub(1) as usize;
+        if start >= lines.len() {
+            continue;
+        }
+        let end = rows.ends.get(&(o.file, o.line)).map(|&e| e as usize).or_else(|| crate::digest::brace_body_end(lines, start)).unwrap_or(o.line as usize);
+        let found: HashSet<String> = base_words(lines, start, end.saturating_sub(1)).into_iter().filter_map(|w| n.bases.get(w)).flatten().cloned().collect();
+        if !found.is_empty() {
+            serves.entry((o.name.clone(), folder(path).to_string())).or_default().extend(found);
+        }
+    }
+    // Through edges from implementing types (a servicer's subclasses).
+    for _ in 0..edges.len() {
+        let mut grew = false;
+        for (base, imp, dir) in &edges {
+            let from: HashSet<String> = serves.iter().filter(|((t, _), _)| t == base).flat_map(|(_, v)| v.iter().cloned()).collect();
+            if from.is_empty() {
+                continue;
+            }
+            let e = serves.entry((imp.clone(), dir.clone())).or_default();
+            let had = e.len();
+            e.extend(from);
+            grew |= e.len() > had;
+        }
+        if !grew {
+            break;
+        }
+    }
+    if !serves.is_empty() {
+        let mut members: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        for (k, o) in rows.occ.iter().enumerate() {
+            if o.sect == SECT_DEF && !generated[o.file as usize] && !o.container.is_empty() {
+                members.entry((folder(&rows.files[o.file as usize].0), o.container.as_str())).or_default().push(k);
+            }
+        }
+        let mut done: HashSet<(usize, u32, u32)> = HashSet::new();
+        let mut keys: Vec<&(String, String)> = serves.keys().collect();
+        keys.sort();
+        let before = new.len();
+        for key in keys {
+            let svcs = &serves[key];
+            for &k in members.get(&(key.1.as_str(), key.0.as_str())).map_or(&[][..], |v| v.as_slice()) {
+                let o = &rows.occ[k];
+                let Some(cands) = names_of(o.file).and_then(|n| n.servers.get(&o.name)) else { continue };
+                for &i in cands.iter().filter(|&&i| svcs.contains(&rpcs[i].1)) {
+                    if done.insert((i, o.file, o.line)) {
+                        new.push(Occ {
+                            name: rpcs[i].0.clone(),
+                            sect: SECT_IMPL,
+                            file: o.file,
+                            line: o.line,
+                            col: o.col,
+                            kind: SERVER_KIND.into(),
+                            container: format!("{} for {}::{}", rpcs[i].1, o.container, o.name),
+                            within: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+        rows.stats.rpc_servers += new.len() - before;
+        // An impl edge the index gave on the same line under the rpc's name
+        // (a C# override of the base's method) is replaced by the link.
+        let mine: HashSet<(&str, u32, u32)> = new[before..].iter().map(|o| (o.name.as_str(), o.file, o.line)).collect();
+        rows.occ.retain(|o| !(o.sect == SECT_IMPL && o.kind == IMPLEMENTS && mine.contains(&(o.name.as_str(), o.file, o.line))));
+    }
+    rows.occ.extend(new);
+}
+
+/// The definitions other code roots than `root` hold under a name some
+/// language's stub of an rpc has ([`crate::langs::Grpc::stubs`]), in
+/// generated files: (name, container, path), for [`link_rows`]'s
+/// cross-root call sites.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn foreign_stubs(conn: &rusqlite::Connection, root: &str, rpcs: &[(String, String)]) -> crate::Result<Vec<(String, String, String)>> {
+    let mut names: Vec<String> = crate::langs::LANGS.iter().filter_map(|l| l.grpc.as_ref()).flat_map(|g| Names::of(g, rpcs).stubs.into_keys()).collect();
+    names.sort();
+    names.dedup();
+    let mut st = conn.prepare_cached("SELECT o.container, f.path FROM code_occ o JOIN code_files f ON f.id = o.file WHERE o.name = ?1 AND o.sect = 0 AND f.root <> ?2")?;
+    let mut out = Vec::new();
+    for n in names {
+        let rows = st.query_map(rusqlite::params![n, root], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for r in rows {
+            let (container, path) = r?;
+            if crate::langs::is_generated(&path) {
+                out.push((n.clone(), container, path));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The rpcs indexed for code roots other than `root`: (name, the short
+/// name of its service).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn indexed_rpc_services(conn: &rusqlite::Connection, root: &str) -> crate::Result<Vec<(String, String)>> {
+    let mut st = conn.prepare(
+        "SELECT DISTINCT o.name, o.container FROM code_occ o JOIN code_files f ON f.id = o.file WHERE o.sect = 0 AND o.kind LIKE 'rpc (%' AND f.root <> ?1",
+    )?;
+    let v = st
+        .query_map([root], |r| Ok((r.get::<_, String>(0)?, service_of(&r.get::<_, String>(1)?))))?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    Ok(v)
+}
+
+/// The short name of an rpc's service from its container
+/// (`hipstershop.CartService`: `CartService`).
+pub fn service_of(container: &str) -> String {
+    container.rsplit('.').next().unwrap_or(container).to_string()
 }
 
 #[cfg(test)]
@@ -546,5 +958,87 @@ service InvoiceService {
         let rs = "let r = client.get_invoice(req).await?;";
         assert_eq!(mentions(rs, &m).len(), 1);
         assert!(mentions("GetInvoices getInvoiceX", &m).is_empty(), "whole words only");
+    }
+
+    fn row(name: &str, sect: i64, file: u32, line: u32, kind: &str, container: &str) -> crate::code::Occ {
+        crate::code::Occ { name: name.into(), sect, file, line, col: 4, kind: kind.into(), container: container.into(), within: "caller".into() }
+    }
+
+    #[test]
+    fn links_java_and_csharp_stubs_calls_and_servers_through_base_classes() {
+        use crate::code::{Rows, IMPLEMENTS, SECT_DEF, SECT_IMPL, SECT_REF};
+        let mut rows = Rows::default();
+        for (p, l) in [
+            ("build/gen/CartServiceGrpc.java", "java"),
+            ("src/Client.java", "java"),
+            ("src/CartImpl.java", "java"),
+            ("obj/CartGrpc.cs", "csharp"),
+            ("Services/CartService.cs", "csharp"),
+            ("Tests/CartTests.cs", "csharp"),
+        ] {
+            rows.files.push((p.into(), l));
+        }
+        rows.occ = vec![
+            // Java: a blocking stub, a call through it, a server two classes
+            // down from the generated base.
+            row("getCart", SECT_DEF, 0, 10, "method", "CartServiceBlockingStub"),
+            row("getCart", SECT_DEF, 0, 20, "method", "CartServiceImplBase"),
+            row("getCart", SECT_REF, 1, 5, "", "CartServiceBlockingStub"),
+            row("getCart", SECT_REF, 1, 6, "", "OtherStub"),
+            row("BaseCart", SECT_IMPL, 2, 3, IMPLEMENTS, "CartServiceImplBase for BaseCart"),
+            row("CartImpl", SECT_IMPL, 2, 9, IMPLEMENTS, "BaseCart for CartImpl"),
+            row("getCart", SECT_DEF, 2, 11, "method", "CartImpl"),
+            row("helper", SECT_DEF, 2, 14, "method", "CartImpl"),
+            // C#: an async client method, its base, an override whose impl
+            // edge the index already gave.
+            row("GetCartAsync", SECT_DEF, 3, 30, "method", "CartServiceClient"),
+            row("GetCart", SECT_DEF, 3, 40, "method", "CartServiceBase"),
+            row("CartService", SECT_IMPL, 4, 8, IMPLEMENTS, "CartServiceBase for CartService"),
+            row("GetCart", SECT_DEF, 4, 12, "method", "CartService"),
+            row("GetCart", SECT_IMPL, 4, 12, IMPLEMENTS, "CartServiceBase::GetCart for CartService::GetCart"),
+            row("GetCartAsync", SECT_REF, 5, 7, "", "CartServiceClient"),
+        ];
+        let rpcs = vec![("GetCart".to_string(), "CartService".to_string())];
+        link_rows(&mut rows, &rpcs, &HashMap::new(), &[]);
+        let got = |kind: &str| -> Vec<String> {
+            let mut v: Vec<String> =
+                rows.occ.iter().filter(|o| o.name == "GetCart" && o.kind == kind).map(|o| format!("{}:{} {}", o.file, o.line, o.container)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            got(STUB_KIND),
+            [
+                "0:10 client stub CartServiceBlockingStub::getCart",
+                "0:20 server stub CartServiceImplBase::getCart",
+                "3:30 client stub CartServiceClient::GetCartAsync",
+                "3:40 server stub CartServiceBase::GetCart"
+            ]
+        );
+        assert_eq!(got(SERVER_KIND), ["2:11 CartService for CartImpl::getCart", "4:12 CartService for CartService::GetCart"]);
+        // Calls: kept under the stub's name and stored under the rpc's.
+        assert_eq!(got(CALL_KIND), ["1:5 CartServiceBlockingStub", "5:7 CartServiceClient"]);
+        assert!(rows.occ.iter().any(|o| o.name == "getCart" && o.line == 5 && o.kind == CALL_KIND && o.within == "caller"));
+        assert!(rows.occ.iter().any(|o| o.name == "getCart" && o.line == 6 && o.kind.is_empty()), "another type's getCart is no call");
+        assert!(!rows.occ.iter().any(|o| o.kind == IMPLEMENTS && o.name == "GetCart"), "the override's edge is the link now");
+        assert_eq!((rows.stats.rpc_stubs, rows.stats.rpc_calls, rows.stats.rpc_servers), (4, 2, 2));
+    }
+
+    #[test]
+    fn mentions_skip_generated_files_comments_strings_and_taken_words() {
+        use crate::code::Rows;
+        let rpcs: HashSet<String> = ["GetCart".to_string()].into_iter().collect();
+        let texts = vec![
+            ("gen/demo_grpc.pb.go".to_string(), "func GetCart() {}\n".to_string()),
+            ("app/main.go".to_string(), "// GetCart here\nx := \"GetCart\"\nc.GetCart()\nd.GetCart()\n".to_string()),
+            ("tool.rb".to_string(), "# GetCart\n".to_string()),
+        ];
+        let mut rows = Rows::default();
+        let mut files = HashMap::new();
+        let f = rows.file(&mut files, "app/main.go", "go");
+        let taken: HashSet<(u32, u32, u32)> = [(f, 4, 2)].into_iter().collect();
+        mention_rows(&texts, &rpcs, &taken, &mut rows, &mut files);
+        let got: Vec<(String, u32)> = rows.occ.iter().map(|o| (rows.files[o.file as usize].0.clone(), o.line)).collect();
+        assert_eq!(got, [("app/main.go".to_string(), 3), ("tool.rb".to_string(), 1)], "a file of no language row is searched as it is");
     }
 }

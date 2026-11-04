@@ -1,0 +1,30 @@
+
+I&
+scip-go0.2.9--output
+index.scipfile://Z:%5Cscratch%5Cfx%5Cgo Á
+scale.goB8scip-go gomod example.com/shapes . `example.com/shapes`/BUAscip-go gomod example.com/shapes . `example.com/shapes`/Double().BZ local 0BK?scip-go gomod example.com/shapes . `example.com/shapes`/Square#BK?scip-go gomod example.com/shapes . `example.com/shapes`/Square#BK?scip-go gomod example.com/shapes . `example.com/shapes`/Square#BPDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.Blocal 0BPDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.BŸ
+Ascip-go gomod example.com/shapes . `example.com/shapes`/Double().,Double returns a square with twice the side.(2Double:""go*func Double(s Square) Square˜
+8scip-go gomod example.com/shapes . `example.com/shapes`/<Package shapes is a fixture for atlas's SCIP decoder tests.
+(#2shapes:"go*package shapes"
+local 0(=2s:"go*var s Square"go0ü
+	shapes.goD8scip-go gomod example.com/shapes . `example.com/shapes`/BR>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#B
+Z WCscip-go gomod example.com/shapes . `example.com/shapes`/Shape#Area.BRS?scip-go gomod example.com/shapes . `example.com/shapes`/Square#B	Z XDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.B
+R
+local 0BK?scip-go gomod example.com/shapes . `example.com/shapes`/Square#BZFscip-go gomod example.com/shapes . `example.com/shapes`/Square#Area().BZ local 0B	PDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.B
+local 0BPDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.BT@scip-go gomod example.com/shapes . `example.com/shapes`/Total().B
+Z local 1BJ>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#Blocal 2Blocal 3B	local 1Blocal 2Blocal 3B	
+OCscip-go gomod example.com/shapes . `example.com/shapes`/Shape#Area.Blocal 2BQ=scip-go gomod example.com/shapes . `example.com/shapes`/Unit.B
+Z p
+Cscip-go gomod example.com/shapes . `example.com/shapes`/Shape#Area.(C2Area:!"go*func (Shape).Area() float64o
+Dscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.(2Side:"go*struct field Side float64Þ
+Fscip-go gomod example.com/shapes . `example.com/shapes`/Square#Area().Area returns the square's area."G
+Cscip-go gomod example.com/shapes . `example.com/shapes`/Shape#Area.(2Area:""go*func (Square).Area() float64‘
+=scip-go gomod example.com/shapes . `example.com/shapes`/Unit.$Unit is the side of the unit square.(2Unit:""go*const Unit untyped float = 1‹
+>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#Shape has an area.(2Shape:,"go*&type Shape interface{ Area() float64 }Í
+?scip-go gomod example.com/shapes . `example.com/shapes`/Square#Square is a Shape."B
+>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#(12Square:("go*"type Square struct{ Side float64 }Œ
+@scip-go gomod example.com/shapes . `example.com/shapes`/Total().Total sums the areas.(2Total:("go*"func Total(shapes []Shape) float64'
+local 2(=2sum:"go*var sum float64!
+local 3(=2s:"go*var s Shape"
+local 0(=2s:"go*var s Square-
+local 1(=2shapes:"go*var shapes []Shape"go0

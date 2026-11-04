@@ -80,7 +80,7 @@ pub fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
                 id,
                 json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
+                    "capabilities": {"tools": {"listChanged": false}, "resources": {}},
                     "serverInfo": {"name": "atlas", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": server.instructions()
                 }),
@@ -88,6 +88,19 @@ pub fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
         }
         "ping" => Some(ok(id, json!({}))),
         "tools/list" => Some(ok(id, json!({ "tools": tools::tool_list() }))),
+        // One resource: the tool reference the short tool list leaves out.
+        "resources/list" => Some(ok(
+            id,
+            json!({"resources": [{"uri": tools::HELP_URI, "name": "atlas tools", "description": "Every tool, op and argument.", "mimeType": "text/markdown"}]}),
+        )),
+        "resources/templates/list" => Some(ok(id, json!({"resourceTemplates": []}))),
+        "resources/read" => match params.get("uri").and_then(Value::as_str) {
+            Some(tools::HELP_URI) => {
+                Some(ok(id, json!({"contents": [{"uri": tools::HELP_URI, "mimeType": "text/markdown", "text": tools::help()}]})))
+            }
+            Some(u) => Some(error(id, -32002, &format!("resource not found: {u}"))),
+            None => Some(error(id, -32602, "resources/read needs params.uri")),
+        },
         "tools/call" => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Some(error(id, -32602, "tools/call needs params.name"));
@@ -96,7 +109,10 @@ pub fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
             // The answer goes out once, as text: no structuredContent copy
             // (no tool declares an output schema), so a client reads each
             // byte once.
-            match server.answer(name, &args) {
+            // Claude Code names the tool_use_id of a call in `_meta`; the
+            // PreToolUse hook names the same id with the agent.
+            let use_id = params.get("_meta").and_then(|m| m.as_object()).and_then(|m| m.iter().find(|(k, _)| k.ends_with("toolUseId")).and_then(|(_, v)| v.as_str()));
+            match server.answer_call(name, &args, use_id) {
                 Ok(answer) => Some(ok(id, content(answer.into_text(), false))),
                 Err(crate::error::Error::NotFound(m)) if m.starts_with("tool ") => {
                     Some(error(id, -32602, &format!("unknown tool: {}", &m[5..])))
@@ -241,7 +257,7 @@ pub fn serve_with_hooks(
 ) -> io::Result<()> {
     use std::sync::{mpsc, Arc, Mutex};
     let out = Arc::new(Mutex::new(output));
-    let (main_tx, main_rx) = mpsc::channel::<Incoming>();
+    let (main_tx, main_rx) = mpsc::channel::<(Incoming, u64)>();
     let (hook_tx, hook_worker) = match hooks {
         Some(settings) => {
             // `None` is the warm-up signal: the main thread sends it once its
@@ -286,6 +302,12 @@ pub fn serve_with_hooks(
         None => (None, None),
     };
     let mut warm_tx = hook_tx.clone();
+    // The reader notes each hook as it reads it, before any call it
+    // announces can reach the main thread, and sends every other message
+    // with the mark of the hooks read before it: a call sees exactly the
+    // hooks that came before it in the stream, however far ahead the
+    // reader has read (see [`crate::tools::dedup::Announcer`]).
+    let announcer = server.announcer();
     let reader = std::thread::Builder::new().name("atlas-reader".into()).spawn(move || -> io::Result<()> {
         let mut input = input;
         let mut buf = Vec::new();
@@ -294,16 +316,20 @@ pub fn serve_with_hooks(
                 Incoming::Eof => return Ok(()),
                 Incoming::Message(m) => {
                     if let (Some(tx), Some(call)) = (&hook_tx, hook_call(&m)) {
+                        let args = call.1.clone();
+                        // Noted once: by the reader when the worker takes
+                        // it, else by the main thread as it answers it.
                         if tx.send(Some(call)).is_ok() {
+                            announcer.hook(&args);
                             continue;
                         }
                     }
-                    if main_tx.send(Incoming::Message(m)).is_err() {
+                    if main_tx.send((Incoming::Message(m), announcer.mark())).is_err() {
                         return Ok(());
                     }
                 }
                 r @ Incoming::Reply(_) => {
-                    if main_tx.send(r).is_err() {
+                    if main_tx.send((r, announcer.mark())).is_err() {
                         return Ok(());
                     }
                 }
@@ -311,9 +337,12 @@ pub fn serve_with_hooks(
         }
     })?;
     let mut result = Ok(());
-    for inc in main_rx {
+    for (inc, mark) in main_rx {
         let response = match inc {
-            Incoming::Message(m) => handle(server, &m),
+            Incoming::Message(m) => {
+                server.set_horizon(Some(mark));
+                handle(server, &m)
+            }
             Incoming::Reply(r) => Some(r),
             Incoming::Eof => None,
         };
@@ -330,6 +359,7 @@ pub fn serve_with_hooks(
             warm_tx = None;
         }
     }
+    server.set_horizon(None);
     if result.is_err() {
         // The reader may be blocked on input; it ends with the process.
         return result;

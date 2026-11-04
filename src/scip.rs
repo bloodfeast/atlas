@@ -10,7 +10,16 @@
 //! | `Index` | `metadata` 1, `documents` 2, `external_symbols` 3 |
 //! | `Metadata` | `tool_info` 2 (`name` 1, `version` 2), `project_root` 3 |
 //! | `Document` | `relative_path` 1, `occurrences` 2, `symbols` 3, `language` 4 |
-//! | `Occurrence` | `range` 1 (packed int32: 3 or 4 values), `symbol` 2, `symbol_roles` 3, `enclosing_range` 7 |
+//! | `Occurrence` | `range` 1 (packed int32: 3 or 4 values), `symbol` 2, `symbol_roles` 3, `enclosing_range` 7 (packed), `single_line_range` 8, `multi_line_range` 9, `single_line_enclosing_range` 10, `multi_line_enclosing_range` 11 |
+//! | `SingleLineRange` | `line` 1, `start_character` 2, `end_character` 3 |
+//! | `MultiLineRange` | `start_line` 1, `start_character` 2, `end_line` 3, `end_character` 4 |
+//!
+//! Ranges come in two forms. The packed `range` and `enclosing_range` (3 or
+//! 4 `int32`s) are deprecated; newer producers (scip-go 0.2.9 among them)
+//! write only the typed messages 8 to 11. Both are read, and the typed form
+//! wins when an occurrence has both, as the schema says. A typed message's
+//! missing field is 0 (proto3), so a range on the first line may arrive as
+//! an empty message.
 //! | `SymbolInformation` | `symbol` 1, `relationships` 4, `kind` 5, `display_name` 6, `enclosing_symbol` 8 |
 //! | `Relationship` | `symbol` 1, `is_reference` 2, `is_implementation` 3, `is_type_definition` 4, `is_definition` 5 |
 //!
@@ -203,12 +212,19 @@ fn document<'a>(ix: &mut Index<'a>, buf: &'a [u8], opts: Options) -> Result<(), 
                 encl.clear();
                 let mut sym = "";
                 let mut roles = 0u32;
+                // Typed ranges (fields 8 to 11): [start line, start char, end line, end char].
+                let mut typed: Option<[i32; 4]> = None;
+                let mut typed_encl: Option<[i32; 4]> = None;
                 while let Some((g, wt2)) = o.field()? {
-                    match g {
-                        1 => o.int32s(wt2, &mut range)?,
-                        2 if wt2 == WireType::Len => sym = o.string()?,
-                        3 if wt2 == WireType::Varint => roles = o.varint()? as u32,
-                        7 => o.int32s(wt2, &mut encl)?,
+                    match (g, wt2) {
+                        (1, _) => o.int32s(wt2, &mut range)?,
+                        (2, WireType::Len) => sym = o.string()?,
+                        (3, WireType::Varint) => roles = o.varint()? as u32,
+                        (7, _) => o.int32s(wt2, &mut encl)?,
+                        (8, WireType::Len) => typed = Some(typed_range(o.bytes()?, false)?),
+                        (9, WireType::Len) => typed = Some(typed_range(o.bytes()?, true)?),
+                        (10, WireType::Len) => typed_encl = Some(typed_range(o.bytes()?, false)?),
+                        (11, WireType::Len) => typed_encl = Some(typed_range(o.bytes()?, true)?),
                         _ => o.skip(wt2)?,
                     }
                 }
@@ -219,14 +235,17 @@ fn document<'a>(ix: &mut Index<'a>, buf: &'a [u8], opts: Options) -> Result<(), 
                     ix.locals_skipped += 1;
                     continue;
                 }
-                let (l0, c0, l1, c1) = match range[..] {
-                    [l, c, e] => (l, c, l, e),
-                    [l, c, el, ec] => (l, c, el, ec),
-                    _ => return Err(DecodeError { what: "occurrence range is not 3 or 4 values", at }),
+                let (l0, c0, l1, c1) = match (typed, &range[..]) {
+                    (Some([l, c, el, ec]), _) => (l, c, el, ec),
+                    (None, &[l, c, e]) => (l, c, l, e),
+                    (None, &[l, c, el, ec]) => (l, c, el, ec),
+                    _ => return Err(DecodeError { what: "occurrence has no range, or a packed range that is not 3 or 4 values", at }),
                 };
-                let (e0, e1) = match encl[..] {
-                    [l, _, e] => (l, e.min(i32::MAX).max(l)),
-                    [l, _, el, _] => (l, el),
+                // A 3-value enclosing range ends on its start line.
+                let (e0, e1) = match (typed_encl, &encl[..]) {
+                    (Some([l, _, el, _]), _) => (l, el),
+                    (None, &[l, _, _]) => (l, l),
+                    (None, &[l, _, el, _]) => (l, el),
                     _ => (NONE, NONE),
                 };
                 let id = ix.intern(sym);
@@ -238,13 +257,28 @@ fn document<'a>(ix: &mut Index<'a>, buf: &'a [u8], opts: Options) -> Result<(), 
                 ix.occ_end_line.push(l1);
                 ix.occ_end_col.push(c1);
                 ix.occ_encl_start.push(e0);
-                // A 3-value enclosing range ends on its start line.
-                ix.occ_encl_end.push(if encl.len() == 3 { e0 } else { e1 });
+                ix.occ_encl_end.push(e1);
             }
             _ => r.skip(wt)?,
         }
     }
     Ok(())
+}
+
+/// Reads a `SingleLineRange` (`multi` false: line, start, end character)
+/// or a `MultiLineRange` (start line, start character, end line, end
+/// character) as `[start line, start char, end line, end char]`; a field
+/// left out is 0.
+fn typed_range(buf: &[u8], multi: bool) -> Result<[i32; 4], DecodeError> {
+    let mut v = [0i32; 4];
+    let mut r = Reader::new(buf);
+    while let Some((f, wt)) = r.field()? {
+        match (f, wt) {
+            (1..=4, WireType::Varint) => v[f as usize - 1] = r.int32()?,
+            _ => r.skip(wt)?,
+        }
+    }
+    Ok(if multi { v } else { [v[0], v[1], v[0], v[2]] })
 }
 
 fn symbol_info<'a>(ix: &mut Index<'a>, buf: &'a [u8]) -> Result<(), DecodeError> {
@@ -336,6 +370,41 @@ fn escaped(b: &[u8], start: usize) -> (usize, usize) {
         j += 1;
     }
     (start.min(b.len()), j.min(b.len()))
+}
+
+/// The package manager and package name of a global SCIP symbol (its
+/// second and third header fields; the version, the fourth, is left out).
+///
+/// # Arguments
+///
+/// * `sym` - the symbol string, e.g.
+///   `scip-go gomod example.com/lib v1.2.0 `example.com/lib/stats`/Mean().`.
+///
+/// # Returns
+///
+/// `(manager, name)` as written (an escaped space stays doubled), or
+/// `None` for a local or malformed symbol.
+pub fn package(sym: &str) -> Option<(&str, &str)> {
+    if sym.starts_with("local ") {
+        return None;
+    }
+    let mut fields: [&str; 4] = [""; 4];
+    let mut rest = sym;
+    for f in &mut fields {
+        let b = rest.as_bytes();
+        let mut i = 0;
+        loop {
+            match b.get(i) {
+                None => return None,
+                Some(b' ') if b.get(i + 1) == Some(&b' ') => i += 2,
+                Some(b' ') => break,
+                Some(_) => i += 1,
+            }
+        }
+        *f = &rest[..i];
+        rest = &rest[i + 1..];
+    }
+    Some((fields[1], fields[2]))
 }
 
 /// Splits a global SCIP symbol into its descriptors (the part after the
@@ -476,6 +545,41 @@ pub fn kind_word(kind: i32) -> Option<&'static str> {
     })
 }
 
+/// A short word for `SymbolInformation.Kind` in an index from any indexer
+/// but rust-analyzer (whose values [`kind_word`] keeps as they were): the
+/// words atlas prints for every language. `None` for 0 (the indexer gave
+/// no kind: scip-python and scip-dotnet) and for kinds no language atlas
+/// indexes uses; the caller falls back to the suffix and the line.
+///
+/// Values are `scip.proto`'s `SymbolInformation.Kind`.
+pub fn generic_kind_word(kind: i32) -> Option<&'static str> {
+    Some(match kind {
+        3 | 54 | 55 | 73 => "type",
+        7 | 75 => "class",
+        8 => "const",
+        9 => "ctor",
+        11 => "enum",
+        12 => "variant",
+        13 | 78 => "event",
+        15 | 77 | 79 => "field",
+        17 => "fn",
+        18 | 41 | 45 | 72 | 81 => "property",
+        21 | 42 => "interface",
+        25 => "macro",
+        26 | 66 | 67 | 68 | 69 | 70 | 74 | 76 | 80 => "method",
+        28 => "message",
+        29 | 30 | 35 | 36 => "mod",
+        33 => "object",
+        49 => "struct",
+        53 => "trait",
+        59 => "union",
+        61 | 82 => "var",
+        84 => "extension",
+        85 => "mixin",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -572,6 +676,81 @@ pub(crate) mod tests {
         for cut in [1, buf.len() / 3, buf.len() - 1] {
             assert!(decode(&buf[..cut], Options::default()).is_err(), "cut at {cut}");
         }
+    }
+
+    /// One occurrence with the given range fields: `packed` as field 1,
+    /// `typed` as (field, values) for 8 to 11.
+    fn typed_occ(sym: &str, packed: &[i32], typed: &[(u32, &[i64])]) -> Writer {
+        let mut o = Writer::default();
+        if !packed.is_empty() {
+            o.packed(1, packed);
+        }
+        o.string(2, sym).int(3, 1);
+        for (field, vals) in typed {
+            let mut r = Writer::default();
+            for (i, v) in vals.iter().enumerate() {
+                if *v != 0 {
+                    r.int(i as u32 + 1, *v);
+                }
+            }
+            o.message(*field, &r);
+        }
+        o
+    }
+
+    #[test]
+    fn typed_ranges_decode_and_win_over_packed_ones() {
+        let s = |x: &str| format!("scip-go gomod example.com/m . `example.com/m`/{x}");
+        let mut d = Writer::default();
+        d.string(1, "a.go");
+        // single_line_range 8 and a multi-line enclosing range 11.
+        d.message(2, &typed_occ(&s("Square#"), &[], &[(8, &[9, 5, 11]), (11, &[9, 0, 11, 1])]));
+        // multi_line_range 9 and a single-line enclosing range 10.
+        d.message(2, &typed_occ(&s("Total()."), &[], &[(9, &[19, 5, 20, 2]), (10, &[19, 0, 30])]));
+        // Both forms: the typed range wins.
+        d.message(2, &typed_occ(&s("Unit."), &[1, 1, 2], &[(8, &[28, 6, 10])]));
+        // An empty typed message is line 0, character 0 (proto3 defaults).
+        d.message(2, &typed_occ(&s("First."), &[], &[(8, &[])]));
+        // A packed range alone still reads.
+        d.message(2, &typed_occ(&s("Old."), &[3, 4, 7], &[]));
+        let mut ix = Writer::default();
+        ix.message(2, &d);
+        let x = decode(&ix.buf, Options::default()).unwrap();
+        let at = |name: &str| x.occ_sym.iter().position(|&i| x.symbols[i as usize] == s(name)).unwrap();
+        let cols = |i: usize| (x.occ_line[i], x.occ_col[i], x.occ_end_line[i], x.occ_end_col[i], x.occ_encl_start[i], x.occ_encl_end[i]);
+        assert_eq!(cols(at("Square#")), (9, 5, 9, 11, 9, 11));
+        assert_eq!(cols(at("Total().")), (19, 5, 20, 2, 19, 19));
+        assert_eq!(cols(at("Unit.")), (28, 6, 28, 10, NONE, NONE));
+        assert_eq!(cols(at("First.")), (0, 0, 0, 0, NONE, NONE));
+        assert_eq!(cols(at("Old.")), (3, 4, 3, 7, NONE, NONE));
+        // No range at all is still an error.
+        let mut d = Writer::default();
+        d.string(1, "a.go").message(2, &typed_occ(&s("X."), &[], &[]));
+        let mut ix = Writer::default();
+        ix.message(2, &d);
+        assert!(decode(&ix.buf, Options::default()).is_err());
+    }
+
+    #[test]
+    fn generic_kinds() {
+        assert_eq!(generic_kind_word(7), Some("class"));
+        assert_eq!(generic_kind_word(9), Some("ctor"));
+        assert_eq!(generic_kind_word(21), Some("interface"));
+        assert_eq!(generic_kind_word(26), Some("method"));
+        assert_eq!(generic_kind_word(49), Some("struct"));
+        assert_eq!(generic_kind_word(0), None, "no kind: the caller falls back");
+        // rust-analyzer's table is unchanged.
+        assert_eq!(kind_word(70), Some("trait method"));
+    }
+
+    #[test]
+    fn package_of_a_symbol() {
+        assert_eq!(package("scip-go gomod example.com/lib v1.2.0 `example.com/lib/stats`/Mean()."), Some(("gomod", "example.com/lib")));
+        assert_eq!(package("scip-typescript npm @demo/shared 1.2.0 src/`cart.ts`/Cart#"), Some(("npm", "@demo/shared")));
+        // An escaped space stays doubled; a local symbol has none.
+        assert_eq!(package("semanticdb maven a  b 1 x/Y#"), Some(("maven", "a  b")));
+        assert_eq!(package("local 4"), None);
+        assert_eq!(package("scip-go gomod"), None);
     }
 
     #[test]

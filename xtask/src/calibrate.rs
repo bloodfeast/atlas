@@ -94,7 +94,17 @@ pub struct Targets {
     /// File names an include names exactly (no wildcard).
     names: Vec<String>,
     handoff: Regex,
-    file_word: Regex,
+}
+
+/// Extensions a shell word names a file by.
+const FILE_EXTS: &[&str] = &["md", "rs", "txt", "json", "toml", "py", "ps1", "sh", "log", "wgsl", "csv", "tsv", "yaml", "yml"];
+
+/// Whether a shell word is a file name (was
+/// `^[^*?$]+\.(md|rs|txt|json|toml|py|ps1|sh|log|wgsl|csv|tsv|yaml|yml)$`):
+/// no wildcard or `$`, something before the dot, a known extension.
+fn file_word(s: &str) -> bool {
+    !s.contains(['*', '?', '$'])
+        && FILE_EXTS.iter().any(|e| s.len() > e.len() + 1 && s.ends_with(e) && s.as_bytes()[s.len() - e.len() - 1] == b'.')
 }
 
 impl Targets {
@@ -111,8 +121,7 @@ impl Targets {
         names.sort();
         names.dedup();
         let handoff = RegexBuilder::new(handoff).case_insensitive(true).build().map_err(|e| format!("handoff pattern: {e}"))?;
-        let file_word = Regex::new(r"^[^*?$]+\.(md|rs|txt|json|toml|py|ps1|sh|log|wgsl|csv|tsv|yaml|yml)$").map_err(|e| e.to_string())?;
-        Ok(Targets { roots, names, handoff, file_word })
+        Ok(Targets { roots, names, handoff })
     }
 
     /// Whether a path (absolute, or relative to `cwd`) is a target.
@@ -154,7 +163,7 @@ impl Targets {
                 let base = base_name(&n);
                 if self.names.iter().any(|x| x == base) || self.handoff.is_match(base) || self.is_target(part, cwd) {
                     hit = true;
-                } else if self.file_word.is_match(base) && !n.starts_with("/dev/") {
+                } else if file_word(base) && !n.starts_with("/dev/") {
                     return false;
                 }
             }
@@ -382,8 +391,65 @@ pub fn measure(dir: &Path, before: &str, t: &Targets) -> Baseline {
 mod tests {
     use super::*;
 
+    /// Inputs for [`file_word`]: random words from its pieces, and edge
+    /// cases (empty, a bare extension, wildcards, Unicode, line endings).
+    fn file_words() -> Vec<String> {
+        const PIECES: &[&str] =
+            &[".", "md", "rs", "yaml", "yml", "ps1", "a", "/", "*", "?", "$", "-", " ", "\n", "\r\n", "\u{e9}", "\u{663}", "x.md", ".json"];
+        let mut out: Vec<String> = ["", ".md", "a.md", "a.mdx", "*.md", "$x.rs", "a.b.toml", ".", "md", "\u{e9}.rs", "a\n.md", "a.md\n"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in 0..20_000 {
+            let mut s = String::new();
+            for _ in 0..(1 + i % 9) {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                s.push_str(PIECES[(x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as usize % PIECES.len()]);
+            }
+            out.push(s);
+        }
+        out
+    }
+
+    #[test]
+    fn file_word_matches_its_old_pattern() {
+        let re = Regex::new(r"^[^*?$]+\.(md|rs|txt|json|toml|py|ps1|sh|log|wgsl|csv|tsv|yaml|yml)$").unwrap();
+        let words = file_words();
+        let hits = words.iter().filter(|w| file_word(w)).count();
+        assert!(hits > 500, "only {hits} words match");
+        for w in &words {
+            assert_eq!(file_word(w), re.is_match(w), "{w:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "timing: run in release with --nocapture"]
+    fn file_word_timing() {
+        let re = Regex::new(r"^[^*?$]+\.(md|rs|txt|json|toml|py|ps1|sh|log|wgsl|csv|tsv|yaml|yml)$").unwrap();
+        let words = file_words();
+        let time = |f: &dyn Fn(&str) -> bool| {
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(words.iter().filter(|w| f(w)).count());
+                    t.elapsed().as_secs_f64()
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let (a, b) = (time(&|w| re.is_match(w)), time(&|w| file_word(w)));
+        println!("| calibrate file word | {:.2} ms | {:.2} ms | {:.1}x |", a * 1e3, b * 1e3, a / b);
+    }
+
     fn targets() -> Targets {
-        Targets::new(&[PathBuf::from("V:/notes vault")], &[(PathBuf::from("R:/repo/.claude"), vec!["RULES.md".into()]), (PathBuf::from("R:/repo/docs"), vec!["*.md".into()])], DEFAULT_HANDOFF).unwrap()
+        Targets::new(
+            &[PathBuf::from("V:/notes vault")],
+            &[(PathBuf::from("R:/repo/.claude"), vec!["RULES.md".into()]), (PathBuf::from("R:/repo/docs"), vec!["*.md".into()])],
+            DEFAULT_HANDOFF,
+        )
+        .unwrap()
     }
 
     #[test]

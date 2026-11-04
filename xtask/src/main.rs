@@ -13,8 +13,9 @@
 //! cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
 //! cargo xtask verify-macos
 //! cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
-//! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
+//! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
 //! cargo xtask memory-tree-check --config CONFIG [--dir DIR]
+//! cargo xtask langs-bench --lang LANG --root DIR [--scip FILE]
 //! ```
 //!
 //! * `calibrate-baseline` measures what agents spent on lookups in the
@@ -44,13 +45,19 @@
 //!   and `sign` are the CI release (see `release_ci.rs`).
 //! * `verify-macos` runs the suite, the fixture checks and the benches and
 //!   prints what to paste back (see `verify_macos.rs`).
+//! * `langs-bench` measures a language of the code index's language table
+//!   on a pinned public corpus: scanner recall and item ends against the
+//!   language's SCIP indexer, and SCIP rows against the grep truth (see
+//!   `langs_bench.rs`).
 //! * `coverage` runs the tests with rustc's coverage instrumentation and
 //!   prints line and region coverage per module (see `coverage.rs`).
 
 mod attrib;
 mod calibrate;
 mod calibrate_recall;
+mod compact_live;
 mod coverage;
+mod langs_bench;
 mod leak;
 mod memory_eval;
 mod memory_tree;
@@ -80,8 +87,10 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
        cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
        cargo xtask verify-macos
        cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
-       cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
-       cargo xtask memory-tree-check --config CONFIG [--dir DIR]";
+       cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
+       cargo xtask memory-tree-check --config CONFIG [--dir DIR]
+       cargo xtask compact-live --transcripts DIR --work DIR [--atlas-bin EXE --atlas-config FILE] [--claude EXE] [--sessions N] [--per-session N] [--thresholds T,T] [--per-threshold N] [--only JOB,JOB] [--dry-run | --score]
+       cargo xtask langs-bench --lang LANG --root DIR [--scip FILE]";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -103,6 +112,8 @@ fn main() -> ExitCode {
             }
         },
         "coverage" => coverage::run(args),
+        "compact-live" => compact_live::run(args),
+        "langs-bench" => langs_bench::run(args),
         "verify-macos" => match verify_macos::run() {
             Ok(0) => Ok(()),
             Ok(code) => return ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -158,7 +169,7 @@ fn memory_tree_check(args: Vec<String>) -> Result<(), String> {
 }
 
 fn memory_eval(args: Vec<String>) -> Result<(), String> {
-    let mut o = memory_eval::Opts { config: PathBuf::new(), questions: PathBuf::new(), fresh_from: None, floors: Vec::new(), rows: false, show: Vec::new(), project: None };
+    let mut o = memory_eval::Opts { config: PathBuf::new(), questions: PathBuf::new(), fresh_from: None, floors: Vec::new(), rows: false, show: Vec::new(), project: None, cwd: None };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || {
@@ -174,6 +185,7 @@ fn memory_eval(args: Vec<String>) -> Result<(), String> {
             "--questions" => o.questions = PathBuf::from(val()?),
             "--fresh-from" => o.fresh_from = Some(PathBuf::from(val()?)),
             "--project" => o.project = Some(val()?),
+            "--cwd" => o.cwd = Some(PathBuf::from(val()?)),
             "--floor" => o.floors.push(val()?.parse().map_err(|e| format!("--floor: {e}"))?),
             "--rows" => o.rows = true,
             "--show" => o.show.push(val()?),

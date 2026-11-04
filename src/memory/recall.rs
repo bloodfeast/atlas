@@ -44,6 +44,12 @@ pub fn terms(text: &str) -> Vec<String> {
 /// One record as text: a header line, then the body (a memory's body only,
 /// not its frontmatter), ending with a line break. Written by [`frame`].
 pub fn render(out: &mut String, h: &Head) {
+    let titled = h.kind == "memory" || h.kind == "journal" || h.kind == "handoff" || h.kind == "decision";
+    frame(out, &header(h), titled.then(|| h.title.trim_end()), &h.body);
+}
+
+/// A record's header line, as [`render`] frames it.
+pub fn header(h: &Head) -> String {
     let mut head = String::with_capacity(h.key.len() + 48);
     head.push_str(&h.key);
     head.push(' ');
@@ -63,8 +69,34 @@ pub fn render(out: &mut String, h: &Head) {
         head.push_str(by);
     }
     head.push_str(&format!(" v{} {}", h.seq, h.time.get(..16).unwrap_or(&h.time)));
-    let titled = h.kind == "memory" || h.kind == "journal" || h.kind == "handoff" || h.kind == "decision";
-    frame(out, &head, titled.then(|| h.title.trim_end()), &h.body);
+    if let Some(a) = anchor(h) {
+        head.push_str(" @");
+        head.push_str(&a);
+    }
+    head
+}
+
+/// Where a record's text sits in its source file, when that says more than
+/// its key: `path:line`, or `L<line>` when the key already names the file
+/// (`intent:r00042` from `INTENT.md`). A memory's file is its key, so it has
+/// none.
+pub fn anchor(h: &Head) -> Option<String> {
+    let a = h.anchor.as_deref()?;
+    let (path, line) = a.rsplit_once(':')?;
+    let stem = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".md");
+    if stem == h.key {
+        return None;
+    }
+    let prefix = h.key.split_once(':').map_or("", |p| p.0);
+    Some(if !prefix.is_empty() && stem.eq_ignore_ascii_case(prefix) { format!("L{line}") } else { a.to_string() })
+}
+
+/// A pointer's anchor, `src:path:line`: the vault or source, file and line
+/// a record's text starts at, so `read_note {vault: src, path, lines}` reads
+/// just that part. None when [`anchor`] has none, or the source is unknown.
+pub fn pointer_anchor(h: &Head) -> Option<String> {
+    anchor(h)?;
+    Some(format!("{}:{}", h.anchor_src.as_deref()?, h.anchor.as_deref()?))
 }
 
 /// The record header's marker: a line that starts with it opens a record.
@@ -85,7 +117,9 @@ pub fn frame(out: &mut String, head: &str, title: Option<&str>, body: &str) {
         out.push_str(head);
     }
     out.push('\n');
-    if let Some(t) = title {
+    // A title made from the body (a decision's, by default) repeats the
+    // body's opening: it is left out rather than shown twice.
+    if let Some(t) = title.filter(|t| !t.trim().is_empty() && !opens_with(body, t)) {
         push_text(out, t);
         out.push('\n');
     }
@@ -94,6 +128,23 @@ pub fn frame(out: &mut String, head: &str, title: Option<&str>, body: &str) {
         push_text(out, body);
         out.push('\n');
     }
+}
+
+/// Whether `body`, its runs of whitespace taken as one space, starts with
+/// `title` (likewise).
+fn opens_with(body: &str, title: &str) -> bool {
+    let mut b = body.split_whitespace().flat_map(|w| w.chars().chain(std::iter::once(' ')));
+    let mut t = title.split_whitespace().flat_map(|w| w.chars().chain(std::iter::once(' '))).peekable();
+    while let Some(c) = t.next() {
+        // The title's own last space need not be matched.
+        if t.peek().is_none() && c == ' ' {
+            return true;
+        }
+        if b.next() != Some(c) {
+            return false;
+        }
+    }
+    true
 }
 
 /// A character a reader may take as the end of a line.
@@ -267,9 +318,43 @@ pub fn gated(store: &MemoryStore, query: &str, budget: usize, g: &Gate, sem: Opt
 ///
 /// [`crate::Error::Db`].
 pub fn lane(store: &MemoryStore, lane: &str, budget: usize) -> Result<String> {
+    Ok(lane_with(store, lane, budget, None)?.text)
+}
+
+/// A lane view as [`lane_with`] built it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaneView {
+    /// The text.
+    pub text: String,
+    /// Entries whose body was trimmed to the clauses matching the prompt.
+    pub trimmed: usize,
+    /// Bytes those entries would have taken whole.
+    pub trimmed_full: usize,
+    /// Bytes they took trimmed.
+    pub trimmed_sent: usize,
+    /// The keys of the entries shown.
+    pub keys: Vec<String>,
+}
+
+/// The sections of a lane view that are its state and are always sent
+/// whole: the handoff, the brief, open questions and the next step.
+const LANE_STATE: &[&str] = &["handoff", "brief", "open questions", "next"];
+
+/// [`lane`], and with `trim` (the prompt, the excerpt length) the hook's
+/// lane brief: the state sections whole, and each older entry (decisions,
+/// measurements, commits, notes) as its header and title with its body cut
+/// to the clauses that match the prompt (see
+/// [`super::select::excerpt`]; nothing of the body when none does), so a
+/// quote of it is still the record's own text. A line after them says how
+/// many were trimmed and that `recall {key}` reads one whole.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&str, usize)>) -> Result<LaneView> {
     let all = store.lane(lane)?;
     if all.is_empty() {
-        return Ok(String::new());
+        return Ok(LaneView::default());
     }
     let answered: HashSet<String> = store.answered(lane)?.into_iter().collect();
     let sub = |s: &str| -> Vec<&Head> { all.iter().rev().filter(|h| h.kind == "journal" && h.sub == s).collect() };
@@ -286,35 +371,69 @@ pub fn lane(store: &MemoryStore, lane: &str, budget: usize) -> Result<String> {
     order.push(("notes", sub("note").into_iter().chain(sub("cap")).collect()));
     let mut out = format!("lane {lane}: {} entries\n", all.len());
     let mut more = 0usize;
+    let mut v = LaneView::default();
     for (title, hs) in order {
         if hs.is_empty() {
             continue;
         }
         let mut section = format!("# {title}\n");
         let mut added = 0;
+        let cut = trim.filter(|_| !LANE_STATE.contains(&title));
         for h in hs {
             let mut one = String::new();
-            render(&mut one, h);
+            let mut whole = String::new();
+            render(&mut whole, h);
+            match cut {
+                Some((q, max)) => {
+                    let body = super::select::clauses(h, q, max).filter(|(x, _)| x.part == super::select::Part::Body).map(|(x, _)| x.render(h)).unwrap_or_default();
+                    frame(&mut one, &header(h), Some(h.title.trim_end()), &body);
+                    if one.len() < whole.len() {
+                        v.trimmed += 1;
+                        v.trimmed_full += whole.len();
+                        v.trimmed_sent += one.len();
+                    } else {
+                        one = whole;
+                    }
+                }
+                None => one = whole,
+            }
             if out.len() + section.len() + one.len() > budget {
                 more += 1;
                 continue;
             }
             section.push_str(&one);
+            v.keys.push(h.key.clone());
             added += 1;
         }
         if added > 0 {
             out.push_str(&section);
         }
     }
+    if v.trimmed > 0 {
+        out.push_str(&format!("+{} trimmed above, more in each: recall {{key}} reads one whole\n", v.trimmed));
+    }
     if more > 0 {
         out.push_str(&format!("+{more} more: memory_log {{scope: \"{lane}\"}}\n"));
     }
-    Ok(out)
+    v.text = out;
+    Ok(v)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_title_made_from_the_body_is_not_shown_twice() {
+        let mut out = String::new();
+        frame(&mut out, "decision:0001 decision superseded by decision:0002 v1", Some("Ship the widget  cache"), "Ship the widget cache\nwith a cap.\n");
+        assert_eq!(out.matches("Ship the widget").count(), 1, "{out}");
+        let mut out = String::new();
+        frame(&mut out, "m memory active v1", Some("Widget cache"), "It holds 64 entries.\n");
+        assert!(out.contains("Widget cache\nIt holds"), "{out}");
+        assert!(opens_with("alpha beta gamma", "alpha be"));
+        assert!(!opens_with("alpha", "alpha beta"));
+    }
 
     #[test]
     fn the_gate_rule() {
@@ -381,6 +500,8 @@ mod tests {
             chain: String::new(),
             superseded_by: None,
             superseded_time: None,
+            anchor: None,
+            anchor_src: None,
         }
     }
 

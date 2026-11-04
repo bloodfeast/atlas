@@ -157,7 +157,7 @@ fn accept_writes_the_pattern_with_a_backup_and_reject_hides_it() {
     let (ok, out) = atlas(&cfg, t.path(), &["grammar", "accept", "9"]);
     assert!(!ok && out.contains("no suggestion 9"), "{out}");
     // The accept is undone like any settings write.
-    let (ok, out) = atlas(&cfg, t.path(), &["settings", "undo"]);
+    let (ok, out) = atlas(&cfg, t.path(), &["settings", "undo", "--yes"]);
     assert!(ok, "{out}");
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
 }

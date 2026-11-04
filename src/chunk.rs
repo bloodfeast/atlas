@@ -9,10 +9,7 @@
 //! frontmatter and any preamble) is section 0. Headings and items inside
 //! fenced code or the frontmatter never start a section.
 
-use std::sync::OnceLock;
-
-use crate::regex::Regex;
-
+use crate::lex;
 use crate::markdown;
 
 /// How a source's files are cut into sections.
@@ -57,10 +54,61 @@ pub struct Chunk {
 }
 
 /// The first `YYYY-MM-DD` date in a string.
+///
+/// A whole word (no letter, digit or `_` either side), the year 19xx or
+/// 20xx, a month 01-12 and a day 01-31.
 pub fn find_date(s: &str) -> Option<&str> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\b(?:19|20)[0-9]{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])\b").expect("date regex"));
-    re.find(s).map(|m| m.as_str())
+    let b = s.as_bytes();
+    let d = |i: usize| b[i].is_ascii_digit();
+    let mut q = 0;
+    while let Some(p) = lex::find2(s, q, b'1', b'2') {
+        q = p + 1;
+        if b.len() < p + 10 || !matches!(&b[p..p + 2], b"19" | b"20") || !(d(p + 2) && d(p + 3)) || b[p + 4] != b'-' || b[p + 7] != b'-' {
+            continue;
+        }
+        let month = matches!((b[p + 5], b[p + 6]), (b'0', b'1'..=b'9') | (b'1', b'0'..=b'2'));
+        let day = matches!((b[p + 8], b[p + 9]), (b'0', b'1'..=b'9') | (b'1' | b'2', b'0'..=b'9') | (b'3', b'0' | b'1'));
+        if month && day && !lex::before(s, p).is_some_and(lex::word) && !lex::at(s, p + 10).is_some_and(lex::word) {
+            return Some(&s[p..p + 10]);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
+    use lex::props::{Mode, Site};
+    vec![Site {
+        name: "chunk date",
+        pattern: r"\b(?:19|20)[0-9]{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])\b".into(),
+        tokens: &[
+            "2026-10-30",
+            "1999-12-31",
+            "2000-01-01",
+            "20",
+            "19",
+            "-",
+            "0",
+            "1",
+            "2",
+            "3",
+            "9",
+            "a",
+            "_",
+            " ",
+            "2026-13-01",
+            "2026-02-32",
+            "x2026-01-01",
+            "2026-01-01x",
+        ],
+        examples: &["## 2026-10-30 ruling", "- 1999-12-31: x"],
+        mode: Mode::One(|s| {
+            find_date(s).map(|d| {
+                let a = d.as_ptr() as usize - s.as_ptr() as usize;
+                vec![Some((a, a + d.len()))]
+            })
+        }),
+    }]
 }
 
 /// Cuts `text` into sections.

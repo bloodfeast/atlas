@@ -1,0 +1,41 @@
+FAIL jest/sum.test.js
+  ● math › adds
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 4
+    Received: 5
+
+    [0m [90m 3 |[39m describe([32m'math'[39m[33m,[39m () [33m=>[39m {
+     [90m 4 |[39m   test([32m'adds'[39m[33m,[39m () [33m=>[39m {
+    [31m[1m>[22m[39m[90m 5 |[39m     expect(sum([35m2[39m[33m,[39m [35m2[39m))[33m.[39mtoBe([35m4[39m)[33m;[39m
+     [90m   |[39m                       [31m[1m^[22m[39m
+     [90m 6 |[39m   })[33m;[39m
+     [90m 7 |[39m   test([32m'subtracts'[39m[33m,[39m () [33m=>[39m {
+     [90m 8 |[39m     expect(sum([35m1[39m[33m,[39m [33m-[39m[35m1[39m))[33m.[39mtoBe([35m0[39m)[33m;[39m[0m
+
+      at Object.toBe (sum.test.js:5:23)
+
+  ● parses
+
+    SyntaxError: Expected ',' or '}' after property value in JSON at position 11 (line 1 column 12)
+        at JSON.parse (<anonymous>)
+
+    [0m [90m 3 |[39m }
+     [90m 4 |[39m [36mfunction[39m parse(s) {
+    [31m[1m>[22m[39m[90m 5 |[39m   [36mreturn[39m [33mJSON[39m[33m.[39mparse(s)[33m.[39mvalue[33m;[39m
+     [90m   |[39m               [31m[1m^[22m[39m
+     [90m 6 |[39m }
+     [90m 7 |[39m module[33m.[39mexports [33m=[39m { sum[33m,[39m parse }[33m;[39m
+     [90m 8 |[39m[0m
+
+      at parse (sum.js:5:15)
+      at Object.parse (sum.test.js:16:10)
+
+PASS jest/ok.test.js
+
+Test Suites: 1 failed, 1 passed, 2 total
+Tests:       2 failed, 1 skipped, 2 passed, 5 total
+Snapshots:   0 total
+Time:        1.812 s
+Ran all test suites.

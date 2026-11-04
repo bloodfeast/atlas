@@ -265,7 +265,11 @@ UserPromptSubmit), and the parent's PreToolUse on the `Agent` tool, which carrie
   line. A record already injected in this session (by key and sha) is not injected again.
 - Prompts that start with `<task-notification>` are not searched. Instead the hook checks the finished
   agent's lane journal (by `<task-id>`) and injects one line if no journal entry is newer than the agent's
-  start.
+  start. An interim stop (the summary says the agent "is waiting on its own background work"; it notifies
+  again later) is skipped. The lane is the one the agent wrote under (the `lane` of its own `journal` or
+  `handoff` calls, from the PreToolUse input or its transcript), else the one its brief assigns
+  ([`brief_lane`]: "Journal lane: X", "You are LANE X", else the one lane after "lane", else the one known
+  lane it mentions). No single lane, or no known start: no line.
 - **Token accounting.** Every hook answer is a `token_log` row (tool `hook:<event>`): bytes injected, and the
   counterfactual computed by the existing rule (the literal grep over the export files plus the reads). Gated
   answers are logged with zero bytes so the gate rate is measured. `--token-report` shows them by event.

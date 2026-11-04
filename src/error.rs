@@ -23,6 +23,15 @@ pub enum Error {
         /// The hash of the file as it is now.
         actual: String,
     },
+    /// The caller's `expected_sha` does not match a memory record's head.
+    StaleRecord {
+        /// The record.
+        key: String,
+        /// The hash (or prefix) the caller sent.
+        expected: String,
+        /// The head version's hash.
+        actual: String,
+    },
     /// A read, write or result set is over its fixed cap.
     TooLarge(String),
     /// The file system refused an operation.
@@ -40,6 +49,9 @@ impl fmt::Display for Error {
             Error::AlreadyExists(m) => write!(f, "already exists: {m}"),
             Error::StaleSha { expected, actual } => {
                 write!(f, "stale edit: expected_sha256 {expected} does not match the current file {actual}; read the note again")
+            }
+            Error::StaleRecord { key, expected, actual } => {
+                write!(f, "stale revision: expected_sha {expected} does not match the head of {key} (sha={}); recall {{key: \"{key}\"}} to read the current version, then revise it", actual.get(..16).unwrap_or(actual))
             }
             Error::TooLarge(m) => write!(f, "too large: {m}"),
             Error::Io(m) => write!(f, "io: {m}"),

@@ -52,6 +52,9 @@ pub struct HookEvent {
     pub source: String,
     /// The session's working directory.
     pub cwd: String,
+    /// Claude Code's permission mode (`default`, `plan`, `acceptEdits`,
+    /// `auto`, `dontAsk`, `bypassPermissions`), empty when the input lacks it.
+    pub permission_mode: String,
     /// The whole tool input (PreToolUse, PostToolUse), `Null` when absent.
     pub tool_input: Value,
     /// The whole tool result (PostToolUse), `Null` when absent.
@@ -95,6 +98,7 @@ impl HookEvent {
             tool_prompt,
             trigger: s("trigger"),
             source: s("source"),
+            permission_mode: s("permission_mode"),
             cwd: s("cwd"),
             tool_input: object_field(v, "tool_input"),
             tool_response: object_field(v, "tool_response"),
@@ -114,12 +118,19 @@ pub struct HookAnswer {
     /// The replacement tool result (PostToolUse `updatedToolOutput`), in
     /// the tool's own output shape.
     pub updated_output: Option<Value>,
+    /// Block the event, with this reason (PreCompact: `decision: block`).
+    pub block: Option<String>,
 }
 
 impl HookAnswer {
     /// The hook JSON Claude Code acts on, or an empty string for "nothing"
     /// (plain text is not injected, so empty is a no-op).
     pub fn to_json(&self, event: &str) -> String {
+        if let Some(r) = &self.block {
+            return crate::json::object(r.len() + 48, |w| {
+                w.field("decision", "block").field("reason", r);
+            });
+        }
         if self.deny.is_none() && self.context.is_empty() && self.updated_input.is_none() && self.updated_output.is_none() {
             return String::new();
         }
@@ -223,6 +234,114 @@ pub fn first_user_text(path: &Path) -> Option<String> {
     None
 }
 
+/// One subagent's run, as the hooks saw it.
+#[derive(Debug, Clone, Default)]
+struct AgentRun {
+    /// The lane its brief names (see [`brief_lane`]).
+    lane: Option<String>,
+    /// When it started (UTC, the store's time format).
+    start: String,
+    /// The lanes it wrote journal entries or handoffs under, in order.
+    wrote: Vec<String>,
+}
+
+/// The atlas tools that write to a lane journal.
+fn is_journal_tool(name: &str) -> bool {
+    is_handoff_tool(name) || name == "journal" || name.ends_with("__journal")
+}
+
+/// Whether a `<task-notification>` is an interim stop: the agent ended its
+/// turn waiting on its own background work and will notify again (Claude
+/// Code says so in the summary and the note, read from transcripts
+/// 2026-11-03). A real finish says "finished" and "no live background
+/// children".
+pub fn is_interim(notification: &str) -> bool {
+    notification.contains("is waiting on its own background work") || notification.contains("the result below may be interim")
+}
+
+/// The lane a brief names for its agent, or `None` when it names none or
+/// several. In order: the one lane the brief assigns ("Journal lane: X",
+/// "journal under lane X", "You are LANE X", "your lane X"); else the one
+/// lane named right after the word "lane"; else the one known lane the
+/// brief mentions. A lane named after "lane" may be new (no entries yet)
+/// when it reads as an id: two or more characters, no lowercase letters.
+pub fn brief_lane(brief: &str, known: &[String]) -> Option<String> {
+    const SEP: [char; 7] = [' ', '\t', ':', '`', '=', '*', '"'];
+    let lower = brief.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let mut strong: Vec<String> = Vec::new();
+    let mut named: Vec<String> = Vec::new();
+    let push = |v: &mut Vec<String>, l: &str| {
+        if !v.iter().any(|x| x == l) {
+            v.push(l.to_string());
+        }
+    };
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("lane") {
+        let s = from + i;
+        let e = s + 4;
+        from = e;
+        let glued_before = s > 0 && (b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'-' || b[s - 1] == b'_');
+        let glued_after = e < b.len() && !SEP.contains(&(b[e] as char));
+        if glued_before || glued_after {
+            continue;
+        }
+        // The token after the separators, in the brief's own case.
+        let rest = brief[e..].trim_start_matches(SEP);
+        let tok: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+        let tok = tok.trim_end_matches(['-', '_']);
+        let is_known = known.iter().any(|k| k == tok);
+        let id_like = tok.len() >= 2 && tok.chars().any(|c| c.is_ascii_uppercase()) && !tok.chars().any(|c| c.is_ascii_lowercase());
+        if !(is_known || id_like) {
+            continue;
+        }
+        push(&mut named, tok);
+        let before = lower[..s].trim_end();
+        if ["journal", "under", "you are", "your", "own"].iter().any(|w| before.ends_with(w)) {
+            push(&mut strong, tok);
+        }
+    }
+    let one = |v: Vec<String>| if v.len() == 1 { v.into_iter().next() } else { None };
+    if !strong.is_empty() {
+        return one(strong);
+    }
+    if !named.is_empty() {
+        return one(named);
+    }
+    one(known.iter().filter(|l| crate::memory::contains_word(brief, l)).cloned().collect())
+}
+
+/// The lanes a subagent's own transcript shows it writing under: the
+/// `lane` of each atlas `journal` or `handoff` call, in order.
+fn written_lanes(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !line.contains("\"tool_use\"") || !(line.contains("journal\"") || line.contains("handoff\"")) {
+            continue;
+        }
+        let Ok(v) = crate::json::parse(line) else { continue };
+        let Some(Value::Array(items)) = v.pointer("/message/content") else { continue };
+        for it in items {
+            if it.get("type").and_then(Value::as_str) != Some("tool_use") || !it.get("name").and_then(Value::as_str).is_some_and(is_journal_tool) {
+                continue;
+            }
+            if let Some(l) = it.pointer("/input/lane").and_then(Value::as_str).map(str::trim).filter(|l| !l.is_empty()) {
+                if !out.iter().any(|x| x == l) {
+                    out.push(l.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The first `timestamp` in a transcript (UTC, the store's time format).
+fn first_timestamp(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().take(50).find_map(|l| crate::json::parse(l).ok()?.get("timestamp").and_then(Value::as_str).map(str::to_string))
+}
+
 /// The tool that may still run past the context cap.
 pub fn is_handoff_tool(name: &str) -> bool {
     name == "handoff" || name.ends_with("__handoff")
@@ -249,6 +368,12 @@ const POINTER_TITLE: usize = 90;
 pub fn pointer(h: &crate::memory::Head) -> String {
     format!("- {}: {}
 ", h.key, pointer_title(h))
+}
+
+/// The pointer line of a record collapsed into a near-duplicate sent
+/// before it: its key, and the key whose text it repeats.
+pub fn collapsed(key: &str, same_as: &str) -> String {
+    format!("- {key}: near-duplicate of {same_as}\n")
 }
 
 /// A record's one-line title as a pointer carries it (see [`pointer`]).
@@ -286,6 +411,33 @@ pub struct Injected {
     pub cos: Option<f32>,
     /// Bytes of the injected text for it (the pointer line, or the lane).
     pub bytes: usize,
+    /// What context selection did to it (see [`crate::memory::select`]).
+    pub how: Sel,
+    /// Bytes it would have taken whole (the untrimmed pointer line);
+    /// `bytes` when sent whole.
+    pub full: usize,
+}
+
+/// What context selection did to one injected record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sel {
+    /// Sent as it was (selection off, nothing to trim, or not a pointer).
+    Whole,
+    /// Its pointer carries the matching clause (an excerpt).
+    Trimmed,
+    /// Sent as a ref to the near-duplicate injected before it.
+    Collapsed,
+}
+
+impl Sel {
+    /// The name logged in `inject_select`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Sel::Whole => "whole",
+            Sel::Trimmed => "trim",
+            Sel::Collapsed => "collapse",
+        }
+    }
 }
 
 /// One token-log row for a hook answer.
@@ -320,11 +472,17 @@ pub struct Hooks {
     store: MemoryStore,
     briefs: HashMap<String, VecDeque<String>>,
     injected: HashMap<String, HashSet<String>>,
+    /// Bytes of recall injected per session or subagent (the session budget).
+    spent: HashMap<String, usize>,
     pending_recall: HashSet<String>,
-    agent_lane: HashMap<String, (String, String)>,
+    /// Each subagent's run: its lane, start and the lanes it wrote under.
+    agent_lane: HashMap<String, AgentRun>,
     warned: HashMap<PathBuf, u64>,
     usage_cache: HashMap<PathBuf, (u64, Option<(String, u64)>)>,
     log: Option<mpsc::Sender<LogRow>>,
+    /// The token-log thread, joined on drop so its rows reach the database
+    /// before a command hook's process exits.
+    log_thread: Option<std::thread::JoinHandle<()>>,
     router: crate::hook_rewrite::Router,
     /// Where the one-time settings offer reads and records its state.
     offer: Option<crate::claude_settings::Paths>,
@@ -332,6 +490,8 @@ pub struct Hooks {
     records: Option<((i64, u64), i64)>,
     /// Files an Edit or Write changed, re-indexed by [Hooks::after].
     edited: Vec<String>,
+    /// Transcripts to index into the opt-in transcript source by [Hooks::after].
+    transcripts: Vec<PathBuf>,
     /// Opens the index store over the vaults and sources (R7: an edited
     /// note or source file is re-indexed at once); None re-indexes code only.
     index_opener: Option<StoreOpener>,
@@ -348,6 +508,12 @@ pub struct Hooks {
     session: String,
     /// Its working directory.
     cwd: String,
+    /// Lookups per session, for post-compaction misses.
+    misses: crate::compact::MissTracker,
+    /// The records the last answer injected, for the memory eval.
+    last: Vec<Injected>,
+    /// The vaults and sources, by name, that lines refs resolve against.
+    roots: Vec<crate::compact::RefRoot>,
 }
 
 /// The repository a record is about, lowercased: its `repo:` frontmatter,
@@ -376,7 +542,7 @@ impl Hooks {
     /// [`crate::Error::Db`] if the store cannot be opened.
     pub fn open(settings: Settings) -> Result<Hooks> {
         let store = MemoryStore::open(&settings.store)?;
-        let log = start_log(&settings);
+        let (log, log_thread) = start_log(&settings).unzip();
         let router = crate::hook_rewrite::Router::new(&settings);
         let offer = crate::claude_settings::Paths::detect_in(None, &settings.index_db, settings.user_state.as_deref());
         Ok(Hooks {
@@ -386,15 +552,18 @@ impl Hooks {
             store,
             briefs: HashMap::new(),
             injected: HashMap::new(),
+            spent: HashMap::new(),
             pending_recall: HashSet::new(),
             agent_lane: HashMap::new(),
             warned: HashMap::new(),
             usage_cache: HashMap::new(),
             log,
+            log_thread,
             router,
             offer,
             records: None,
             edited: Vec::new(),
+            transcripts: Vec::new(),
             index_opener: None,
             index: None,
             project_roots: None,
@@ -403,6 +572,9 @@ impl Hooks {
             session: String::new(),
             // Until an event names one: the folder the server runs in.
             cwd: std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(),
+            misses: crate::compact::MissTracker::default(),
+            last: Vec::new(),
+            roots: Vec::new(),
         })
     }
 
@@ -419,10 +591,25 @@ impl Hooks {
     /// vault or source is rescanned. Fails open: an error is logged as a miss
     /// and nothing else happens; the edit itself was never held.
     pub fn after(&mut self) {
+        self.index_transcripts();
         for path in std::mem::take(&mut self.edited) {
             if let Err(e) = self.reindex(&path) {
                 eprintln!("atlas reindex {path}: {e}");
                 self.router.miss_text(&format!("reindex {path}"), &e);
+            }
+        }
+    }
+
+    /// Indexes the transcripts a PreCompact queued into the opt-in transcript
+    /// source (`memory.transcripts`); a command hook calls it after printing.
+    pub fn index_transcripts(&mut self) {
+        for path in std::mem::take(&mut self.transcripts) {
+            let r = rusqlite::Connection::open(&self.settings.index_db).map_err(crate::Error::from).and_then(|c| {
+                let _ = c.busy_timeout(std::time::Duration::from_secs(10));
+                crate::transcripts::index(&c, &path)
+            });
+            if let Err(e) = r {
+                eprintln!("atlas transcripts {}: {e}", path.display());
             }
         }
     }
@@ -459,6 +646,12 @@ impl Hooks {
     /// given the folders atlas already indexes.
     pub fn set_project_roots(&mut self, roots: Option<Vec<PathBuf>>) {
         self.project_roots = roots;
+    }
+
+    /// The vaults and sources (name, root) that a lines ref (`src:path:a-b@hash`)
+    /// resolves against; without them such refs are reported unchecked.
+    pub fn set_roots(&mut self, roots: Vec<crate::compact::RefRoot>) {
+        self.roots = roots;
     }
 
     /// Turns on the project offer of a project-scoped configuration.
@@ -565,7 +758,7 @@ impl Hooks {
         match ev.event.as_str() {
             "UserPromptSubmit" => {
                 if ev.prompt.starts_with("<task-notification>") {
-                    a.context = self.notification(&ev.prompt)?;
+                    a.context = self.notification(&ev.prompt, &ev.transcript_path)?;
                 } else {
                     let (t, k) = self.recall(&ev.session_id, &ev.prompt)?;
                     a.context = t;
@@ -573,6 +766,7 @@ impl Hooks {
                 }
             }
             "SubagentStart" => {
+                self.agent_lane.entry(ev.agent_id.clone()).or_insert_with(|| AgentRun { start: crate::memory::now(), ..AgentRun::default() });
                 let brief = self.briefs.get_mut(&ev.session_id).and_then(VecDeque::pop_front);
                 match brief {
                     Some(b) => {
@@ -588,12 +782,33 @@ impl Hooks {
             }
             "PreToolUse" => {
                 let sub = !ev.agent_id.is_empty();
+                // A main-session lookup made before the last compaction and
+                // again after it is a post-compaction miss.
+                if !sub {
+                    if let Some(sig) = crate::compact::lookup_sig(&ev.tool_name, &ev.tool_input) {
+                        if self.misses.lookup(&ev.session_id, sig) {
+                            if let Some(l) = &self.log {
+                                let _ = l.send(LogRow { tool: "compact:miss".into(), returned: 0, keys: Vec::new(), brief: None, session: ev.session_id.clone(), agent: String::new(), transcript: String::new() });
+                            }
+                        }
+                    }
+                }
                 if sub || self.settings.cap.main_session {
                     let path = if sub { subagent_transcript(&ev.transcript_path, &ev.agent_id) } else { PathBuf::from(&ev.transcript_path) };
                     self.cap(ev, &path, &mut a)?;
                 }
+                if sub && is_journal_tool(&ev.tool_name) {
+                    // The lane the agent itself writes under, when the hook
+                    // input carries the tool input (a command hook does).
+                    if let Some(l) = ev.tool_input.get("lane").and_then(Value::as_str).map(str::trim).filter(|l| !l.is_empty()) {
+                        let run = self.agent_lane.entry(ev.agent_id.clone()).or_insert_with(|| AgentRun { start: crate::memory::now(), ..AgentRun::default() });
+                        if !run.wrote.iter().any(|w| w == l) {
+                            run.wrote.push(l.to_string());
+                        }
+                    }
+                }
                 if a.deny.is_none() {
-                    if (ev.tool_name == "Agent" || ev.tool_name == "Task") && !ev.tool_prompt.is_empty() {
+                    if (ev.tool_name == "Agent"|| ev.tool_name == "Task") && !ev.tool_prompt.is_empty() {
                         self.briefs.entry(ev.session_id.clone()).or_default().push_back(ev.tool_prompt.clone());
                     }
                     if sub && self.pending_recall.remove(&ev.agent_id) {
@@ -655,10 +870,24 @@ impl Hooks {
                     }
                     (Some(p), _) => {
                         if let Some(roots) = self.project_roots.as_ref() {
-                            lines.extend(crate::claude_settings::project_line(p, Path::new(&ev.cwd), roots));
+                            // A folder of repositories is offered as a new
+                            // project (add-project --new moves the setup into
+                            // projects first); one repository gets the vault
+                            // question.
+                            let cwd = Path::new(&ev.cwd);
+                            let line = match crate::claude_settings::folder_of_repos(cwd) {
+                                true => crate::claude_settings::repos_line(p, cwd, &crate::claude_settings::OfferCtx::unscoped(roots)),
+                                false => crate::claude_settings::project_line(p, cwd, roots),
+                            };
+                            lines.extend(line);
                         }
                     }
                     _ => {}
+                }
+                // Once per folder: the Compact instructions for its CLAUDE.md
+                // (experimental compaction only).
+                if let Some(p) = self.offer.as_ref().filter(|_| self.settings.compact.enabled) {
+                    lines.extend(crate::claude_settings::compact_md_line(p, Path::new(&ev.cwd)));
                 }
                 for line in lines {
                     if !a.context.is_empty() {
@@ -666,14 +895,79 @@ impl Hooks {
                     }
                     a.context.push_str(&line);
                 }
+                if ev.source == "compact" && self.settings.compact.enabled {
+                    // The checkpoint card first, then the ref report.
+                    if let Some(h) = crate::checkpoint::newest(&self.store, &ev.session_id)? {
+                        if !a.context.is_empty() {
+                            a.context.push('\n');
+                        }
+                        a.context.push_str(&crate::checkpoint::card(&h));
+                        a.context.push('\n');
+                    }
+                    let report = self.after_compact(ev)?;
+                    if !report.is_empty() {
+                        if !a.context.is_empty() {
+                            a.context.push('\n');
+                        }
+                        a.context.push_str(&report);
+                    }
+                }
             }
             "PreCompact" => {
-                let ctx = last_usage(Path::new(&ev.transcript_path)).ok().flatten().map_or(0, |(_, c)| c);
+                // The opt-in transcript source is brought up to date once the
+                // answer is out (its own switch, `memory.transcripts`).
+                if self.settings.transcripts && !ev.transcript_path.is_empty() {
+                    self.transcripts.push(PathBuf::from(&ev.transcript_path));
+                }
+                // The rest is the experimental compaction work, off unless
+                // `compact.enabled` is set.
+                if !self.settings.compact.enabled {
+                    return Ok(a);
+                }
+                let t_pre = std::time::Instant::now();
+                // The segment since the last compaction: in-task state and
+                // the context curve (visible records only). A transcript not
+                // yet written is waited for briefly, then read from the
+                // session it was forked from.
+                let (t, from) = crate::checkpoint::tail_settled(Path::new(&ev.transcript_path), &ev.session_id, crate::checkpoint::SETTLE_WAIT);
+                if self.settings.compact.defer {
+                    let w = crate::checkpoint::window(self.settings.compact.window, &t);
+                    if let Some(reason) = crate::checkpoint::defer(&ev.trigger, &t, w) {
+                        if let Some(l) = &self.log {
+                            let _ = l.send(LogRow { tool: "compact:defer".into(), returned: 0, keys: Vec::new(), brief: None, session: ev.session_id.clone(), agent: String::new(), transcript: String::new() });
+                        }
+                        a.block = Some(reason);
+                        return Ok(a);
+                    }
+                }
+                self.misses.compact(&ev.session_id);
+                let ctx = match &from {
+                    crate::checkpoint::TailFrom::Own => if t.last_ctx > 0 { t.last_ctx } else { last_usage(Path::new(&ev.transcript_path)).ok().flatten().map_or(0, |(_, c)| c) },
+                    crate::checkpoint::TailFrom::Parent(_) => t.last_ctx,
+                    crate::checkpoint::TailFrom::Unread => 0,
+                };
                 let lane = format!("session:{}", ev.session_id);
+                let scope = crate::checkpoint::Lanes::for_project(self.settings.graph.as_deref());
+                let state = crate::checkpoint::state(&self.store, &ev.session_id, &t.start, "", scope)?;
+                let mut body = crate::checkpoint::body(&state, &t, self.settings.bytes_for(self.settings.compact.card_tokens));
+                // Never a silent 0-context card: say what is missing.
+                if matches!(from, crate::checkpoint::TailFrom::Unread) {
+                    body.push_str(crate::checkpoint::UNREAD_LINE);
+                    body.push('\n');
+                }
+                let at = match (ctx, &from) {
+                    (0, crate::checkpoint::TailFrom::Unread) => "transcript unread".to_string(),
+                    (0, _) => "at unknown context tokens".to_string(),
+                    _ => format!("at {ctx} context tokens"),
+                };
+                let tail_from = match &from {
+                    crate::checkpoint::TailFrom::Parent(p) => format!("tail_from: {}\n", p.display()),
+                    _ => String::new(),
+                };
                 let d = Draft {
-                    title: format!("compaction ({}) at {ctx} context tokens", if ev.trigger.is_empty() { "unknown" } else { &ev.trigger }),
-                    meta: format!("transcript: {}\n", ev.transcript_path),
-                    body: String::new(),
+                    title: format!("checkpoint ({}) {at}", if ev.trigger.is_empty() { "unknown" } else { &ev.trigger }),
+                    meta: format!("transcript: {}\n{tail_from}hook_ms: {:.1}\n", ev.transcript_path, t_pre.elapsed().as_secs_f64() * 1e3),
+                    body,
                     reason: "context compaction checkpoint written by the PreCompact hook".into(),
                     author: "hook".into(),
                     client: "atlas-hook".into(),
@@ -682,11 +976,12 @@ impl Hooks {
                 };
                 let mut w = self.store.writer()?;
                 let key = w.next_key(&format!("journal:{lane}:"), 4)?;
-                w.create(&key, "journal", "note", &lane, &d, None)?;
+                w.create(&key, "journal", "checkpoint", &lane, &d, None)?;
                 w.commit()?;
             }
             _ => {}
         }
+        self.last = keys.clone();
         if matches!(ev.event.as_str(), "UserPromptSubmit" | "SubagentStart") || !a.context.is_empty() || a.deny.is_some() || a.updated_input.is_some() || a.updated_output.is_some() {
             let returned = a.to_json(&ev.event).len();
             if let Some(l) = &self.log {
@@ -709,6 +1004,12 @@ impl Hooks {
             }
         }
         Ok(a)
+    }
+
+    /// The records the last answer injected, with what context selection
+    /// did to each (the memory eval reads it).
+    pub fn last_injected(&self) -> &[Injected] {
+        &self.last
     }
 
     /// Every candidate the gate scores for a text (passing or not), in the
@@ -734,6 +1035,14 @@ impl Hooks {
         let r = self.settings.recall.clone();
         let mut out = String::new();
         let mut keys = Vec::new();
+        // The session budget: past it, nothing more is injected.
+        let left = match r.session_budget_tokens {
+            0 => usize::MAX,
+            cap => self.settings.bytes_for(cap).saturating_sub(self.spent.get(scope).copied().unwrap_or(0)),
+        };
+        if left == 0 {
+            return Ok((out, keys));
+        }
         // A lane the text names gets its journal first.
         for l in self.store.lanes()? {
             if l.lane.starts_with("session:") || !crate::memory::contains_word(text, &l.lane) {
@@ -743,9 +1052,19 @@ impl Hooks {
             if !seen.insert(format!("lane:{}", l.lane)) {
                 continue;
             }
-            let before = out.len();
-            out.push_str(&recall::lane(&self.store, &l.lane, self.settings.bytes_for(r.lane_budget_tokens))?);
-            keys.push(Injected { key: format!("lane:{}", l.lane), fts: None, cos: None, bytes: out.len() - before });
+            // The lane brief: its state whole, older entries cut to the
+            // clauses the text matches (context selection).
+            let trim = (r.select.enabled && r.select.lane_chars > 0).then_some((text, r.select.lane_chars));
+            let v = recall::lane_with(&self.store, &l.lane, self.settings.bytes_for(r.lane_budget_tokens), trim)?;
+            out.push_str(&v.text);
+            // A record the lane view shows whole or trimmed is not pointed to
+            // again below (send once).
+            if r.select.enabled {
+                self.injected.entry(scope.to_string()).or_default().extend(v.keys.iter().cloned());
+            }
+            let bytes = v.text.len();
+            let (how, full) = if v.trimmed > 0 { (Sel::Trimmed, bytes + v.trimmed_full - v.trimmed_sent) } else { (Sel::Whole, bytes) };
+            keys.push(Injected { key: format!("lane:{}", l.lane), fts: None, cos: None, bytes, how, full });
         }
         // A repository the text names gets its line from the project graph:
         // what it is, what it talks to and depends on, what uses it.
@@ -758,7 +1077,8 @@ impl Hooks {
                 if let Some(line) = g.describe(&r.name) {
                     let before = out.len();
                     out.push_str(&format!("atlas project {}: {line}\n", g.name));
-                    keys.push(Injected { key: format!("repo:{}", r.name), fts: None, cos: None, bytes: out.len() - before });
+                    let bytes = out.len() - before;
+                    keys.push(Injected { key: format!("repo:{}", r.name), fts: None, cos: None, bytes, how: Sel::Whole, full: bytes });
                 }
             }
         }
@@ -782,7 +1102,7 @@ impl Hooks {
         };
         gate.fts_floor *= crate::memory::settings::floor_scale(records);
         // Pointers, not bodies: the body is one `recall key=` away.
-        let budget = self.settings.bytes_for(r.budget_tokens);
+        let budget = self.settings.bytes_for(r.budget_tokens).min(left);
         let mut lines = String::new();
         let mut chosen = Vec::new();
         let mut more = 0usize;
@@ -815,14 +1135,41 @@ impl Hooks {
                 passed.sort_by_key(|c| rank(c));
             }
         }
+        let sel = r.select;
+        // The records sent so far, for the collapse check.
+        let mut sent: Vec<(i64, String, String)> = Vec::new();
         for cand in passed {
-            let one = pointer(&cand.head);
+            let whole = pointer(&cand.head);
+            let (one, how) = if sel.enabled {
+                let rtext = crate::memory::select::record_words_text(&cand.head);
+                let dup = sent.iter().find(|(rid, _, t)| {
+                    let near = sem.as_ref().and_then(|s| s.vecs.pair(s.isa, *rid, cand.head.rid)).is_some_and(|c| c >= sel.dup_cos);
+                    near && crate::memory::select::overlap(t, &rtext) >= sel.dup_overlap
+                });
+                match dup {
+                    Some((_, k, _)) => (collapsed(&cand.head.key, k), Sel::Collapsed),
+                    None => {
+                        let line = match crate::memory::select::excerpt(&cand.head, text, sel.trim_chars) {
+                            Some(x) => format!("- {}: {}\n", cand.head.key, x.render(&cand.head)),
+                            None => whole.clone(),
+                        };
+                        let how = if line == whole { Sel::Whole } else { Sel::Trimmed };
+                        sent.push((cand.head.rid, cand.head.key.clone(), rtext));
+                        (line, how)
+                    }
+                }
+            } else {
+                (whole.clone(), Sel::Whole)
+            };
             if POINTER_HEAD.len() + lines.len() + one.len() + 32 > budget {
                 more += 1;
+                if how != Sel::Collapsed {
+                    sent.pop();
+                }
                 continue;
             }
             lines.push_str(&one);
-            chosen.push(Injected { key: cand.head.key, fts: Some(cand.fts), cos: cand.cos, bytes: one.len() });
+            chosen.push(Injected { key: cand.head.key, fts: Some(cand.fts), cos: cand.cos, bytes: one.len(), how, full: whole.len() });
         }
         if !chosen.is_empty() {
             out.push_str(POINTER_HEAD);
@@ -836,22 +1183,95 @@ impl Hooks {
                 keys.push(k);
             }
         }
+        *self.spent.entry(scope.to_string()).or_default() += out.len();
         Ok((out, keys))
     }
 
-    fn note_lane(&mut self, agent_id: &str, brief: &str) {
-        if let Ok(lanes) = self.store.lanes() {
-            if let Some(l) = lanes.iter().find(|l| !l.lane.starts_with("session:") && crate::memory::contains_word(brief, &l.lane)) {
-                self.agent_lane.insert(agent_id.to_string(), (l.lane.clone(), crate::memory::now()));
+    /// After a compaction (SessionStart, `source: compact`): checks every
+    /// ref in the newest summary of the session's transcript, logs the
+    /// compaction (`compact_log`), and returns one line per changed or
+    /// dangling ref. Fails open: no transcript or no summary is no report.
+    fn after_compact(&mut self, ev: &HookEvent) -> Result<String> {
+        let t0 = std::time::Instant::now();
+        let Some(c) = crate::compact::newest(Path::new(&ev.transcript_path)) else { return Ok(String::new()) };
+        let mut check = crate::compact::check(&self.store, &self.roots, &c.summary)?;
+        // Turn refs resolve against the transcripts beside this one.
+        let dir = Path::new(&ev.transcript_path).parent().map(Path::to_path_buf).unwrap_or_default();
+        for r in crate::compact::refs_in(&c.summary) {
+            let crate::compact::Target::Turn { session8, line } = &r.target else { continue };
+            let file = std::fs::read_dir(&dir).ok().and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "jsonl") && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(session8.as_str()))));
+            check.unchecked = check.unchecked.saturating_sub(1);
+            if file.and_then(|f| crate::transcripts::check_line(&f, *line, &r.hash)) != Some(true) {
+                check.dangling.push(r.text.clone());
             }
+        }
+        let report = crate::compact::report_lines(&check);
+        let logged = crate::compact::Logged {
+            session: ev.session_id.clone(),
+            trigger: c.trigger,
+            pre_tokens: c.pre_tokens,
+            post_tokens: c.post_tokens,
+            summary_bytes: c.summary.len(),
+            check,
+            hook_ms: t0.elapsed().as_secs_f64() * 1e3,
+        };
+        if let Ok(conn) = rusqlite::Connection::open(&self.settings.index_db) {
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+            let _ = crate::compact::log(&conn, &logged);
+        }
+        Ok(report)
+    }
+
+    fn known_lanes(&self) -> Vec<String> {
+        self.store.lanes().map(|ls| ls.into_iter().map(|l| l.lane).filter(|l| !l.starts_with("session:")).collect()).unwrap_or_default()
+    }
+
+    fn note_lane(&mut self, agent_id: &str, brief: &str) {
+        let lane = brief_lane(brief, &self.known_lanes());
+        let run = self.agent_lane.entry(agent_id.to_string()).or_insert_with(|| AgentRun { start: crate::memory::now(), ..AgentRun::default() });
+        if run.lane.is_none() {
+            run.lane = lane;
         }
     }
 
-    fn notification(&mut self, prompt: &str) -> Result<String> {
+    /// A `<task-notification>`: when a subagent really finished (not an
+    /// interim stop while its own background work runs) and wrote no
+    /// journal entry since it started, one line says so. The lane is the
+    /// one the agent wrote under (its own journal or handoff calls), else
+    /// the one its brief names; with neither, nothing is said.
+    fn notification(&mut self, prompt: &str, transcript: &str) -> Result<String> {
         let id = prompt.split("<task-id>").nth(1).and_then(|r| r.split("</task-id>").next()).unwrap_or("").trim().to_string();
-        let Some((lane, start)) = self.agent_lane.get(&id).cloned() else { return Ok(String::new()) };
-        let fresh = self.store.lane(&lane)?.iter().any(|h| h.time >= start);
-        Ok(if fresh { String::new() } else { format!("atlas: agent {id} finished with no journal entry for lane {lane} since it started; check its report against the journal.\n") })
+        if id.is_empty() || is_interim(prompt) {
+            return Ok(String::new());
+        }
+        let own = Some(transcript).filter(|t| !t.is_empty()).map(|t| subagent_transcript(t, &id)).filter(|p| p.is_file());
+        let mut run = self.agent_lane.get(&id).cloned().unwrap_or_default();
+        if let Some(p) = &own {
+            for l in written_lanes(p) {
+                if !run.wrote.contains(&l) {
+                    run.wrote.push(l);
+                }
+            }
+            if run.start.is_empty() {
+                run.start = first_timestamp(p).unwrap_or_default();
+            }
+            if run.lane.is_none() && run.wrote.is_empty() {
+                run.lane = first_user_text(p).and_then(|b| brief_lane(&b, &self.known_lanes()));
+            }
+        }
+        // No start: not an agent this server saw start (a background
+        // command, or a server restarted since) and no transcript says when.
+        if run.start.is_empty() {
+            return Ok(String::new());
+        }
+        let lanes: Vec<String> = if run.wrote.is_empty() { run.lane.into_iter().collect() } else { run.wrote };
+        let Some(first) = lanes.first().cloned() else { return Ok(String::new()) };
+        for lane in &lanes {
+            if self.store.lane(lane)?.iter().any(|h| h.time >= run.start) {
+                return Ok(String::new());
+            }
+        }
+        Ok(format!("atlas: agent {id} finished with no journal entry for lane {first} since it started; check its report against the journal.\n"))
     }
 
     fn cap(&mut self, ev: &HookEvent, path: &Path, a: &mut HookAnswer) -> Result<()> {
@@ -866,7 +1286,7 @@ impl Hooks {
         };
         let Some((_, ctx)) = usage else { return Ok(()) };
         let c = self.settings.cap.clone();
-        let lane = self.agent_lane.get(&ev.agent_id).map(|(l, _)| l.clone()).unwrap_or_else(|| format!("agent:{}", ev.agent_id));
+        let lane = self.agent_lane.get(&ev.agent_id).and_then(|r| r.wrote.first().cloned().or_else(|| r.lane.clone())).unwrap_or_else(|| format!("agent:{}", ev.agent_id));
         if ctx >= c.block_tokens {
             if !passes_cap(&ev.tool_name) {
                 a.deny = Some(format!(
@@ -919,12 +1339,12 @@ impl Hooks {
 /// either side of it in its export (the window a reader opens); for a lane,
 /// every record of the lane. A subagent start also logs the size of the
 /// rulebook at that moment to `brief_log` (the "brief without atlas").
-fn start_log(s: &Settings) -> Option<mpsc::Sender<LogRow>> {
+fn start_log(s: &Settings) -> Option<(mpsc::Sender<LogRow>, std::thread::JoinHandle<()>)> {
     let db = s.index_db.clone();
     let store = s.store.clone();
     let reference = s.brief_reference.clone();
     let (tx, rx) = mpsc::channel::<LogRow>();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("atlas-hook-log".into())
         .spawn(move || {
             // Nothing is opened until the first row, so a server's start-up
@@ -943,6 +1363,7 @@ fn start_log(s: &Settings) -> Option<mpsc::Sender<LogRow>> {
                 let hook = r.tool.strip_prefix("hook:").unwrap_or(&r.tool);
                 for (k, read) in r.keys.iter().zip(&reads) {
                     let _ = crate::hook_hits::log_injection(&conn, hook, &r.session, &r.agent, &r.transcript, k, *read);
+                    let _ = crate::tokens::log_select(&conn, hook, &k.key, k.how.name(), k.bytes, k.full);
                 }
                 if let (Some((session, agent)), Some(p)) = (&r.brief, &reference) {
                     if let Ok(m) = std::fs::metadata(p) {
@@ -952,7 +1373,18 @@ fn start_log(s: &Settings) -> Option<mpsc::Sender<LogRow>> {
             }
         })
         .ok()?;
-    Some(tx)
+    Some((tx, handle))
+}
+
+impl Drop for Hooks {
+    /// Closes the token log and waits for its thread to write the rows
+    /// queued so far (a command hook exits right after its answer).
+    fn drop(&mut self) {
+        self.log = None;
+        if let Some(t) = self.log_thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 #[cfg(test)]

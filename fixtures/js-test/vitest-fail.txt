@@ -1,0 +1,49 @@
+
+[1m[7m[36m RUN [39m[27m[22m [36mv2.1.9 [39m[90m/home/dev/demo/vt[39m
+
+ [32m✓[39m ok.test.mjs [2m([22m[2m1 test[22m[2m)[22m[90m 2[2mms[22m[39m
+ [31m❯[39m sum.test.mjs [2m([22m[2m4 tests[22m[2m | [22m[31m2 failed[39m[2m | [22m[33m1 skipped[39m[2m)[22m[90m 11[2mms[22m[39m
+[31m   [31m×[31m math[2m > [22madds[90m 8[2mms[22m[31m[39m
+[31m     → expected 5 to be 4 // Object.is equality[39m
+[31m   [31m×[31m parses[90m 1[2mms[22m[31m[39m
+[31m     → Expected ',' or '}' after property value in JSON at position 11 (line 1 column 12)[39m
+
+[31m⎯⎯⎯⎯⎯⎯⎯[1m[7m Failed Tests 2 [27m[22m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[31m[1m[7m FAIL [27m[22m[39m sum.test.mjs[2m > [22mmath[2m > [22madds
+[31m[1mAssertionError[22m: expected 5 to be 4 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 4[39m
+[31m+ 5[39m
+
+[36m [2m❯[22m sum.test.mjs:[2m6:23[22m[39m
+    [90m  4| [39m[34mdescribe[39m([32m'math'[39m[33m,[39m () [33m=>[39m {
+    [90m  5| [39m  [34mtest[39m([32m'adds'[39m[33m,[39m () [33m=>[39m {
+    [90m  6| [39m    [34mexpect[39m([34msum[39m([34m2[39m[33m,[39m [34m2[39m))[33m.[39m[34mtoBe[39m([34m4[39m)[33m;[39m
+    [90m   | [39m                      [31m^[39m
+    [90m  7| [39m  })[33m;[39m
+    [90m  8| [39m  [34mtest[39m([32m'subtracts'[39m[33m,[39m () [33m=>[39m {
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯[22m[39m
+
+[31m[1m[7m FAIL [27m[22m[39m sum.test.mjs[2m > [22mparses
+[31m[1mSyntaxError[22m: Expected ',' or '}' after property value in JSON at position 11 (line 1 column 12)[39m
+[36m [2m❯[22m Module.parse ../jest/sum.js:[2m5:15[22m[39m
+    [90m  3| [39m}
+    [90m  4| [39m[35mfunction[39m [34mparse[39m(s) {
+    [90m  5| [39m  [35mreturn[39m [33mJSON[39m[33m.[39m[34mparse[39m(s)[33m.[39mvalue[33m;[39m
+    [90m   | [39m              [31m^[39m
+    [90m  6| [39m}
+    [90m  7| [39mmodule[33m.[39mexports [33m=[39m { sum[33m,[39m parse }[33m;[39m
+[90m [2m❯[22m sum.test.mjs:[2m17:10[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m1 passed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[31m2 failed[39m[22m[2m | [22m[1m[32m2 passed[39m[22m[2m | [22m[33m1 skipped[39m[90m (5)[39m
+[2m   Start at [22m 21:48:01
+[2m   Duration [22m 745ms[2m (transform 61ms, setup 0ms, collect 84ms, tests 13ms, environment 1ms, prepare 607ms)[22m
+

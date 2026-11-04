@@ -48,7 +48,6 @@
 //! Headings, table rows and list items inside fenced code never define.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 use crate::regex::{Regex, RegexBuilder};
 
@@ -328,14 +327,64 @@ pub struct DocInfo<'a> {
     pub names_kind: Option<&'a str>,
 }
 
-fn wiki_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\[\[([^\[\]\n]+?)\]\]").expect("wikilink regex"))
+/// The inner text of every wikilink, left to right (was the
+/// `captures_iter` of `\[\[([^\[\]\n]+?)\]\]`, group 1).
+pub(crate) fn wikilink_inners(s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut q = 0;
+    while let Some(p) = crate::lex::find_str(s, q, "[[") {
+        match crate::markdown::wiki_inner(s, p + 2) {
+            Some(e) => {
+                out.push((p + 2, e));
+                q = e + 2;
+            }
+            None => q = p + 1,
+        }
+    }
+    out
 }
 
-fn token_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[A-Za-z0-9_-]+").expect("token regex"))
+/// Every run of `[A-Za-z0-9_-]`, left to right (was the `find_iter` of
+/// `[A-Za-z0-9_-]+`).
+pub(crate) fn tokens(s: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    const TOKEN: crate::lex::Ascii = crate::lex::Ascii::new(b"_-", &[(b'a', b'z'), (b'A', b'Z'), (b'0', b'9')]);
+    let b = s.as_bytes();
+    let tok = |c: u8| TOKEN.has(c);
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < b.len() && !tok(b[i]) {
+            i += 1;
+        }
+        if i >= b.len() {
+            return None;
+        }
+        let a = i;
+        while i < b.len() && tok(b[i]) {
+            i += 1;
+        }
+        Some((a, i))
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn lex_sites() -> Vec<crate::lex::props::Site> {
+    use crate::lex::props::{Mode, Site};
+    vec![
+        Site {
+            name: "registry wikilink",
+            pattern: r"\[\[([^\[\]\n]+?)\]\]".into(),
+            tokens: &["[[", "]]", "[", "]", "a", "|", "#", "\n", "[[x]]"],
+            examples: &["see [[a/b.md#h|alias]] and [[c]]"],
+            mode: Mode::All(|s| wikilink_inners(s).into_iter().map(|(a, b)| vec![Some((a - 2, b + 2)), Some((a, b))]).collect()),
+        },
+        Site {
+            name: "registry token",
+            pattern: r"[A-Za-z0-9_-]+".into(),
+            tokens: &["a", "Z", "0", "_", "-", " ", "\u{e9}", "TK-1"],
+            examples: &["TK-001 and PI-2"],
+            mode: Mode::All(|s| tokens(s).map(|(a, b)| vec![Some((a, b))]).collect()),
+        },
+    ]
 }
 
 /// The note a wikilink's inner text points at: the part before `|` and `#`,
@@ -439,23 +488,24 @@ pub fn extract(rules: &Rules, names: &Names, text: &str, chunks: &[Chunk], info:
     }
     if !names.is_empty() {
         let mut buf = String::new();
-        for t in token_re().find_iter(text) {
+        for (a, b) in tokens(text) {
+            let t = &text[a..b];
             if t.len() < 2 || t.len() > 128 {
                 continue;
             }
             buf.clear();
-            buf.extend(t.as_str().chars().map(|c| c.to_ascii_lowercase()));
+            buf.extend(t.chars().map(|c| c.to_ascii_lowercase()));
             if let Some((_, kind)) = names.get(&buf) {
-                raw.push((t.start(), t.end(), t.as_str(), kind.as_str()));
+                raw.push((a, b, t, kind.as_str()));
             }
         }
     }
     if rules.wikilinks {
-        for c in wiki_re().captures_iter(text) {
-            let inner = c.get(1).expect("group 1");
-            let target = wikilink_target(inner.as_str());
+        for (a, b) in wikilink_inners(text) {
+            let inner = &text[a..b];
+            let target = wikilink_target(inner);
             if !target.is_empty() {
-                let off = inner.as_str().find(target).unwrap_or(0) + inner.start();
+                let off = inner.find(target).unwrap_or(0) + a;
                 raw.push((off, off + target.len(), target, NOTE_KIND));
             }
         }

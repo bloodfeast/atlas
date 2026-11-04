@@ -95,3 +95,26 @@ fn an_entry_lands_in_its_own_file_under_its_own_heading() {
     let (ok, out) = atlas(&home, &["entry", "--title", "x", "--time", "6pm", "--", "t"]);
     assert!(!ok && out.contains("HH:MM"), "{out}");
 }
+
+/// The documented form, `atlas ruling --by NAME --defines ID ... TEXT`,
+/// without `--`: the list flag stops at the quoted text, and when the text
+/// is one word the list's last word is the text.
+#[test]
+fn a_ruling_takes_its_text_after_the_defines_list_without_a_separator() {
+    let t = Temp::new("records-nosep");
+    let home = t.path().join("home");
+    let (ok, out) = atlas(&home, &["settings", "list"]);
+    assert!(ok, "{out}");
+    let intent = home.join("notes").join("INTENT.md");
+    write(&intent, "# Intent\n");
+    let (ok, out) = atlas(&home, &["ruling", "--by", "Owner", "--defines", "BETA-ONE", "BETA-TWO", "--date", "2026-11-01", "the beta plan is adopted"]);
+    assert!(ok, "{out}");
+    let (ok, out2) = atlas(&home, &["ruling", "--by", "Owner", "--defines", "GAMMA-ONE", "--date", "2026-11-01", "Adopted."]);
+    assert!(ok, "{out2}");
+    let (ok, out3) = atlas(&home, &["ruling", "--by", "Owner", "--date", "2026-11-01", "--defines", "DELTA-ONE", "Adopted"]);
+    assert!(ok, "{out3}");
+    let text = std::fs::read_to_string(&intent).unwrap();
+    assert!(text.contains("- 2026-11-01 Owner: the beta plan is adopted <!-- atlas defines: BETA-ONE BETA-TWO -->\n"), "{text}");
+    assert!(text.contains("- 2026-11-01 Owner: Adopted. <!-- atlas defines: GAMMA-ONE -->\n"), "{text}");
+    assert!(text.contains("- 2026-11-01 Owner: Adopted <!-- atlas defines: DELTA-ONE -->\n"), "{text}");
+}

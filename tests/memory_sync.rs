@@ -285,3 +285,29 @@ fn rescans_sync_a_changed_source_and_skip_an_unchanged_one() {
     assert_eq!(rule_count(&settings.store), 4);
     assert_eq!(fs::read_to_string(f.root.join("out").join("RULES.md")).unwrap(), text);
 }
+
+#[test]
+fn a_pointer_anchor_names_the_lines_read_note_reads_from_the_source() {
+    let f = fixture("sync-anchor");
+    let c = config(&f);
+    let settings = Settings::from_config(Some(&c), c.db.as_ref().unwrap()).unwrap();
+    let ms = {
+        let mut ms = MemoryStore::open(&settings.store).unwrap();
+        let mut w = ms.writer().unwrap();
+        import::import(&mut w, &settings.exports[1], &f.rules(), "test").unwrap();
+        w.commit().unwrap();
+        ms
+    };
+    let h = ms.heads(Some("rule"), None).unwrap().into_iter().find(|h| h.body.contains("gamma queue")).unwrap();
+    let a = atlas::memory::recall::pointer_anchor(&h).expect("an anchor");
+    let (src, rest) = a.split_once(':').unwrap();
+    let (path, line) = rest.rsplit_once(':').unwrap();
+    assert_eq!((src, path), ("rules", "RULES.md"), "{a}");
+    let mut s = atlas::tools::Server::new(open_index(&c));
+    let out = s.answer("note", &json!({"vault": src, "path": path, "lines": line})).unwrap().into_text();
+    assert!(out.starts_with("rules:RULES.md sha256=") && out.contains("gamma queue drains oldest first"), "{out}");
+    // Only the source's own files: not one its globs leave out.
+    write(&f.root.join("handbook").join("notes.txt"), "private\n");
+    assert!(s.answer("note", &json!({"vault": "rules", "path": "notes.txt"})).is_err());
+    assert!(s.answer("note", &json!({"vault": "rules", "path": "../atlas.json"})).is_err());
+}

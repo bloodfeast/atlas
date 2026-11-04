@@ -5,10 +5,8 @@
 //! edited span are untouched, and inserted lines use the file's own line
 //! ending.
 
-use std::sync::OnceLock;
-
-use crate::regex::Regex;
 use crate::json::{Map, Value};
+use crate::lex;
 
 use crate::error::{Error, Result};
 
@@ -774,26 +772,267 @@ pub struct RawLink {
     pub line: usize,
 }
 
-fn re_wiki() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"(!?)\[\[([^\[\]\n]+?)\]\]").expect("static regex"))
+/// The inner text of `[[...]]` at byte `i` (after the brackets): one or
+/// more characters but `[`, `]` and a newline, then `]]`. Returns the end
+/// of the inner text.
+pub(crate) fn wiki_inner(s: &str, i: usize) -> Option<usize> {
+    let e = lex::run1(s, i, |c| !matches!(c, '[' | ']' | '\n'))?;
+    lex::lit(s, e, "]]").map(|_| e)
 }
 
-fn re_md() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(r#"!?\[(?:[^\[\]\n]|\[\[[^\]\n]*\]\])*\]\(\s*(<[^>\n]*>|[^)\s]+)(?:\s+"[^"\n]*")?\s*\)"#).expect("static regex")
-    })
+/// The leftmost wikilink from byte `from` (was `(!?)\[\[([^\[\]\n]+?)\]\]`):
+/// groups 0, the `!` and the inner text.
+pub(crate) fn find_wiki(s: &str, from: usize) -> Option<[lex::Span; 3]> {
+    let mut q = from;
+    while let Some(p) = lex::find_str(s, q, "[[") {
+        if let Some(e) = wiki_inner(s, p + 2) {
+            let bang = p > from && s.as_bytes()[p - 1] == b'!';
+            let start = if bang { p - 1 } else { p };
+            return Some([Some((start, e + 2)), Some((start, if bang { p } else { start })), Some((p + 2, e))]);
+        }
+        q = p + 1;
+    }
+    None
 }
 
-fn re_autolink() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"<(obsidian://[^>\s]+)>").expect("static regex"))
+/// Every Markdown link, left to right (was the `captures_iter` of
+/// `!?\[(?:[^\[\]\n]|\[\[[^\]\n]*\]\])*\]\(\s*(<[^>\n]*>|[^)\s]+)(?:\s+"[^"\n]*")?\s*\)`):
+/// groups 0 and the destination.
+pub(crate) fn md_links(s: &str) -> Vec<[lex::Span; 2]> {
+    let b = s.as_bytes();
+    let mut text = LinkText {
+        memo: std::collections::HashMap::new(),
+        walks: 0,
+        path: Vec::new(),
+        stop: lex::Next::new(lex::stop2(b']', b'\n')),
+        bracket: lex::Next::new(lex::stop2(b'[', b']')),
+        newline: lex::Next::new(|s: &str, x| lex::line_end(s, x)),
+    };
+    let mut rest = LinkRest {
+        angle: lex::Next::new(lex::stop2(b'>', b'\n')),
+        bare: lex::Next::new(|s: &str, x| lex::run(s, x, |c| c != ')' && !lex::space(c))),
+        quote: lex::Next::new(lex::stop2(b'"', b'\n')),
+        last: None,
+    };
+    let mut out = Vec::new();
+    let (mut from, mut q) = (0, 0);
+    while let Some(p) = lex::find_byte(s, q, b'[') {
+        match text.end(s, p + 1).and_then(|j| rest.at(s, j)) {
+            Some((d, end)) => {
+                let start = if p > from && b[p - 1] == b'!' { p - 1 } else { p };
+                out.push([Some((start, end)), Some(d)]);
+                (from, q) = (end, end);
+            }
+            None => q = p + 1,
+        }
+    }
+    out
 }
 
-fn re_tag() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"(?:^|[\s(,])#([\p{L}\p{N}_/-]+)").expect("static regex"))
+/// Where a link text that starts at a byte ends (its `]`). Plain text is
+/// skipped by vector search to the next bracket or newline; the walk only
+/// stops at a walk's start and after each `[[...]]`, and those stops are
+/// remembered: texts from different `[` meet at them, and a line of
+/// brackets would otherwise be walked once per bracket.
+struct LinkText<F, G, H> {
+    /// Stop byte to the walk's answer, from the second walk of the line on.
+    memo: std::collections::HashMap<usize, Option<usize>>,
+    /// Walks so far.
+    walks: usize,
+    /// The current walk's stops.
+    path: Vec<usize>,
+    /// The first `]` or newline.
+    stop: lex::Next<F>,
+    /// The first `[` or `]`.
+    bracket: lex::Next<G>,
+    /// The first newline.
+    newline: lex::Next<H>,
+}
+
+impl<F: Fn(&str, usize) -> usize, G: Fn(&str, usize) -> usize, H: Fn(&str, usize) -> usize> LinkText<F, G, H> {
+    /// The text from byte `j0`: characters but brackets and newlines, or
+    /// whole `[[...]]`s, up to the first `]`. Returns that `]`'s byte.
+    fn end(&mut self, s: &str, j0: usize) -> Option<usize> {
+        let b = s.as_bytes();
+        // The first walk of a line needs no memory (most lines have one
+        // link); later walks are remembered so they cannot add up.
+        let remember = self.walks > 0;
+        self.walks += 1;
+        let mut j = j0;
+        let res = loop {
+            if remember {
+                if let Some(&r) = self.memo.get(&j) {
+                    break r;
+                }
+                self.path.push(j);
+            }
+            let k = self.bracket.find(s, j).min(self.newline.find(s, j));
+            match b.get(k) {
+                None | Some(b'\n') => break None,
+                Some(b']') => break Some(k),
+                _ => {
+                    if b.get(k + 1) != Some(&b'[') {
+                        break None;
+                    }
+                    let t = self.stop.find(s, k + 2);
+                    if lex::lit(s, t, "]]").is_none() {
+                        break None;
+                    }
+                    j = t + 2;
+                }
+            }
+        };
+        for p in self.path.drain(..) {
+            self.memo.insert(p, res);
+        }
+        res
+    }
+}
+
+/// The rest of a Markdown link after its text, with its searches kept
+/// (see [`lex::Next`]) and its last answer: texts from several `[` that
+/// end at the same `]` ask for the same rest.
+struct LinkRest<A, B, Q> {
+    /// The first `>` or newline (an angle destination's end).
+    angle: lex::Next<A>,
+    /// The first `)` or space (a bare destination's end).
+    bare: lex::Next<B>,
+    /// The first `"` or newline (a title's end).
+    quote: lex::Next<Q>,
+    /// The last answer: the `]` asked from and what it gave.
+    last: Option<(usize, Option<((usize, usize), usize)>)>,
+}
+
+impl<A: Fn(&str, usize) -> usize, B: Fn(&str, usize) -> usize, Q: Fn(&str, usize) -> usize> LinkRest<A, B, Q> {
+    /// After the text's `]` at byte `j`: `(\s*(<[^>\n]*>|[^)\s]+)(?:\s+"[^"\n]*")?\s*\)`,
+    /// giving the destination and the end.
+    fn at(&mut self, s: &str, j: usize) -> Option<((usize, usize), usize)> {
+        if let Some((k, r)) = self.last {
+            if k == j {
+                return r;
+            }
+        }
+        let r = self.compute(s, j);
+        self.last = Some((j, r));
+        r
+    }
+
+    fn compute(&mut self, s: &str, j: usize) -> Option<((usize, usize), usize)> {
+        let b = s.as_bytes();
+        let u = lex::spaces(s, lex::lit(s, j, "](")?);
+        let mut dests: [Option<usize>; 2] = [None, None];
+        if b.get(u) == Some(&b'<') {
+            let k = self.angle.find(s, u + 1);
+            if b.get(k) == Some(&b'>') {
+                dests[0] = Some(k + 1);
+            }
+        }
+        let k = self.bare.find(s, u);
+        dests[1] = (k > u).then_some(k);
+        for v in dests.into_iter().flatten() {
+            // An optional `"title"`, then `)`.
+            let titled = lex::spaces1(s, v).filter(|&t| b.get(t) == Some(&b'"')).and_then(|t| {
+                let k = self.quote.find(s, t + 1);
+                (b.get(k) == Some(&b'"')).then_some(k + 1)
+            });
+            for w in [titled, Some(v)].into_iter().flatten() {
+                let e = lex::spaces(s, w);
+                if b.get(e) == Some(&b')') {
+                    return Some(((u, v), e + 1));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The leftmost `<obsidian://...>` from byte `from` (was
+/// `<(obsidian://[^>\s]+)>`): groups 0 and the URI.
+pub(crate) fn find_autolink(s: &str, from: usize) -> Option<[lex::Span; 2]> {
+    let mut q = from;
+    while let Some(p) = lex::find_str(s, q, "<obsidian://") {
+        let e = lex::run(s, p + 12, |c| c != '>' && !lex::space(c));
+        if e > p + 12 && s.as_bytes().get(e) == Some(&b'>') {
+            return Some([Some((p, e + 1)), Some((p + 1, e))]);
+        }
+        // Every opener up to `e` runs to the same `e` and fails too.
+        q = e.max(p + 1);
+    }
+    None
+}
+
+/// A character of an inline tag: `[\p{L}\p{N}_/-]`.
+fn tag_char(c: char) -> bool {
+    const TAG: lex::Ascii = lex::Ascii::new(b"_/-", &[(b'a', b'z'), (b'A', b'Z'), (b'0', b'9')]);
+    if c.is_ascii() {
+        TAG.has(c as u8)
+    } else {
+        c.is_alphabetic() || c.is_numeric()
+    }
+}
+
+/// The leftmost inline tag from byte `from` (was
+/// `(?:^|[\s(,])#([\p{L}\p{N}_/-]+)`): groups 0 and the tag.
+pub(crate) fn find_tag(s: &str, from: usize) -> Option<[lex::Span; 2]> {
+    let mut q = from;
+    while let Some(h) = lex::find_byte(s, q, b'#') {
+        let e = lex::run(s, h + 1, tag_char);
+        if e > h + 1 {
+            if h == 0 {
+                return Some([Some((0, e)), Some((1, e))]);
+            }
+            if let Some(c) = lex::before(s, h).filter(|&c| lex::space(c) || c == '(' || c == ',') {
+                let p = h - c.len_utf8();
+                if p >= from {
+                    return Some([Some((p, e)), Some((h + 1, e))]);
+                }
+            }
+        }
+        q = h + 1;
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
+    use lex::props::{v, Mode, Site};
+    let toks: &'static [&'static str] =
+        &["[[", "]]", "[", "]", "!", "(", ")", "<", ">", "\"", " ", "a", "|", "#", "](", "[t](u)", "[[x]]", "![[y]]", "<u v>", " \"t\"", "obsidian://", "<obsidian://a>", "\n"];
+    let ex: &'static [&'static str] = &[
+        "see [[Note]] and ![[img.png|300]] here",
+        "[t](a/b.md) [x [[y]] z](<c d.md> \"title\" ) ![i](obsidian://open?x=1)",
+        "<obsidian://open?vault=a&file=b> [a](b \"t\")",
+    ];
+    vec![
+        Site {
+            name: "markdown wikilink",
+            pattern: r"(!?)\[\[([^\[\]\n]+?)\]\]".into(),
+            tokens: toks,
+            examples: ex,
+            mode: Mode::All(|s| lex::all(s, find_wiki).into_iter().map(v).collect()),
+        },
+        Site {
+            name: "markdown link",
+            pattern: r#"!?\[(?:[^\[\]\n]|\[\[[^\]\n]*\]\])*\]\(\s*(<[^>\n]*>|[^)\s]+)(?:\s+"[^"\n]*")?\s*\)"#.into(),
+            tokens: toks,
+            examples: ex,
+            mode: Mode::All(|s| md_links(s).into_iter().map(v).collect()),
+        },
+        Site {
+            name: "markdown autolink",
+            pattern: r"<(obsidian://[^>\s]+)>".into(),
+            tokens: toks,
+            examples: ex,
+            mode: Mode::All(|s| lex::all(s, find_autolink).into_iter().map(v).collect()),
+        },
+        Site {
+            name: "markdown tag",
+            pattern: r"(?:^|[\s(,])#([\p{L}\p{N}_/-]+)".into(),
+            tokens: &["#", "##", " #", "(#", ",#", "a", "/", "-", "_", "\u{663}", "\u{e9}", " "],
+            examples: &["#tag and (#area/gp, #x-1_y)", "text #2026 #\u{e9}t\u{e9}"],
+            mode: Mode::All(|s| lex::all(s, find_tag).into_iter().map(v).collect()),
+        },
+    ]
 }
 
 /// Blanks out inline code spans so links inside them are not seen.
@@ -864,9 +1103,10 @@ pub fn extract_links(text: &str) -> Vec<RawLink> {
         if !line.contains('[') && !line.contains("obsidian://") {
             continue;
         }
-        for c in re_wiki().captures_iter(&line) {
-            let embed = &c[1] == "!";
-            let inner = &c[2];
+        let span = |g: lex::Span| g.map_or("", |(a, b)| &line[a..b]);
+        for c in lex::all(&line, find_wiki) {
+            let embed = span(c[1]) == "!";
+            let inner = span(c[2]);
             let target_part = match inner.find('|') {
                 Some(p) => inner[..p].trim_end_matches('\\'),
                 None => inner,
@@ -877,19 +1117,20 @@ pub fn extract_links(text: &str) -> Vec<RawLink> {
             }
             out.push(RawLink {
                 kind: if embed { LinkKind::Embed } else { LinkKind::Wiki },
-                raw: c[0].to_string(),
+                raw: span(c[0]).to_string(),
                 target,
                 heading,
                 line: i + 1,
             });
         }
-        for c in re_md().captures_iter(&line) {
-            let mut dest = c[1].to_string();
+        for c in md_links(&line) {
+            let raw = span(c[0]).to_string();
+            let mut dest = span(c[1]).to_string();
             if dest.starts_with('<') && dest.ends_with('>') {
                 dest = dest[1..dest.len() - 1].to_string();
             }
             if dest.starts_with("obsidian://") {
-                out.push(RawLink { kind: LinkKind::Uri, raw: c[0].to_string(), target: dest, heading: None, line: i + 1 });
+                out.push(RawLink { kind: LinkKind::Uri, raw, target: dest, heading: None, line: i + 1 });
                 continue;
             }
             if dest.starts_with('#') || dest.contains("://") || dest.starts_with("mailto:") || dest.contains(':') {
@@ -900,10 +1141,10 @@ pub fn extract_links(text: &str) -> Vec<RawLink> {
             if target.is_empty() {
                 continue;
             }
-            out.push(RawLink { kind: LinkKind::Md, raw: c[0].to_string(), target, heading, line: i + 1 });
+            out.push(RawLink { kind: LinkKind::Md, raw, target, heading, line: i + 1 });
         }
-        for c in re_autolink().captures_iter(&line) {
-            out.push(RawLink { kind: LinkKind::Uri, raw: c[0].to_string(), target: c[1].to_string(), heading: None, line: i + 1 });
+        for c in lex::all(&line, find_autolink) {
+            out.push(RawLink { kind: LinkKind::Uri, raw: span(c[0]).to_string(), target: span(c[1]).to_string(), heading: None, line: i + 1 });
         }
     }
     out
@@ -935,8 +1176,10 @@ pub fn extract_tags(text: &str, fm: &Map) -> Vec<String> {
         if !line.contains('#') {
             continue;
         }
-        for c in re_tag().captures_iter(&line) {
-            push(&c[1]);
+        for c in lex::all(&line, find_tag) {
+            if let Some((a, b)) = c[1] {
+                push(&line[a..b]);
+            }
         }
     }
     tags.sort();

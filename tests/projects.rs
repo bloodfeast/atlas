@@ -61,6 +61,10 @@ fn text(s: &mut Server, tool: &str, args: Value) -> String {
     } else {
         args
     };
+    // Every answer whole: these tests read the store again after changing
+    // it, which a repeat would answer with the changed lines.
+    let mut a = a;
+    a["fresh"] = json!(true);
     match s.answer(tool, &a) {
         Ok(x) => x.into_text(),
         Err(e) => panic!("{tool}: {e}"),
@@ -454,14 +458,14 @@ fn each_project_has_its_own_tree_and_shared_pins_reach_every_root() {
 /// A scratch home for `atlas settings`.
 fn paths(root: &Path, config: &Path) -> Paths {
     std::fs::create_dir_all(root.join("claude")).unwrap();
-    Paths { claude_dir: root.join("claude"), atlas_config: Some(config.to_path_buf()), state: Some(root.join("state").join(cs::OFFER_STATE)), db: Some(root.join("state").join("atlas.sqlite")), user_state: Some(root.join("state")) }
+    Paths { claude_dir: root.join("claude"), atlas_config: Some(config.to_path_buf()), state: Some(root.join("state").join(cs::OFFER_STATE)), db: Some(root.join("state").join("atlas.sqlite")), user_state: Some(root.join("state")), project: None }
 }
 
 fn settings_cmd(p: &Paths, args: &[&str]) -> (bool, String) {
     let mut out = Vec::new();
     let mut input: &[u8] = b"";
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: false, version: None });
+    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false });
     match code {
         Ok(c) => (c == std::process::ExitCode::SUCCESS, String::from_utf8(out).unwrap()),
         Err(e) => (false, e),
@@ -508,7 +512,7 @@ fn migration_moves_a_setup_into_one_project_once_and_undoes() {
     assert!(ok && out.contains("nothing to change"), "{out}");
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), migrated);
     // Undo restores the file byte for byte.
-    let (ok, out) = settings_cmd(&p, &["undo"]);
+    let (ok, out) = settings_cmd(&p, &["undo", "--yes"]);
     assert!(ok, "{out}");
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
 }
@@ -590,6 +594,11 @@ fn a_root_of_repos_is_discovered_offered_written_routed_and_indexed() {
     assert!(line.contains("holds 3 git repos (auth, billing, gateway)"), "{line}");
     assert!(line.contains("new project here") && line.contains("add to an existing project (other)") && line.contains("skip"), "{line}");
     assert!(line.contains("add-project --new"), "{line}");
+    // The new-project answer folds in the vault, beside the configuration.
+    let vault = r.join("vaults").join("acme-notes");
+    let vault_shown = atlas::paths::canonical(r).join("vaults").join("acme-notes").to_string_lossy().replace('\\', "/");
+    assert!(line.contains(&format!("and a vault for its notes at {vault_shown}")), "{line}");
+    assert!(line.contains("--vault-at") && line.contains("--no-vault"), "{line}");
     assert!(!session_start(&p).contains("git repos"), "asked once per folder");
 
     // Yes: the project file, then undo removes it, then yes again.
@@ -613,8 +622,14 @@ fn a_root_of_repos_is_discovered_offered_written_routed_and_indexed() {
     // /private/var), and one folder with the file as given.
     assert_eq!(entry.file.as_deref(), Some(atlas::paths::canonical(&pf).as_path()));
     assert_eq!(entry.file.as_deref().map(project::path_key), Some(project::path_key(&pf)));
-    let (ok, out) = settings_cmd(&p, &["undo"]);
+    // With its vault, in the project's own entry, never inside a repo.
+    assert!(out.contains("vault acme-notes:") && vault.join(cs::VAULT_NOTE).is_file(), "{out}");
+    let vaults: Vec<(&str, String)> = entry.body.vaults.iter().map(|v| (v.name.as_str(), project::path_key(&v.path))).collect();
+    assert_eq!(vaults, vec![("acme-notes", project::path_key(&vault))]);
+    assert!(reg.vaults.is_empty(), "not a top-level vault every project sees");
+    let (ok, out) = settings_cmd(&p, &["undo", "--yes"]);
     assert!(ok && !pf.exists(), "undo removes the project file: {out}");
+    assert!(!vault.exists(), "and the vault folder atlas made, still holding only its note: {out}");
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original, "the same undo removes the registration");
     assert!(settings_cmd(&p, &["add-project", "--new", &acme_arg]).0);
     let (ok, out) = settings_cmd(&p, &["add-project", "--new", &acme_arg]);
@@ -880,6 +895,39 @@ fn a_workspace_root_that_is_a_checkout_is_no_member() {
     assert!(f1.contains("acme/lib") && !f1.contains("someone/notes"), "{f1}");
 }
 
+#[test]
+fn a_new_project_takes_its_vault_where_told_or_none() {
+    let t = Temp::new("proj-new-vault");
+    let r = t.path();
+    let cfg = r.join("atlas.json");
+    let original = r#"{"projects_dir": "state", "watch": false, "projects": [{"name": "other", "roots": ["elsewhere"]}]}"#;
+    write(&cfg, original);
+    let p = paths(r, &cfg);
+    // --name names the vault too; --vault-at puts it in a folder the user
+    // named, which was there and is kept on undo.
+    let ws = r.join("ws");
+    repo(&ws.join("engine"), "git@git.example:acme/engine.git");
+    let mine = r.join("my-notes");
+    write(&mine.join("Idea.md"), "# Idea\n");
+    let (ok, out) = settings_cmd(&p, &["add-project", "--new", "--name", "studio", "--vault-at", &mine.to_string_lossy(), &ws.to_string_lossy()]);
+    assert!(ok && out.contains("vault studio-notes:") && out.contains("an existing folder"), "{out}");
+    let c = Config::load(&cfg).unwrap();
+    let e = c.user.projects.iter().find(|x| x.name == "studio").unwrap();
+    assert_eq!(e.body.vaults.iter().map(|v| project::path_key(&v.path)).collect::<Vec<_>>(), vec![project::path_key(&mine)]);
+    let (ok, out) = settings_cmd(&p, &["undo", "--yes"]);
+    assert!(ok && out.contains("is kept") && mine.join("Idea.md").is_file() && !ws.join(project::PROJECT_FILE).exists(), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+    // The project folder itself is no vault: refused before anything is written.
+    let (ok, out) = settings_cmd(&p, &["add-project", "--new", "--vault-at", &ws.to_string_lossy(), &ws.to_string_lossy()]);
+    assert!(!ok && out.contains("is the project folder") && !ws.join(project::PROJECT_FILE).exists(), "{out}");
+    // --no-vault: the project alone.
+    let (ok, out) = settings_cmd(&p, &["add-project", "--new", "--no-vault", &ws.to_string_lossy()]);
+    assert!(ok && !out.contains("vault "), "{out}");
+    let c = Config::load(&cfg).unwrap();
+    assert!(c.user.projects.iter().find(|x| x.name == "ws").unwrap().body.vaults.is_empty());
+    assert!(!r.join("vaults").exists());
+}
+
 /// A directory link `link` to `target`: a symlink, else on Windows (where a
 /// symlink needs a privilege or developer mode) a junction. `Err` says why
 /// neither could be made.
@@ -1137,4 +1185,382 @@ fn a_leading_config_reaches_the_settings_subcommand() {
     assert!(!text.contains("expected on or off"), "{text}");
     let c = Config::load(&cfg).unwrap();
     assert_eq!(c.user.projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["alpha"], "{text}");
+}
+
+/// A configuration with two projects, `alpha` and `beta` (each with a root
+/// folder and a vault of its own), and no top-level vaults or sources.
+fn two_projects(r: &Path) -> (PathBuf, String) {
+    write(&r.join("alpha").join("a.md"), "# A\n");
+    write(&r.join("beta").join("b.md"), "# B\n");
+    write(&r.join("va").join("n.md"), "# NA\n");
+    write(&r.join("vb").join("n.md"), "# NB\n");
+    let cfg = r.join("atlas.json");
+    let text = r#"{"projects_dir": "state", "watch": false,
+  "projects": [
+    {"name": "alpha", "roots": ["alpha"], "vaults": [{"name": "va", "path": "va"}]},
+    {"name": "beta", "roots": ["beta"], "vaults": [{"name": "vb", "path": "vb"}]}
+  ]
+}
+"#
+    .to_string();
+    write(&cfg, &text);
+    (cfg, text)
+}
+
+/// #73: a repository folder over 32 characters gets a source name that
+/// fits; every later run loads; and a name over the cap written by hand is
+/// refused by the loader, naming the file to fix.
+#[test]
+fn a_long_repo_folder_never_bricks_the_configuration() {
+    let t = Temp::new("proj-long-name");
+    let r = t.path();
+    let cfg = r.join("atlas.json");
+    write(&cfg, r#"{"projects_dir": "state", "watch": false, "projects": [{"name": "other", "roots": ["elsewhere"]}]}"#);
+    let p = paths(r, &cfg);
+    let ws = r.join("ws");
+    let long = "socket-account-config-manager-cli";
+    repo(&ws.join(long), "git@git.example:acme/socket-account-config-manager-cli.git");
+    let (ok, out) = settings_cmd(&p, &["add-project", "--new", "--no-vault", &ws.to_string_lossy()]);
+    assert!(ok, "{out}");
+    let c = Config::load(&cfg).unwrap();
+    let res = project::resolve(&c, &ws.join(long), None).unwrap();
+    let s = res.config.sources.iter().find(|s| project::path_key(&s.root) == project::path_key(&ws.join(long))).unwrap();
+    assert!(s.name.len() <= 32, "{}", s.name);
+    atlas::store::AtlasSetup::from_config(&res.config).expect("the project's configuration runs");
+    // A listed repo name up to 64 characters (as a project file may hold
+    // one written before the cap) still runs: its source name is cut.
+    let file = ws.join(project::PROJECT_FILE);
+    write(&file, &format!(r#"{{"name": "ws", "repos": [{{"name": "{long}-and-then-some", "path": "{long}"}}]}}"#));
+    project::clear_cache();
+    let c = Config::load(&cfg).unwrap();
+    let res = project::resolve(&c, &ws.join(long), None).unwrap();
+    atlas::store::AtlasSetup::from_config(&res.config).expect("a long listed name runs");
+    // A source name over the cap, by hand: the loader names the file.
+    write(&file, &format!(r#"{{"name": "ws", "sources": [{{"name": "{long}", "root": ".", "include": ["*.md"]}}]}}"#));
+    project::clear_cache();
+    let e = Config::load(&cfg).unwrap_err().to_string();
+    assert!(e.replace('\\', "/").contains("ws/atlas.project.json") && e.contains("sources[0].name") && e.contains(long), "{e}");
+}
+
+/// #74: in a two-project configuration add-project writes into the project
+/// named (or the folder's own), never the top level that every project
+/// reads, and leaves the other project as it was.
+#[test]
+fn add_project_writes_only_into_the_active_project() {
+    let t = Temp::new("proj-add-active");
+    let r = t.path();
+    let (cfg, _) = two_projects(r);
+    let client = r.join("client");
+    write(&client.join("README.md"), "# Client\n");
+    write(&client.join("src").join("lib.rs"), "pub fn f() {}\n");
+    let mut p = paths(r, &cfg);
+    p.project = Some("beta".into());
+    let before = Config::load(&cfg).unwrap();
+    let (ok, out) = settings_cmd(&p, &["add-project", &client.to_string_lossy()]);
+    assert!(ok && out.contains("indexed source client") && out.contains("project beta"), "{out}");
+    let c = Config::load(&cfg).unwrap();
+    assert!(c.sources.is_empty() && c.vaults.is_empty() && c.code.is_none(), "nothing at the top level");
+    let beta = c.user.projects.iter().find(|x| x.name == "beta").unwrap();
+    assert_eq!(beta.body.sources.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["client"]);
+    assert_eq!(beta.body.code.as_ref().unwrap().roots.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["client-code"]);
+    let (a0, a1) = (before.user.projects.iter().find(|x| x.name == "alpha").unwrap(), c.user.projects.iter().find(|x| x.name == "alpha").unwrap());
+    assert!(a1.body.sources.is_empty() && a1.body.code.is_none() && a1.body.vaults.len() == a0.body.vaults.len(), "alpha is untouched");
+    // Alpha's resolved configuration does not read the client's files.
+    project::clear_cache();
+    let ra = project::resolve(&c, &r.join("alpha"), None).unwrap().config;
+    assert!(!ra.sources.iter().any(|s| s.name == "client"), "{:?}", ra.sources.iter().map(|s| &s.name).collect::<Vec<_>>());
+    // The folder is now covered: a second run changes nothing.
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    let (ok, out) = settings_cmd(&p, &["add-project", &client.to_string_lossy()]);
+    assert!(ok && out.contains("already indexed"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    // --vault puts the vault in the project too.
+    let other = r.join("other");
+    write(&other.join("README.md"), "# Other\n");
+    let (ok, out) = settings_cmd(&p, &["add-project", "--vault", &other.to_string_lossy()]);
+    assert!(ok, "{out}");
+    let c = Config::load(&cfg).unwrap();
+    assert!(c.vaults.is_empty());
+    assert_eq!(c.user.projects.iter().find(|x| x.name == "beta").unwrap().body.vaults.len(), 2);
+}
+
+/// #74: an add-project that cannot succeed writes nothing: the
+/// configuration is byte-identical and no vault folder is left behind.
+#[test]
+fn a_failing_add_project_leaves_the_configuration_byte_identical() {
+    let t = Temp::new("proj-add-fail");
+    let r = t.path();
+    let (cfg, text) = two_projects(r);
+    let client = r.join("client");
+    write(&client.join("README.md"), "# Client\n");
+    // In no project, none named, no default_project: which project is unknown.
+    let p = paths(r, &cfg);
+    let (ok, out) = settings_cmd(&p, &["add-project", "--vault", &client.to_string_lossy()]);
+    assert!(!ok && out.contains("in no project") && out.contains("nothing written"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    assert!(!r.join("vaults").exists(), "no vault folder made");
+    // Without projects and without a vault, atlas could not run on the
+    // result: refused before the first write.
+    let flat = r.join("flat.json");
+    let flat_text = format!("{{\"db\": \"state/flat.sqlite\", \"sources\": [{{\"name\": \"beta\", \"root\": \"{}\", \"include\": [\"*.md\"]}}]}}\n", project::path_key(&r.join("beta")));
+    write(&flat, &flat_text);
+    let (ok, out) = settings_cmd(&paths(r, &flat), &["add-project", &client.to_string_lossy()]);
+    assert!(!ok && out.contains("nothing written"), "{out}");
+    assert_eq!(std::fs::read_to_string(&flat).unwrap(), flat_text);
+}
+
+/// #75: a folder a project covers (a root, its project file's folder, a
+/// repository) is indexed: not offered, and add-project changes nothing.
+#[test]
+fn a_project_covered_folder_is_not_offered_and_add_project_no_ops() {
+    let t = Temp::new("proj-covered");
+    let r = t.path();
+    let (cfg, _) = two_projects(r);
+    let ws = r.join("ws");
+    repo(&ws.join("svc"), "git@git.example:acme/svc.git");
+    // Registered with --new: a project file folder and a repository.
+    let p = paths(r, &cfg);
+    let (ok, out) = settings_cmd(&p, &["add-project", "--new", "--no-vault", &ws.to_string_lossy()]);
+    assert!(ok, "{out}");
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    let c = Config::load(&cfg).unwrap();
+    let roots = cs::configured_roots(&c);
+    for d in [r.join("alpha").join("sub"), ws.clone(), ws.join("svc")] {
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(cs::project_line(&p, &d, &roots).is_none(), "{} is covered", d.display());
+        let (ok, out) = settings_cmd(&p, &["add-project", &d.to_string_lossy()]);
+        assert!(ok && out.contains("already indexed"), "{}: {out}", d.display());
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    }
+    // A folder no project covers is still offered.
+    let loose = r.join("loose").join("thing");
+    std::fs::create_dir_all(&loose).unwrap();
+    assert!(cs::project_line(&p, &loose, &roots).is_some());
+}
+
+/// #76: --dry-run shows the change, the file and the project, and writes
+/// nothing; a bare `add-project` (no folder, no --yes) does the same; and
+/// `--project` reaches the settings command.
+#[test]
+fn add_project_dry_run_and_the_bare_form_write_nothing() {
+    let t = Temp::new("proj-dry");
+    let r = t.path();
+    let (cfg, text) = two_projects(r);
+    let client = r.join("client");
+    write(&client.join("README.md"), "# Client\n");
+    let mut p = paths(r, &cfg);
+    p.project = Some("beta".into());
+    let (ok, out) = settings_cmd(&p, &["add-project", "--dry-run", "--vault", &client.to_string_lossy()]);
+    assert!(ok && out.contains("dry run: would write") && out.contains(&cfg.display().to_string()) && out.contains("into project beta") && out.contains("would create the vault folder"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    assert!(!r.join("vaults").exists() && !r.join("state").join("beta").join("atlas.sqlite").exists(), "nothing made");
+    // --new and --to dry runs.
+    let ws = r.join("ws");
+    repo(&ws.join("svc"), "git@git.example:acme/svc.git");
+    let (ok, out) = settings_cmd(&p, &["add-project", "--dry-run", "--new", &ws.to_string_lossy()]);
+    assert!(ok && out.contains("would write") && out.contains(project::PROJECT_FILE) && out.contains("into project ws"), "{out}");
+    assert!(!ws.join(project::PROJECT_FILE).exists());
+    let (ok, out) = settings_cmd(&p, &["add-project", "--dry-run", "--to", "alpha", &ws.to_string_lossy()]);
+    assert!(ok && out.contains("into project alpha"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    // The bare form, as a user types it, in the folder.
+    let claude = r.join("claude");
+    let run = |args: &[&str]| {
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_atlas"))
+            .arg("--config")
+            .arg(&cfg)
+            .args(args)
+            .current_dir(&client)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("ATLAS_HOME", r.join("home-atlas"))
+            .env("HOME", r)
+            .env("USERPROFILE", r)
+            .env_remove("ATLAS_CONFIG")
+            .env_remove("ATLAS_PROJECT")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+    };
+    let (ok, out) = run(&["--project", "beta", "settings", "add-project"]);
+    assert!(ok && out.contains("writes nothing") && out.contains("usage:") && out.contains("dry run: would write") && out.contains("into project beta"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    // Named with `.`, it writes.
+    let (ok, out) = run(&["--project", "beta", "settings", "add-project", "."]);
+    assert!(ok && out.contains("indexed source client"), "{out}");
+    assert!(Config::load(&cfg).unwrap().user.projects.iter().find(|x| x.name == "beta").unwrap().body.sources.iter().any(|s| s.name == "client"));
+}
+
+/// `atlas settings` with a person answering `answer` in a terminal.
+fn settings_cmd_answering(p: &Paths, args: &[&str], answer: &str) -> (bool, String) {
+    let mut out = Vec::new();
+    let mut input: &[u8] = answer.as_bytes();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false });
+    match code {
+        Ok(c) => (c == std::process::ExitCode::SUCCESS, String::from_utf8(out).unwrap()),
+        Err(e) => (false, format!("{}{e}", String::from_utf8_lossy(&out))),
+    }
+}
+
+/// A folder in no project: in a terminal, add-project lists every project
+/// and cancel, and writes into the one picked; one project is asked about
+/// too; cancel, a dry run and no terminal write nothing.
+#[test]
+fn a_folder_in_no_project_is_asked_about_in_a_terminal() {
+    let t = Temp::new("proj-pick");
+    let r = t.path();
+    let (cfg, text) = two_projects(r);
+    let client = r.join("client");
+    write(&client.join("README.md"), "# Client\n");
+    let p = paths(r, &cfg);
+    // Cancel: nothing written.
+    let (ok, out) = settings_cmd_answering(&p, &["add-project", &client.to_string_lossy()], "c\n");
+    assert!(ok && out.contains("1) alpha") && out.contains("2) beta") && out.contains("c) cancel") && out.contains("cancelled; nothing written"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    // A dry run is not asked: refused, nothing written.
+    let (ok, out) = settings_cmd_answering(&p, &["add-project", "--dry-run", &client.to_string_lossy()], "2\n");
+    assert!(!ok && out.contains("in no project") && !out.contains("c) cancel"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    // No terminal: refused, nothing written.
+    let (ok, out) = settings_cmd(&p, &["add-project", &client.to_string_lossy()]);
+    assert!(!ok && out.contains("in no project") && out.contains("nothing written"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    // Picked: written into that project alone, in one edit.
+    let (ok, out) = settings_cmd_answering(&p, &["add-project", &client.to_string_lossy()], "2\n");
+    assert!(ok && out.contains("project beta: added source client") && out.contains("indexed source client"), "{out}");
+    let c = Config::load(&cfg).unwrap();
+    assert!(c.sources.is_empty() && c.user.projects.iter().find(|x| x.name == "alpha").unwrap().body.sources.is_empty());
+    assert!(c.user.projects.iter().find(|x| x.name == "beta").unwrap().body.sources.iter().any(|s| s.name == "client"));
+    // One project configured: still asked, never picked silently.
+    let one = r.join("one.json");
+    let one_text = r#"{"projects_dir": "state", "watch": false, "projects": [{"name": "solo", "roots": ["alpha"], "vaults": [{"name": "va", "path": "va"}]}]}"#;
+    write(&one, one_text);
+    let p1 = paths(r, &one);
+    let other = r.join("other");
+    write(&other.join("README.md"), "# Other\n");
+    let (ok, out) = settings_cmd_answering(&p1, &["add-project", &other.to_string_lossy()], "\n");
+    assert!(ok && out.contains("1) solo") && out.contains("cancelled; nothing written"), "{out}");
+    assert_eq!(std::fs::read_to_string(&one).unwrap(), one_text);
+}
+
+#[test]
+fn the_checkpoint_card_lists_only_the_sessions_project() {
+    let two = Two::new("proj-card");
+    let (ra, rb) = (two.resolve("alpha"), two.resolve("beta"));
+    let (mut a, mut b) = (server_for(&ra.config), server_for(&rb.config));
+    text(&mut a, "journal", json!({"lane": "ALPHA-LANE", "entry": "next", "text": "alpha work on the compactor"}));
+    text(&mut b, "journal", json!({"lane": "BETA-LANE", "entry": "next", "text": "beta work on the capacitor"}));
+    drop((a, b));
+    for (r, own, other) in [(ra, "ALPHA-LANE", "BETA-LANE"), (rb, "BETA-LANE", "ALPHA-LANE")] {
+        let mut s = settings_for(&r.config);
+        s.compact.enabled = true;
+        s.graph = Some(Arc::new(r.graph.clone()));
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.set_offer_paths(None);
+        h.handle(&HookEvent { event: "PreCompact".into(), session_id: "s1".into(), trigger: "manual".into(), ..HookEvent::default() });
+        let store = atlas::memory::MemoryStore::open(&s.store).unwrap();
+        let ck = atlas::checkpoint::newest(&store, "s1").unwrap().expect("a checkpoint");
+        assert!(ck.body.contains(own), "{own} missing from the card: {}", ck.body);
+        assert!(!ck.body.contains(other), "{other} bled into the card: {}", ck.body);
+    }
+}
+
+/// A fresh install has no projects: `add-project --new` in a folder of
+/// repositories moves the setup into a project first (one undo reverses
+/// both), and SessionStart there offers the new project, not the
+/// single-repository vault question.
+#[test]
+fn add_project_new_on_a_fresh_install_moves_the_setup_into_projects_first() {
+    let t = Temp::new("proj-fresh-new");
+    let r = t.path();
+    let orchard = r.join("work").join("orchard");
+    repo(&orchard.join("pears"), "https://git.example/orchard/pears.git");
+    repo(&orchard.join("plums"), "https://git.example/orchard/plums.git");
+    // The setup moves into a project named after its configuration folder.
+    let (cfg, original) = fresh_setup(&r.join("My Atlas"));
+    let c = Config::load(&cfg).unwrap();
+    assert!(!c.user.scoped);
+    let p = paths(r, &cfg);
+
+    let mut h = Hooks::open(settings_for(&c)).unwrap();
+    h.set_offer_paths(Some(p.clone()));
+    h.set_project_roots(Some(cs::configured_roots(&c)));
+    let line = h.handle(&HookEvent { event: "SessionStart".into(), cwd: orchard.to_string_lossy().into_owned(), ..HookEvent::default() }).context;
+    assert!(line.contains("holds 2 git repos (pears, plums)") && line.contains("no projects yet"), "{line}");
+    assert!(line.contains("add-project --new") && !line.contains("add-project --vault \""), "{line}");
+
+    let (ok, out) = settings_cmd(&p, &["add-project", "--new", &orchard.to_string_lossy()]);
+    assert!(ok, "{out}");
+    assert!(out.contains("moving the current setup into project my-atlas"), "{out}");
+    let reg = Config::load(&cfg).unwrap();
+    let names: Vec<&str> = reg.user.projects.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(names, vec!["my-atlas", "orchard"]);
+    assert_eq!(reg.user.default_project.as_deref(), Some("my-atlas"));
+    assert!(orchard.join(project::PROJECT_FILE).is_file());
+
+    let (ok, out) = settings_cmd(&p, &["undo", "--yes"]);
+    assert!(ok, "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original, "one undo reverses the move and the project: {out}");
+    assert!(!orchard.join(project::PROJECT_FILE).exists(), "{out}");
+}
+
+/// A single-scope configuration (a vault `notes`, no projects) in `home`;
+/// returns the configuration file and its text.
+fn fresh_setup(home: &Path) -> (PathBuf, &'static str) {
+    write(&home.join("notes").join("a.md"), "# A\n");
+    let cfg = home.join("atlas.json");
+    let original = "{\n  \"db\": \"state/atlas.sqlite\",\n  \"vaults\": [{\"name\": \"notes\", \"path\": \"notes\"}],\n  \"sources\": [],\n  \"ids\": [],\n  \"models\": {\"auto_download\": false, \"files\": []}\n}\n";
+    write(&cfg, original);
+    (cfg, original)
+}
+
+fn project_names(cfg: &Path) -> Vec<String> {
+    Config::load(cfg).unwrap().user.projects.iter().map(|x| x.name.clone()).collect()
+}
+
+/// Without a terminal the setup's project is named after its configuration
+/// folder, `-2` when the new project takes that name; a dry run names the
+/// same and writes nothing; in a terminal the user names it, and an answer
+/// that is no valid name or is the new project's is asked again.
+#[test]
+fn the_moved_setup_is_named_after_its_folder_or_by_the_user() {
+    let t = Temp::new("proj-fresh-name");
+    let r = t.path();
+    let orchard = r.join("work").join("orchard");
+    repo(&orchard.join("pears"), "https://git.example/orchard/pears.git");
+
+    // The configuration folder has the new project's name.
+    let (cfg, original) = fresh_setup(&r.join("Orchard"));
+    let p = paths(r, &cfg);
+    let (ok, out) = settings_cmd(&p, &["add-project", "--dry-run", "--new", &orchard.to_string_lossy()]);
+    assert!(ok && out.contains("moving the current setup into project orchard-2"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original, "a dry run writes nothing");
+    let (ok, out) = settings_cmd_answering(&p, &["add-project", "--dry-run", "--new", &orchard.to_string_lossy()], "home\n");
+    assert!(ok && out.contains("project orchard-2") && !out.contains("Name for the project"), "a dry run asks nothing: {out}");
+    let (ok, out) = settings_cmd(&p, &["add-project", "--new", &orchard.to_string_lossy()]);
+    assert!(ok, "{out}");
+    assert_eq!(project_names(&cfg), ["orchard-2", "orchard"]);
+    let (ok, out) = settings_cmd(&p, &["undo", "--yes"]);
+    assert!(ok && std::fs::read_to_string(&cfg).unwrap() == original, "{out}");
+
+    // In a terminal: a bad name and the new project's are refused, then
+    // the answer is taken.
+    let (ok, out) = settings_cmd_answering(&p, &["add-project", "--new", &orchard.to_string_lossy()], "_hidden\nOrchard\nhome-notes\n");
+    assert!(ok, "{out}");
+    assert!(out.contains("Name for the project the current setup moves into [orchard-2]"), "{out}");
+    assert!(out.contains("\"_hidden\" is no project name") && out.contains("\"Orchard\" is the new project's name"), "{out}");
+    assert!(out.contains("moving the current setup into project home-notes"), "{out}");
+    assert_eq!(project_names(&cfg), ["home-notes", "orchard"]);
+    let (ok, out) = settings_cmd(&p, &["undo", "--yes"]);
+    assert!(ok && std::fs::read_to_string(&cfg).unwrap() == original, "{out}");
+
+    // An empty answer, or no answer at all, takes the default.
+    for answer in ["\n", ""] {
+        let (ok, out) = settings_cmd_answering(&p, &["add-project", "--new", &orchard.to_string_lossy()], answer);
+        assert!(ok, "{out}");
+        assert_eq!(project_names(&cfg), ["orchard-2", "orchard"], "{answer:?}");
+        let (ok, out) = settings_cmd(&p, &["undo", "--yes"]);
+        assert!(ok && std::fs::read_to_string(&cfg).unwrap() == original, "{out}");
+    }
 }

@@ -1,6 +1,7 @@
 //! The code index behind the `symbol` tool: definitions, references,
 //! impl edges and callers for Rust (from `rust-analyzer scip`, decoded by
-//! [`crate::scip`]) and WGSL (scanned by [`crate::wgsl`]).
+//! [`crate::scip`]), WGSL (scanned by [`crate::wgsl`]), and any language a
+//! SCIP indexer wrote a file for ([`scip_rows`]).
 //!
 //! # Storage
 //!
@@ -11,7 +12,8 @@
 //! definition, 1 for a reference, 2 for an impl edge. Source lines are kept
 //! once each in `code_lines` and joined, so a snippet costs no per-row copy.
 //! `code_counts` holds per-name totals; `code_roots` each root's last
-//! indexing (fingerprint, time, counts, error).
+//! indexing (fingerprint, time, counts, error); `code_units` the parts of a
+//! root indexed on their own (its Rust side, a `--scip` file's languages).
 //!
 //! # What a row is
 //!
@@ -21,7 +23,8 @@
 //!   `Store::open`, the self type for a method in an impl block).
 //! * Rust references: every non-definition occurrence of a symbol that is
 //!   defined in the same index (references into dependencies and `std` are
-//!   not stored). `within` is the innermost enclosing definition that has an
+//!   not stored, except into a package another code root defines: see
+//!   [`Rows::linked`]). `within` is the innermost enclosing definition that has an
 //!   `enclosing_range` (rust-analyzer gives one for functions, methods,
 //!   impls and types), so references double as call sites: `within` names
 //!   the caller.
@@ -56,7 +59,11 @@ pub const DEFAULT_TIMEOUT_S: usize = 1800;
 /// Default quiet time before a changed root is re-indexed, seconds.
 pub const DEFAULT_DEBOUNCE_S: usize = 20;
 /// Bumped whenever the code tables change shape or meaning.
-pub const CODE_SCHEMA: &str = "code-5";
+pub const CODE_SCHEMA: &str = "code-7";
+/// The schemas [`ensure_schema`] migrates in place (their rows keep their
+/// meaning in [`CODE_SCHEMA`]), oldest first, each with the statements that
+/// bring it to the next; any other schema is dropped and rebuilt.
+const MIGRATIONS: &[(&str, &str)] = &[("code-5", MIGRATE_5), ("code-6", MIGRATE_6)];
 /// The longest source line stored for snippets, in bytes.
 pub const MAX_LINE: usize = 400;
 /// The largest source file read, in bytes.
@@ -118,6 +125,23 @@ CREATE TABLE IF NOT EXISTS code_roots(
     elapsed_ms INTEGER NOT NULL,
     dir TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS code_units(
+    root TEXT NOT NULL,
+    dir TEXT NOT NULL,
+    lang TEXT NOT NULL,
+    source TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    indexed TEXT NOT NULL,
+    elapsed_ms INTEGER NOT NULL,
+    PRIMARY KEY(root, dir, lang)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS code_packages(
+    root TEXT NOT NULL,
+    package TEXT NOT NULL,
+    defines INTEGER NOT NULL,
+    PRIMARY KEY(root, package, defines)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS code_packages_package ON code_packages(package, defines);
 CREATE TABLE IF NOT EXISTS code_lease(
     id INTEGER PRIMARY KEY CHECK (id = 1),
     holder TEXT NOT NULL,
@@ -126,7 +150,61 @@ CREATE TABLE IF NOT EXISTS code_lease(
 ";
 
 const DROP: &str = "DROP TABLE IF EXISTS code_files; DROP TABLE IF EXISTS code_occ; DROP TABLE IF EXISTS code_lines;
-DROP TABLE IF EXISTS code_counts; DROP TABLE IF EXISTS code_roots;";
+DROP TABLE IF EXISTS code_counts; DROP TABLE IF EXISTS code_roots; DROP TABLE IF EXISTS code_units; DROP TABLE IF EXISTS code_packages;";
+
+/// From `code-5`: the tables keep their rows (every `code-5` row means the
+/// same in `code-6`), `code_units` is added, and each indexed root gets its
+/// Rust unit from its `code_roots` note.
+const MIGRATE_5: &str = "INSERT OR IGNORE INTO code_units(root, dir, lang, source, fingerprint, indexed, elapsed_ms)
+SELECT root, '', 'rust', rust, fingerprint, indexed, elapsed_ms FROM code_roots WHERE rust <> 'no Rust files';";
+
+/// From `code-6`: `code_packages` is added (by the schema), and every
+/// root's fingerprint is cleared so the next walk re-indexes it and records
+/// its packages (its cross-root references come with that run).
+const MIGRATE_6: &str = "UPDATE code_roots SET fingerprint = '';";
+
+/// One unit of a code root: a part indexed and timed on its own (in this
+/// release the root's Rust side, and a `--scip` file's language).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unit {
+    /// The unit's folder below the root (empty for the root itself).
+    pub dir: String,
+    /// Its language (`rust`, `go`, `typescript`, ...).
+    pub lang: String,
+    /// Where its rows came from: `scip` (rust-analyzer), `prebuilt TOOL
+    /// VERSION` (a `--scip` file from another indexer), or `scan only:
+    /// why`.
+    pub source: String,
+}
+
+/// Folder names that hold test inputs rather than a project's code: a unit
+/// at or below one (`fixtures/scip/ts`, `testdata/mod`) is indexed like any
+/// other but left out of the root's note ([`units_note`]), which every
+/// `symbol` answer's freshness lines read.
+pub const NOTE_SKIPPED_DIRS: &[&str] = &["fixtures", "fixture", "__fixtures__", "testdata", "test-data", "test_data"];
+
+/// True when a unit folder is at or below a [`NOTE_SKIPPED_DIRS`] folder.
+pub fn fixture_unit(dir: &str) -> bool {
+    dir.split('/').any(|d| NOTE_SKIPPED_DIRS.contains(&d))
+}
+
+/// The one-line note `code_roots.rust` keeps: a lone Rust unit's source as
+/// it always was (`scip`, `scan only: why`), else `lang: source` per unit,
+/// joined by `; `. Units in fixture folders ([`fixture_unit`]) are left
+/// out, unless every unit is in one.
+pub fn units_note(units: &[Unit]) -> String {
+    let real: Vec<Unit> = units.iter().filter(|u| !fixture_unit(&u.dir)).cloned().collect();
+    let units = if real.is_empty() { units } else { &real[..] };
+    match units {
+        [] => "no Rust files".into(),
+        [u] if u.lang == "rust" => u.source.clone(),
+        _ => units
+            .iter()
+            .map(|u| if u.dir.is_empty() { format!("{}: {}", u.lang, u.source) } else { format!("{} {}: {}", u.lang, u.dir, u.source) })
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
 
 /// One configured code root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +215,74 @@ pub struct CodeRoot {
     pub root: PathBuf,
     /// See [`crate::config::CodeRootSpec::build_scripts`].
     pub build_scripts: bool,
+    /// Its prebuilt SCIP files ([`Prebuilt`]).
+    pub scip: Prebuilt,
+}
+
+/// Where a root's prebuilt SCIP files are (`code.roots[i].scip`): files an
+/// indexer wrote elsewhere (CI, WSL, Docker) that the code index reads as a
+/// unit's index. A source file newer than the file it is in is scanned
+/// instead, so a stale prebuilt index never gives wrong lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Prebuilt {
+    /// [`PREBUILT_FILE`] in a unit's folder, when there is one (the
+    /// default).
+    #[default]
+    Convention,
+    /// None is read.
+    Off,
+    /// Files by unit folder (below the root, `/`-separated; empty for the
+    /// root): a path is that folder's file, `None` reads none for it, and a
+    /// folder not named follows the convention.
+    Files(Vec<(String, Option<PathBuf>)>),
+}
+
+/// The file name a prebuilt SCIP index has by convention, in its unit's
+/// folder.
+pub const PREBUILT_FILE: &str = "index.scip";
+
+impl Prebuilt {
+    /// The prebuilt file of a unit folder, if one is configured or found by
+    /// the walk.
+    pub fn for_dir(&self, root: &Path, walk: &Walk, dir: &str) -> Option<PathBuf> {
+        let found = || {
+            let want = if dir.is_empty() { PREBUILT_FILE.to_string() } else { format!("{dir}/{PREBUILT_FILE}") };
+            walk.prebuilt.iter().any(|f| f.path == want).then(|| root.join(&want))
+        };
+        match self {
+            Prebuilt::Off => None,
+            Prebuilt::Convention => found(),
+            Prebuilt::Files(list) => match list.iter().find(|(d, _)| d == dir) {
+                Some((_, p)) => p.clone().filter(|p| p.is_file()),
+                None => found(),
+            },
+        }
+    }
+
+    /// The configured files, as the walk lists files (their path in full),
+    /// for a root's fingerprint: a file outside the root changes the
+    /// fingerprint too.
+    pub fn configured(&self) -> Vec<WalkedFile> {
+        let Prebuilt::Files(list) = self else { return Vec::new() };
+        list.iter()
+            .filter_map(|(_, p)| p.as_ref())
+            .filter_map(|p| {
+                let m = fs::metadata(p).ok()?;
+                let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i64);
+                Some(WalkedFile { path: p.to_string_lossy().into_owned(), mtime, size: m.len() })
+            })
+            .collect()
+    }
+}
+
+/// A root's fingerprint: its walk's ([`Walk::fingerprint`]) and its
+/// configured prebuilt files'.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the root cannot be walked.
+pub fn root_fingerprint(root: &CodeRoot) -> Result<String> {
+    Ok(walk(&root.root)?.fingerprint_with(&root.scip.configured()))
 }
 
 /// Everything the code index is configured with.
@@ -162,6 +308,26 @@ pub struct CodeSetup {
     pub watch: bool,
     /// Seconds between safety-net fingerprint walks of a watched root.
     pub rescan_interval: Duration,
+    /// Which SCIP indexers of [`crate::langs`] run (rust-analyzer is
+    /// chosen apart, see [`crate::code_index::RustSource`]).
+    pub indexers: Indexers,
+}
+
+/// Which SCIP indexers of the language table ([`crate::langs::Driver`])
+/// the code index runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Indexers {
+    /// Each one that is found ([`crate::langs::Driver::find`]); the default.
+    Search,
+    /// None: every unit is scanned, and its note says why.
+    Off(String),
+    /// These binaries, by tool name (`scip-go`); a tool not listed does not
+    /// run.
+    Fixed(Vec<(String, PathBuf)>),
+    /// The configuration's `code.indexers` object: a named tool runs from
+    /// its path (`None`: it does not run), a tool not named is found as
+    /// for [`Indexers::Search`].
+    Chosen(Vec<(String, Option<PathBuf>)>),
 }
 
 impl CodeSetup {
@@ -175,7 +341,11 @@ impl CodeSetup {
     pub fn from_spec(spec: &crate::config::CodeSpec, db: &Path, watch: bool) -> CodeSetup {
         let dir = spec.dir.clone().unwrap_or_else(|| db.parent().unwrap_or(Path::new(".")).join("code"));
         CodeSetup {
-            roots: spec.roots.iter().map(|r| CodeRoot { name: r.name.clone(), root: r.root.clone(), build_scripts: r.build_scripts }).collect(),
+            roots: spec
+                .roots
+                .iter()
+                .map(|r| CodeRoot { name: r.name.clone(), root: r.root.clone(), build_scripts: r.build_scripts, scip: r.scip.clone() })
+                .collect(),
             rust_analyzer: spec.rust_analyzer.clone(),
             timeout: Duration::from_secs(spec.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S) as u64),
             debounce: Duration::from_secs(spec.debounce_s.unwrap_or(DEFAULT_DEBOUNCE_S) as u64),
@@ -184,11 +354,18 @@ impl CodeSetup {
             dir,
             watch,
             rescan_interval: Duration::from_secs(crate::config::DEFAULT_RESCAN_INTERVAL_S),
+            indexers: match &spec.indexers {
+                None => Indexers::Search,
+                Some(None) => Indexers::Off("indexers are off (code.indexers is false)".into()),
+                Some(Some(list)) => Indexers::Chosen(list.clone()),
+            },
         }
     }
 }
 
-/// Creates the code tables, dropping them first when their schema changed.
+/// Creates the code tables: migrates them in place from `code-5` (adding
+/// `code_units`) or `code-6` (adding `code_packages`), else drops and
+/// rebuilds them when their schema changed.
 ///
 /// # Errors
 ///
@@ -202,9 +379,20 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     conn.execute_batch("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
-    conn.execute_batch(DROP)?;
-    conn.execute_batch(SCHEMA)?;
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('code_schema', ?1)", [CODE_SCHEMA])?;
+    // One write transaction, taken at its start (a deferred one that reads
+    // first cannot wait for another writer).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(from) = MIGRATIONS.iter().position(|(s, _)| have.as_deref() == Some(*s)) {
+        tx.execute_batch(SCHEMA)?;
+        for (_, sql) in &MIGRATIONS[from..] {
+            tx.execute_batch(sql)?;
+        }
+    } else {
+        tx.execute_batch(DROP)?;
+        tx.execute_batch(SCHEMA)?;
+    }
+    tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('code_schema', ?1)", [CODE_SCHEMA])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -232,8 +420,68 @@ pub struct Walk {
     /// `.proto` files (see [`crate::proto`]).
     pub proto: Vec<WalkedFile>,
     /// Other source files searched for rpc call sites
-    /// ([`crate::proto::MENTION_EXTS`], Rust aside).
+    /// ([`crate::proto::MENTION_EXTS`], Rust and the languages of
+    /// [`crate::langs`] aside).
     pub mention: Vec<WalkedFile>,
+    /// Source files of the languages of [`crate::langs`] (Go, TypeScript, JavaScript), outside the
+    /// folders their row skips.
+    pub source: Vec<WalkedFile>,
+    /// Their unit markers and the other files whose change makes the root
+    /// stale (`go.mod`, `go.sum`, `package.json`, `tsconfig.json`, lock files).
+    pub markers: Vec<WalkedFile>,
+    /// Prebuilt SCIP indexes found by convention ([`PREBUILT_FILE`]).
+    pub prebuilt: Vec<WalkedFile>,
+}
+
+/// One unit of a language of [`crate::langs`] in a root: a folder holding
+/// one of its markers (a Go module).
+#[derive(Debug, Clone)]
+pub struct LangUnit {
+    /// The language's row.
+    pub lang: &'static crate::langs::Lang,
+    /// The folder below the root, `/`-separated (empty: the root).
+    pub dir: String,
+}
+
+impl PartialEq for LangUnit {
+    fn eq(&self, other: &LangUnit) -> bool {
+        self.lang.name == other.lang.name && self.dir == other.dir
+    }
+}
+
+impl Eq for LangUnit {}
+
+/// The units of a walked root: every folder with a marker of a language of
+/// [`crate::langs`], sorted by language then folder. Each Go module is its
+/// own unit, nested ones included (the Go tool treats them so); for a row
+/// without [`crate::langs::Lang::nested_units`] (TypeScript) the shallowest
+/// marker claims its subtree.
+pub fn units(walk: &Walk) -> Vec<LangUnit> {
+    let mut out: Vec<LangUnit> = Vec::new();
+    // A marker may be a source file (Python's `setup.py`).
+    for f in walk.markers.iter().chain(&walk.source) {
+        let (dir, name) = f.path.rsplit_once('/').unwrap_or(("", f.path.as_str()));
+        for lang in crate::langs::LANGS.iter().filter(|l| l.marker_rank(name).is_some()) {
+            out.push(LangUnit { lang, dir: dir.to_string() });
+        }
+    }
+    out.sort_by(|a, b| (a.lang.name, &a.dir).cmp(&(b.lang.name, &b.dir)));
+    out.dedup();
+    let below = |d: &str, top: &str| top.is_empty() || (d.len() > top.len() && d.starts_with(top) && d.as_bytes()[top.len()] == b'/');
+    let all = out.clone();
+    out.retain(|u| u.lang.nested_units || !all.iter().any(|o| o.lang.name == u.lang.name && o.dir != u.dir && below(&u.dir, &o.dir)));
+    out
+}
+
+/// The unit holding a source file: the deepest unit folder of its
+/// language above it (for JavaScript, of the row it takes its units from:
+/// [`crate::langs::Lang::units_of`]).
+pub fn unit_of<'a>(units: &'a [LangUnit], lang: &str, path: &str) -> Option<&'a LangUnit> {
+    let lang = crate::langs::by_name(lang).and_then(|l| l.units_of).unwrap_or(lang);
+    units
+        .iter()
+        .filter(|u| u.lang.name == lang && (u.dir.is_empty() || (path.len() > u.dir.len() && path.starts_with(u.dir.as_str()) && path.as_bytes()[u.dir.len()] == b'/')))
+        .max_by_key(|u| u.dir.len())
 }
 
 /// True for a path component the walk never enters: build output,
@@ -248,7 +496,22 @@ pub fn relevant(rel: &str) -> bool {
     if rel.split('/').any(skipped_dir) {
         return false;
     }
-    rel.ends_with(".rs") || rel.ends_with(".wgsl") || rel.ends_with("Cargo.toml") || rel.ends_with("Cargo.lock") || rel.ends_with(".proto") || crate::proto::is_mention_file(rel)
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    rel.ends_with(".rs")
+        || rel.ends_with(".wgsl")
+        || rel.ends_with("Cargo.toml")
+        || rel.ends_with("Cargo.lock")
+        || rel.ends_with(".proto")
+        || crate::proto::is_mention_file(rel)
+        || crate::langs::of_path(rel).is_some_and(|l| !l.skips_path(rel))
+        || crate::langs::of_stale_file(name).is_some_and(|l| !l.skips_path(rel))
+        || name == PREBUILT_FILE
+}
+
+/// The language row of a file the walk lists in [`Walk::source`]: its
+/// extension is a row's and no folder on its path is one the row skips.
+pub fn source_lang(rel: &str) -> Option<&'static crate::langs::Lang> {
+    crate::langs::of_path(rel).filter(|l| !l.skips_path(rel))
 }
 
 /// Walks a code root for `.rs`, `.wgsl` and Cargo manifest files, skipping
@@ -289,6 +552,12 @@ pub fn walk(root: &Path) -> Result<Walk> {
                 &mut w.manifests
             } else if name.ends_with(".proto") {
                 &mut w.proto
+            } else if source_lang(&child).is_some() {
+                &mut w.source
+            } else if crate::langs::of_stale_file(&name).is_some_and(|l| !l.skips_path(&child)) {
+                &mut w.markers
+            } else if name == PREBUILT_FILE {
+                &mut w.prebuilt
             } else if crate::proto::is_mention_file(&name) {
                 &mut w.mention
             } else {
@@ -299,7 +568,7 @@ pub fn walk(root: &Path) -> Result<Walk> {
             list.push(WalkedFile { path: child, mtime, size: m.len() });
         }
     }
-    for l in [&mut w.rust, &mut w.wgsl, &mut w.manifests, &mut w.proto, &mut w.mention] {
+    for l in [&mut w.rust, &mut w.wgsl, &mut w.manifests, &mut w.proto, &mut w.mention, &mut w.source, &mut w.markers, &mut w.prebuilt] {
         l.sort_by(|a, b| a.path.cmp(&b.path));
     }
     Ok(w)
@@ -307,13 +576,36 @@ pub fn walk(root: &Path) -> Result<Walk> {
 
 impl Walk {
     /// A digest of every walked file's path, time and size: equal when
-    /// nothing the index depends on changed.
+    /// nothing the index depends on changed. (A root with none of the
+    /// [`crate::langs`] files digests as it did before they existed.)
     pub fn fingerprint(&self) -> String {
+        self.fingerprint_with(&[])
+    }
+
+    /// [`Walk::fingerprint`] with files from outside the walk (configured
+    /// prebuilt indexes); with none, the same digest.
+    pub fn fingerprint_with(&self, extra: &[WalkedFile]) -> String {
         let mut s = String::new();
-        for (tag, l) in [("r", &self.rust), ("w", &self.wgsl), ("m", &self.manifests), ("p", &self.proto), ("o", &self.mention)] {
+        let extra = extra.to_vec();
+        for (tag, l) in [
+            ("r", &self.rust),
+            ("w", &self.wgsl),
+            ("m", &self.manifests),
+            ("p", &self.proto),
+            ("o", &self.mention),
+            ("s", &self.source),
+            ("k", &self.markers),
+            ("x", &self.prebuilt),
+            ("c", &extra),
+        ] {
             for f in l {
                 s.push_str(&format!("{tag}\t{}\t{}\t{}\n", f.path, f.mtime, f.size));
             }
+        }
+        // A root with `.proto` files or generated gRPC code is indexed once
+        // more when rpc linking ([`crate::proto::link_rows`]) first applies.
+        if !self.proto.is_empty() || self.source.iter().any(|f| crate::langs::is_generated(&f.path)) {
+            s.push_str("rpc links 1\n");
         }
         crate::sha256::hex(s.as_bytes())
     }
@@ -350,6 +642,20 @@ pub struct Rows {
     pub occ: Vec<Occ>,
     /// Counts of what came from where, for the stats line.
     pub stats: RowStats,
+    /// End lines decided while building rows, by (file, line): those of
+    /// [`scip_rows`]. A definition without one gets the brace matcher's end
+    /// when written.
+    pub ends: HashMap<(u32, u32), u32>,
+    /// The packages other code roots define ([`crate::langs::package_key`]),
+    /// set before the SCIP rows are built: a reference into one of them is
+    /// stored (a cross-root reference) where any other reference into a
+    /// dependency is dropped.
+    pub linked: HashSet<String>,
+    /// The packages this root's SCIP indexes define symbols of.
+    pub pkg_defs: HashSet<String>,
+    /// The packages this root's references go into without defining them
+    /// (its dependencies, linked or not).
+    pub pkg_uses: HashSet<String>,
 }
 
 /// Counts of what [`Rows`] holds.
@@ -363,6 +669,9 @@ pub struct RowStats {
     pub scip_refs: usize,
     /// References into dependencies, not stored.
     pub external_refs: usize,
+    /// References into a package another code root defines, stored
+    /// ([`Rows::linked`]).
+    pub xroot_refs: usize,
     /// Impl edge rows.
     pub impls: usize,
     /// WGSL declarations.
@@ -375,6 +684,18 @@ pub struct RowStats {
     pub proto_refs: usize,
     /// rpc call sites in other source files.
     pub mentions: usize,
+    /// Definitions from the scanner of a language of [`crate::langs`]
+    /// (files no SCIP index covers).
+    pub lang_defs: usize,
+    /// rpc stub links: a generated stub method of an rpc
+    /// ([`crate::proto::link_rows`]).
+    pub rpc_stubs: usize,
+    /// References to an rpc's stub outside generated code: exact call
+    /// sites.
+    pub rpc_calls: usize,
+    /// rpc implementation links: a method of a type that extends,
+    /// implements or embeds a generated server type.
+    pub rpc_servers: usize,
 }
 
 impl Rows {
@@ -441,6 +762,67 @@ fn parse_symbol(sym: &str) -> Option<Parsed<'_>> {
     Some(Parsed { name: last.name, suffix: last.suffix, container, imp, is_impl_block })
 }
 
+/// Each symbol's package ([`crate::langs::package_key`]) as an index into
+/// the distinct keys, which are returned beside: `None` for a local symbol
+/// or a package with no name.
+fn package_ids(ix: &Index<'_>) -> (Vec<Option<u32>>, Vec<String>) {
+    let mut seen: HashMap<(&str, &str), Option<u32>> = HashMap::new();
+    let mut keys: Vec<String> = Vec::new();
+    let ids = ix
+        .symbols
+        .iter()
+        .map(|s| {
+            let (m, n) = scip::package(s)?;
+            *seen.entry((m, n)).or_insert_with(|| {
+                crate::langs::package_key(m, n).map(|k| {
+                    keys.push(k);
+                    keys.len() as u32 - 1
+                })
+            })
+        })
+        .collect();
+    (ids, keys)
+}
+
+/// Records the packages an index defines symbols of in `rows.pkg_defs`, and
+/// says per package whether a reference into it is stored although its
+/// symbol has no definition here (another root defines the package:
+/// [`Rows::linked`]).
+fn package_links(ix: &Index<'_>, defined: &[bool], rows: &mut Rows) -> (Vec<Option<u32>>, Vec<String>, Vec<bool>) {
+    let (ids, keys) = package_ids(ix);
+    for (s, id) in ids.iter().enumerate() {
+        if let (true, Some(k)) = (defined[s], id) {
+            if !rows.pkg_defs.contains(&keys[*k as usize]) {
+                rows.pkg_defs.insert(keys[*k as usize].clone());
+            }
+        }
+    }
+    // A package this index defines is its own, whoever else defines it
+    // too (a second checkout of the same repository).
+    let link = keys.iter().map(|k| rows.linked.contains(k) && !rows.pkg_defs.contains(k)).collect();
+    (ids, keys, link)
+}
+
+/// For a reference to a symbol with no definition in its index: records its
+/// package as used, and says whether the reference is stored (its package
+/// is another root's), counting it either way.
+fn external_ref(rows: &mut Rows, id: Option<u32>, keys: &[String], link: &[bool], used: &mut [bool]) -> bool {
+    let Some(k) = id.map(|k| k as usize) else {
+        rows.stats.external_refs += 1;
+        return false;
+    };
+    if !used[k] {
+        used[k] = true;
+        rows.pkg_uses.insert(keys[k].clone());
+    }
+    if link[k] {
+        rows.stats.xroot_refs += 1;
+    } else {
+        rows.stats.external_refs += 1;
+    }
+    link[k]
+}
+
 /// Builds rows from a decoded SCIP index.
 ///
 /// # Arguments
@@ -459,6 +841,8 @@ pub fn rust_rows(ix: &Index<'_>, rows: &mut Rows, files: &mut HashMap<String, u3
             defined[ix.occ_sym[i] as usize] = true;
         }
     }
+    let (pkg, pkg_keys, pkg_link) = package_links(ix, &defined, rows);
+    let mut pkg_used = vec![false; pkg_keys.len()];
     let doc_file: Vec<u32> = ix.doc_path.iter().map(|p| rows.file(files, &p.replace('\\', "/"), "rust")).collect();
     // Per document, the definitions with an enclosing range, for `within`.
     let mut encl: Vec<Vec<(i32, i32, u32)>> = vec![Vec::new(); ix.doc_path.len()];
@@ -504,8 +888,7 @@ pub fn rust_rows(ix: &Index<'_>, rows: &mut Rows, files: &mut HashMap<String, u3
             rows.stats.scip_defs += 1;
             continue;
         }
-        if !defined[s] {
-            rows.stats.external_refs += 1;
+        if !defined[s] && !external_ref(rows, pkg[s], &pkg_keys, &pkg_link, &mut pkg_used) {
             continue;
         }
         let l0 = ix.occ_line[i];
@@ -530,6 +913,439 @@ pub fn rust_rows(ix: &Index<'_>, rows: &mut Rows, files: &mut HashMap<String, u3
 
 fn suffix_kind(c: char) -> &'static str {
     scip::suffix_word(&scip::Descriptor { name: "", suffix: c })
+}
+
+/// The language word `code_files.lang` stores for a SCIP document: from
+/// its `language` field, else from its extension; `other` when neither is
+/// known.
+///
+/// # Arguments
+///
+/// * `doc_lang` - the document's `language` (any case; often empty).
+/// * `path` - its path.
+pub fn lang_of(doc_lang: &str, path: &str) -> &'static str {
+    let named = match doc_lang.to_ascii_lowercase().as_str() {
+        "go" => "go",
+        "typescript" | "typescriptreact" => "typescript",
+        "javascript" | "javascriptreact" => "javascript",
+        "python" => "python",
+        "java" => "java",
+        "kotlin" => "kotlin",
+        "scala" => "scala",
+        "csharp" | "c#" => "csharp",
+        "rust" => "rust",
+        "c" => "c",
+        "cpp" | "c++" => "cpp",
+        "ruby" => "ruby",
+        "php" => "php",
+        "dart" => "dart",
+        "swift" => "swift",
+        _ => "",
+    };
+    if !named.is_empty() {
+        return named;
+    }
+    let ext = path.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_lowercase();
+    match ext.as_str() {
+        "go" => "go",
+        "ts" | "tsx" | "mts" | "cts" => "typescript",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "py" | "pyi" => "python",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "scala" | "sc" => "scala",
+        "cs" => "csharp",
+        "rs" => "rust",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "rb" => "ruby",
+        "php" => "php",
+        "dart" => "dart",
+        "swift" => "swift",
+        _ => "other",
+    }
+}
+
+/// Languages whose blocks are indentation (a row with
+/// [`crate::langs::ScanRow::indent`]): end lines come from the scanner's
+/// indentation blocks, else SCIP's enclosing ranges, never from the brace
+/// matcher.
+fn indented(lang: &str) -> bool {
+    crate::langs::by_name(lang).is_some_and(|l| l.scanner.indent)
+}
+
+/// The kind of an impl edge from a SCIP relationship (Rust's impl blocks
+/// are `impl`): it sits on its definition's line, so it is no item of its
+/// own in [`file_items`].
+pub const IMPLEMENTS: &str = "implements";
+
+/// Constructor spellings: TypeScript, Java, C# (and its static
+/// constructor), Python.
+pub const CTORS: &[&str] = &["<constructor>", "<init>", ".ctor", ".cctor", "__init__"];
+
+/// Name, container and shape of a symbol from any SCIP indexer.
+struct Generic<'a> {
+    /// The name stored: the last descriptor, or the type's name for a
+    /// constructor.
+    name: &'a str,
+    /// The last descriptor's suffix.
+    suffix: char,
+    /// The nearest enclosing type, else the nearest callable or term, else
+    /// the last namespace segment.
+    container: String,
+    /// True when the parent descriptor is a type (a member).
+    member: bool,
+    /// True for a constructor.
+    ctor: bool,
+}
+
+impl Generic<'_> {
+    /// `Container::name`, or the name alone.
+    fn qualified(&self) -> String {
+        if self.container.is_empty() {
+            self.name.to_string()
+        } else {
+            format!("{}::{}", self.container, self.name)
+        }
+    }
+}
+
+/// The last segment of a namespace descriptor: `gin` for Go's
+/// `github.com/gin-gonic/gin`, `conftest` for Python's
+/// `examples.tests.conftest`, `standard-schema` for TypeScript's
+/// `standard-schema.ts`.
+fn namespace_name<'a>(name: &'a str, scheme: &str) -> &'a str {
+    let last = name.rsplit('/').next().unwrap_or(name);
+    if scheme == "scip-python" {
+        return last.rsplit('.').next().unwrap_or(last);
+    }
+    for ext in [".d.ts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js", ".mjs", ".cjs", ".py", ".go", ".java", ".kt", ".cs", ".scala"] {
+        if let Some(stem) = last.strip_suffix(ext).filter(|s| !s.is_empty()) {
+            return stem;
+        }
+    }
+    last
+}
+
+/// The member name of a C# explicit interface implementation's
+/// descriptor (`IEnumerable<Serilog.Core.ILogEventEnricher>.GetEnumerator`:
+/// `GetEnumerator`); any other name as it is.
+fn explicit_member(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((iface, member))
+            if !iface.is_empty()
+                && !member.is_empty()
+                && member.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && !iface.starts_with('.') =>
+        {
+            member
+        }
+        _ => name,
+    }
+}
+
+/// Parses a symbol of any indexer: `None` for what is not stored as a
+/// definition or a reference target (parameters, type parameters, `:` meta
+/// such as TypeScript's object-literal members, namespaces and file
+/// modules).
+fn parse_generic(sym: &str) -> Option<Generic<'_>> {
+    let d = scip::descriptors(sym);
+    let last = *d.last()?;
+    if matches!(last.suffix, '[' | ')' | ':' | '/') || last.name.is_empty() {
+        return None;
+    }
+    let scheme = sym.split(' ').next().unwrap_or("");
+    let parents = &d[..d.len() - 1];
+    let is_ctor = last.suffix == '(' && CTORS.contains(&last.name);
+    let owner = parents.last().filter(|x| x.suffix == '#');
+    // A constructor is stored under its type's name, in its type.
+    // scip-typescript names an accessor `<get>name` or `<set>name`: it is
+    // stored under the name it is used by.
+    // A C# explicit interface member is named with its interface
+    // (`System.Collections.IEnumerable.GetEnumerator`): it is stored under
+    // the name it is called by.
+    let (name, ctor) = match owner {
+        Some(t) if is_ctor => (t.name, true),
+        _ => {
+            let n =
+                last.name.strip_prefix("<get>").or_else(|| last.name.strip_prefix("<set>")).filter(|n| !n.is_empty()).unwrap_or(last.name);
+            (explicit_member(n), false)
+        }
+    };
+    let container = if let Some(t) = parents.iter().rev().find(|x| x.suffix == '#') {
+        t.name.to_string()
+    } else if let Some(c) = parents.iter().rev().find(|x| matches!(x.suffix, '(' | '.')) {
+        c.name.to_string()
+    } else {
+        parents.iter().rev().find(|x| x.suffix == '/').map(|x| namespace_name(x.name, scheme).to_string()).unwrap_or_default()
+    };
+    Some(Generic { name, suffix: last.suffix, container, member: owner.is_some(), ctor })
+}
+
+/// The kind word of a definition when the indexer gave none: the nearest
+/// keyword before the name on its line, else its shape (a member term
+/// followed by an accessor block, C#'s `{ get; }`, is a property).
+///
+/// # Arguments
+///
+/// * `g` - the parsed symbol.
+/// * `before` - the definition's line up to the name.
+/// * `after` - the rest of the line from the name.
+fn fallback_kind(g: &Generic<'_>, before: &str, after: &str) -> &'static str {
+    if g.ctor {
+        return "ctor";
+    }
+    for w in before.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).rev() {
+        return match w {
+            "class" | "record" => "class",
+            "interface" | "protocol" => "interface",
+            "struct" => "struct",
+            "enum" => "enum",
+            "trait" => "trait",
+            "def" | "func" | "function" | "fn" | "fun" if g.member => "method",
+            "def" | "func" | "function" | "fn" | "fun" => "fn",
+            "const" => "const",
+            "var" | "let" | "val" => "var",
+            "type" => "type",
+            "event" => "event",
+            _ => continue,
+        };
+    }
+    match g.suffix {
+        '#' => "type",
+        '(' if g.member => "method",
+        '(' => "fn",
+        '!' => "macro",
+        '.' if g.member && ["{ get", "{get", "{ set", "{set", "{ init"].iter().any(|a| after.contains(a)) => "property",
+        // An expression-bodied property (`int Count => n;`).
+        '.' if g.member
+            && after.split_once(|c: char| !(c.is_alphanumeric() || c == '_')).is_some_and(|(_, r)| r.trim_start().starts_with("=>")) =>
+        {
+            "property"
+        }
+        _ if g.member => "field",
+        _ => "var",
+    }
+}
+
+/// Builds rows from a SCIP index of any indexer but rust-analyzer (whose
+/// symbols [`rust_rows`] reads): scip-go, scip-typescript, scip-python,
+/// scip-java, scip-dotnet and the rest share one symbol grammar.
+///
+/// * Definitions: every definition occurrence of a symbol
+///   [`parse_generic`] keeps. Kind from `SymbolInformation.kind`
+///   ([`scip::generic_kind_word`]), else from the line's keyword and the
+///   symbol's shape ([`fallback_kind`]); a constructor is stored under its
+///   type's name with kind `ctor`.
+/// * End lines: the brace matcher where it finds a body that closes (brace
+///   languages), else SCIP's enclosing range, else the line itself; kept in
+///   [`Rows::ends`].
+/// * References: every other occurrence of a symbol defined in the index;
+///   `within` is the innermost type or callable whose range (the end lines
+///   above) holds it, so callers do not depend on the indexer writing
+///   enclosing ranges.
+/// * Impl edges: each `Relationship.is_implementation` from a symbol
+///   defined here, at its definition, under both names, of kind
+///   [`IMPLEMENTS`]; the container is `Base for Impl` (members qualified:
+///   `Shape::Area for Square::Area`).
+///
+/// # Arguments
+///
+/// * `ix` - the decoded index.
+/// * `rows` - where rows go.
+/// * `files` - the file map, shared with the root's other rows.
+/// * `text_of` - a document's text by its path below the root (`None` when
+///   unreadable: its definitions keep SCIP's ranges only).
+pub fn scip_rows(ix: &Index<'_>, rows: &mut Rows, files: &mut HashMap<String, u32>, text_of: &dyn Fn(&str) -> Option<String>) {
+    scip_rows_in(ix, "", &HashSet::new(), rows, files, text_of);
+}
+
+/// [`scip_rows`] for an index written in a unit's folder: its document
+/// paths are relative to `dir` (a folder below the root, `/`-separated;
+/// empty for the root) and are stored, and read through `text_of`,
+/// relative to the root. Documents in `skip` (already read from another
+/// unit's index: a C# project another unit's project references) and
+/// documents outside the root give no rows.
+pub fn scip_rows_in(
+    ix: &Index<'_>,
+    dir: &str,
+    skip: &HashSet<String>,
+    rows: &mut Rows,
+    files: &mut HashMap<String, u32>,
+    text_of: &dyn Fn(&str) -> Option<String>,
+) {
+    let parsed: Vec<Option<Generic<'_>>> = ix.symbols.iter().map(|s| parse_generic(s)).collect();
+    let mut defined = vec![false; ix.symbols.len()];
+    // The first definition occurrence of each symbol, for impl edges.
+    let mut first_def: Vec<Option<usize>> = vec![None; ix.symbols.len()];
+    let mut has_def = vec![false; ix.doc_path.len()];
+    for i in 0..ix.occurrences() {
+        if ix.occ_roles[i] & scip::ROLE_DEFINITION != 0 {
+            let s = ix.occ_sym[i] as usize;
+            defined[s] = true;
+            first_def[s].get_or_insert(i);
+            has_def[ix.occ_doc[i] as usize] |= parsed[s].is_some();
+        }
+    }
+    let (pkg, pkg_keys, pkg_link) = package_links(ix, &defined, rows);
+    let mut pkg_used = vec![false; pkg_keys.len()];
+    let paths: Vec<String> = ix.doc_path.iter().map(|p| rebase(dir, p)).collect();
+    let keep: Vec<bool> = paths.iter().map(|p| !skip.contains(p) && !p.starts_with("../")).collect();
+    let langs: Vec<&'static str> = paths.iter().zip(&ix.doc_lang).map(|(p, l)| lang_of(l, p)).collect();
+    let doc_file: Vec<u32> =
+        paths.iter().zip(&langs).zip(&keep).map(|((p, l), &k)| if k { rows.file(files, p, l) } else { u32::MAX }).collect();
+    let texts: Vec<Option<String>> =
+        paths.iter().zip(&has_def).zip(&keep).map(|((p, &h), &k)| if h && k { text_of(p) } else { None }).collect();
+    let lines: Vec<Vec<&str>> = texts.iter().map(|t| t.as_deref().map(|t| t.lines().collect()).unwrap_or_default()).collect();
+    // Per document, each type or callable with its range: (start, end,
+    // symbol), 1-based.
+    let mut scopes: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); ix.doc_path.len()];
+    // Per document, the scanner's end line by definition line (scanned
+    // when a definition first needs it).
+    let mut scan_ends: Vec<Option<HashMap<u32, u32>>> = vec![None; ix.doc_path.len()];
+    for i in 0..ix.occurrences() {
+        if ix.occ_roles[i] & scip::ROLE_DEFINITION == 0 {
+            continue;
+        }
+        let s = ix.occ_sym[i] as usize;
+        let Some(g) = &parsed[s] else { continue };
+        let doc = ix.occ_doc[i] as usize;
+        if !keep[doc] {
+            continue;
+        }
+        let file = doc_file[doc];
+        let line = ix.occ_line[i].max(0) as u32 + 1;
+        let col = ix.occ_col[i].max(0) as u32;
+        let kind = match scip::generic_kind_word(ix.info[s].kind) {
+            Some(_) if g.ctor => "ctor",
+            Some(k) => k,
+            None => {
+                let text_line = lines[doc].get(line as usize - 1).copied().unwrap_or("");
+                let mut at = (col as usize).min(text_line.len());
+                while !text_line.is_char_boundary(at) {
+                    at -= 1;
+                }
+                fallback_kind(g, &text_line[..at], &text_line[at..])
+            }
+        };
+        let brace = if indented(langs[doc]) || lines[doc].len() < line as usize { None } else { crate::digest::brace_body_end(&lines[doc], line as usize - 1).map(|e| e as u32) };
+        let scip_end = (ix.occ_encl_end[i] != scip::NONE).then(|| ix.occ_encl_end[i].max(0) as u32 + 1);
+        // The scanner's end for a definition on the line: an indentation
+        // language's first choice, and a brace language's when it has
+        // neither a brace body nor an enclosing range (scip-dotnet writes
+        // none; the brace matcher stops at a base list's or a `where`
+        // clause's comma).
+        let mut scanned = || {
+            let lang = crate::langs::of_path(&paths[doc])?;
+            let ends = scan_ends[doc].get_or_insert_with(|| {
+                let mut m: HashMap<u32, u32> = HashMap::new();
+                for d in crate::scanner::of(lang).scan_file(&paths[doc], texts[doc].as_deref().unwrap_or("")) {
+                    let e = m.entry(d.line).or_insert(d.end);
+                    *e = (*e).max(d.end);
+                }
+                m
+            });
+            ends.get(&line).copied()
+        };
+        let end = if indented(langs[doc]) { scanned().or(scip_end) } else { brace.or(scip_end).or_else(scanned) };
+        let end = end.unwrap_or(line).max(line);
+        rows.ends.insert((file, line), end);
+        if matches!(g.suffix, '#' | '(') {
+            scopes[doc].push((line, end, s as u32));
+        }
+        rows.occ.push(Occ { name: g.name.to_string(), sect: SECT_DEF, file, line, col, kind: kind.into(), container: g.container.clone(), within: String::new() });
+        rows.stats.scip_defs += 1;
+    }
+    for i in 0..ix.occurrences() {
+        let roles = ix.occ_roles[i];
+        if roles & scip::ROLE_DEFINITION != 0 {
+            continue;
+        }
+        let s = ix.occ_sym[i] as usize;
+        let Some(g) = &parsed[s] else { continue };
+        if !defined[s] && !external_ref(rows, pkg[s], &pkg_keys, &pkg_link, &mut pkg_used) {
+            continue;
+        }
+        let doc = ix.occ_doc[i] as usize;
+        if !keep[doc] {
+            continue;
+        }
+        let line = ix.occ_line[i].max(0) as u32 + 1;
+        let within = scopes[doc]
+            .iter()
+            .filter(|(a, b, sym)| *a <= line && line <= *b && *sym as usize != s)
+            .max_by_key(|(a, b, _)| (*a, u32::MAX - *b))
+            .and_then(|(_, _, sym)| parsed[*sym as usize].as_ref())
+            .map(Generic::qualified)
+            .unwrap_or_default();
+        let kind = if roles & scip::ROLE_IMPORT != 0 {
+            "use"
+        } else if roles & scip::ROLE_WRITE != 0 {
+            "write"
+        } else {
+            ""
+        };
+        rows.occ.push(Occ { name: g.name.to_string(), sect: SECT_REF, file: doc_file[doc], line, col: ix.occ_col[i].max(0) as u32, kind: kind.into(), container: g.container.clone(), within });
+        rows.stats.scip_refs += 1;
+    }
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    for r in 0..ix.rel_from.len() {
+        if ix.rel_flags[r] & scip::REL_IMPLEMENTATION == 0 {
+            continue;
+        }
+        let (a, b) = (ix.rel_from[r], ix.rel_to[r]);
+        let (Some(at), Some(ga), Some(gb)) = (first_def[a as usize], &parsed[a as usize], &parsed[b as usize]) else { continue };
+        if !keep[ix.occ_doc[at] as usize] || !seen.insert((a, b)) {
+            continue;
+        }
+        let q = |g: &Generic<'_>| if g.suffix == '#' { g.name.to_string() } else { g.qualified() };
+        let edge = format!("{} for {}", q(gb), q(ga));
+        let file = doc_file[ix.occ_doc[at] as usize];
+        let line = ix.occ_line[at].max(0) as u32 + 1;
+        let col = ix.occ_col[at].max(0) as u32;
+        // A member implementing its namesake (`Area` for `Shape::Area`) is
+        // one row.
+        let names = if ga.name == gb.name { vec![ga.name] } else { vec![ga.name, gb.name] };
+        for name in names {
+            rows.occ.push(Occ { name: name.to_string(), sect: SECT_IMPL, file, line, col, kind: IMPLEMENTS.into(), container: edge.clone(), within: String::new() });
+            rows.stats.impls += 1;
+        }
+    }
+}
+
+/// A SCIP document path relative to the root: `/`-separated, below the
+/// unit folder `dir` (empty: the root).
+pub fn rebase(dir: &str, path: &str) -> String {
+    let p = path.replace('\\', "/");
+    let p = p.trim_start_matches("./");
+    let joined = if dir.is_empty() { p.to_string() } else { format!("{dir}/{p}") };
+    if !joined.split('/').any(|c| c == ".." || c == ".") {
+        return joined;
+    }
+    // A document beside the unit (`../lib/a.cs`): the path below the root,
+    // or still starting with `../` when it is outside the root.
+    let mut out: Vec<&str> = Vec::new();
+    for c in joined.split('/') {
+        match c {
+            "." | "" => {}
+            ".." if out.last().is_some_and(|l| *l != "..") => {
+                out.pop();
+            }
+            _ => out.push(c),
+        }
+    }
+    out.join("/")
+}
+
+/// True when an index came from rust-analyzer (or names no tool and holds
+/// only `.rs` documents, as hand-built test indexes do): its symbols are
+/// read by [`rust_rows`], every other index's by [`scip_rows`].
+pub fn is_rust_index(ix: &Index<'_>) -> bool {
+    match ix.tool.0 {
+        "rust-analyzer" => true,
+        "" => ix.doc_path.iter().all(|p| p.ends_with(".rs")),
+        _ => false,
+    }
 }
 
 /// Rust item keywords the line scan recognises.
@@ -945,6 +1761,76 @@ pub fn wgsl_rows(texts: &[(String, String)], rows: &mut Rows, files: &mut HashMa
     }
 }
 
+/// Builds scanner rows ([`crate::scanner`]) for files of the languages of
+/// [`crate::langs`]: definitions with their kinds marked `(scan)`,
+/// containers and end lines (kept in [`Rows::ends`]), no references.
+/// Every file is registered, so later rows (rpc call sites) find it under
+/// its language.
+///
+/// # Arguments
+///
+/// * `texts` - each file's path below the root and text; a file of no
+///   row's language is skipped.
+/// * `rows` - where rows go.
+/// * `files` - the shared file map.
+pub fn lang_rows(texts: &[(String, String)], rows: &mut Rows, files: &mut HashMap<String, u32>) {
+    for (path, text) in texts {
+        let Some(lang) = crate::langs::of_path(path) else { continue };
+        let file = rows.file(files, path, lang.name);
+        for d in crate::scanner::of(lang).scan_file(path, text) {
+            // Several definitions on a line share its end: the longest.
+            let e = rows.ends.entry((file, d.line)).or_insert(d.end);
+            *e = (*e).max(d.end);
+            rows.occ.push(Occ {
+                name: d.name,
+                sect: SECT_DEF,
+                file,
+                line: d.line,
+                col: d.col,
+                kind: format!("{} (scan)", d.kind),
+                container: d.container,
+                within: String::new(),
+            });
+            rows.stats.lang_defs += 1;
+        }
+    }
+}
+
+/// Adds, for files of a row that fills ([`crate::langs::Lang::fills`]) and
+/// that a SCIP index covers, the scanner's definitions on lines where the
+/// index has no definition, marked `(scan)` as [`lang_rows`] marks them.
+///
+/// # Arguments
+///
+/// * `texts` - the root's source files of the language table, by path.
+/// * `covered` - the paths an index has a document for.
+pub fn fill_rows(texts: &[(String, String)], covered: &HashSet<String>, rows: &mut Rows, files: &mut HashMap<String, u32>) {
+    let mut have: Option<HashSet<(u32, u32)>> = None;
+    for (path, text) in texts {
+        let Some(lang) = crate::langs::of_path(path).filter(|l| l.fills && covered.contains(path)) else { continue };
+        let have = have.get_or_insert_with(|| rows.occ.iter().filter(|o| o.sect == SECT_DEF).map(|o| (o.file, o.line)).collect());
+        let file = rows.file(files, path, lang.name);
+        for d in crate::scanner::of(lang).scan_file(path, text) {
+            if have.contains(&(file, d.line)) {
+                continue;
+            }
+            let e = rows.ends.entry((file, d.line)).or_insert(d.end);
+            *e = (*e).max(d.end);
+            rows.occ.push(Occ {
+                name: d.name,
+                sect: SECT_DEF,
+                file,
+                line: d.line,
+                col: d.col,
+                kind: format!("{} (scan)", d.kind),
+                container: d.container,
+                within: String::new(),
+            });
+            rows.stats.lang_defs += 1;
+        }
+    }
+}
+
 /// Reads a source file as text (lossy), or `None` when it is missing or
 /// over [`MAX_FILE`].
 pub fn read_source(root: &Path, rel: &str) -> Option<String> {
@@ -983,7 +1869,8 @@ pub struct WriteStats {
 /// * `text_of` - each file's text, by index into `rows.files` (`None` for
 ///   an unreadable file: its rows keep no snippet).
 /// * `fingerprint` - the walk fingerprint the rows were built from.
-/// * `rust` - a one-line note on the Rust side (`scip`, `scan only: why`).
+/// * `units` - the root's units (`code_units`); `code_roots.rust` gets
+///   their [`units_note`].
 /// * `elapsed_ms` - how long the indexing took.
 ///
 /// # Errors
@@ -996,7 +1883,7 @@ pub fn write_root(
     rows: &Rows,
     text_of: &dyn Fn(usize) -> Option<String>,
     fingerprint: &str,
-    rust: &str,
+    units: &[Unit],
     elapsed_ms: u64,
 ) -> Result<WriteStats> {
     ensure_schema(conn)?;
@@ -1005,12 +1892,30 @@ pub fn write_root(
     tx.execute("DELETE FROM code_lines WHERE file IN (SELECT id FROM code_files WHERE root = ?1)", [root])?;
     tx.execute("DELETE FROM code_files WHERE root = ?1", [root])?;
     tx.execute("DELETE FROM code_counts WHERE root = ?1", [root])?;
-    let mut ids = Vec::with_capacity(rows.files.len());
+    tx.execute("DELETE FROM code_units WHERE root = ?1", [root])?;
+    tx.execute("DELETE FROM code_packages WHERE root = ?1", [root])?;
     {
+        let mut st = tx.prepare("INSERT OR IGNORE INTO code_packages(root, package, defines) VALUES(?1, ?2, ?3)")?;
+        for p in &rows.pkg_defs {
+            st.execute(params![root, p, 1])?;
+        }
+        for p in rows.pkg_uses.iter().filter(|p| !rows.pkg_defs.contains(*p)) {
+            st.execute(params![root, p, 0])?;
+        }
+    }
+    // File ids order a name's rows within each section: `.proto` files
+    // first (an rpc's definition), generated code last (its stubs), the
+    // rest as walked.
+    let mut ids = vec![0; rows.files.len()];
+    {
+        let rank = |p: &str| if p.ends_with(".proto") { 0 } else if crate::langs::is_generated(p) { 2 } else { 1 };
+        let mut by_rank: Vec<usize> = (0..rows.files.len()).collect();
+        by_rank.sort_by_key(|&i| rank(&rows.files[i].0));
         let mut st = tx.prepare("INSERT INTO code_files(root, path, lang) VALUES(?1, ?2, ?3)")?;
-        for (p, lang) in &rows.files {
+        for i in by_rank {
+            let (p, lang) = &rows.files[i];
             st.execute(params![root, p, lang])?;
-            ids.push(tx.last_insert_rowid());
+            ids[i] = tx.last_insert_rowid();
         }
     }
     // Rows sorted by key so the b-tree is written in order.
@@ -1026,7 +1931,7 @@ pub fn write_root(
     let mut ends: HashMap<(u32, u32), u32> = HashMap::new();
     {
         let mut by_file: HashMap<u32, Vec<u32>> = HashMap::new();
-        for o in rows.occ.iter().filter(|o| o.sect != SECT_REF) {
+        for o in rows.occ.iter().filter(|o| o.sect != SECT_REF && !rows.ends.contains_key(&(o.file, o.line))) {
             by_file.entry(o.file).or_default().push(o.line);
         }
         for (f, defs) in by_file {
@@ -1052,7 +1957,7 @@ pub fn write_root(
             let key = (o.name.as_str(), o.sect, o.file, o.line, o.col);
             ord = if prev == Some(key) { ord + 1 } else { 0 };
             prev = Some(key);
-            let end = if o.sect != SECT_REF { ends.get(&(o.file, o.line)).copied().unwrap_or(0) } else { 0 };
+            let end = if o.sect != SECT_REF { rows.ends.get(&(o.file, o.line)).or_else(|| ends.get(&(o.file, o.line))).copied().unwrap_or(0) } else { 0 };
             st.execute(params![o.name, o.sect, ids[o.file as usize], o.line, o.col, ord, o.kind, o.container, o.within, end])?;
             counts.entry(o.name.as_str()).or_insert([0; 3])[o.sect as usize] += 1;
             need[o.file as usize].insert(o.line);
@@ -1090,17 +1995,24 @@ pub fn write_root(
             }
         }
     }
+    let now = crate::store::utc(SystemTime::now());
+    {
+        let mut st = tx.prepare("INSERT OR REPLACE INTO code_units(root, dir, lang, source, fingerprint, indexed, elapsed_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+        for u in units {
+            st.execute(params![root, u.dir, u.lang, u.source, fingerprint, now, elapsed_ms as i64])?;
+        }
+    }
     tx.execute(
         "INSERT OR REPLACE INTO code_roots(root, fingerprint, indexed, files, defs, refs, impls, rust, elapsed_ms, dir) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             root,
             fingerprint,
-            crate::store::utc(SystemTime::now()),
+            now,
             ws.files as i64,
             ws.defs as i64,
             ws.refs as i64,
             ws.impls as i64,
-            rust,
+            units_note(units),
             elapsed_ms as i64,
             dir.to_string_lossy().replace('\\', "/")
         ],
@@ -1271,6 +2183,58 @@ pub struct RootRecord {
     pub rust: String,
 }
 
+/// The packages code roots have recorded ([`write_root`]): those `root`
+/// defines when `own`, else those every other root defines (the packages a
+/// reference of `root` is stored into: [`Rows::linked`]).
+///
+/// # Errors
+///
+/// [`Error::Db`] from SQLite (a missing table is an empty set).
+pub fn defined_packages(conn: &Connection, root: &str, own: bool) -> Result<HashSet<String>> {
+    let sql = if own {
+        "SELECT package FROM code_packages WHERE defines = 1 AND root = ?1"
+    } else {
+        "SELECT DISTINCT package FROM code_packages WHERE defines = 1 AND root <> ?1"
+    };
+    let mut st = match conn.prepare_cached(sql) {
+        Ok(st) => st,
+        Err(e) if e.to_string().contains("no such table") => return Ok(HashSet::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let rows = st.query_map([root], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// After `root` was written: when the packages it defines changed (`before`
+/// to `after`), every other root whose references go into a changed one has
+/// its fingerprint cleared, so the next walk re-indexes it and its
+/// cross-root references follow. Nothing else is re-indexed: a root's rows
+/// never need another root's run, only its recorded packages.
+///
+/// # Returns
+///
+/// How many roots were marked.
+///
+/// # Errors
+///
+/// [`Error::Db`] from SQLite.
+pub fn mark_package_users(conn: &Connection, root: &str, before: &HashSet<String>, after: &HashSet<String>) -> Result<usize> {
+    let mut changed: Vec<&String> = before.symmetric_difference(after).collect();
+    if changed.is_empty() {
+        return Ok(0);
+    }
+    changed.sort();
+    let mut st = conn.prepare_cached(
+        "UPDATE code_roots SET fingerprint = '' WHERE root <> ?1 AND fingerprint <> ''
+         AND root IN (SELECT root FROM code_packages WHERE package = ?2 AND defines = 0)",
+    )?;
+    let mut n = 0;
+    for p in changed {
+        n += st.execute(params![root, p])?;
+    }
+    Ok(n)
+}
+
 /// Every root's last indexing, by name.
 ///
 /// # Errors
@@ -1311,7 +2275,7 @@ impl Item {
 fn short_kind(kind: &str) -> String {
     let k = kind.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
     match k.as_str() {
-        "function" | "method" | "staticmethod" | "constructor" => "fn".into(),
+        "function" | "method" | "staticmethod" | "constructor" | "ctor" => "fn".into(),
         "module" | "namespace" => "mod".into(),
         "constant" => "const".into(),
         "typealias" | "typeparameter" => "type".into(),
@@ -1390,7 +2354,9 @@ pub fn file_items(conn: &Connection, path: &str) -> Result<Option<Vec<Item>>> {
     }
     // Definitions, and impl blocks (an impl edge row names its block
     // `Trait for Type`; the two rows of one block become one item).
-    let mut st = conn.prepare_cached("SELECT name, kind, container, line, end_line, sect FROM code_occ WHERE file = ?1 AND sect IN (0, 2)")?;
+    // An impl edge from a SCIP relationship (kind `implements`) sits on its
+    // definition's own line and range: the definition is the item.
+    let mut st = conn.prepare_cached("SELECT name, kind, container, line, end_line, sect FROM code_occ WHERE file = ?1 AND sect IN (0, 2) AND kind <> 'implements'")?;
     let mut items: Vec<Item> = st
         .query_map([file], |r| {
             let name: String = r.get(0)?;
@@ -1446,7 +2412,8 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
     }
     let Some((root, _, dir, rel)) = root_of(conn, path)? else { return Ok(Reindexed::NotCovered) };
     let wgsl = rel.ends_with(".wgsl");
-    if !relevant(&rel) || !(wgsl || rel.ends_with(".rs")) {
+    let lang = source_lang(&rel);
+    if !relevant(&rel) || !(wgsl || rel.ends_with(".rs") || lang.is_some()) {
         return Ok(Reindexed::NotCovered);
     }
     let text = read_source(Path::new(&dir), &rel);
@@ -1456,6 +2423,8 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
         let one = [(rel.clone(), t.clone())];
         if wgsl {
             wgsl_rows(&one, &mut rows, &mut files);
+        } else if lang.is_some() {
+            lang_rows(&one, &mut rows, &mut files);
         } else {
             scan_rows(&one, &mut rows, &mut files);
         }
@@ -1487,7 +2456,7 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
             id
         }
         None => {
-            tx.execute("INSERT INTO code_files(root, path, lang, indexed) VALUES(?1, ?2, ?3, ?4)", params![root, rel, if wgsl { "wgsl" } else { "rust" }, now])?;
+            tx.execute("INSERT INTO code_files(root, path, lang, indexed) VALUES(?1, ?2, ?3, ?4)", params![root, rel, if wgsl { "wgsl" } else { lang.map_or("rust", |l| l.name) }, now])?;
             tx.last_insert_rowid()
         }
     };
@@ -1505,7 +2474,11 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
             let key = (o.name.as_str(), o.sect, o.line, o.col);
             ord = if prev == Some(key) { ord + 1 } else { 0 };
             prev = Some(key);
-            let end = if o.sect != SECT_REF && o.line >= 1 && (o.line as usize) <= lines.len() { crate::digest::item_end(&lines, o.line as usize - 1) as u32 } else { 0 };
+            let end = match rows.ends.get(&(o.file, o.line)) {
+                Some(&e) if o.sect != SECT_REF => e,
+                _ if o.sect != SECT_REF && o.line >= 1 && (o.line as usize) <= lines.len() => crate::digest::item_end(&lines, o.line as usize - 1) as u32,
+                _ => 0,
+            };
             st.execute(params![o.name, o.sect, id, o.line, o.col, ord, o.kind, o.container, o.within, end])?;
             names.insert(o.name.clone());
             need.insert(o.line);
@@ -1680,6 +2653,165 @@ mod tests {
     }
 
     #[test]
+    fn generic_symbol_parts() {
+        fn part(sym: &str) -> Option<(&str, char, String, bool, bool)> {
+            parse_generic(sym).map(|g| (g.name, g.suffix, g.container, g.member, g.ctor))
+        }
+        // The samples of each indexer's scheme in docs/design/langs.md.
+        assert_eq!(
+            part("scip-go gomod github.com/gin-gonic/gin 0f09c3a9b462 `github.com/gin-gonic/gin`/authPairs#searchCredential()."),
+            Some(("searchCredential", '(', "authPairs".into(), true, false))
+        );
+        assert_eq!(part("scip-go gomod github.com/gin-gonic/gin 0f09c3a9b462 `github.com/gin-gonic/gin`/New()."), Some(("New", '(', "gin".into(), false, false)));
+        assert_eq!(
+            part("scip-typescript npm got 16.2.0 source/core/`standard-schema.ts`/StandardSchemaV1Issue#"),
+            Some(("StandardSchemaV1Issue", '#', "standard-schema".into(), false, false))
+        );
+        assert_eq!(part("scip-python python flask 49943b5 `examples.tutorial.tests.conftest`/AuthActions#"), Some(("AuthActions", '#', "conftest".into(), false, false)));
+        assert_eq!(
+            part("semanticdb maven maven/com.google.code.gson/gson 2.15.1-SNAPSHOT com/google/gson/JsonNull#deepCopy()."),
+            Some(("deepCopy", '(', "JsonNull".into(), true, false))
+        );
+        // Constructors take their type's name.
+        assert_eq!(
+            part("scip-dotnet nuget . . Capturing/PropertyValueConverter#DepthLimiter#`.ctor`()."),
+            Some(("DepthLimiter", '(', "DepthLimiter".into(), true, true))
+        );
+        assert_eq!(part("scip-typescript npm shapes 1.0.0 src/`shapes.ts`/Square#`<constructor>`()."), Some(("Square", '(', "Square".into(), true, true)));
+        assert_eq!(part("semanticdb maven . . a/B#`<init>`()."), Some(("B", '(', "B".into(), true, true)));
+        // A C# static constructor too; an explicit interface member by the
+        // name it is called by.
+        assert_eq!(
+            part("scip-dotnet nuget . . Core/LoggerTests#`.cctor`()."),
+            Some(("LoggerTests", '(', "LoggerTests".into(), true, true))
+        );
+        assert_eq!(
+            part("scip-dotnet nuget . . Context/EnricherStack#`System.Collections.Generic.IEnumerable<Serilog.Core.ILogEventEnricher>.GetEnumerator`()."),
+            Some(("GetEnumerator", '(', "EnricherStack".into(), true, false))
+        );
+        assert_eq!(explicit_member("System.Collections.IEnumerator.Current"), "Current");
+        assert_eq!(explicit_member("plain"), "plain");
+        assert_eq!(explicit_member("a.b-c"), "a.b-c", "only an identifier after the dot");
+        // A Python class inside a function: the function is the container.
+        assert_eq!(part("scip-python python p 1 `m`/make().Inner#"), Some(("Inner", '#', "make".into(), false, false)));
+        // Not stored: parameters, type parameters, `:` members, namespaces.
+        assert!(parse_generic("scip-typescript npm shapes 1.0.0 src/`shapes.ts`/total().(shapes)").is_none());
+        assert!(parse_generic("semanticdb maven . . a/B#[T]").is_none());
+        assert!(parse_generic("scip-typescript npm got 16.2.0 source/`index.ts`/options0:").is_none());
+        assert!(parse_generic("scip-typescript npm shapes 1.0.0 src/`shapes.ts`/").is_none());
+        assert!(parse_generic("local 3").is_none());
+    }
+
+    #[test]
+    fn kinds_without_an_indexer_kind() {
+        let k = |sym: &str, line: &str, name: &str| {
+            let g = parse_generic(sym).unwrap();
+            let at = line.find(name).unwrap();
+            fallback_kind(&g, &line[..at], &line[at..])
+        };
+        let cs = "scip-dotnet nuget . . Shapes/";
+        assert_eq!(k(&format!("{cs}IShape#"), "    public interface IShape", "IShape"), "interface");
+        assert_eq!(k(&format!("{cs}Square#Name."), "    public string Name => $\"{Side}\";", "Name"), "property");
+        assert_eq!(k(&format!("{cs}Square#_side."), "    readonly double _side = 1;", "_side"), "field");
+        assert_eq!(k(&format!("{cs}Square#"), "    public sealed class Square : IShape", "Square"), "class");
+        assert_eq!(k(&format!("{cs}Point#"), "    public readonly record struct Point(int X);", "Point"), "struct");
+        assert_eq!(k(&format!("{cs}Square#`.ctor`()."), "        public Square(double side)", "Square"), "ctor");
+        assert_eq!(k(&format!("{cs}Square#Area()."), "        public double Area()", "Area"), "method");
+        assert_eq!(k(&format!("{cs}Square#Side."), "        public double Side { get; }", "Side"), "property");
+        assert_eq!(k(&format!("{cs}Square#side."), "        private double side;", "side"), "field");
+        let py = "scip-python python p 1 `pkg.shapes`/";
+        assert_eq!(k(&format!("{py}Square#"), "class Square(Shape):", "Square"), "class");
+        assert_eq!(k(&format!("{py}Square#area()."), "    def area(self):", "area"), "method");
+        assert_eq!(k(&format!("{py}total()."), "def total(shapes):", "total"), "fn");
+        assert_eq!(k(&format!("{py}UNIT."), "UNIT = 1.0", "UNIT"), "var");
+    }
+
+    #[test]
+    fn languages_of_documents() {
+        assert_eq!(lang_of("TypeScript", "src/a.ts"), "typescript");
+        assert_eq!(lang_of("", "src\\a.tsx"), "typescript");
+        assert_eq!(lang_of("", "shapes.go"), "go");
+        assert_eq!(lang_of("", "Shapes.cs"), "csharp");
+        assert_eq!(lang_of("python", "x"), "python");
+        assert_eq!(lang_of("", "README"), "other");
+    }
+
+    #[test]
+    fn units_note_keeps_the_rust_note() {
+        let u = |lang: &str, source: &str| Unit { dir: String::new(), lang: lang.into(), source: source.into() };
+        assert_eq!(units_note(&[u("rust", "scip")]), "scip");
+        assert_eq!(units_note(&[]), "no Rust files");
+        assert_eq!(units_note(&[u("go", "prebuilt scip-go 0.2.9")]), "go: prebuilt scip-go 0.2.9");
+        assert_eq!(units_note(&[u("rust", "scan only: x"), u("go", "prebuilt scip-go 0.2.9")]), "rust: scan only: x; go: prebuilt scip-go 0.2.9");
+        // Fixture units are indexed but not named, unless nothing else is.
+        let at = |dir: &str, lang: &str, source: &str| Unit { dir: dir.into(), lang: lang.into(), source: source.into() };
+        let units = [u("rust", "scip"), at("fixtures/scip/ts", "typescript", "scan only: x"), at("svc/testdata/m", "go", "scan only: y")];
+        assert_eq!(units_note(&units), "scip");
+        assert_eq!(units_note(&units[1..2]), "typescript fixtures/scip/ts: scan only: x");
+        assert_eq!(
+            units_note(&[at("web", "typescript", "scip-typescript 0.5.2"), units[1].clone()]),
+            "typescript web: scip-typescript 0.5.2"
+        );
+        assert!(!fixture_unit("fixturesque") && fixture_unit("fixtures") && !fixture_unit(""));
+    }
+
+    #[test]
+    fn schema_migrates_from_code_5_and_6_and_rebuilds_from_older() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        // A code-5 database: the same tables without code_units, and rows.
+        conn.execute_batch(
+            "DROP TABLE code_units;
+             UPDATE meta SET value = 'code-5' WHERE key = 'code_schema';
+             INSERT INTO code_files(id, root, path, lang) VALUES(1, 'app', 'src/lib.rs', 'rust');
+             INSERT INTO code_occ(name, sect, file, line, col, ord, kind, container, within, end_line) VALUES('Store', 0, 1, 3, 11, 0, 'struct', '', '', 3);
+             INSERT INTO code_counts(name, root, defs, refs, impls) VALUES('Store', 'app', 1, 0, 0);
+             INSERT INTO code_roots(root, fingerprint, indexed, files, defs, refs, impls, rust, elapsed_ms, dir) VALUES('app', 'fp', '2026-11-01T00:00:00.000Z', 1, 1, 0, 0, 'scip', 42, 'C:/app');
+             INSERT INTO code_roots(root, fingerprint, indexed, files, defs, refs, impls, rust, elapsed_ms, dir) VALUES('shaders', 'fp2', '2026-11-01T00:00:00.000Z', 0, 0, 0, 0, 'no Rust files', 1, 'C:/shaders');",
+        )
+        .unwrap();
+        ensure_schema(&conn).unwrap();
+        let schema: String = conn.query_row("SELECT value FROM meta WHERE key = 'code_schema'", [], |r| r.get(0)).unwrap();
+        assert_eq!(schema, CODE_SCHEMA);
+        let occ: i64 = conn.query_row("SELECT COUNT(*) FROM code_occ", [], |r| r.get(0)).unwrap();
+        assert_eq!(occ, 1, "a code-5 index keeps its rows");
+        let units: Vec<(String, String, String, String, String, i64)> = conn
+            .prepare("SELECT root, dir, lang, source, fingerprint, elapsed_ms FROM code_units")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(units, [("app".into(), "".into(), "rust".into(), "scip".into(), "fp".into(), 42)], "one Rust unit per Rust root");
+        assert_eq!(root_records(&conn).unwrap()["app"].rust, "scip");
+        // Then on to code-7: code_packages, and every root re-indexed to
+        // fill it.
+        assert_eq!(root_records(&conn).unwrap()["app"].fingerprint, "");
+        // From code-6: the rows stay, the roots are stale.
+        conn.execute_batch(
+            "DROP TABLE code_packages;
+             UPDATE meta SET value = 'code-6' WHERE key = 'code_schema';
+             UPDATE code_roots SET fingerprint = 'fp';",
+        )
+        .unwrap();
+        ensure_schema(&conn).unwrap();
+        let occ: i64 = conn.query_row("SELECT COUNT(*) FROM code_occ", [], |r| r.get(0)).unwrap();
+        let pkgs: i64 = conn.query_row("SELECT COUNT(*) FROM code_packages", [], |r| r.get(0)).unwrap();
+        assert_eq!((occ, pkgs), (1, 0), "a code-6 index keeps its rows");
+        assert!(root_records(&conn).unwrap().values().all(|r| r.fingerprint.is_empty()));
+        // Current: nothing to do.
+        ensure_schema(&conn).unwrap();
+        let occ: i64 = conn.query_row("SELECT COUNT(*) FROM code_occ", [], |r| r.get(0)).unwrap();
+        assert_eq!(occ, 1);
+        // Any older schema is rebuilt (its rows dropped).
+        conn.execute("UPDATE meta SET value = 'code-4' WHERE key = 'code_schema'", []).unwrap();
+        ensure_schema(&conn).unwrap();
+        let occ: i64 = conn.query_row("SELECT COUNT(*) FROM code_occ", [], |r| r.get(0)).unwrap();
+        let units: i64 = conn.query_row("SELECT COUNT(*) FROM code_units", [], |r| r.get(0)).unwrap();
+        assert_eq!((occ, units), (0, 0));
+    }
+
+    #[test]
     fn relevant_paths() {
         assert!(relevant("src/a.rs"));
         assert!(relevant("crates/x/Cargo.toml"));
@@ -1687,5 +2819,41 @@ mod tests {
         assert!(!relevant("target/debug/build/x.rs"));
         assert!(!relevant(".git/HEAD"));
         assert!(!relevant("README.md"));
+    }
+}
+
+impl std::fmt::Display for RowStats {
+    /// `name N` pairs for the nonzero counts, as `--code-index` prints them.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let all = [
+            ("scip defs", self.scip_defs),
+            ("scan defs", self.scan_defs),
+            ("scip refs", self.scip_refs),
+            ("external refs", self.external_refs),
+            ("cross-root refs", self.xroot_refs),
+            ("impls", self.impls),
+            ("wgsl defs", self.wgsl_defs),
+            ("wgsl refs", self.wgsl_refs),
+            ("proto defs", self.proto_defs),
+            ("proto refs", self.proto_refs),
+            ("mentions", self.mentions),
+            ("other-language defs", self.lang_defs),
+            ("rpc stubs", self.rpc_stubs),
+            ("rpc calls", self.rpc_calls),
+            ("rpc servers", self.rpc_servers),
+        ];
+        let shown: Vec<String> = all.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{n} {k}")).collect();
+        if shown.is_empty() {
+            f.write_str("none")
+        } else {
+            f.write_str(&shown.join(", "))
+        }
+    }
+}
+
+impl std::fmt::Display for WriteStats {
+    /// `N files, N defs, N refs, N impls, N lines`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} files, {} defs, {} refs, {} impls, {} lines", self.files, self.defs, self.refs, self.impls, self.lines)
     }
 }

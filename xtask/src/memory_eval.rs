@@ -16,9 +16,35 @@
 //!   `decision_queue`, `awaiting` and `next_id` against counts taken from
 //!   the database and the files directly.
 //!
+//! * (d) repeats: every question's first call made again by the same agent
+//!   (announced by the PreToolUse hook), which may answer `unchanged since`
+//!   or with the changed lines; read with the earlier answer, it must find
+//!   the facts the first answer did.
+//!
+//! * (e) anchors: the question set again with `recall.pointer_anchors` on,
+//!   the follow-up `recall {key}` as before, then `read_note` of a window of
+//!   lines from the picked pointer's anchor instead: tokens and facts each way.
+//!
+//! * (f) a subagent without hooks: with no agent identity the server compares
+//!   repeats per process, so a subagent asking what its parent asked may be
+//!   told `unchanged since call #N`; it must reach the facts by following
+//!   the `fresh: true` the reply names.
+//!
+//! Every question of (b), (c) and (e) is asked by its own agent, named to the
+//! server by a PreToolUse hook as Claude Code does, so no answer is a
+//! reference to another question's.
+//!
 //! `--floor F` (repeatable) also replays every recall question through the
 //! UserPromptSubmit hook with `recall.inject_floor` at F: the injected
-//! pointers, then the same one follow-up.
+//! pointers, then the same one follow-up. Each floor runs twice, context
+//! selection (`recall.select`) off and then on, the second with a
+//! `selection:` line (pointers trimmed and collapsed, tokens whole and
+//! sent); with the first floor,
+//!
+//! * (h) lane briefs: the lane questions as prompts, so the hook injects the
+//!   lane's journal; then the lane follow-up of (c)'s rule. A question passes
+//!   when its facts are in the injection and that follow-up, and the row
+//!   also counts those found in the injection alone.
 //!
 //! The question file is plain text, one block per question:
 //!
@@ -40,6 +66,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use atlas::json::Value;
+
+/// The start (g) builds its checkpoint card from: the whole eval store, on
+/// purpose. An explicit start, so not the bounded unknown-start window a
+/// live hook uses (the snapshot's records are older than that window).
+const EVAL_CARD_SINCE: &str = "0";
 
 /// One question of the set.
 #[derive(Debug, Clone, PartialEq)]
@@ -244,9 +275,20 @@ fn names_source(q: &Question, text: &str) -> bool {
     }
 }
 
+/// The anchor a pointer line for `key` ends with: (source, path, line).
+pub fn pointer_anchor(first: &str, key: &str) -> Option<(String, String, usize)> {
+    let l = first.lines().find(|l| l.strip_prefix("- ").and_then(|r| r.split_whitespace().next()) == Some(key))?;
+    let a = l.rsplit_once(" @")?.1.trim();
+    let (src, rest) = a.split_once(':')?;
+    let (path, line) = rest.rsplit_once(':')?;
+    Some((src.to_string(), path.to_string(), line.parse().ok()?))
+}
+
 /// The follow-up an agent makes after `first`, by the policy; None when
-/// the answer gives it nothing to follow.
-pub fn follow_up(q: &Question, first: &str, policy: Policy) -> Option<(String, Value)> {
+/// the answer gives it nothing to follow. With `window`, a recall pointer
+/// that carries an anchor is followed by `read_note` of that many lines from
+/// the anchor, rather than `recall {key}`.
+pub fn follow_up_with(q: &Question, first: &str, policy: Policy, window: Option<usize>) -> Option<(String, Value)> {
     let get = |k: &str| q.args.get(k).and_then(Value::as_str).map(str::to_string);
     match q.tool.as_str() {
         "recall" if get("query").is_some() => {
@@ -260,6 +302,10 @@ pub fn follow_up(q: &Question, first: &str, policy: Policy) -> Option<(String, V
                 },
                 Policy::Strict => keys.first().cloned(),
             }?;
+            if let Some((src, path, line)) = window.and_then(|_| pointer_anchor(first, &pick)) {
+                let w = window.unwrap_or(1).max(1);
+                return Some(("read_note".into(), atlas::json!({"vault": src, "path": path, "lines": format!("{line}-{}", line + w - 1)})));
+            }
             Some(("recall".into(), atlas::json!({"key": pick})))
         }
         "recall" => {
@@ -302,6 +348,11 @@ pub fn score(q: &Question, policy: Policy, call: &mut Call<'_>) -> Scored {
 
 /// As [`score`], with the first answer already in hand (the hook replay).
 pub fn score_after(q: &Question, first: &str, policy: Policy, call: &mut Call<'_>) -> Scored {
+    score_after_with(q, first, policy, None, call)
+}
+
+/// As [`score_after`], the follow-up chosen by [`follow_up_with`].
+pub fn score_after_with(q: &Question, first: &str, policy: Policy, window: Option<usize>, call: &mut Call<'_>) -> Scored {
     let mut s = Scored { calls: 1, bytes: first.len(), surfaced: names_source(q, first), ..Scored::default() };
     let (found, missing) = score_text(q, first);
     if missing.is_empty() {
@@ -314,7 +365,7 @@ pub fn score_after(q: &Question, first: &str, policy: Policy, call: &mut Call<'_
     } else {
         q.clone()
     };
-    if let Some((tool, args)) = follow_up(&fq, first, policy) {
+    if let Some((tool, args)) = follow_up_with(&fq, first, policy, window) {
         let second = call(&tool, &args);
         s.calls = 2;
         s.bytes += second.len();
@@ -400,11 +451,17 @@ pub struct Opts {
     pub floors: Vec<f64>,
     /// One row per question.
     pub rows: bool,
-    /// Questions whose calls and answers are printed whole.
+    /// Questions whose calls and answers are printed whole, and their hook
+    /// injections with the candidates that passed the gate.
     pub show: Vec<String>,
     /// The project to run as (default: the one the working directory and
     /// the configuration resolve to; see [`atlas::project`]).
     pub project: Option<String>,
+    /// The folder the replayed session works in (default: the working
+    /// directory): the project resolves from it, as the server's does, and
+    /// every replayed hook event carries it as its `cwd`, so the active
+    /// repository is the one a session started there would have.
+    pub cwd: Option<PathBuf>,
 }
 
 fn copy_fresh(from: &Path, to: &Path) -> Result<(), String> {
@@ -428,10 +485,14 @@ fn copy_fresh(from: &Path, to: &Path) -> Result<(), String> {
 /// invalid or a check fails to run.
 pub fn run(o: &Opts) -> Result<bool, String> {
     let raw = atlas::config::Config::load(&o.config).map_err(|e| e.to_string())?;
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = o.cwd.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let resolved = atlas::project::resolve(&raw, &cwd, o.project.as_deref()).map_err(|e| e.to_string())?;
     if let Some(a) = &resolved.active {
         println!("project {} ({:?})", a.spec.name, a.why);
+    }
+    let graph = resolved.graph;
+    if !graph.name.is_empty() {
+        println!("graph: {} repos; cwd {}", graph.repos.len(), graph.repo_of(&cwd.to_string_lossy()).map_or("in no repo", |r| r.name.as_str()));
     }
     let c = resolved.config;
     let db = c.db.clone().ok_or("the configuration names no db")?;
@@ -447,7 +508,11 @@ pub fn run(o: &Opts) -> Result<bool, String> {
     let open = || {
         atlas::paths::Vaults::new(&vaults).and_then(|v| atlas::store::Store::open_with(&db, v, setup.clone())).map_err(|e| e.to_string())
     };
-    let settings = atlas::memory::settings::Settings::from_config(Some(&c), &db).map_err(|e| e.to_string())?;
+    let mut settings = atlas::memory::settings::Settings::from_config(Some(&c), &db).map_err(|e| e.to_string())?;
+    // The project's graph, as the server hands it to the tools and hooks.
+    if !graph.name.is_empty() {
+        settings.graph = Some(std::sync::Arc::new(graph));
+    }
     let mut ok = true;
 
     // (a) recall-check.
@@ -540,7 +605,11 @@ pub fn run(o: &Opts) -> Result<bool, String> {
     }
     let mut server = atlas::tools::Server::new(store);
     server.set_memory(settings.clone());
+    // The agent asking: each question's own, announced by the PreToolUse
+    // hook before every call (a repeat by one agent may be a reference).
+    let agent = std::cell::RefCell::new(String::new());
     let mut call = |tool: &str, args: &Value| -> String {
+        announce(&mut server, &agent.borrow(), tool);
         match server.answer(tool, args) {
             Ok(a) => a.into_text(),
             Err(e) => format!("error: {e}"),
@@ -564,7 +633,9 @@ pub fn run(o: &Opts) -> Result<bool, String> {
             }
             out
         };
+        *agent.borrow_mut() = format!("{}-informed", q.id);
         let s = score(q, Policy::Informed, &mut traced);
+        *agent.borrow_mut() = format!("{}-strict", q.id);
         let st = if q.tool == "recall" && q.args.get("query").is_some() { score(q, Policy::Strict, &mut traced) } else { s.clone() };
         pass += s.pass as usize;
         strict += st.pass as usize;
@@ -616,49 +687,412 @@ pub fn run(o: &Opts) -> Result<bool, String> {
     }
 
     // (c) the work queue.
+    *agent.borrow_mut() = "work-queue".into();
     ok &= work_queue(&mut call, &settings.store, &roots, &c)?;
     drop(call);
 
-    // The hook replay.
-    for &floor in &o.floors {
+    // (e) anchors on recall pointers: the set again with anchors on, followed
+    // by `recall {key}`, then by a window of lines read from the anchor.
+    for (label, on, window) in [("off, recall {key}", false, None), ("on, recall {key}", true, None), ("on, read_note 6 lines", true, Some(6)), ("on, read_note 12 lines", true, Some(12))] {
         let mut s = settings.clone();
-        s.recall.inject_floor = floor as f32;
-        let mut hooks = atlas::hooks::Hooks::open(s).map_err(|e| e.to_string())?;
-        let recall_qs: Vec<&Question> = qs.iter().filter(|q| q.tool == "recall" && q.args.get("query").is_some()).collect();
-        let (mut p, mut st, mut sur, mut inj) = (0, 0, 0, 0usize);
-        let mut lost = Vec::new();
-        for q in &recall_qs {
-            let ev = atlas::hooks::HookEvent::from_value(
-                &atlas::json!({"event": "UserPromptSubmit", "session_id": format!("eval-{}-{floor}", q.id), "prompt": q.ask.clone()}),
-            );
-            let ctx = hooks.handle(&ev).context;
-            inj += ctx.len();
-            let hq = Question { tool: "hook".into(), ..(*q).clone() };
-            let a = score_after(&hq, &ctx, Policy::Informed, &mut |t, a| {
-                server.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"))
-            });
-            let b = score_after(&hq, &ctx, Policy::Strict, &mut |t, a| {
-                server.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"))
-            });
+        s.recall.pointer_anchors = on;
+        server.set_memory(s);
+        let (mut p, mut st, mut f, mut fr, mut anchored) = (0, 0, 0, 0, 0);
+        let (mut toks, mut rtoks) = (Vec::new(), Vec::new());
+        for q in &qs {
+            let mut ask = |policy: Policy| {
+                let id = format!("{}-anchors-{label}-{policy:?}", q.id);
+                let mut c = |t: &str, a: &Value| -> String {
+                    if t == "read_note" && policy == Policy::Informed {
+                        anchored += 1;
+                    }
+                    announce(&mut server, &id, t);
+                    server.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"))
+                };
+                let first = c(&q.tool, &q.args);
+                score_after_with(q, &first, policy, window, &mut c)
+            };
+            let a = ask(Policy::Informed);
+            let recall_q = q.tool == "recall" && q.args.get("query").is_some();
+            let b = if recall_q { ask(Policy::Strict) } else { a.clone() };
             p += a.pass as usize;
             st += b.pass as usize;
-            sur += a.surfaced as usize;
-            if !a.surfaced {
-                lost.push(q.id.clone());
+            f += a.found;
+            toks.push(a.bytes as f64 / bpt);
+            if recall_q {
+                fr += 1;
+                rtoks.push(a.bytes as f64 / bpt);
             }
         }
-        let m = recall_qs.len();
+        let n = qs.len();
         println!(
-            "hook floor {floor}: {m} recall questions as prompts; source injected {sur}/{m}; pass {p}/{m} informed, {st}/{m} strict (injection plus one recall key); injected tokens total {:.0}, mean {:.0}",
-            inj as f64 / bpt,
-            inj as f64 / bpt / m.max(1) as f64
+            "(e) anchors {label}: pass {p}/{n} informed, {st}/{n} strict; facts {f}/{total}; tokens per question mean {:.0}, median {:.0}; recall queries ({fr}) mean {:.0}; anchored follow-ups {anchored}",
+            toks.iter().sum::<f64>() / n.max(1) as f64,
+            median(toks.clone()),
+            rtoks.iter().sum::<f64>() / fr.max(1) as f64
         );
-        println!("    source not injected: {}", lost.join(" "));
     }
+    // (e) the follow-up read itself: most questions are answered by their
+    // first call, so the rows above take few follow-ups. Here every recall
+    // query whose informed pick is an anchored pointer is followed both
+    // ways, needed or not: `recall {key}` against lines read at the anchor.
+    {
+        let mut s = settings.clone();
+        s.recall.pointer_anchors = true;
+        server.set_memory(s);
+        let mut rows: Vec<(&str, Option<usize>, usize, usize, usize)> = vec![("recall {key}", None, 0, 0, 0), ("read_note 6 lines", Some(6), 0, 0, 0), ("read_note 12 lines", Some(12), 0, 0, 0)];
+        let mut n = 0;
+        for q in qs.iter().filter(|q| q.tool == "recall" && q.args.get("query").is_some()) {
+            let id = format!("{}-anchors-forced", q.id);
+            announce(&mut server, &id, &q.tool);
+            let first = server.answer(&q.tool, &q.args).map(|x| x.into_text()).unwrap_or_default();
+            let Some((_, a)) = follow_up_with(q, &first, Policy::Informed, None) else { continue };
+            let Some(key) = a.get("key").and_then(Value::as_str) else { continue };
+            if pointer_anchor(&first, key).is_none() {
+                continue;
+            }
+            n += 1;
+            for r in rows.iter_mut() {
+                let (t, args) = follow_up_with(q, &first, Policy::Informed, r.1).unwrap_or(("recall".into(), a.clone()));
+                announce(&mut server, &format!("{id}-{}", r.0), &t);
+                let out = server.answer(&t, &args).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"));
+                let (f, missing) = score_text(q, &format!("{first}\n{out}"));
+                r.2 += out.len();
+                r.3 += f;
+                r.4 += missing.is_empty() as usize;
+            }
+        }
+        for (label, _, b, f, p) in &rows {
+            println!("(e) anchored follow-up forced, {label}: {n} recall queries; follow-up tokens mean {:.0}; facts {f}; pass {p}/{n}", *b as f64 / bpt / n.max(1) as f64);
+        }
+    }
+    server.set_memory(settings.clone());
+
+    // The hook replay, on the store as a live session sees it: the hooks
+    // embed every record without a vector in the background once the model
+    // loads (see `atlas::memory::vectors::spawn_embedder`), so a session
+    // running for more than a minute has them all. Embedded here first, the
+    // replay sees that store, and no question's score depends on how far a
+    // background embedder got before it was asked.
+    if !o.floors.is_empty() && settings.model.is_file() {
+        let t0 = std::time::Instant::now();
+        let model = atlas::embed::Model::load(&settings.model).map_err(|e| e.to_string())?;
+        let mem = atlas::memory::MemoryStore::open(&settings.store).map_err(|e| e.to_string())?;
+        let mut n = 0;
+        loop {
+            let k = atlas::memory::vectors::embed_pending(&mem, &model, 128, settings.embed_threads).map_err(|e| e.to_string())?;
+            if k == 0 {
+                break;
+            }
+            n += k;
+        }
+        println!("hook replay: embedded {n} pending record vectors first in {:.1} s", t0.elapsed().as_secs_f64());
+    }
+    // Each floor twice: context selection off (the pointers as before it),
+    // then on (the default); the selection line says what trim and
+    // collapse saved. (h) replays the lane questions the same way: their
+    // prompt names the lane, so the hook injects the lane's journal.
+    for (fi, &floor) in o.floors.iter().enumerate() {
+        for select in [false, true] {
+            let mut s = settings.clone();
+            s.recall.inject_floor = floor as f32;
+            s.recall.select.enabled = select;
+            let label = if select { "" } else { " select off" };
+            let mut hooks = atlas::hooks::Hooks::open(s).map_err(|e| e.to_string())?;
+            let recall_qs: Vec<&Question> = qs.iter().filter(|q| q.tool == "recall" && q.args.get("query").is_some()).collect();
+            let (mut p, mut st, mut sur, mut inj) = (0, 0, 0, 0usize);
+            let (mut lost, mut informed_fails, mut strict_fails) = (Vec::new(), Vec::new(), Vec::new());
+            // (count, bytes sent, bytes whole) per selection outcome.
+            let mut how: BTreeMap<&'static str, (usize, usize, usize)> = BTreeMap::new();
+            for q in &recall_qs {
+                let ev = atlas::hooks::HookEvent::from_value(
+                    &atlas::json!({"event": "UserPromptSubmit", "session_id": format!("eval-{}-{floor}-{select}", q.id), "prompt": q.ask.clone(), "cwd": cwd.to_string_lossy().into_owned()}),
+                );
+                let ctx = hooks.handle(&ev).context;
+                inj += ctx.len();
+                for k in hooks.last_injected() {
+                    let e = how.entry(k.how.name()).or_default();
+                    e.0 += 1;
+                    e.1 += k.bytes;
+                    e.2 += k.full;
+                }
+                if o.show.contains(&q.id) {
+                    println!("--- {} hook floor {floor}{label}\n{ctx}", q.id);
+                    for c in hooks.scores(&q.ask).map_err(|e| e.to_string())?.iter().filter(|c| c.pass).take(12) {
+                        println!("    candidate {} fts {:.2} cos {}", c.head.key, c.fts, c.cos.map_or("-".to_string(), |x| format!("{x:.3}")));
+                    }
+                }
+                let hq = Question { tool: "hook".into(), ..(*q).clone() };
+                let a = score_after(&hq, &ctx, Policy::Informed, &mut |t, a| {
+                    server.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"))
+                });
+                let b = score_after(&hq, &ctx, Policy::Strict, &mut |t, a| {
+                    server.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"))
+                });
+                p += a.pass as usize;
+                st += b.pass as usize;
+                sur += a.surfaced as usize;
+                if !a.surfaced {
+                    lost.push(q.id.clone());
+                }
+                if !a.pass {
+                    informed_fails.push(q.id.clone());
+                }
+                if !b.pass {
+                    strict_fails.push(q.id.clone());
+                }
+            }
+            let m = recall_qs.len();
+            println!(
+                "hook floor {floor}{label}: {m} recall questions as prompts; source injected {sur}/{m}; pass {p}/{m} informed, {st}/{m} strict (injection plus one recall key); injected tokens total {:.0}, mean {:.0}",
+                inj as f64 / bpt,
+                inj as f64 / bpt / m.max(1) as f64
+            );
+            println!("    source not injected: {}", lost.join(" "));
+            println!("    fail informed: {}", informed_fails.join(" "));
+            println!("    fail strict: {}", strict_fails.join(" "));
+            if select {
+                let row = |k: &str| how.get(k).copied().unwrap_or_default();
+                let (t, c, w) = (row("trim"), row("collapse"), row("whole"));
+                println!(
+                    "    selection: trimmed {} (tokens {:.0} -> {:.0}), collapsed {} (tokens {:.0} -> {:.0}), whole {} ({:.0} tokens)",
+                    t.0,
+                    t.2 as f64 / bpt,
+                    t.1 as f64 / bpt,
+                    c.0,
+                    c.2 as f64 / bpt,
+                    c.1 as f64 / bpt,
+                    w.0,
+                    w.1 as f64 / bpt
+                );
+            }
+            if fi > 0 {
+                continue;
+            }
+            // (h) the lane questions as prompts: the lane journal the hook
+            // injects, then the lane follow-up the work queue rule makes.
+            let lane_qs: Vec<&Question> = qs.iter().filter(|q| q.tool == "recall" && q.args.get("lane").is_some()).collect();
+            let (mut lp, mut ls, mut linj) = (0, 0, 0usize);
+            let mut lfails = Vec::new();
+            for q in &lane_qs {
+                let ev = atlas::hooks::HookEvent::from_value(
+                    &atlas::json!({"event": "UserPromptSubmit", "session_id": format!("eval-brief-{}-{select}", q.id), "prompt": q.ask.clone(), "cwd": cwd.to_string_lossy().into_owned()}),
+                );
+                let ctx = hooks.handle(&ev).context;
+                linj += ctx.len();
+                if o.show.contains(&q.id) {
+                    println!("--- {} lane hook{label}\n{ctx}", q.id);
+                }
+                let a = score_after(q, &ctx, Policy::Informed, &mut |t, a| server.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}")));
+                lp += a.pass as usize;
+                ls += (a.pass && a.calls == 1) as usize;
+                if !a.pass {
+                    lfails.push(q.id.clone());
+                }
+            }
+            let n = lane_qs.len();
+            println!(
+                "(h) lane briefs{label}: {n} lane questions as prompts; pass {lp}/{n} (injection plus the lane follow-up), {ls}/{n} from the injection alone; injected tokens total {:.0}, mean {:.0}; fail: {}",
+                linj as f64 / bpt,
+                linj as f64 / bpt / n.max(1) as f64,
+                lfails.join(" ")
+            );
+        }
+    }
+
+    // (d) repeats in one session: every question's first call made twice by
+    // one agent, announced by the PreToolUse hook as Claude Code does. A
+    // repeat that answers `unchanged since` is read as the earlier answer
+    // (the agent holds it), and a changed-lines answer with the earlier one;
+    // the facts found must be the same as the first time.
+    {
+        let mut call = |t: &str, a: &Value| server.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"));
+        let (mut b1, mut b2, mut f1, mut f2) = (0usize, 0usize, 0usize, 0usize);
+        let (mut same, mut changed, mut by_rule) = (0usize, 0usize, 0usize);
+        let mut first: Vec<String> = Vec::new();
+        for pass in 0..2 {
+            for (i, q) in qs.iter().enumerate() {
+                let hook = atlas::json!({"event": "PreToolUse", "session_id": "eval-repeats", "agent_id": "", "tool_name": format!("mcp__atlas__{}", q.tool)});
+                let _ = call("hook", &hook);
+                let out = call(&q.tool, &q.args);
+                if pass == 0 {
+                    b1 += out.len();
+                    f1 += score_text(q, &out).0;
+                    first.push(out);
+                } else {
+                    b2 += out.len();
+                    same += out.starts_with("unchanged since") as usize;
+                    changed += out.starts_with("changed since") as usize;
+                    // The work queue and lane journals answer whole by rule.
+                    let whole_by_rule = (q.tool == "recall" && q.args.get("lane").is_some()) || ["decision_queue", "awaiting", "journal_status", "next_id"].contains(&q.tool.as_str());
+                    by_rule += whole_by_rule as usize;
+                    let hay = if out.starts_with("unchanged since") || out.starts_with("changed since") { format!("{}\n{out}", first[i]) } else { out };
+                    f2 += score_text(q, &hay).0;
+                }
+            }
+        }
+        println!(
+            "(d) repeats: each first call again by the same agent: tokens {:.0} first, {:.0} repeated ({same} unchanged, {changed} changed lines, the rest whole, {by_rule} of them by rule); facts {f2} on the repeat, {f1} the first time",
+            b1 as f64 / bpt,
+            b2 as f64 / bpt
+        );
+        ok &= f2 == f1;
+        let _ = call("hook", &atlas::json!({"event": "PreCompact", "session_id": "eval-repeats"}));
+    }
+
+    // (f) a subagent without hooks: a new server that never sees a hook, so
+    // it compares repeats per process. The parent makes every question's
+    // first call; then a subagent, which holds none of the parent's answers,
+    // makes the same call. A reference reply is all the subagent has until
+    // it follows the `fresh: true` the reply names.
+    {
+        let mut store = open()?;
+        store.set_memory_sync(Some(settings.clone()));
+        store.rescan().map_err(|e| e.to_string())?;
+        store.rescan_sources(None).map_err(|e| e.to_string())?;
+        let mut bare = atlas::tools::Server::new(store);
+        bare.set_memory(settings.clone());
+        let mut call = |t: &str, a: &Value| bare.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"));
+        let (mut parent, mut refs, mut named, mut alone, mut after, mut extra) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for q in &qs {
+            let mine = call(&q.tool, &q.args);
+            let mine = if is_reference(&mine) { call(&q.tool, &fresh(&q.args)) } else { mine };
+            parent += score_text(q, &mine).0;
+        }
+        for q in &qs {
+            let got = call(&q.tool, &q.args);
+            if !is_reference(&got) {
+                alone += score_text(q, &got).0;
+                after += score_text(q, &got).0;
+                continue;
+            }
+            refs += 1;
+            named += got.contains("fresh: true") as usize;
+            alone += score_text(q, &got).0;
+            let whole = call(&q.tool, &fresh(&q.args));
+            extra += got.len() + whole.len();
+            after += score_text(q, &format!("{got}\n{whole}")).0;
+        }
+        println!(
+            "(f) subagent without hooks: {refs} of {} calls answered by reference to the parent's, {named} naming fresh: true; facts {alone} from the reply alone, {after} after following fresh, {parent} the parent found; the reference and fresh call cost {:.0} tokens",
+            qs.len(),
+            extra as f64 / bpt
+        );
+        ok &= after == parent && named == refs;
+    }
+
+    // (g) compaction: what survives a simulated compaction is refs, not
+    // text. Each question's answer is replaced by the ref it rests on (a
+    // record source: its head as key@hash; a file source: the lines holding
+    // its facts as src:path:a-b@hash); after the compaction the agent makes
+    // one call, `recall {key: ref}`, and the facts must still be found. A
+    // file path a ref cannot spell (one with a space) is looked up again
+    // with the question's own first call instead, and counted.
+    {
+        let mut store = open()?;
+        store.set_memory_sync(Some(settings.clone()));
+        let mut post = atlas::tools::Server::new(store);
+        post.set_memory(settings.clone());
+        let mem = atlas::memory::MemoryStore::open(&settings.store).map_err(|e| e.to_string())?;
+        let (mut pass, mut found, mut total, mut resolved, mut dangling, mut again, mut bytes) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut gfails: Vec<String> = Vec::new();
+        for q in &qs {
+            let r = match (source_key(q), source_file(q)) {
+                (Some(k), _) => mem.head(k).map_err(|e| e.to_string())?.map(|h| atlas::compact::record_ref(k, &h.sha)),
+                (None, Some((n, p))) => roots.get(n).and_then(|root| std::fs::read_to_string(root.join(p)).ok()).and_then(|text| {
+                    let lines: Vec<String> = text.lines().map(norm).collect();
+                    let at: Vec<usize> = q.facts.iter().filter_map(|f| lines.iter().position(|l| holds(l, f))).collect();
+                    let (a, b) = if at.len() == q.facts.len() { (at.iter().min()? + 1, at.iter().max()? + 1) } else { (1, lines.len()) };
+                    let h = atlas::compact::lines_hash(&text, a, b)?;
+                    Some(format!("{n}:{p}:{a}-{b}@{h}"))
+                }),
+                _ => None,
+            };
+            let out = match r.filter(|r| atlas::compact::parse_ref(r).is_some()) {
+                Some(r) => {
+                    announce(&mut post, &format!("{}-compaction", q.id), "recall");
+                    let out = post.answer("recall", &atlas::json!({"key": r})).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"));
+                    if out.starts_with("error:") && out.contains("dangling") {
+                        dangling += 1;
+                    } else if !out.starts_with("error:") {
+                        resolved += 1;
+                    }
+                    out
+                }
+                None => {
+                    again += 1;
+                    // As (b) asks it: the first call, then the one follow-up.
+                    let agent = format!("{}-compaction", q.id);
+                    let mut c = |t: &str, a: &Value| -> String {
+                        announce(&mut post, &agent, t);
+                        post.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"))
+                    };
+                    let first = c(&q.tool, &q.args);
+                    match follow_up_with(q, &first, Policy::Informed, None).filter(|_| !score_text(q, &first).1.is_empty()) {
+                        Some((t, a)) => {
+                            let second = c(&t, &a);
+                            format!("{first}\n{second}")
+                        }
+                        None => first,
+                    }
+                }
+            };
+            bytes += out.len();
+            let (f, missing) = score_text(q, &out);
+            found += f;
+            total += q.facts.len();
+            pass += missing.is_empty() as usize;
+            if !missing.is_empty() {
+                gfails.push(format!("    FAIL (g) {}: missing {}", q.id, missing.join("; ")));
+            }
+        }
+        let n = qs.len();
+        // The checkpoint card the eval store would give a session now: its
+        // size, and every ref in it resolving.
+        let card = atlas::checkpoint::body(&atlas::checkpoint::state(&mem, "eval-compaction", EVAL_CARD_SINCE, "", atlas::checkpoint::Lanes::Store).map_err(|e| e.to_string())?, &atlas::checkpoint::Tail::default(), settings.bytes_for(settings.compact.card_tokens));
+        let check = atlas::compact::check(&mem, &[], &card).map_err(|e| e.to_string())?;
+        println!(
+            "(g) compaction: {n} questions; {resolved} answered by recall of a ref ({dangling} dangling), {again} looked up again (no ref spells the path); pass {pass}/{n}; facts {found}/{total}; tokens per question after compaction mean {:.0}; card {:.0} tokens, {} refs, {} dangling, {} changed",
+            bytes as f64 / bpt / n.max(1) as f64,
+            card.len() as f64 / bpt,
+            check.refs,
+            check.dangling.len(),
+            check.changed.len()
+        );
+        for f in &gfails {
+            println!("{f}");
+        }
+        ok &= pass == n && dangling == 0 && check.dangling.is_empty();
+    }
+
     Ok(ok)
 }
 
 /// Lowercase `D-` thread files under each vault's Discussions folder.
+/// Names the agent of the next call to the server, as Claude Code's
+/// PreToolUse hook does; nothing for an empty name.
+fn announce(server: &mut atlas::tools::Server, agent: &str, tool: &str) {
+    if !agent.is_empty() {
+        let hook = atlas::json!({"event": "PreToolUse", "session_id": "eval", "agent_id": agent, "tool_name": format!("mcp__atlas__{tool}")});
+        let _ = server.answer("hook", &hook);
+    }
+}
+
+/// Whether an answer is a reference to an earlier one.
+fn is_reference(out: &str) -> bool {
+    out.starts_with("unchanged since") || out.starts_with("changed since")
+}
+
+/// The arguments with `fresh: true`.
+fn fresh(args: &Value) -> Value {
+    let mut a = args.clone();
+    if a.is_null() {
+        a = atlas::json!({});
+    }
+    a["fresh"] = atlas::json!(true);
+    a
+}
+
 fn thread_files(roots: &BTreeMap<String, PathBuf>, c: &atlas::config::Config) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     for v in &c.vaults {
@@ -798,7 +1232,9 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
     // decision_queue and awaiting against the thread files.
     let threads = thread_files(roots, c);
     let unresolved = threads.iter().filter(|(_, p)| std::fs::read_to_string(p).is_ok_and(|t| fm_status(&t) == "unresolved")).count();
-    let dq = call("decision_queue", &atlas::json!({}));
+    // Counted from the JSON form; the text form is checked to list as many.
+    let dq = call("decision_queue", &atlas::json!({"format": "json"}));
+    let dq_text = call("decision_queue", &atlas::json!({}));
     let got = atlas::json::parse(&dq).ok().and_then(|v| v.get("queue").and_then(Value::as_array).map(Vec::len));
     let mut waiting = 0;
     for (_, p) in &threads {
@@ -808,10 +1244,22 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
         }
         waiting += atlas::discussion::awaiting(&atlas::discussion::parse(&t), "Brandon").len();
     }
-    let aw = call("awaiting", &atlas::json!({"author": "Brandon"}));
+    let aw = call("awaiting", &atlas::json!({"author": "Brandon", "format": "json"}));
+    let aw_text = call("awaiting", &atlas::json!({"author": "Brandon"}));
     let got_aw = atlas::json::parse(&aw).ok().and_then(|v| v.get("awaiting").and_then(Value::as_array).map(Vec::len));
     println!("    decision_queue: {got:?} items, {unresolved} unresolved thread files of {}; awaiting Brandon: {got_aw:?} items, {waiting} by the files", threads.len());
     ok &= got == Some(unresolved) && got_aw == Some(waiting);
+    // The text answer (the default) names the same count: `key: N`, or
+    // `key: none` for an empty list.
+    let text_count = |t: &str, k: &str| -> Option<usize> {
+        let v = t.lines().find_map(|l| l.strip_prefix(&format!("{k}: ")))?;
+        if v == "none" { Some(0) } else { v.parse().ok() }
+    };
+    let (dq_n, aw_n) = (text_count(&dq_text, "queue"), text_count(&aw_text, "awaiting"));
+    if dq_n != got || aw_n != got_aw {
+        println!("    text answers list {dq_n:?} queued and {aw_n:?} awaiting, the JSON {got:?} and {got_aw:?}");
+    }
+    ok &= dq_n == got && aw_n == got_aw;
 
     // next_id: one past the highest number on disk, per vault and prefix.
     let (mut nid_ok, mut nid_all) = (0, 0);
@@ -842,7 +1290,7 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
                 &atlas::json!({"vault": v.name.clone(), "folder": folder, "prefix": prefix.clone(), "digits": (*width).max(3), "reason": "memory eval: the next id of each sequence"}),
             );
             nid_all += 1;
-            if got.contains(&format!("\"{want}\"")) {
+            if got.contains(&format!("\"{want}\"")) || got.lines().any(|l| l == format!("id: {want}")) {
                 nid_ok += 1;
             } else {
                 println!("    next_id {}:{prefix}: expected {want}, got {}", v.name, got.trim());

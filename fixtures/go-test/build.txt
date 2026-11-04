@@ -1,0 +1,6 @@
+# example.com/demo/calc [example.com/demo/calc.test]
+calc\broken_test.go:5:33: undefined: Missing
+FAIL	example.com/demo/calc [build failed]
+?   	example.com/demo/empty	[no test files]
+ok  	example.com/demo/shapes	(cached)
+FAIL

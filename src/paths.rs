@@ -8,6 +8,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
@@ -145,6 +146,11 @@ fn check_component(c: &str) -> Result<()> {
     if c.starts_with('.') {
         return Err(Error::PathRejected(format!("{c:?}: dot files and dot folders are not served")));
     }
+    // Every component, folders and the note alike: a note's name is `.md`,
+    // to which only these rules of the deny-list apply.
+    if crate::sources::is_denied_folder(c) {
+        return Err(Error::PathRejected(format!("{c:?}: .env, key and credential files are never read or written (the deny-list)")));
+    }
     if c.ends_with('.') || c.ends_with(' ') {
         return Err(Error::PathRejected(format!("{c:?}: a component may not end in a dot or a space")));
     }
@@ -229,6 +235,9 @@ fn rel_under(root: &Path, full: &Path) -> Result<String> {
                 if s.starts_with('.') {
                     return Err(Error::PathRejected("path resolves into a dot folder".into()));
                 }
+                if crate::sources::is_denied_folder(s) {
+                    return Err(Error::PathRejected("path resolves to a denied file (.env, keys, credentials)".into()));
+                }
                 out.push(s.to_string());
             }
             _ => return Err(Error::PathRejected("path resolves outside the vault".into())),
@@ -292,25 +301,62 @@ pub fn resolve_existing(vault: &Vault, rel: &str) -> Result<Resolved> {
     let (file, dirs) = parts.split_last().ok_or_else(|| Error::PathRejected("empty path".into()))?;
     let dir = walk_dirs(vault, dirs, false)?;
     let candidate = dir.join(file);
-    let not_found = || Error::NotFound(format!("note {rel:?} in vault {}", vault.name));
-    let meta = match fs::symlink_metadata(&candidate) {
-        Ok(m) => m,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Err(not_found()),
-        Err(e) => return Err(e.into()),
-    };
-    let full = match leaf(&dir, file, &candidate, &meta) {
-        Ok(f) => f,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Err(not_found()),
-        Err(e) => return Err(e.into()),
+    let mut first_miss = None;
+    let mut attempt = 0u32;
+    let (full, is_file) = loop {
+        match look_up(&dir, file, &candidate) {
+            Ok(found) => break found,
+            // Windows can miss a note's name for a moment while another
+            // process replaces it by rename, at any of the lookups. Look
+            // again before calling it missing.
+            Err(e) if e.kind() == ErrorKind::NotFound && first_miss.get_or_insert_with(Instant::now).elapsed() < REPLACE_GAP => {
+                attempt += 1;
+                if attempt <= 4 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(Error::NotFound(format!("note {rel:?} in vault {}", vault.name)));
+            }
+            Err(e) => return Err(e.into()),
+        }
     };
     let rel = rel_under(&vault.root, &full)?;
     if !rel.ends_with(".md") {
         return Err(Error::PathRejected("resolves to a file that is not a .md note".into()));
     }
-    if !full.is_file() {
+    if !is_file {
         return Err(Error::PathRejected("not a regular file".into()));
     }
     Ok(Resolved { full, rel })
+}
+
+/// How long [`resolve_existing`] keeps looking for a note after a lookup
+/// says it is missing, before it reports [`Error::NotFound`].
+///
+/// A rename that replaces a note on NTFS is atomic for the note's contents
+/// but not for its name: an open by name or a directory search that lands
+/// inside the rename can report the file missing, and so can a second lookup
+/// straight after the first succeeded (issue #71). This holds for
+/// `MoveFileExW` and for a POSIX-semantics `FileRenameInfoEx` alike, so the
+/// writer cannot close it and the reader has to. The gap is one rename, but
+/// a writer preempted inside it holds it for a scheduler quantum: up to
+/// about 32 ms was measured with the machine four times oversubscribed.
+/// The budget covers that with margin. Only a note that is really missing
+/// pays it in full, on an error path.
+const REPLACE_GAP: Duration = Duration::from_millis(100);
+
+/// One lookup of a note: its full path inside `dir`, and whether it (or the
+/// file a link leads to) is a regular file. Every step can report
+/// [`ErrorKind::NotFound`] for a note being replaced; [`resolve_existing`]
+/// retries those.
+fn look_up(dir: &Path, file: &str, candidate: &Path) -> std::io::Result<(PathBuf, bool)> {
+    let meta = fs::symlink_metadata(candidate)?;
+    let full = leaf(dir, file, candidate, &meta)?;
+    let is_file = if meta.file_type().is_symlink() { fs::metadata(&full)?.is_file() } else { meta.is_file() };
+    Ok((full, is_file))
 }
 
 /// The full path of the last component of a note path, inside a folder that
@@ -642,7 +688,11 @@ mod tests {
     /// keep resolving inside the vault. Canonicalising the note itself opened
     /// a handle that could land on the replaced file, which NTFS had already
     /// moved to `\$Extend\$Deleted`: "path resolves outside the vault" about
-    /// 2% of the time under contention.
+    /// 2% of the time under contention. The name itself can also go missing
+    /// for a moment inside the rename, which read as "not found" or "not a
+    /// regular file" once in a loaded workspace run (issue #71);
+    /// [`REPLACE_GAP`] covers that, and the ignored stress test below loads
+    /// it hard enough to show it.
     #[test]
     fn a_note_being_replaced_still_resolves_inside_the_vault() {
         let (dir, vault) = scratch_vault("replace");
@@ -684,6 +734,71 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(replaced >= 200 && resolves >= 20_000, "only {resolves} resolves and {replaced} replacements in 120 s");
         assert!(bad.is_empty(), "{} of {resolves} resolves failed while the note was replaced {replaced} times; first: {}", bad.len(), bad[0]);
+    }
+
+    /// The heavy form of the test above: several notes, each replaced by its
+    /// own writer and resolved by several readers at once, so the machine is
+    /// loaded the way a full workspace run loads it. Every failure is tallied
+    /// by its message. `ATLAS_STRESS_SECS` sets the length (default 30).
+    #[test]
+    #[ignore = "stress: seconds of parallel replace and resolve"]
+    fn stress_notes_being_replaced_still_resolve() {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        let secs: u64 = std::env::var("ATLAS_STRESS_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let (dir, vault) = scratch_vault("stress");
+        let stop = Arc::new(AtomicBool::new(false));
+        let (resolves, replaces) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let bad: Arc<Mutex<BTreeMap<String, u64>>> = Arc::default();
+        let mut threads = Vec::new();
+        for i in 0..8 {
+            let name = format!("D-{i:03} Topic.md");
+            let note = dir.join("Threads").join(&name);
+            fs::write(&note, b"v0").unwrap();
+            {
+                let (stop, replaces) = (stop.clone(), replaces.clone());
+                threads.push(std::thread::spawn(move || {
+                    let mut n = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        crate::fsio::replace_atomic(&note, format!("v{n}").as_bytes()).unwrap();
+                        n += 1;
+                        replaces.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            }
+            for _ in 0..3 {
+                let (stop, resolves, bad, vault, name) = (stop.clone(), resolves.clone(), bad.clone(), vault.clone(), name.clone());
+                threads.push(std::thread::spawn(move || {
+                    let want = format!("Threads/{name}");
+                    while !stop.load(Ordering::Relaxed) {
+                        let miss = match resolve_existing(&vault, &want) {
+                            Ok(r) if r.full.starts_with(&vault.root) && r.rel == want => None,
+                            Ok(r) => Some(format!("wrong: {} {}", r.full.display(), r.rel)),
+                            Err(e) => Some(e.to_string().replace(&name, "<note>")),
+                        };
+                        if let Some(m) = miss {
+                            *bad.lock().unwrap().entry(m).or_default() += 1;
+                        }
+                        resolves.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
+        let bad = bad.lock().unwrap();
+        let failed: u64 = bad.values().sum();
+        let (resolves, replaces) = (resolves.load(Ordering::Relaxed), replaces.load(Ordering::Relaxed));
+        eprintln!("stress: {resolves} resolves, {replaces} replaces, {failed} failed");
+        for (m, n) in bad.iter() {
+            eprintln!("  {n:>8}  {m}");
+        }
+        assert_eq!(failed, 0, "{failed} of {resolves} resolves failed during {replaces} replaces");
     }
 
     #[test]

@@ -28,14 +28,21 @@ fn hit_json(h: &SymbolHit) -> Value {
 
 impl Server {
     /// One line per code root that is not fresh: pending, running, failed,
-    /// never indexed, or indexed without rust-analyzer.
-    fn code_freshness(&self) -> Result<Vec<String>> {
-        let Some(c) = &self.code else { return Ok(Vec::new()) };
+    /// never indexed, or indexed without rust-analyzer; and one per unit of
+    /// another language left to the scanner (no indexer, or it failed).
+    ///
+    /// Returns the state lines (indexing, stale, failed, not indexed) and,
+    /// apart, the coverage notes (definitions only, scan only): a session's
+    /// first `symbol` answer that has any carries them, later ones do not.
+    fn code_freshness(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let Some(c) = &self.code else { return Ok((Vec::new(), Vec::new())) };
         let records = code::root_records(self.store.conn())?;
         let status = c.indexer.as_ref().map(|i| i.status()).unwrap_or_default();
         let mut out = Vec::new();
+        let mut cov = Vec::new();
         for r in &c.setup.roots {
             match status.get(&r.name) {
+                Some(RootState::Starting) => out.push(format!("{}: indexing (the first walk since atlas started is running)", r.name)),
                 Some(RootState::Pending) => out.push(format!("stale {}: changed, reindex pending", r.name)),
                 Some(RootState::Running) => out.push(format!("stale {}: reindex running", r.name)),
                 Some(RootState::Failed(e)) => out.push(format!("stale {}: last index failed: {e}", r.name)),
@@ -44,11 +51,22 @@ impl Server {
             }
             match records.get(&r.name) {
                 None => out.push(format!("{}: not indexed yet", r.name)),
-                Some(x) if x.rust.starts_with("scan only") => out.push(format!("{}: rust definitions only ({})", r.name, x.rust)),
-                _ => {}
+                Some(x) if x.rust.starts_with("scan only") => cov.push(format!("{}: rust definitions only ({})", r.name, x.rust)),
+                Some(x) => {
+                    // A mixed note: `lang [dir]: source` per unit.
+                    for part in x.rust.split("; ") {
+                        if let Some((unit, why)) = part.split_once(": scan only") {
+                            cov.push(format!("{}: {unit} definitions only (scan only{why})", r.name));
+                        } else if part.contains(" newer, scanned)") {
+                            // A prebuilt index older than some of its files:
+                            // those have definitions only.
+                            cov.push(format!("{}: {part}", r.name));
+                        }
+                    }
+                }
             }
         }
-        Ok(out)
+        Ok((out, cov))
     }
 
     pub(super) fn symbol(&mut self, a: &Map, f: Fmt) -> Result<Answer> {
@@ -64,7 +82,11 @@ impl Server {
         let t0 = std::time::Instant::now();
         let ans = code::symbol(self.store.conn(), name, lim)?;
         let query_us = t0.elapsed().as_micros();
-        let fresh = self.code_freshness()?;
+        let (mut fresh, cov) = self.code_freshness()?;
+        if !cov.is_empty() && !self.symbol_coverage_shown {
+            self.symbol_coverage_shown = true;
+            fresh.extend(cov);
+        }
         let found = ans.totals.iter().any(|&n| n > 0);
         let near = if found { Vec::new() } else { code::near_names(self.store.conn(), &ans.name, 8)? };
         if f.json {

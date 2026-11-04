@@ -134,7 +134,7 @@ fn vaults(db: &Path) -> atlas::paths::Vaults {
 }
 
 fn setup(f: &Fixture) -> CodeSetup {
-    let spec = atlas::config::CodeSpec { roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: f.root.clone(), build_scripts: false }], debounce_s: Some(0), ..Default::default() };
+    let spec = atlas::config::CodeSpec { roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: f.root.clone(), build_scripts: false, scip: Default::default() }], debounce_s: Some(0), ..Default::default() };
     let mut code = CodeSetup::from_spec(&spec, &f.db, false);
     // Another build on the machine must not stall the tests.
     code.defer_on_cargo = false;
@@ -250,8 +250,13 @@ fn reindex_replaces_one_root_and_scan_only_without_rust_analyzer() {
     let v = s.call("symbol", &json!({"name": "Store"})).unwrap();
     assert_eq!(rows(&v, "defs"), [("src/lib.rs".into(), 3, "struct (scan)".into(), "".into())]);
     assert_eq!(v["totals"]["refs"].as_i64(), Some(0));
+    // The coverage note comes with the session's first symbol answer only.
+    assert_eq!(v["freshness"], json!(["app: rust definitions only (scan only: not installed)"]), "{v}");
     let t = s.answer("symbol", &json!({"name": "Store"})).unwrap().into_text();
-    assert!(t.ends_with("app: rust definitions only (scan only: not installed)\n"), "{t}");
+    assert!(!t.contains("definitions only"), "said once per session: {t}");
+    let mut s2 = server(&f, code.clone(), None);
+    let t = s2.answer("symbol", &json!({"name": "Store"})).unwrap().into_text();
+    assert!(t.ends_with("app: rust definitions only (scan only: not installed)\n"), "a new session hears it again: {t}");
     // One root replaced: no duplicates after a second write.
     let rep = code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::File(f.scip.clone())).unwrap();
     assert_eq!(rep.write.defs, 14);
@@ -335,7 +340,7 @@ fn code_config_is_read_and_unconfigured_symbol_is_refused() {
     fs::write(&p, r#"{"db": "s/a.sqlite", "code": {"roots": [{"name": "app", "root": "app"}], "debounce_s": 5}}"#).unwrap();
     let c = atlas::config::Config::load(&p).unwrap();
     let setup = CodeSetup::from_spec(c.code.as_ref().unwrap(), c.db.as_ref().unwrap(), true);
-    assert_eq!(setup.roots, [CodeRoot { name: "app".into(), root: t.path().join("app"), build_scripts: false }]);
+    assert_eq!(setup.roots, [CodeRoot { name: "app".into(), root: t.path().join("app"), build_scripts: false, scip: Default::default() }]);
     assert!(setup.defer_on_cargo && setup.defer_lock.is_none(), "defaults: wait for cargo, no lock file");
     assert_eq!(setup.debounce, Duration::from_secs(5));
     assert_eq!(setup.dir, t.path().join("s").join("code"));
@@ -480,4 +485,39 @@ fn shell_reads_are_annotated_like_grep_and_read() {
         let (u, note) = router.annotate(&bash(cmd, out)).unwrap();
         assert!(u.is_none() && note.is_empty(), "{cmd}");
     }
+}
+/// Until a root's first walk since start finishes, its state is Starting
+/// (symbol says "indexing"), never the "stale ... reindex pending" of a root
+/// that changed after it was indexed.
+#[test]
+fn a_root_reads_as_indexing_until_its_first_walk_finishes() {
+    let f = fixture("code-starting");
+    let code = setup(&f);
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let ix = Indexer::start(code.clone(), f.db.clone(), Some(RustSource::File(f.scip.clone())));
+    let mut seen = Vec::new();
+    let t0 = std::time::Instant::now();
+    loop {
+        let st = ix.status().get("app").cloned();
+        if seen.last() != Some(&st) {
+            seen.push(st.clone());
+        }
+        if st == Some(code_index::RootState::Idle) || t0.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+    }
+    assert_eq!(seen.first(), Some(&Some(code_index::RootState::Starting)), "{seen:?}");
+    assert!(seen.iter().all(|s| matches!(s, Some(code_index::RootState::Starting | code_index::RootState::Idle))), "{seen:?}");
+    let mut s = server(&f, code, Some(ix));
+    let t = s.answer("symbol", &json!({"name": "helper"})).unwrap().into_text();
+    assert!(!t.contains("stale app"), "{t}");
+}
+
+#[test]
+fn code_index_stats_print_as_words_not_debug_structs() {
+    let rows = atlas::code::RowStats { scip_defs: 3, impls: 1, ..Default::default() };
+    assert_eq!(rows.to_string(), "3 scip defs, 1 impls");
+    assert_eq!(atlas::code::RowStats::default().to_string(), "none");
+    let w = atlas::code::WriteStats { files: 2, defs: 3, refs: 4, impls: 1, lines: 9 };
+    assert_eq!(w.to_string(), "2 files, 3 defs, 4 refs, 1 impls, 9 lines");
 }

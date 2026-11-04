@@ -1,0 +1,12 @@
+--- FAIL: TestAdd (0.00s)
+    calc_test.go:7: Add(1, 2) = 4, want 3
+--- FAIL: TestTable (0.00s)
+    --- FAIL: TestTable/zero (0.00s)
+        calc_test.go:15: got 1, want 0
+    --- FAIL: TestTable/one (0.00s)
+        calc_test.go:15: got 2, want 1
+FAIL
+FAIL	example.com/demo/calc	0.527s
+?   	example.com/demo/empty	[no test files]
+ok  	example.com/demo/shapes	0.527s
+FAIL

@@ -1,0 +1,24 @@
+=== RUN   TestAdd
+    calc_test.go:7: Add(1, 2) = 4, want 3
+--- FAIL: TestAdd (0.00s)
+=== RUN   TestTable
+=== RUN   TestTable/zero
+    calc_test.go:15: got 1, want 0
+=== RUN   TestTable/one
+    calc_test.go:15: got 2, want 1
+--- FAIL: TestTable (0.00s)
+    --- FAIL: TestTable/zero (0.00s)
+    --- FAIL: TestTable/one (0.00s)
+=== RUN   TestOk
+--- PASS: TestOk (0.00s)
+FAIL
+FAIL	example.com/demo/calc	0.558s
+?   	example.com/demo/empty	[no test files]
+=== RUN   TestArea
+--- PASS: TestArea (0.00s)
+=== RUN   TestPerimeter
+    shapes_test.go:12: not written yet
+--- SKIP: TestPerimeter (0.00s)
+PASS
+ok  	example.com/demo/shapes	0.535s
+FAIL

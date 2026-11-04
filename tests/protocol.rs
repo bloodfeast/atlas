@@ -52,9 +52,9 @@ fn round_trip_through_the_binary() {
     assert_eq!(init["protocolVersion"], json!("2025-06-18"));
     assert_eq!(init["serverInfo"]["name"], json!("atlas"));
     let instr = init["instructions"].as_str().unwrap();
-    assert!(!instr.contains('\n') && instr.starts_with("Obsidian vaults served: perf (Research Log)"), "{instr}");
+    assert!(!instr.contains('\n') && instr.starts_with("Markdown vaults served: perf (Research Log)"), "{instr}");
     let tools = out[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 47);
+    assert_eq!(tools.len(), 14, "the listed tools; the full tools behind their ops stay callable");
     assert!(tools.iter().any(|t| t["name"] == json!("section")) && tools.iter().any(|t| t["name"] == json!("grep")), "the core read verbs");
     assert!(tools.iter().any(|t| t["name"] == json!("symbol")), "the code index answers through symbol");
     // The core verbs are always loaded; every other tool stays deferred.
@@ -69,8 +69,10 @@ fn round_trip_through_the_binary() {
     }
     let read = &out[2]["result"];
     assert_eq!(read["isError"], json!(false));
-    let data: Value = atlas::json::parse(read["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(data["content"].as_str().unwrap(), IDEA_2);
+    // Text by default: one line naming the note and its hash, then the note as written.
+    let text = read["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("perf:Ideas/PI-002 Throttle.md sha256=") && text.ends_with(IDEA_2), "{text}");
+    assert_eq!(text.lines().count(), IDEA_2.lines().count() + 1);
     assert!(read.get("structuredContent").is_none(), "the answer is sent once");
     assert_eq!(out[3]["result"]["isError"], json!(true));
     assert!(out[3]["result"]["content"][0]["text"].as_str().unwrap().contains("path rejected"));
@@ -100,7 +102,7 @@ fn twelve_processes_never_share_an_id() {
             for i in 0..EACH {
                 // Mix in reads and other writes so the processes contend on everything.
                 msgs.push(json!({"jsonrpc": "2.0", "id": 100 + i, "method": "tools/call", "params": {"name": "next_id", "arguments": {
-                    "vault": "perf", "folder": "Ideas", "prefix": "PI-", "name": format!("From {p} {i}"), "content": "---\nid: {{id}}\n---\n", "reason": "concurrent id allocation test"}}}));
+                    "vault": "perf", "folder": "Ideas", "prefix": "PI-", "name": format!("From {p} {i}"), "content": "---\nid: {{id}}\n---\n", "reason": "concurrent id allocation test", "format": "json"}}}));
                 msgs.push(json!({"jsonrpc": "2.0", "id": 200 + i, "method": "tools/call", "params": {"name": "append_history", "arguments": {
                     "vault": "perf", "path": "Index.md", "text": format!("proc {p} step {i}"), "date": "2026-10-08", "reason": "concurrent history append test"}}}));
                 msgs.push(json!({"jsonrpc": "2.0", "id": 300 + i, "method": "tools/call", "params": {"name": "search", "arguments": {"query": "PI-"}}}));
@@ -208,8 +210,10 @@ fn no_network_code() {
     for path in files {
         let src = std::fs::read_to_string(&path).unwrap();
         // The bench may spawn an older build to compare against; the code
-        // indexer spawns rust-analyzer (bounded, one at a time, off the query
-        // path); the platform module lists processes (macOS `ps`); the model
+        // indexer spawns rust-analyzer and the language table's SCIP indexers
+        // (and asks `npm root -g` where a Node one is)
+        // (bounded, one at a time, off the query path); the platform module
+        // lists processes (macOS `ps`); the model
         // download runs the system curl (setup and first start only, never
         // at query time); the release check restarts atlas on the binary it
         // just swapped in (session start only); `atlas run` spawns the command
@@ -246,4 +250,15 @@ fn a_leading_byte_order_mark_is_ignored() {
     let v: Value = atlas::json::parse_bytes(&out).unwrap();
     assert_eq!(v["id"], json!(7), "{v}");
     assert!(v.get("error").is_none(), "{v}");
+}
+
+#[test]
+fn help_lists_every_mode_and_subcommand() {
+    let out = Command::new(bin()).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for want in ["--setup", "--hook", "--memory-check", "--memory-snapshot", "--token-report", "--code-index", "atlas run ", "atlas slice ", "atlas digest ", "atlas crop ", "atlas ruling ", "atlas entry ", "atlas grammar ", "settings list", "undo [--yes]", "add-project", "migrate-projects", "on|off update"] {
+        assert!(text.contains(want), "--help lacks {want:?}:\n{text}");
+    }
+    assert!(text.lines().count() > 20, "{text}");
 }

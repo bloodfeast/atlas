@@ -80,7 +80,12 @@ follows a symlink or junction, never enters a dot folder, and stays as deep as t
 opened only after its canonical path is checked to be under the canonical root.
 
 **Deny-list**, fixed in code (`sources::is_denied`), checked before a file is stat'ed and again before it is
-opened, and refused in a config's globs: `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
+opened, and refused in a config's globs. It holds for sources, for vaults (a denied note or folder is not
+walked, indexed, read or written, by name or through a link), for the CLI file tools (`atlas digest`, `atlas
+crop`), and for files Claude Code reads (never kept as a `slice` handle or read again from disk). The names: `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
 `*.jks`, `*.keystore`, `*.kdbx`, `*.asc`, `*.gpg`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*`,
 `credentials`, `credentials.*`, `*.credentials`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`, `secrets.*`,
-`*.secret`. Only `.md`, `.markdown` and `.txt` are indexed at all.
+`*.secret`. The name rules (`id_rsa*` and the other key names, `credentials`, `credentials.*`, `_netrc`,
+`secrets.*`) do not apply to a `.md` note or to a folder name, so `Secrets.md` and a `credentials/` folder are
+served; the extension and `.env` rules, dot names and the check of the name a link resolves to apply everywhere.
+Only `.md`, `.markdown` and `.txt` are indexed at all.

@@ -1,0 +1,18 @@
+Test run for C:\src\demo\Calc.Tests\bin\Debug\net8.0\Calc.Tests.dll (.NETCoreApp,Version=v8.0)
+VSTest version 17.11.1 (x64)
+
+Starting test execution, please wait...
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.8.2+699d445a1a (64-bit .NET 8.0.33)
+[xUnit.net 00:00:00.07]   Discovering: Calc.Tests
+[xUnit.net 00:00:00.12]   Discovered:  Calc.Tests
+[xUnit.net 00:00:00.13]   Starting:    Calc.Tests
+[xUnit.net 00:00:00.19]   Finished:    Calc.Tests
+  Passed Calc.Tests.CalculatorTests.AddsTwoNumbers [7 ms]
+  Passed Calc.Tests.CalculatorTests.AddsMany(a: 1, b: 1, sum: 2) [< 1 ms]
+  Passed Calc.Tests.CalculatorTests.AddsMany(a: 2, b: 2, sum: 4) [< 1 ms]
+
+Test Run Successful.
+Total tests: 3
+     Passed: 3
+ Total time: 0.7616 Seconds

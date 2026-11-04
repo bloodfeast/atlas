@@ -89,7 +89,17 @@ pub struct CodeRootSpec {
     /// default: off, no compiler runs and derive-generated items are not
     /// indexed.
     pub build_scripts: bool,
+    /// Its prebuilt SCIP files: `true` or absent, `index.scip` in a unit's
+    /// folder; `false`, none; a path, the root folder's file; an object
+    /// from unit folder (below the root; `""` or `"."` the root) to a path
+    /// or `false`, other folders following the convention. Paths are
+    /// relative to the configuration file.
+    pub scip: crate::code::Prebuilt,
 }
+
+/// `code.indexers` as an object: each named indexer's path, or `None` when
+/// it is turned off.
+pub type IndexerPaths = Vec<(String, Option<PathBuf>)>;
 
 /// The code index settings (see [`crate::code`]).
 #[derive(Debug, Clone, Default)]
@@ -99,6 +109,13 @@ pub struct CodeSpec {
     /// The rust-analyzer binary; found on `PATH` or through `rustup which`
     /// when absent.
     pub rust_analyzer: Option<PathBuf>,
+    /// The SCIP indexers of the language table ([`crate::langs`]): `None`
+    /// (the key absent, or `true`) finds each as
+    /// [`crate::langs::Driver::find`] does; `Some(None)` (`false`) runs
+    /// none; `Some(Some(map))` names tools: a path runs that binary (or Node
+    /// package folder, or script), `false` turns the tool off, and a tool
+    /// not named is found as usual.
+    pub indexers: Option<Option<IndexerPaths>>,
     /// The longest a rust-analyzer run may take before it is killed
     /// (default [`crate::code::DEFAULT_TIMEOUT_S`]).
     pub timeout_s: Option<usize>,
@@ -239,6 +256,9 @@ pub struct MemorySpec {
     /// routing switch, shared by every project; set by
     /// [`crate::project::resolve`], not read from the file).
     pub user_state: Option<PathBuf>,
+    /// Index the session transcripts as an opt-in source (default false;
+    /// see `crate::transcripts`).
+    pub transcripts: Option<bool>,
     /// The memory index as a tree (see `crate::memory::tree`); `None` keeps
     /// the index as it is.
     pub tree: Option<crate::memory::tree::TreeSpec>,
@@ -319,8 +339,29 @@ pub struct RecallSpec {
     pub query_tokens: Option<usize>,
     /// The bm25 floor of a lexical match when a model is loaded.
     pub hybrid_fts_floor: Option<f64>,
+    /// The tokens one session's recall injections may use in all (0: no cap).
+    pub session_budget_tokens: Option<usize>,
     /// The cosine below which a hook injects nothing (tuned on hit data).
     pub inject_floor: Option<f64>,
+    /// Whether `recall {query}` pointers carry their source anchor.
+    pub pointer_anchors: Option<bool>,
+    /// Context selection of what the hooks inject (`recall.select`).
+    pub select: Option<SelectSpec>,
+}
+
+/// Context selection (`recall.select`, see [`crate::memory::select`]).
+#[derive(Debug, Clone, Default)]
+pub struct SelectSpec {
+    /// Collapse and trim are on (default true).
+    pub enabled: Option<bool>,
+    /// The cosine at which two records may collapse (default 0.82).
+    pub dup_cos: Option<f64>,
+    /// The share of a record's words the one sent before it must hold (default 0.90).
+    pub dup_overlap: Option<f64>,
+    /// The longest excerpt of a trimmed pointer, in characters (default 90).
+    pub trim_chars: Option<usize>,
+    /// The longest excerpt of an older lane entry in a lane brief (default 180; 0: whole).
+    pub lane_chars: Option<usize>,
 }
 
 /// The context-cap hook's settings.
@@ -334,6 +375,22 @@ pub struct CapSpec {
     pub warn_every: Option<usize>,
     /// Apply to the main session too (default false: subagents only).
     pub main_session: Option<bool>,
+}
+
+/// The compaction settings (`docs/design/compaction.md`).
+#[derive(Debug, Clone, Default)]
+pub struct CompactSpec {
+    /// Turn on the experimental compaction features: the PreCompact
+    /// checkpoint, the SessionStart(compact) card and ref report, the
+    /// Compact instructions offer and `defer` (default false).
+    pub enabled: Option<bool>,
+    /// Block a proactive automatic compaction while a tool chain is running,
+    /// up to a hard ceiling (default false).
+    pub defer: Option<bool>,
+    /// The context window `defer` measures against (default 0: inferred).
+    pub window: Option<usize>,
+    /// The checkpoint card's budget in tokens (default 400).
+    pub card_tokens: Option<usize>,
 }
 
 /// The configuration `atlas --setup` writes, and the one used when no
@@ -378,6 +435,8 @@ pub struct Config {
     pub recall: Option<RecallSpec>,
     /// The context-cap hook.
     pub cap: Option<CapSpec>,
+    /// Compaction: the checkpoint card and `compact.defer`.
+    pub compact: Option<CompactSpec>,
     /// The model files downloaded at setup.
     pub models: Option<ModelsSpec>,
     /// The release check at session start.
@@ -394,7 +453,7 @@ pub struct Config {
 /// The keys of the configuration file's top level that are not about
 /// projects.
 pub const TOP_KEYS: &[&str] =
-    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "models", "update", "lean"];
+    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "models", "update", "lean"];
 
 pub(crate) fn absolute(base: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -434,6 +493,15 @@ impl<'a> Fields<'a> {
     pub(crate) fn req_string(&self, k: &str) -> Result<String> {
         self.string(k)?.ok_or_else(|| Error::InvalidArgument(format!("{}.{k} is required", self.at)))
     }
+    /// A required vault, source or identifier pattern name, checked here so
+    /// the error names the file it is in (the index checks it again).
+    pub(crate) fn short_name(&self, k: &str) -> Result<String> {
+        let n = self.req_string(k)?;
+        if n.is_empty() || n.len() > crate::project::MAX_SHORT_NAME || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            return Err(self.bad(k, &format!("1 to {} characters of A-Z a-z 0-9 _ - (it is {n:?})", crate::project::MAX_SHORT_NAME)));
+        }
+        Ok(n)
+    }
     pub(crate) fn boolean(&self, k: &str) -> Result<Option<bool>> {
         match self.get(k) {
             None => Ok(None),
@@ -464,6 +532,63 @@ impl<'a> Fields<'a> {
             Some(Value::Array(a)) => Ok(a),
             Some(_) => Err(self.bad(k, "a list")),
         }
+    }
+}
+
+/// Reads a code root's `scip`: `true` or absent (the convention), `false`
+/// (none), a path (the root folder's file), or an object from unit folder
+/// to a path or `false`.
+fn prebuilt_spec(f: &Fields<'_>, key: &str, base: &Path) -> Result<crate::code::Prebuilt> {
+    use crate::code::Prebuilt;
+    let folder = |d: &str| d.replace('\\', "/").trim_start_matches("./").trim_matches('/').to_string();
+    match f.get("scip") {
+        None | Some(Value::Bool(true)) => Ok(Prebuilt::Convention),
+        Some(Value::Bool(false)) => Ok(Prebuilt::Off),
+        Some(Value::String(p)) => Ok(Prebuilt::Files(vec![(String::new(), Some(absolute(base, Path::new(p))))])),
+        Some(Value::Object(m)) => {
+            let mut out = Vec::new();
+            for (dir, v) in m.iter() {
+                let dir = if dir == "." { String::new() } else { folder(dir) };
+                let path = match v {
+                    Value::String(p) => Some(absolute(base, Path::new(p))),
+                    Value::Bool(false) => None,
+                    _ => return Err(Error::InvalidArgument(format!("{key}.{dir} must be a path or false"))),
+                };
+                out.push((dir, path));
+            }
+            Ok(Prebuilt::Files(out))
+        }
+        Some(_) => Err(f.bad("scip", "true, false, a path, or an object from unit folder to a path or false")),
+    }
+}
+
+/// Reads `code.indexers`: `false` (none run), `true` (the default), or an
+/// object from tool name to a path or `false`.
+fn indexers_spec(f: &Fields<'_>, base: &Path) -> Result<Option<Option<IndexerPaths>>> {
+    let what = "false, true, or an object from indexer name to a path or false";
+    match f.get("indexers") {
+        None | Some(Value::Bool(true)) => Ok(None),
+        Some(Value::Bool(false)) => Ok(Some(None)),
+        Some(Value::Object(m)) => {
+            let known: Vec<&str> = crate::langs::LANGS.iter().filter_map(|l| l.driver.as_ref().map(|d| d.tool)).collect();
+            let mut out = Vec::new();
+            for (tool, v) in m.iter() {
+                if !known.contains(&tool.as_str()) {
+                    return Err(Error::InvalidArgument(format!(
+                        "code.indexers: unknown indexer {tool:?}; known indexers are {}",
+                        known.join(", ")
+                    )));
+                }
+                let path = match v {
+                    Value::String(p) => Some(absolute(base, Path::new(p))),
+                    Value::Bool(false) => None,
+                    _ => return Err(Error::InvalidArgument(format!("code.indexers.{tool} must be a path or false"))),
+                };
+                out.push((tool.clone(), path));
+            }
+            Ok(Some(Some(out)))
+        }
+        Some(_) => Err(f.bad("indexers", what)),
     }
 }
 
@@ -521,6 +646,8 @@ impl Config {
     /// As [`Config::load`].
     pub fn parse_object(v: &Value, base: &Path, at: &str, known: &[&str]) -> Result<Config> {
         let top = Fields::new(at, v, known)?;
+        // Where a nested key is, for a message: `projects[1].sources[0]`.
+        let pre = if at == "config" { String::new() } else { format!("{at}.") };
         let mut c = Config {
             db: top.string("db")?.map(|d| absolute(base, Path::new(&d))),
             wikilinks: top.boolean("wikilinks")?,
@@ -535,11 +662,11 @@ impl Config {
             ..Config::default()
         };
         for (i, x) in top.list("vaults")?.iter().enumerate() {
-            let f = Fields::new(&format!("vaults[{i}]"), x, &["name", "path"])?;
-            c.vaults.push(VaultSpec { name: f.req_string("name")?, path: absolute(base, Path::new(&f.req_string("path")?)) });
+            let f = Fields::new(&format!("{pre}vaults[{i}]"), x, &["name", "path"])?;
+            c.vaults.push(VaultSpec { name: f.short_name("name")?, path: absolute(base, Path::new(&f.req_string("path")?)) });
         }
         for (i, x) in top.list("sources")?.iter().enumerate() {
-            let at = format!("sources[{i}]");
+            let at = format!("{pre}sources[{i}]");
             let f = Fields::new(&at, x, &["name", "root", "include", "exclude", "chunk", "id_keys", "names_kind"])?;
             let mut chunk = ChunkRule::default();
             if let Some(cv) = f.get("chunk") {
@@ -551,7 +678,7 @@ impl Config {
                 }
             }
             c.sources.push(SourceSpec {
-                name: f.req_string("name")?,
+                name: f.short_name("name")?,
                 root: absolute(base, Path::new(&f.req_string("root")?)),
                 include: f.strings("include")?.ok_or_else(|| Error::InvalidArgument(format!("{at}.include is required")))?,
                 exclude: f.strings("exclude")?.unwrap_or_default(),
@@ -561,18 +688,19 @@ impl Config {
             });
         }
         for (i, x) in top.list("ids")?.iter().enumerate() {
-            let f = Fields::new(&format!("ids[{i}]"), x, &["name", "regex", "case_insensitive", "exclude"])?;
+            let f = Fields::new(&format!("{pre}ids[{i}]"), x, &["name", "regex", "case_insensitive", "exclude"])?;
             c.ids.push(PatternSpec {
-                name: f.req_string("name")?,
+                name: f.short_name("name")?,
                 regex: f.req_string("regex")?,
                 case_insensitive: f.boolean("case_insensitive")?.unwrap_or(false),
                 exclude: f.strings("exclude")?.unwrap_or_default(),
             });
         }
         if let Some(cv) = top.get("code") {
-            let f = Fields::new("code", cv, &["roots", "rust_analyzer", "timeout_s", "debounce_s", "defer_lock", "dir"])?;
+            let f = Fields::new("code", cv, &["roots", "rust_analyzer", "indexers", "timeout_s", "debounce_s", "defer_lock", "dir"])?;
             let mut code = CodeSpec {
                 rust_analyzer: f.string("rust_analyzer")?.map(|p| absolute(base, Path::new(&p))),
+                indexers: indexers_spec(&f, base)?,
                 timeout_s: f.uint("timeout_s")?,
                 debounce_s: f.uint("debounce_s")?,
                 defer_lock: f.string("defer_lock")?.map(|p| absolute(base, Path::new(&p))),
@@ -580,11 +708,12 @@ impl Config {
                 ..CodeSpec::default()
             };
             for (i, x) in f.list("roots")?.iter().enumerate() {
-                let r = Fields::new(&format!("code.roots[{i}]"), x, &["name", "root", "build_scripts"])?;
+                let r = Fields::new(&format!("{pre}code.roots[{i}]"), x, &["name", "root", "build_scripts", "scip"])?;
                 code.roots.push(CodeRootSpec {
                     name: r.req_string("name")?,
                     root: absolute(base, Path::new(&r.req_string("root")?)),
                     build_scripts: r.boolean("build_scripts")?.unwrap_or(false),
+                    scip: prebuilt_spec(&r, &format!("code.roots[{i}].scip"), base)?,
                 });
             }
             c.code = Some(code);
@@ -651,7 +780,7 @@ impl Config {
             c.update = Some(UpdateSpec { enabled: f.boolean("enabled")?, pin, url });
         }
         if let Some(mv) = top.get("memory") {
-            let f = Fields::new("memory", mv, &["store", "export_dir", "exports", "snapshot_hours", "snapshot_dir", "snapshot_cap_mb", "brief_reference", "tree"])?;
+            let f = Fields::new("memory", mv, &["store", "export_dir", "exports", "snapshot_hours", "snapshot_dir", "snapshot_cap_mb", "brief_reference", "tree", "transcripts"])?;
             let mut m = MemorySpec {
                 store: f.string("store")?.map(|p| absolute(base, Path::new(&p))),
                 export_dir: f.string("export_dir")?.map(|p| absolute(base, Path::new(&p))),
@@ -659,6 +788,7 @@ impl Config {
                 snapshot_dir: f.string("snapshot_dir")?.map(|p| absolute(base, Path::new(&p))),
                 snapshot_cap_mb: f.uint("snapshot_cap_mb")?,
                 brief_reference: f.string("brief_reference")?.map(|p| absolute(base, Path::new(&p))),
+                transcripts: f.boolean("transcripts")?,
                 ..MemorySpec::default()
             };
             for (i, x) in f.list("exports")?.iter().enumerate() {
@@ -699,7 +829,7 @@ impl Config {
             c.memory = Some(m);
         }
         if let Some(rv) = top.get("recall") {
-            let f = Fields::new("recall", rv, &["budget_tokens", "lane_budget_tokens", "fts_floor", "min_terms", "cos_floor", "cos_alone", "query_tokens", "hybrid_fts_floor", "inject_floor"])?;
+            let f = Fields::new("recall", rv, &["budget_tokens", "lane_budget_tokens", "fts_floor", "min_terms", "cos_floor", "cos_alone", "query_tokens", "hybrid_fts_floor", "inject_floor", "session_budget_tokens", "pointer_anchors", "select"])?;
             let num = |k: &str| -> Result<Option<f64>> {
                 match f.get(k) {
                     None => Ok(None),
@@ -716,6 +846,21 @@ impl Config {
                 query_tokens: f.uint("query_tokens")?,
                 hybrid_fts_floor: num("hybrid_fts_floor")?,
                 inject_floor: num("inject_floor")?,
+                session_budget_tokens: f.uint("session_budget_tokens")?,
+                pointer_anchors: f.boolean("pointer_anchors")?,
+                select: match f.get("select") {
+                    None => None,
+                    Some(sv) => {
+                        let g = Fields::new("recall.select", sv, &["enabled", "dup_cos", "dup_overlap", "trim_chars", "lane_chars"])?;
+                        let unit = |k: &str| -> Result<Option<f64>> {
+                            match g.get(k) {
+                                None => Ok(None),
+                                Some(v) => Ok(Some(v.as_f64().filter(|x| (0.0..=1.0).contains(x)).ok_or_else(|| g.bad(k, "a number from 0 to 1"))?)),
+                            }
+                        };
+                        Some(SelectSpec { enabled: g.boolean("enabled")?, dup_cos: unit("dup_cos")?, dup_overlap: unit("dup_overlap")?, trim_chars: g.uint("trim_chars")?, lane_chars: g.uint("lane_chars")? })
+                    }
+                },
             });
         }
         if let Some(cv) = top.get("cap") {
@@ -726,6 +871,10 @@ impl Config {
                 warn_every: f.uint("warn_every")?,
                 main_session: f.boolean("main_session")?,
             });
+        }
+        if let Some(cv) = top.get("compact") {
+            let f = Fields::new("compact", cv, &["enabled", "defer", "window", "card_tokens"])?;
+            c.compact = Some(CompactSpec { enabled: f.boolean("enabled")?, defer: f.boolean("defer")?, window: f.uint("window")?, card_tokens: f.uint("card_tokens")? });
         }
         if let Some(lv) = top.get("lean") {
             if lv.as_object().is_none() {
@@ -808,6 +957,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_context_selection() {
+        let c = Config::parse(r#"{"recall": {"select": {"enabled": false, "dup_cos": 0.9, "dup_overlap": 0.95, "trim_chars": 70, "lane_chars": 0}}}"#, Path::new("b")).unwrap();
+        let s = c.recall.clone().unwrap().select.unwrap();
+        assert_eq!((s.enabled, s.dup_cos, s.dup_overlap, s.trim_chars, s.lane_chars), (Some(false), Some(0.9), Some(0.95), Some(70), Some(0)));
+        let r = crate::memory::settings::Settings::from_config(Some(&c), Path::new("b/i.sqlite")).unwrap().recall.select;
+        assert_eq!((r.enabled, r.trim_chars, r.lane_chars), (false, 70, 0));
+        let d = crate::memory::settings::Settings::from_config(None, Path::new("b/i.sqlite")).unwrap().recall.select;
+        assert_eq!(d, crate::memory::select::Select::default());
+        assert!(d.enabled, "on by default");
+    }
+
+    #[test]
     fn the_shipped_template_parses() {
         let c = Config::parse(TEMPLATE, Path::new("b")).unwrap();
         let m = c.models.expect("the template lists the models");
@@ -833,8 +994,58 @@ mod tests {
             r#"{"models": {"files": [{"id": "e", "file": "m.atm", "url": "https://example.com/m", "sha256": "abc", "size": 3}]}}"#,
             r#"{"models": {"files": [{"id": "e", "file": "m.atm", "url": "https://example.com/m", "sha256": "00000000000000000000000000000000000000000000000000000000000000aa"}]}}"#,
             r#"{"models": {"files": [{"id": "e", "file": "m.atm", "url": "https://x.org/a", "sha256": "00000000000000000000000000000000000000000000000000000000000000aa", "size": 3}, {"id": "e", "file": "n.atm", "url": "https://x.org/b", "sha256": "00000000000000000000000000000000000000000000000000000000000000aa", "size": 3}]}}"#,
+            r#"{"recall": {"select": {"dup_cos": 1.5}}}"#,
+            r#"{"recall": {"select": {"trim": 90}}}"#,
+            r#"{"recall": {"select": true}}"#,
         ] {
             assert!(Config::parse(bad, base).is_err(), "accepted {bad}");
         }
+    }
+
+    #[test]
+    fn a_code_root_scip_is_true_false_a_path_or_a_map_of_unit_folders() {
+        use crate::code::Prebuilt;
+        let scip = |v: &str| {
+            Config::parse(&format!(r#"{{"code": {{"roots": [{{"name": "a", "root": "r", "scip": {v}}}]}}}}"#), Path::new("b"))
+                .map(|c| c.code.unwrap().roots[0].scip.clone())
+        };
+        assert_eq!(scip("true").unwrap(), Prebuilt::Convention);
+        assert_eq!(scip("false").unwrap(), Prebuilt::Off);
+        assert_eq!(scip(r#""ci/index.scip""#).unwrap(), Prebuilt::Files(vec![(String::new(), Some(Path::new("b").join("ci/index.scip")))]));
+        assert_eq!(
+            scip(r#"{".": "x.scip", "./svc/api/": false}"#).unwrap(),
+            Prebuilt::Files(vec![(String::new(), Some(Path::new("b").join("x.scip"))), ("svc/api".to_string(), None)])
+        );
+        assert!(scip(r#"{"svc": 1}"#).unwrap_err().to_string().contains("code.roots[0].scip.svc must be a path or false"));
+        assert!(scip("3").unwrap_err().to_string().contains("code.roots[0].scip must be"));
+        let none = Config::parse(r#"{"code": {"roots": [{"name": "a", "root": "r"}]}}"#, Path::new("b")).unwrap();
+        assert_eq!(none.code.unwrap().roots[0].scip, Prebuilt::Convention);
+    }
+
+    #[test]
+    fn code_indexers_is_false_true_or_a_map_of_known_tools() {
+        let code =
+            |v: &str| Config::parse(&format!(r#"{{"code": {{"indexers": {v}}}}}"#), Path::new("b")).map(|c| c.code.unwrap().indexers);
+        assert_eq!(code("true").unwrap(), None);
+        assert_eq!(code("false").unwrap(), Some(None));
+        assert_eq!(
+            code(r#"{"scip-go": "bin/scip-go", "scip-typescript": false}"#).unwrap(),
+            Some(Some(vec![("scip-go".to_string(), Some(Path::new("b").join("bin/scip-go"))), ("scip-typescript".to_string(), None)]))
+        );
+        let e = code(r#"{"scip-goo": "x"}"#).unwrap_err().to_string();
+        assert!(e.contains("unknown indexer \"scip-goo\"") && e.contains("scip-go, scip-typescript"), "{e}");
+        assert!(code(r#"{"scip-go": true}"#).unwrap_err().to_string().contains("code.indexers.scip-go must be a path or false"));
+        assert!(code("3").unwrap_err().to_string().contains("code.indexers must be"));
+        let setup = |v: &str| {
+            crate::code::CodeSetup::from_spec(
+                &Config::parse(&format!(r#"{{"code": {{"indexers": {v}}}}}"#), Path::new("b")).unwrap().code.unwrap(),
+                Path::new("db"),
+                false,
+            )
+            .indexers
+        };
+        assert_eq!(setup("true"), crate::code::Indexers::Search);
+        assert!(matches!(setup("false"), crate::code::Indexers::Off(_)));
+        assert_eq!(setup(r#"{"scip-go": false}"#), crate::code::Indexers::Chosen(vec![("scip-go".into(), None)]));
     }
 }
