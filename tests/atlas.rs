@@ -83,7 +83,8 @@ pub fn corpus(root: &Path) -> PathBuf {
     write(&hb.join(".env.local"), "TK-901 zebraquartz\n");
     write(&hb.join("server.pem"), "TK-902 zebraquartz\n");
     write(&hb.join("signing.key"), "TK-903 zebraquartz\n");
-    write(&hb.join("credentials.md"), "TK-904 zebraquartz\n");
+    // A credential file by name (the name rules skip .md notes: Secrets.md is served).
+    write(&hb.join("credentials.txt"), "TK-904 zebraquartz\n");
     write(&hb.join("notes.txt"), "Plain text mentions TK-003.\n");
     let mem = root.join("memory");
     write(&mem.join("alpha-slug.md"), ALPHA);
@@ -231,7 +232,7 @@ fn deny_list_and_globs_keep_secrets_and_outside_files_unread() {
     let mut s = open(&cfg);
     let docs = s.store_mut().docs().unwrap();
     let paths: Vec<&str> = docs.iter().map(|d| d.1.as_str()).collect();
-    for bad in [".env", ".env.local", "server.pem", "signing.key", "credentials.md", "deep/NESTED.md", "TK-905 Outside.md"] {
+    for bad in [".env", ".env.local", "server.pem", "signing.key", "credentials.txt", "deep/NESTED.md", "TK-905 Outside.md"] {
         assert!(!paths.contains(&bad), "{bad} was indexed: {paths:?}");
     }
     let r = call(&mut s, "search", json!({"mode": "sections", "query": "zebraquartz"}));
@@ -242,7 +243,7 @@ fn deny_list_and_globs_keep_secrets_and_outside_files_unread() {
     }
     // The readers refuse them even when asked directly.
     let src = &s.store_mut().sources()[0].clone();
-    for bad in [".env", ".env.local", "server.pem", "signing.key", "credentials.md", "../outside/TK-905 Outside.md", "deep/NESTED.md"] {
+    for bad in [".env", ".env.local", "server.pem", "signing.key", "credentials.txt", "../outside/TK-905 Outside.md", "deep/NESTED.md"] {
         assert!(src.read(bad).is_err(), "read {bad}");
     }
     // And a configuration cannot name them.
@@ -274,7 +275,7 @@ fn no_write_tool_can_reach_a_source() {
     let cfg = corpus(t.path());
     let mut s = open(&cfg);
     let before: Vec<_> = ["handbook", "memory"].iter().map(|d| snapshot(&t.path().join(d))).collect();
-    let tools = atlas::tools::tool_list();
+    let tools = atlas::tools::full_tool_list();
     let writes: Vec<String> = tools
         .iter()
         .filter(|t| t["annotations"]["readOnlyHint"] != json!(true))

@@ -147,6 +147,9 @@ pub fn cli(args: Vec<String>) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     let (input, output, cut) = parse(&args)?;
+    if crate::sources::path_denied(std::path::Path::new(&input)) {
+        return Err(crate::sources::denied_message(std::path::Path::new(&input)));
+    }
     let bytes = std::fs::read(&input).map_err(|e| format!("{input}: {e}"))?;
     let img = picture::decode(&bytes).map_err(|e| format!("{input}: {e}"))?;
     let out = apply(&img, &cut)?;

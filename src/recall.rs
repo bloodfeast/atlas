@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::Result;
+use crate::lex;
 use crate::markdown;
 use crate::registry;
 use crate::store::Store;
@@ -301,6 +302,29 @@ pub struct CodeMiss {
     pub name: String,
     /// The keyword grep matched.
     pub keyword: String,
+    /// The file's language (`rust`, `wgsl`, `go`).
+    pub lang: String,
+}
+
+/// The recall check of one language of [`crate::langs`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LangRecall {
+    /// The language.
+    pub lang: String,
+    /// Its files read.
+    pub files: usize,
+    /// Definitions its truth regex found (lines inside block comments and
+    /// multi-line strings excluded).
+    pub truth: usize,
+    /// Lines the regex matched inside a block comment or multi-line string.
+    pub excluded: usize,
+    /// Of `truth`, how many SCIP rows have.
+    pub indexed: usize,
+    /// Of `truth`, how many only scanner rows have.
+    pub scan_only: usize,
+    /// Of `truth`, how many the index lacks (listed in
+    /// [`CodeRecall::misses`]).
+    pub missing: usize,
 }
 
 /// What the code recall check found.
@@ -308,6 +332,9 @@ pub struct CodeMiss {
 pub struct CodeRecall {
     /// Rust files and WGSL files read.
     pub files: (usize, usize),
+    /// Each language of [`crate::langs`] a root has files of; the counts
+    /// above are Rust's and WGSL's alone.
+    pub langs: Vec<LangRecall>,
     /// Definitions grep found (lines in comments and strings excluded).
     pub truth: usize,
     /// Lines grep matched that sit inside a block comment or string.
@@ -316,23 +343,171 @@ pub struct CodeRecall {
     pub indexed: usize,
     /// Of `truth`, how many only the line-scan rows have.
     pub scan_only: usize,
-    /// Definitions grep found and the index lacks entirely.
+    /// Definitions grep found and the index lacks entirely (every
+    /// language's).
     pub misses: Vec<CodeMiss>,
     /// Roots never indexed (`atlas --code-index` builds them): not
     /// checked, as the `symbol` tool reports them "not indexed yet".
     pub unindexed: Vec<String>,
 }
 
-/// The ground-truth patterns: grep-style regexes over one line. Rust items
-/// at a line start after visibility and qualifiers; WGSL functions and
-/// structs anywhere at a line start, module-scope `var`, `const`,
-/// `override` and `alias` at column 0.
-const RUST_DEF_RE: &str = r#"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|safe|default|extern(?:\s+"[^"]*")?)\s+)*(?:(fn|struct|enum|trait|type|union|mod|const|static(?:\s+mut)?)\s+|(macro_rules!)\s*)(?:r#)?([A-Za-z_][A-Za-z0-9_]*)"#;
-const WGSL_DEF_RE: &str = r"^(?:\s*(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*(fn|struct)\s+|(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*(var)(?:<[^>]*>)?\s+|(const|override|alias)\s+)([A-Za-z_][A-Za-z0-9_]*)";
+// The ground truth: grep-style line scans. Rust items at a line start
+// after visibility and qualifiers; WGSL functions and structs anywhere at a
+// line start, module-scope `var`, `const`, `override` and `alias` at
+// column 0.
+
+#[cfg(test)]
+pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
+    use lex::props::{v, Mode, Site};
+    vec![
+        Site {
+            name: "recall rust definition",
+            pattern: r#"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|safe|default|extern(?:\s+"[^"]*")?)\s+)*(?:(fn|struct|enum|trait|type|union|mod|const|static(?:\s+mut)?)\s+|(macro_rules!)\s*)(?:r#)?([A-Za-z_][A-Za-z0-9_]*)"#.into(),
+            tokens: &[
+                "pub", "pub(crate)", "(", ")", " ", "\t", "const", "async", "unsafe", "safe", "default", "extern", "\"C\"", "\"", "fn", "struct", "enum", "trait", "type",
+                "union", "mod", "static", "mut", "macro_rules!", "r#", "x", "X1", "_", "1", "{", "<T>",
+            ],
+            examples: &[
+                "pub(crate) const unsafe fn x() {}",
+                "  pub extern \"C\" fn y_1()",
+                "const MAX: u32 = 1;",
+                "static mut COUNT: usize = 0;",
+                "static mutable: u8 = 0;",
+                "macro_rules! m {",
+                "pub fn r#type()",
+                "unsafe extern \"system\" fn z",
+                "pub(in a::b) struct S;",
+            ],
+            mode: Mode::One(|s| rust_def(s).map(v)),
+        },
+        Site {
+            name: "recall wgsl definition",
+            pattern: r"^(?:\s*(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*(fn|struct)\s+|(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*(var)(?:<[^>]*>)?\s+|(const|override|alias)\s+)([A-Za-z_][A-Za-z0-9_]*)".into(),
+            tokens: &["@", "@vertex", "@group(0)", "(", ")", " ", "\t", "fn", "struct", "var", "<uniform>", "<", ">", "const", "override", "alias", "x", "_y", "1", "a"],
+            examples: &[
+                "@vertex fn vs_main(",
+                "  @compute @workgroup_size(64) fn cs(",
+                "@group(0) @binding(1) var<storage, read> buf: B;",
+                "var<private> p: f32;",
+                "const N = 4u;",
+                "override K: f32;",
+                "alias V = vec3f;",
+                "struct S {",
+                "@vertexfn x",
+                "@foovar<f32> y",
+            ],
+            mode: Mode::One(|s| wgsl_def(s).map(v)),
+        },
+    ]
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*` at byte `i`: where it ends.
+fn ident_at(s: &str, i: usize) -> Option<usize> {
+    lex::at(s, i).filter(|&c| lex::ident_start(c)).map(|_| lex::run(s, i + 1, lex::ident))
+}
+
+/// A Rust definition line (was
+/// `^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|safe|default|extern(?:\s+"[^"]*")?)\s+)*(?:(fn|struct|enum|trait|type|union|mod|const|static(?:\s+mut)?)\s+|(macro_rules!)\s*)(?:r#)?([A-Za-z_][A-Za-z0-9_]*)`):
+/// groups 0, the keyword, `macro_rules!` and the name.
+pub(crate) fn rust_def(s: &str) -> Option<[lex::Span; 4]> {
+    let mut i = lex::spaces(s, 0);
+    // `pub` or `pub(...)`, then space. Without it nothing else can match a
+    // `pub` line, so taking it when it is there is the whole choice.
+    if let Some(p) = lex::lit(s, i, "pub") {
+        let parens = (s.as_bytes().get(p) == Some(&b'(')).then(|| s[p + 1..].find(')').map(|k| p + 2 + k)).flatten();
+        if let Some(a) = parens.and_then(|q| lex::spaces1(s, q)).or_else(|| lex::spaces1(s, p)) {
+            i = a;
+        }
+    }
+    // The qualifiers, each then space; where each one starts.
+    let mut starts = vec![i];
+    loop {
+        let x = *starts.last().expect("one start");
+        // A prefix compare per word: most fail on the first byte, which
+        // measured faster than a binary search of six words.
+        let Some((e, w)) = lex::one_of(s, x, &["const", "async", "unsafe", "safe", "default", "extern"]) else { break };
+        let abi = (w == "extern")
+            .then(|| lex::spaces1(s, e).filter(|&q| s.as_bytes().get(q) == Some(&b'"')).and_then(|q| s[q + 1..].find('"').map(|k| q + 2 + k)))
+            .flatten()
+            .and_then(|q| lex::spaces1(s, q));
+        match abi.or_else(|| lex::spaces1(s, e)) {
+            Some(n) => starts.push(n),
+            None => break,
+        }
+    }
+    // The most qualifiers first: `const` is a qualifier and a keyword.
+    starts.iter().rev().find_map(|&x| {
+        let name = |n: usize| {
+            let r = lex::lit(s, n, "r#").filter(|&r| ident_at(s, r).is_some());
+            let n = r.unwrap_or(n);
+            ident_at(s, n).map(|e| (n, e))
+        };
+        if let Some((e, w)) = lex::one_of(s, x, &["fn", "struct", "enum", "trait", "type", "union", "mod", "const", "static"]) {
+            let with_mut = (w == "static").then(|| lex::spaces1(s, e).and_then(|m| lex::lit(s, m, "mut"))).flatten();
+            for k in [with_mut, Some(e)].into_iter().flatten() {
+                if let Some(n) = lex::spaces1(s, k).and_then(name) {
+                    return Some([Some((0, n.1)), Some((x, k)), None, Some(n)]);
+                }
+            }
+            return None;
+        }
+        let e = lex::lit(s, x, "macro_rules!")?;
+        let n = name(lex::spaces(s, e))?;
+        Some([Some((0, n.1)), None, Some((x, e)), Some(n)])
+    })
+}
+
+/// A WGSL definition line (was
+/// `^(?:\s*(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*(fn|struct)\s+|(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*(var)(?:<[^>]*>)?\s+|(const|override|alias)\s+)([A-Za-z_][A-Za-z0-9_]*)`):
+/// groups 0, `fn` or `struct`, `var`, `const` `override` or `alias`, and
+/// the name.
+pub(crate) fn wgsl_def(s: &str) -> Option<[lex::Span; 5]> {
+    let fn_or_struct = |x: usize| {
+        let (e, _) = lex::one_of(s, x, &["fn", "struct"])?;
+        let n = lex::spaces1(s, e)?;
+        Some([Some((0, ident_at(s, n)?)), Some((x, e)), None, None, Some((n, ident_at(s, n)?))])
+    };
+    let var = |x: usize| {
+        let e = lex::lit(s, x, "var")?;
+        let g = (s.as_bytes().get(e) == Some(&b'<')).then(|| s[e + 1..].find('>').map(|k| e + 2 + k)).flatten().unwrap_or(e);
+        let n = lex::spaces1(s, g)?;
+        Some([Some((0, ident_at(s, n)?)), None, Some((x, e)), None, Some((n, ident_at(s, n)?))])
+    };
+    wgsl_attrs_then(s, lex::spaces(s, 0), fn_or_struct).or_else(|| wgsl_attrs_then(s, 0, var)).or_else(|| {
+        let (e, _) = lex::one_of(s, 0, &["const", "override", "alias"])?;
+        let n = lex::spaces1(s, e)?;
+        Some([Some((0, ident_at(s, n)?)), None, None, Some((0, e)), Some((n, ident_at(s, n)?))])
+    })
+}
+
+/// `(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*` from byte `x`, then `k`, tried in
+/// the order the regex engine backtracks: every attribute whole first,
+/// then the last attribute's name cut shorter (the keyword can start
+/// inside it: `@vertexfn`), then the one before it, and so on.
+fn wgsl_attrs_then<R>(s: &str, x: usize, k: impl Fn(usize) -> Option<R>) -> Option<R> {
+    let b = s.as_bytes();
+    // (name start, name end) of each attribute, and where the run ends.
+    let mut names: Vec<(usize, usize)> = Vec::new();
+    let mut y = x;
+    while b.get(y) == Some(&b'@') {
+        let ne = lex::run(s, y + 1, lex::ident_start);
+        if ne == y + 1 {
+            break;
+        }
+        let pe = (b.get(ne) == Some(&b'(')).then(|| s[ne + 1..].find(')').map(|k| ne + 2 + k)).flatten().unwrap_or(ne);
+        names.push((y + 1, ne));
+        y = lex::spaces(s, pe);
+    }
+    if let Some(r) = k(y) {
+        return Some(r);
+    }
+    names.iter().rev().find_map(|&(ns, ne)| (ns + 1..ne).rev().find_map(&k))
+}
 
 /// Compares the code index with a grep of every `.rs` and `.wgsl` file of
-/// the configured roots: every definition grep finds must be a definition
-/// row at the same line with the same name. A root with no index yet
+/// the configured roots, and of every file of a language of
+/// [`crate::langs`] by its row's truth regex: every definition grep finds
+/// must be a definition row at the same line with the same name. A root with no index yet
 /// is listed in [`CodeRecall::unindexed`] and not checked.
 ///
 /// # Arguments
@@ -346,8 +521,6 @@ const WGSL_DEF_RE: &str = r"^(?:\s*(?:@[A-Za-z_]+(?:\([^)]*\))?\s*)*(fn|struct)\
 /// [`crate::error::Error::Db`] from SQLite.
 pub fn code_check(conn: &rusqlite::Connection, roots: &[crate::code::CodeRoot]) -> Result<CodeRecall> {
     use std::collections::HashMap;
-    let rust_re = crate::regex::Regex::new(RUST_DEF_RE).map_err(|e| crate::error::Error::InvalidArgument(e.to_string()))?;
-    let wgsl_re = crate::regex::Regex::new(WGSL_DEF_RE).map_err(|e| crate::error::Error::InvalidArgument(e.to_string()))?;
     let mut rep = CodeRecall::default();
     let built = crate::code::root_records(conn)?;
     for root in roots {
@@ -373,37 +546,114 @@ pub fn code_check(conn: &rusqlite::Connection, roots: &[crate::code::CodeRoot]) 
         rep.files.0 += walk.rust.len();
         rep.files.1 += walk.wgsl.len();
         for (files, rust) in [(&walk.rust, true), (&walk.wgsl, false)] {
-            for f in files {
-                let Some(text) = crate::code::read_source(&root.root, &f.path) else { continue };
+            // Files are read and scanned on several threads; the results
+            // come back in file order, so the report is the same.
+            let defs = lex::par_map(files, |f| {
+                let Some(text) = crate::code::read_source(&root.root, &f.path) else { return Vec::new() };
                 let code = if rust { crate::code::rust_code_lines(&text) } else { wgsl_code_lines(&text) };
+                let mut out: Vec<(usize, String, String, bool)> = Vec::new();
                 for (i, line) in text.lines().enumerate() {
+                    let g = |m: lex::Span| m.map(|(a, b)| &line[a..b]);
                     let (kw, name) = if rust {
-                        let Some(c) = rust_re.captures(line) else { continue };
-                        let kw = c.get(1).or_else(|| c.get(2)).map_or("", |m| m.as_str());
-                        (kw.split_whitespace().next().unwrap_or("").to_string(), c.get(3).map_or("", |m| m.as_str()))
+                        let Some(c) = rust_def(line) else { continue };
+                        let kw = g(c[1]).or_else(|| g(c[2])).unwrap_or("");
+                        (kw.split_whitespace().next().unwrap_or("").to_string(), g(c[3]).unwrap_or(""))
                     } else {
-                        let Some(c) = wgsl_re.captures(line) else { continue };
-                        let kw = (1..=3).find_map(|g| c.get(g)).map_or("", |m| m.as_str()).to_string();
-                        (kw, c.get(4).map_or("", |m| m.as_str()))
+                        let Some(c) = wgsl_def(line) else { continue };
+                        let kw = (1..=3).find_map(|k| g(c[k])).unwrap_or("").to_string();
+                        (kw, g(c[4]).unwrap_or(""))
                     };
-                    if name == "_" {
-                        continue;
+                    if name != "_" {
+                        out.push((i, kw, name.to_string(), code.get(i).copied().unwrap_or(true)));
                     }
-                    if !code.get(i).copied().unwrap_or(true) {
+                }
+                out
+            });
+            for (f, defs) in files.iter().zip(defs) {
+                for (i, kw, name, is_code) in defs {
+                    if !is_code {
                         rep.excluded += 1;
                         continue;
                     }
                     rep.truth += 1;
-                    match have.get(&(f.path.clone(), i as u32 + 1, name.to_string())) {
+                    match have.get(&(f.path.clone(), i as u32 + 1, name.clone())) {
                         Some(false) => rep.indexed += 1,
                         Some(true) => rep.scan_only += 1,
-                        None => rep.misses.push(CodeMiss { root: root.name.clone(), path: f.path.clone(), line: i as u32 + 1, name: name.to_string(), keyword: kw }),
+                        None => rep.misses.push(CodeMiss { root: root.name.clone(), path: f.path.clone(), line: i as u32 + 1, name, keyword: kw, lang: if rust { "rust" } else { "wgsl" }.into() }),
+                    }
+                }
+            }
+        }
+        for lang in crate::langs::LANGS {
+            let files: Vec<&crate::code::WalkedFile> = walk.source.iter().filter(|f| crate::langs::of_path(&f.path).is_some_and(|l| l.name == lang.name)).collect();
+            if files.is_empty() {
+                continue;
+            }
+            let re = crate::regex::Regex::new(lang.truth).map_err(|e| crate::error::Error::InvalidArgument(e.to_string()))?;
+            let scanner = crate::scanner::of(lang);
+            // A constructor's own spelling (Python's `__init__`) is stored
+            // under its type's name: such a line is held by a `ctor` row.
+            let ctors = ctor_rows(conn, &root.name)?;
+            let at = match rep.langs.iter().position(|l| l.lang == lang.name) {
+                Some(i) => i,
+                None => {
+                    rep.langs.push(LangRecall { lang: lang.name.into(), ..LangRecall::default() });
+                    rep.langs.len() - 1
+                }
+            };
+            for f in files {
+                rep.langs[at].files += 1;
+                let Some(text) = crate::code::read_source(&root.root, &f.path) else { continue };
+                let code = scanner.code_lines(&text);
+                for (i, line) in text.lines().enumerate() {
+                    let Some(c) = re.captures(line) else { continue };
+                    let (kw, name) = (c.name("kw").map_or("", |m| m.as_str()), c.name("name").map_or("", |m| m.as_str()));
+                    if name == "_" {
+                        continue;
+                    }
+                    let l = &mut rep.langs[at];
+                    if !code.get(i).copied().unwrap_or(true) {
+                        l.excluded += 1;
+                        continue;
+                    }
+                    l.truth += 1;
+                    let held = have
+                        .get(&(f.path.clone(), i as u32 + 1, name.to_string()))
+                        .or_else(|| crate::code::CTORS.contains(&name).then(|| ctors.get(&(f.path.clone(), i as u32 + 1))).flatten());
+                    match held {
+                        Some(false) => l.indexed += 1,
+                        Some(true) => l.scan_only += 1,
+                        None => {
+                            l.missing += 1;
+                            rep.misses.push(CodeMiss { root: root.name.clone(), path: f.path.clone(), line: i as u32 + 1, name: name.to_string(), keyword: kw.to_string(), lang: lang.name.into() });
+                        }
                     }
                 }
             }
         }
     }
     Ok(rep)
+}
+
+/// The constructor definition rows of a root, by (path, line): whether
+/// only scanner rows are there.
+///
+/// # Errors
+///
+/// [`crate::error::Error::Db`] from SQLite.
+pub fn ctor_rows(conn: &rusqlite::Connection, root: &str) -> Result<std::collections::HashMap<(String, u32), bool>> {
+    let mut out: std::collections::HashMap<(String, u32), bool> = std::collections::HashMap::new();
+    let mut st = conn.prepare(
+        "SELECT f.path, o.line, o.kind FROM code_occ o JOIN code_files f ON f.id = o.file WHERE f.root = ?1 AND o.sect = 0 AND o.kind LIKE 'ctor%'",
+    )?;
+    let rows = st.query_map([root], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?)))?;
+    for r in rows {
+        let (p, l, k) = r?;
+        let scan = k.ends_with("(scan)");
+        let e = out.entry((p, l)).or_insert(scan);
+        *e = *e && scan;
+    }
+    Ok(out)
 }
 
 /// For each WGSL line, whether it starts outside a block comment.

@@ -72,6 +72,7 @@ Development tasks are `cargo xtask <command>`, in Rust, in the `xtask` workspace
 | `memory-tree-check` | checks the memory index tree (see [[Memory tree]]) |
 | `pack-embedder` | packs a BERT sentence embedder into atlas's model file |
 | `coverage` | the coverage report above |
+| `langs-bench` | a code index language's numbers on a pinned public corpus (see [[Code index]]) |
 | `release` | the release, its notes and the wiki (see [[Releasing]]) |
 | `verify-macos` | the whole suite, the recall check and the bench on macOS, to paste back |
 

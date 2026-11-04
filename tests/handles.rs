@@ -303,6 +303,60 @@ fn shell_reads_and_builds_get_an_exit_tail_and_nothing_else_does() {
     assert_eq!(r.pre_tool_use(&pre("ATLAS_RAW=1 cat a", false)).unwrap(), None);
 }
 
+/// Auto mode gets no exit tail (its classifier judges the command as
+/// written, issue #67); every other mode, and an input with no mode, keeps it.
+#[test]
+fn the_exit_tail_follows_the_permission_mode() {
+    let t = Temp::new("modes");
+    let mut r = Router::with_db(&t.path().join("index.sqlite"), None);
+    let pre = |tool: &str, cmd: &str, mode: &str| HookEvent {
+        event: "PreToolUse".into(),
+        tool_name: tool.into(),
+        permission_mode: mode.into(),
+        tool_input: json!({"command": cmd, "description": "d"}),
+        ..HookEvent::default()
+    };
+    for cmd in ["git show HEAD", "sed -n 1,20p src/a.rs", "grep -n fn src/a.rs", "cargo test"] {
+        assert_eq!(r.pre_tool_use(&pre("Bash", cmd, "auto")).unwrap(), None, "auto: {cmd}");
+        assert_eq!(r.pre_tool_use(&pre("PowerShell", cmd, "auto")).unwrap(), None, "auto PowerShell: {cmd}");
+        for mode in ["", "default", "plan", "acceptEdits", "dontAsk", "bypassPermissions"] {
+            let out = r.pre_tool_use(&pre("Bash", cmd, mode)).unwrap().unwrap_or_else(|| panic!("{mode}: {cmd}"));
+            assert_eq!(out["command"], json!(format!("{cmd} || echo {EXIT_MARK}")), "{mode}: {cmd}");
+            assert_eq!(out["description"], json!("d"));
+        }
+    }
+    // ATLAS_RAW=1 skips the tail in every mode.
+    for mode in ["", "default", "auto", "bypassPermissions"] {
+        for cmd in ["ATLAS_RAW=1 git show HEAD", "ATLAS_RAW=1 cargo test", "cd x && ATLAS_RAW=1 grep -n a b"] {
+            assert_eq!(r.pre_tool_use(&pre("Bash", cmd, mode)).unwrap(), None, "{mode}: {cmd}");
+            assert_eq!(r.pre_tool_use(&pre("PowerShell", cmd, mode)).unwrap(), None, "{mode} PowerShell: {cmd}");
+        }
+    }
+    // The mode reaches the router from Claude Code's hook input, and from an
+    // mcp_tool hook that had no value to substitute.
+    let v = json!({"hook_event_name": "PreToolUse", "permission_mode": "auto", "tool_name": "Bash", "tool_input": {"command": "cat a"}});
+    let ev = HookEvent::from_value(&v);
+    assert_eq!(ev.permission_mode, "auto");
+    assert_eq!(r.pre_tool_use(&ev).unwrap(), None);
+    let v = json!({"event": "PreToolUse", "permission_mode": "${permission_mode}", "tool_name": "Bash", "tool_input": "{\"command\": \"cat a\"}"});
+    let ev = HookEvent::from_value(&v);
+    assert_eq!(ev.permission_mode, "");
+    assert_eq!(r.pre_tool_use(&ev).unwrap().unwrap()["command"], json!(format!("cat a || echo {EXIT_MARK}")));
+}
+
+/// In auto mode the command runs as written: a success is still digested
+/// with no exit marker to strip.
+#[test]
+fn an_untailed_success_is_still_digested() {
+    let t = Temp::new("untailed");
+    let mut r = Router::with_db(&t.path().join("index.sqlite"), None);
+    let text = fixture("cargo-test-fail.txt").repeat(40);
+    let out = r.post_tool_use(&bash_event("cargo test", &text)).unwrap().expect("a large untailed result is routed");
+    let stdout = out["stdout"].as_str().unwrap();
+    assert!(stdout.len() < text.len(), "digested");
+    assert!(!stdout.contains(EXIT_MARK));
+}
+
 #[test]
 fn a_failed_rewritten_command_says_so_small_or_large() {
     let t = Temp::new("fail");

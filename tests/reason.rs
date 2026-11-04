@@ -68,7 +68,7 @@ fn every_write_tool_requires_a_real_reason() {
     // The list above covers every write tool the server has, and each one's schema requires `reason`.
     let mut listed: Vec<&str> = calls.iter().map(|c| c.0).collect();
     listed.sort();
-    let tools = atlas::tools::tool_list();
+    let tools = atlas::tools::full_tool_list();
     // Thread posts carry their own reason (kind and body); every other write needs one.
     let self_reasoned: Vec<&str> = tools
         .iter()
@@ -76,8 +76,9 @@ fn every_write_tool_requires_a_real_reason() {
         .filter(|t| !t["inputSchema"]["required"].as_array().is_some_and(|r| r.contains(&json!("reason"))))
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    // Journal entries and handoffs record their entry kind as the reason.
-    assert_eq!(self_reasoned, vec!["open_discussion", "post", "journal", "handoff"]);
+    // Journal entries and handoffs record their entry kind as the reason;
+    // the hook (it writes journal entries: context caps, checkpoints) its event.
+    assert_eq!(self_reasoned, vec!["open_discussion", "post", "journal", "handoff", "hook"]);
     let mut writes: Vec<String> = tools
         .iter()
         .filter(|t| t["annotations"]["readOnlyHint"] != json!(true))

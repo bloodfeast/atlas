@@ -10,8 +10,9 @@
 //! * Anything else: no backend; every root falls back to the stat walk.
 //!
 //! The API every backend offers: `Backend::spawn(root, index, sink)`
-//! returns `None` when the root cannot be watched, and `Backend::stop`
-//! ends the watch.
+//! returns `None` when the root cannot be watched, and otherwise returns
+//! only once the watch is armed (a change made after it returns is
+//! reported); `Backend::stop` ends the watch.
 #![allow(unsafe_code)]
 
 #[cfg(windows)]

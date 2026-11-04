@@ -58,7 +58,7 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings_once() {
     let vals = json!({
         "session_id": "s1", "prompt": "how does the cache evict entries", "transcript_path": transcript.to_string_lossy().to_string(),
         "agent_id": "", "agent_type": "general-purpose", "tool_name": "Bash", "tool_input.prompt": "", "trigger": "manual",
-        "source": "startup", "cwd": root.to_string_lossy().to_string(),
+        "source": "startup", "permission_mode": "default", "cwd": root.to_string_lossy().to_string(),
         "tool_input": {"command": "ls"},
         "tool_response": {"stdout": "a\nb\n", "stderr": "", "interrupted": false, "isImage": false, "noOutputExpected": false}
     });
@@ -162,7 +162,7 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings_once() {
     assert!(ok && o.contains("[subagent-cache-1h]") && o.contains("[routing]"), "{o}");
     let (ok, o) = run(&["--setup"]);
     // The model download fails (no network here); the settings step still runs and writes nothing.
-    assert!(o.contains("Claude Code settings atlas offers") && o.contains("nothing written"), "{ok} {o}");
+    assert!(o.contains("Claude Code settings atlas offers") && o.contains("Nothing went wrong"), "{ok} {o}");
     assert!(!root.join("claude").join("settings.json").exists());
     let (ok, o) = run(&["settings", "offer", "--yes", "subagent-cache-1h", "goal-checkin-120"]);
     assert!(ok, "{o}");

@@ -48,20 +48,58 @@ pub const MAX_FILES: usize = 20_000;
 /// `_netrc`, `.npmrc`, `.pypirc`, `secrets.*` and `*.secret`. Matching is
 /// case-insensitive.
 ///
+/// The name rules (`id_rsa*` and the other key names, `credentials`,
+/// `credentials.*`, `_netrc`, `secrets.*`) do not apply to a Markdown note
+/// (`*.md`): a note is never the key or credential file those names guard,
+/// so `Secrets.md` and `id_rsa rotation.md` are read. The extension and
+/// `.env` rules apply to every name, and a caller checks the name a path
+/// resolves to as well as the name given ([`path_denied`]), so a note that
+/// is a link to a denied file is still refused. Folder names are checked
+/// by [`is_denied_folder`].
+///
 /// # Arguments
 ///
 /// * `name` - a file name (the last path component).
 pub fn is_denied(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    let ext = n.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    n == ".env"
-        || n.starts_with(".env.")
-        || matches!(ext, "env" | "pem" | "key" | "p12" | "pfx" | "jks" | "keystore" | "kdbx" | "asc" | "gpg" | "credentials" | "secret")
-        || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].iter().any(|k| n.starts_with(k))
+    if is_denied_folder(&n) {
+        return true;
+    }
+    if n.ends_with(".md") {
+        return false;
+    }
+    ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].iter().any(|k| n.starts_with(k))
         || n == "credentials"
         || n.starts_with("credentials.")
         || matches!(n.as_str(), ".netrc" | "_netrc" | ".npmrc" | ".pypirc")
         || n.starts_with("secrets.")
+}
+
+/// True for folder names on the deny-list: the `.env` and extension rules of
+/// [`is_denied`] only (`keys.gpg/`, `prod.env/`), never its name rules, so a
+/// `credentials/` or `secrets.d/` folder is walked and each file in it is
+/// judged by its own name.
+///
+/// # Arguments
+///
+/// * `name` - a folder name (one path component).
+pub fn is_denied_folder(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let ext = n.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    n == ".env" || n.starts_with(".env.") || matches!(ext, "env" | "pem" | "key" | "p12" | "pfx" | "jks" | "keystore" | "kdbx" | "asc" | "gpg" | "credentials" | "secret")
+}
+
+/// Whether a file atlas is asked to read by path (a CLI file tool, a file
+/// Claude Code read) is on the deny-list: its name as given, or the name it
+/// resolves to through links, is [`is_denied`].
+pub fn path_denied(p: &Path) -> bool {
+    let named = |q: &Path| q.file_name().and_then(|n| n.to_str()).is_some_and(is_denied);
+    named(p) || std::fs::canonicalize(p).is_ok_and(|c| named(&c))
+}
+
+/// The refusal for a [`path_denied`] file.
+pub fn denied_message(p: &Path) -> String {
+    format!("{}: atlas never reads .env, key or credential files (the deny-list)", p.display())
 }
 
 fn has_text_extension(name: &str) -> bool {
@@ -191,11 +229,15 @@ impl Source {
             first = false;
             for entry in entries.flatten() {
                 let Ok(name) = entry.file_name().into_string() else { continue };
-                if name.starts_with('.') || is_denied(&name) {
+                if name.starts_with('.') {
                     continue;
                 }
                 let Ok(ft) = entry.file_type() else { continue };
                 if ft.is_symlink() {
+                    continue;
+                }
+                // A folder by the folder rules; a file by its own name (`wants`).
+                if if ft.is_dir() { is_denied_folder(&name) } else { is_denied(&name) } {
                     continue;
                 }
                 let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
@@ -238,7 +280,8 @@ impl Source {
         let full = fs::canonicalize(self.root.join(rel))?;
         let under = full.strip_prefix(&self.root).map_err(|_| Error::PathRejected("path resolves outside the source".into()))?;
         let canon_rel: Vec<&str> = under.components().filter_map(|c| c.as_os_str().to_str()).collect();
-        if canon_rel.iter().any(|c| c.starts_with('.')) || canon_rel.last().is_none_or(|n| is_denied(n)) {
+        let (last, dirs) = canon_rel.split_last().map_or(("", &[][..]), |(l, d)| (*l, d));
+        if canon_rel.iter().any(|c| c.starts_with('.')) || is_denied(last) || last.is_empty() || dirs.iter().any(|d| is_denied_folder(d)) {
             return Err(Error::PathRejected("path resolves into a dot folder or a denied file".into()));
         }
         let mut f = File::open(&full)?;
@@ -280,8 +323,19 @@ mod tests {
         ] {
             assert!(is_denied(n), "{n} should be denied");
         }
-        for n in ["notes.md", "environment.md", "keyboard.md", "envelope.txt", "key-ideas.md", "monkey.md"] {
+        for n in ["notes.md", "environment.md", "keyboard.md", "envelope.txt", "key-ideas.md", "monkey.md", "Secrets.md", "Credentials.md", "id_rsa rotation.md", "credentials.MD"] {
             assert!(!is_denied(n), "{n} should be allowed");
+        }
+        // The extension and .env rules hold for notes too.
+        for n in [".env.md", "notes.md.pem"] {
+            assert!(is_denied(n), "{n} should be denied");
+        }
+        // Folders: only the .env and extension rules.
+        for n in ["credentials", "secrets.d", "id_rsa_backups"] {
+            assert!(!is_denied_folder(n), "folder {n} should be allowed");
+        }
+        for n in [".env", "keys.gpg", "prod.env"] {
+            assert!(is_denied_folder(n), "folder {n} should be denied");
         }
     }
 }

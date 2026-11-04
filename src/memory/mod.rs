@@ -18,7 +18,7 @@
 //! See `docs/design/atlas-c.md`.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -31,6 +31,7 @@ pub mod check;
 pub mod export;
 pub mod import;
 pub mod recall;
+pub mod select;
 pub mod settings;
 pub mod sync;
 pub mod tree;
@@ -104,7 +105,7 @@ pub const ORD_STEP: i64 = 1 << 16;
 pub const KINDS: &[&str] = &["memory", "rule", "section", "block", "handoff", "journal", "decision"];
 
 /// Journal entry kinds (`records.sub` for kind `journal`).
-pub const ENTRIES: &[&str] = &["brief", "decision", "measurement", "commit", "question", "answered", "next", "note", "cap"];
+pub const ENTRIES: &[&str] = &["brief", "decision", "measurement", "commit", "question", "answered", "next", "note", "cap", "checkpoint"];
 
 /// Where an imported text came from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -175,6 +176,11 @@ pub struct Head {
     pub superseded_by: Option<String>,
     /// When it was superseded.
     pub superseded_time: Option<String>,
+    /// Where the head version came from in its source, `path:line`, for a
+    /// record imported or synced from a file.
+    pub anchor: Option<String>,
+    /// The source or export that `anchor` is in (`intent`), when known.
+    pub anchor_src: Option<String>,
 }
 
 /// What a write did.
@@ -236,6 +242,191 @@ pub struct MemoryStore {
     vocab: std::cell::RefCell<Option<((i64, u64), std::collections::HashMap<String, i64>)>>,
 }
 
+/// The shortest `expected_sha` prefix a revision accepts.
+pub const MIN_SHA_PREFIX: usize = 12;
+
+/// The recorded end of the `.jsonl` copy's committed lines.
+fn jsonl_end(c: &Connection) -> Result<Option<u64>> {
+    let v: Option<String> = c.query_row("SELECT value FROM mem_meta WHERE key = 'jsonl_end'", [], |r| r.get(0)).optional()?;
+    Ok(v.and_then(|s| s.parse().ok()))
+}
+
+/// Whether one `.jsonl` line could be a committed one: the store holds what
+/// it says (a version's key, seq and sha; a supersede's row; a placement; a
+/// refs row; a status). None for a line that says nothing checkable (a
+/// respace, which only comes with a place).
+fn line_in_store(c: &Connection, line: &str) -> rusqlite::Result<Option<bool>> {
+    let Ok(v) = json::parse(line) else { return Ok(Some(false)) };
+    let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let rid: Option<i64> = c.prepare_cached("SELECT rid FROM records WHERE key = ?1")?.query_row([s("key")], |r| r.get(0)).optional()?;
+    let Some(rid) = rid else { return Ok(Some(false)) };
+    let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<bool> { Ok(c.prepare_cached(sql)?.query_row(p, |_| Ok(())).optional()?.is_some()) };
+    Ok(Some(match v.get("op").and_then(Value::as_str) {
+        Some("create" | "version") => {
+            let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(-1);
+            one("SELECT 1 FROM versions WHERE rid = ?1 AND seq = ?2 AND sha = ?3", &[&rid, &seq, &s("sha")])?
+        }
+        Some("retire") => one("SELECT 1 FROM records WHERE rid = ?1 AND status = 'retired'", &[&rid])?,
+        Some("reactivate") => one("SELECT 1 FROM records WHERE rid = ?1 AND status = 'active'", &[&rid])?,
+        Some("supersede") => one("SELECT 1 FROM supersedes WHERE new_rid = ?1 AND time = ?2", &[&rid, &s("time")])?,
+        Some("place") => {
+            let ord = v.get("ord").and_then(Value::as_i64).unwrap_or(i64::MIN);
+            one("SELECT 1 FROM placement WHERE export = ?1 AND ord = ?2 AND rid = ?3", &[&s("export"), &ord, &rid])?
+        }
+        Some("unplace") => !one("SELECT 1 FROM placement WHERE export = ?1 AND rid = ?2", &[&s("export"), &rid])?,
+        Some("refs") => {
+            let mut all = true;
+            for p in v.get("refs").and_then(Value::as_array).into_iter().flatten() {
+                let (k, t) = (p.get(0).and_then(Value::as_str).unwrap_or(""), p.get(1).and_then(Value::as_str).unwrap_or(""));
+                all &= one("SELECT 1 FROM refs WHERE rid = ?1 AND kind = ?2 AND target = ?3", &[&rid, &k, &t])?;
+            }
+            all
+        }
+        Some("respace") => return Ok(None),
+        _ => false,
+    }))
+}
+
+/// What one `.jsonl` line past the recorded end is, by the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineState {
+    /// The store holds what it says: a committed line.
+    Held,
+    /// The store has never held it: its record is not in the store, or it
+    /// is a version the store does not have. Only a batch that appended and
+    /// never committed leaves such a line past the end.
+    Foreign,
+    /// Neither: a line that says nothing checkable (a respace), one whose
+    /// state a later line may have changed (a retire, a refs row), or one
+    /// that does not parse.
+    Unsure,
+}
+
+fn line_state(c: &Connection, line: &str) -> rusqlite::Result<LineState> {
+    let Ok(v) = json::parse(line) else {
+        // A torn append that a whole line from another writer was appended
+        // onto: that line is judged on its own, so it is never cut.
+        return match line.rfind("{\"op\":") {
+            Some(p) if p > 0 && line_state(c, &line[p..])? == LineState::Held => Ok(LineState::Held),
+            _ => Ok(LineState::Unsure),
+        };
+    };
+    let key = v.get("key").and_then(Value::as_str).unwrap_or("");
+    let rid: Option<i64> = c.prepare_cached("SELECT rid FROM records WHERE key = ?1")?.query_row([key], |r| r.get(0)).optional()?;
+    if v.get("op").and_then(Value::as_str) == Some("respace") {
+        return Ok(LineState::Unsure);
+    }
+    let Some(rid) = rid else { return Ok(LineState::Foreign) };
+    let version = matches!(v.get("op").and_then(Value::as_str), Some("create" | "version"));
+    if version {
+        let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(-1);
+        let sha = v.get("sha").and_then(Value::as_str).unwrap_or("");
+        let held = c.prepare_cached("SELECT 1 FROM versions WHERE rid = ?1 AND seq = ?2 AND sha = ?3")?.query_row(params![rid, seq, sha], |_| Ok(())).optional()?.is_some();
+        return Ok(if held { LineState::Held } else { LineState::Foreign });
+    }
+    Ok(if line_in_store(c, line)? == Some(true) { LineState::Held } else { LineState::Unsure })
+}
+
+/// The `.jsonl` copy past its recorded end, judged line by line against
+/// the store (see [`MemoryStore::copy_tail`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyTail {
+    /// Where the committed lines end: just past the last line the store
+    /// holds, or the recorded end when it holds none past it.
+    pub end: u64,
+    /// Whole lines before `end` that the store has never held (each a byte
+    /// range, newline included): a batch that appended and never committed,
+    /// followed by lines a writer that does not record the end (an atlas
+    /// older than 0.2) committed after it.
+    pub uncommitted: Vec<std::ops::Range<u64>>,
+}
+
+/// Judges the lines of `bytes` (the copy as read) past the recorded `end`.
+///
+/// Uncommitted lines only ever come from a batch killed between its append
+/// and its commit, and every 0.2 batch first deals with what such a batch
+/// left, under the write lock, so they are the copy's last lines unless an
+/// older writer (which appends after its commit and records no end)
+/// appended after them. So: everything past the last line the store holds
+/// is uncommitted (a whole batch, or a torn last line), and is cut; a line
+/// before it is kept, since a committed line is never cut, and one the
+/// store has never held is reported in `uncommitted` instead.
+///
+/// # Errors
+///
+/// [`Error::Db`].
+fn copy_tail(c: &Connection, bytes: &[u8], end: u64) -> Result<CopyTail> {
+    let len = bytes.len() as u64;
+    if len <= end {
+        return Ok(CopyTail { end: len, uncommitted: Vec::new() });
+    }
+    let mut at = end;
+    let mut keep = end;
+    let mut foreign: Vec<std::ops::Range<u64>> = Vec::new();
+    // The key of the last line the store has never held: the lines after it
+    // for the same record (its refs) came in the same batch, though the
+    // store may hold a row like theirs from an earlier one.
+    let mut foreign_key: Option<String> = None;
+    // Only whole lines: a last line without its newline is a torn append,
+    // never committed.
+    for line in bytes[end as usize..].split_inclusive(|b| *b == b'\n').filter(|l| l.ends_with(b"\n")) {
+        let r = at..at + line.len() as u64;
+        at = r.end;
+        let text = std::str::from_utf8(line).ok().map(str::trim_end);
+        let parsed = text.and_then(|t| json::parse(t).ok());
+        let key = parsed.as_ref().and_then(|v| v.get("key")).and_then(Value::as_str).map(str::to_string);
+        let version = parsed.as_ref().and_then(|v| v.get("op")).and_then(Value::as_str).is_some_and(|o| o == "create" || o == "version");
+        let mut state = match text {
+            Some(t) => line_state(c, t)?,
+            None => LineState::Unsure,
+        };
+        if state != LineState::Foreign && !version && key.is_some() && key == foreign_key {
+            state = LineState::Foreign;
+        }
+        foreign_key = if state == LineState::Foreign { key } else { None };
+        match state {
+            LineState::Held => keep = r.end,
+            LineState::Foreign => foreign.push(r),
+            LineState::Unsure => {}
+        }
+    }
+    foreign.retain(|r| r.end <= keep);
+    Ok(CopyTail { end: keep, uncommitted: foreign })
+}
+
+/// The line that takes an uncommitted line's place in the copy, at the same
+/// length: a no-op every reader skips.
+fn void_line(len: usize) -> Vec<u8> {
+    const VOID: &[u8] = b"{\"op\":\"void\"}";
+    let mut v = if len > VOID.len() { VOID.to_vec() } else { Vec::new() };
+    v.resize(len.saturating_sub(1), b' ');
+    v.push(b'\n');
+    v
+}
+
+/// Records where the copy's committed lines end when nothing has yet: a
+/// fresh store, or one an atlas older than 0.2 wrote (whose copy holds only
+/// committed lines, appended after each commit). Without it a fresh store's
+/// first batch killed between its append and its commit left a line that
+/// read as an older writer's committed one.
+fn record_jsonl_end(c: &Connection, jsonl: &Path) -> Result<()> {
+    c.execute_batch("BEGIN IMMEDIATE")?;
+    let made = (|| -> Result<()> {
+        if jsonl_end(c)?.is_none() {
+            let len = std::fs::metadata(jsonl).map_or(0, |m| m.len());
+            c.prepare_cached("INSERT INTO mem_meta(key, value) VALUES('jsonl_end', ?1)")?.execute([len.to_string()])?;
+        }
+        Ok(())
+    })();
+    match made {
+        Ok(()) => Ok(c.execute_batch("COMMIT")?),
+        Err(e) => {
+            let _ = c.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// The `.jsonl` copy beside a store file.
 pub fn jsonl_path(store: &Path) -> PathBuf {
     let mut p = store.as_os_str().to_owned();
@@ -245,7 +436,8 @@ pub fn jsonl_path(store: &Path) -> PathBuf {
 
 const HEAD_SQL: &str = "SELECT r.rid, r.key, r.kind, r.sub, r.scope, r.status, v.seq, v.time, v.title, v.meta, v.body, v.sha, v.chain,
     (SELECT n.key FROM supersedes s JOIN records n ON n.rid = s.new_rid WHERE s.old_rid = r.rid ORDER BY s.time DESC LIMIT 1),
-    (SELECT s.time FROM supersedes s WHERE s.old_rid = r.rid ORDER BY s.time DESC LIMIT 1)
+    (SELECT s.time FROM supersedes s WHERE s.old_rid = r.rid ORDER BY s.time DESC LIMIT 1),
+    v.src_path, v.src_line, v.src
     FROM records r JOIN versions v ON v.vid = r.head";
 
 fn head_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Head> {
@@ -265,6 +457,11 @@ fn head_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Head> {
         chain: row.get(12)?,
         superseded_by: row.get(13)?,
         superseded_time: row.get(14)?,
+        anchor: match (row.get::<_, Option<String>>(15)?, row.get::<_, Option<i64>>(16)?) {
+            (Some(p), Some(l)) if !p.is_empty() && l > 0 => Some(format!("{p}:{l}")),
+            _ => None,
+        },
+        anchor_src: row.get::<_, Option<String>>(17)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -353,12 +550,41 @@ impl MemoryStore {
         // with two pragma reads (start to first answer is an aim of 5 ms).
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != SCHEMA_VERSION {
-            conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-            conn.execute_batch(SCHEMA)?;
-            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            // Two sessions can open a fresh store at once. Switching to WAL
+            // answers SQLITE_BUSY at once (the busy handler is not consulted
+            // for a journal mode change), so it is retried until the busy
+            // timeout; the schema is then made under the write lock, and
+            // only by the first session to take it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+                    Ok(_) => break,
+                    Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy && std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let made = (|| -> rusqlite::Result<()> {
+                let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                if v != SCHEMA_VERSION {
+                    conn.execute_batch(SCHEMA)?;
+                    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+                }
+                conn.execute_batch("COMMIT")
+            })();
+            if let Err(e) = made {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
         }
         conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
-        Ok(MemoryStore { conn, path: path.to_path_buf(), jsonl: jsonl_path(path), vocab: Default::default() })
+        let jsonl = jsonl_path(path);
+        if jsonl_end(&conn)?.is_none() {
+            record_jsonl_end(&conn, &jsonl)?;
+        }
+        Ok(MemoryStore { conn, path: path.to_path_buf(), jsonl, vocab: Default::default() })
     }
 
     /// An in-memory store with no `.jsonl` copy (round-trip checks, tests).
@@ -387,14 +613,82 @@ impl MemoryStore {
         &self.jsonl
     }
 
-    /// Starts a write batch: one transaction, one `.jsonl` append on commit.
+    /// Starts a write batch: one transaction (it takes the write lock), and
+    /// the batch's `.jsonl` lines appended under that lock on commit.
+    ///
+    /// The store records where the copy's committed lines end
+    /// (`jsonl_end`, written in each batch's transaction, and when the store
+    /// is opened if nothing has yet). Lines past it are judged against the
+    /// store here, under the lock, before this batch appends (see
+    /// [`copy_tail`]): those after the last line the store holds were
+    /// appended by a batch that never committed (a crash between the append
+    /// and the commit) and are cut off; one the store has never held that
+    /// lines committed by an older writer follow is overwritten in place,
+    /// at the same length, with a `void` line, so no committed line moves.
     ///
     /// # Errors
     ///
-    /// [`Error::Db`] if the transaction cannot start.
+    /// [`Error::Db`] if the transaction cannot start; [`Error::Io`] if the
+    /// copy cannot be cut back.
     pub fn writer(&mut self) -> Result<Writer<'_>> {
         let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !self.jsonl.as_os_str().is_empty() {
+            let end = jsonl_end(&tx)?;
+            if let (Some(end), Ok(m)) = (end, std::fs::metadata(&self.jsonl)) {
+                if m.len() > end {
+                    let bytes = std::fs::read(&self.jsonl)?;
+                    let tail = copy_tail(&tx, &bytes, end)?;
+                    if tail.end < bytes.len() as u64 || !tail.uncommitted.is_empty() {
+                        let mut f = OpenOptions::new().write(true).open(&self.jsonl)?;
+                        for r in &tail.uncommitted {
+                            f.seek(std::io::SeekFrom::Start(r.start))?;
+                            f.write_all(&void_line((r.end - r.start) as usize))?;
+                        }
+                        if tail.end < bytes.len() as u64 {
+                            f.set_len(tail.end)?;
+                        }
+                        f.sync_data()?;
+                    }
+                }
+            }
+        }
         Ok(Writer { tx, log: String::new(), jsonl: self.jsonl.clone(), pid: std::process::id() as i64 })
+    }
+
+    /// Where the `.jsonl` copy's committed lines end, in bytes (`None` for a
+    /// store written before this was recorded).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn jsonl_end(&self) -> Result<Option<u64>> {
+        jsonl_end(&self.conn)
+    }
+
+    /// The committed lines of `bytes` (the `.jsonl` copy as read): where
+    /// they end, and the lines before that end the store has never held
+    /// (see [`copy_tail`]); the whole copy for a store whose end was never
+    /// recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn copy_tail(&self, bytes: &[u8]) -> Result<CopyTail> {
+        match jsonl_end(&self.conn)? {
+            Some(end) => copy_tail(&self.conn, bytes, end),
+            None => Ok(CopyTail { end: bytes.len() as u64, uncommitted: Vec::new() }),
+        }
+    }
+
+    /// Whether atlas has written export `export`'s file `rel` (relative to
+    /// the export folder) at least once.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn exported(&self, export: &str, rel: &Path) -> Result<bool> {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        Ok(self.conn.prepare_cached("SELECT 1 FROM export_files WHERE export = ?1 AND path = ?2")?.query_row([export, rel.as_str()], |_| Ok(())).optional()?.is_some())
     }
 
     /// A record's head.
@@ -510,7 +804,7 @@ impl MemoryStore {
         let sql = "SELECT rowid, -bm25(records_fts, 2.0, 1.0) FROM records_fts WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts, 2.0, 1.0) LIMIT ?2";
         let ranked: Vec<(i64, f64)> = self.conn.prepare_cached(sql)?.query_map(params![q, (limit * 2 + 8) as i64], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         let mut st = self.conn.prepare_cached(
-            "SELECT r.rid, r.key, r.kind, r.sub, r.scope, r.status, v.seq, v.time, v.title, v.meta, v.body, v.sha, v.chain, NULL, NULL
+            "SELECT r.rid, r.key, r.kind, r.sub, r.scope, r.status, v.seq, v.time, v.title, v.meta, v.body, v.sha, v.chain, NULL, NULL, v.src_path, v.src_line, v.src
              FROM records r JOIN versions v ON v.vid = r.head WHERE r.rid = ?1",
         )?;
         let mut rows: Vec<(Head, f64)> = Vec::with_capacity(limit);
@@ -813,13 +1107,20 @@ impl Writer<'_> {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] for an unknown key; [`Error::StaleSha`] when the
-    /// head moved; [`Error::Db`].
+    /// [`Error::NotFound`] for an unknown key; [`Error::InvalidArgument`] for
+    /// an `expected_sha` shorter than [`MIN_SHA_PREFIX`] hex digits;
+    /// [`Error::StaleRecord`] when the head moved; [`Error::Db`].
     pub fn revise(&mut self, key: &str, expected_sha: Option<&str>, draft: &Draft) -> Result<Written> {
         let (rid, sha, chain) = self.rid_of(key)?.ok_or_else(|| Error::NotFound(format!("record {key:?}")))?;
         if let Some(e) = expected_sha {
-            if e != sha {
-                return Err(Error::StaleSha { expected: e.to_string(), actual: sha });
+            // The ok line shows 16 hex digits: any prefix of at least 12
+            // names the head (case aside), as the full 64 do.
+            let e = e.trim().to_ascii_lowercase();
+            if e.len() < MIN_SHA_PREFIX || e.len() > sha.len() || !e.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(Error::InvalidArgument(format!("expected_sha {e:?}: give the head's sha, or at least its first {MIN_SHA_PREFIX} hex digits (the ok line and recall show 16)")));
+            }
+            if !sha.starts_with(&e) {
+                return Err(Error::StaleRecord { key: key.to_string(), expected: e, actual: sha });
             }
         }
         let new_sha = version_sha(&draft.title, &draft.meta, &draft.body);
@@ -1075,21 +1376,38 @@ impl Writer<'_> {
         self.log.push('\n');
     }
 
-    /// Commits the batch, then appends its lines to the `.jsonl` copy and
-    /// syncs it.
+    /// Appends the batch's lines to the `.jsonl` copy and syncs it, then
+    /// commits, all under the batch's write lock: the copy holds the lines
+    /// in commit order, and a crash between the append and the commit
+    /// leaves only lines past the recorded end, which the next batch cuts
+    /// off (see [`MemoryStore::writer`]). A crash after the commit leaves
+    /// nothing to repair.
     ///
     /// # Errors
     ///
-    /// [`Error::Db`] if the commit fails (nothing is written);
-    /// [`Error::Io`] if the copy cannot be appended (the database holds the
-    /// batch; `--memory-check` reports the gap).
+    /// [`Error::Io`] if the copy cannot be appended, or [`Error::Db`] if the
+    /// commit fails; either way nothing is committed and the copy is cut
+    /// back to where it was.
     pub fn commit(self) -> Result<()> {
         let Writer { tx, log, jsonl, .. } = self;
-        tx.commit()?;
-        if !log.is_empty() && !jsonl.as_os_str().is_empty() {
-            let mut f = OpenOptions::new().create(true).append(true).open(&jsonl)?;
-            f.write_all(log.as_bytes())?;
-            f.sync_data()?;
+        if log.is_empty() || jsonl.as_os_str().is_empty() {
+            tx.commit()?;
+            return Ok(());
+        }
+        let mut f = OpenOptions::new().create(true).append(true).open(&jsonl)?;
+        let before = f.metadata()?.len();
+        let end = before + log.len() as u64;
+        tx.prepare_cached("INSERT INTO mem_meta(key, value) VALUES('jsonl_end', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?.execute([end.to_string()])?;
+        let cut_back = |f: &std::fs::File| {
+            let _ = f.set_len(before);
+        };
+        if let Err(e) = f.write_all(log.as_bytes()).and_then(|()| f.sync_data()) {
+            cut_back(&f);
+            return Err(e.into());
+        }
+        if let Err(e) = tx.commit() {
+            cut_back(&f);
+            return Err(e.into());
         }
         Ok(())
     }

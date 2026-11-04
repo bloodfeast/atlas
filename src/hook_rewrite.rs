@@ -63,6 +63,9 @@ use crate::memory::settings::Settings;
 pub const OFF_FLAG: &str = "routing-off";
 /// A Bash command containing this passes through unrouted.
 pub const RAW_MARK: &str = "ATLAS_RAW=1";
+/// The `permission_mode` in which PreToolUse appends no exit tail (see
+/// [`Router::pre_tool_use`]).
+pub const AUTO_MODE: &str = "auto";
 
 /// The routing off-switch file for an index database.
 pub fn off_flag(db: &Path) -> PathBuf {
@@ -301,11 +304,25 @@ impl Router {
     /// command itself is untouched, so the user's permission rules still
     /// decide it; the tails are read-only and need no rule.
     ///
+    /// In auto mode nothing is appended. The auto-mode classifier judges the
+    /// command the model wrote, and no hook output makes it judge the
+    /// rewritten one: Claude Code checks permission rules against
+    /// `updatedInput`, but the classifier's only hook channel is PostToolUse
+    /// `classifierContext`, which is about results. With a tail, the
+    /// classifier refused every routed command once. Untailed, a successful
+    /// command still reaches PostToolUse and is digested; a failing one
+    /// arrives as Claude Code's own error text.
+    ///
+    /// An input without `permission_mode` keeps the tail. The field is a
+    /// documented common input, so its absence means a client that reports
+    /// no mode, and the tail is a read-only `echo` that never widens what
+    /// runs: keeping it costs at most a resend, dropping it loses failures.
+    ///
     /// # Errors
     ///
     /// Never.
     pub fn pre_tool_use(&mut self, ev: &HookEvent) -> Result<Option<Value>> {
-        if !matches!(ev.tool_name.as_str(), "Bash" | "PowerShell") || !self.routing_on() {
+        if !matches!(ev.tool_name.as_str(), "Bash" | "PowerShell") || !self.routing_on() || ev.permission_mode == AUTO_MODE {
             return Ok(None);
         }
         let input = &ev.tool_input;
@@ -380,6 +397,11 @@ impl Router {
             "Read" => {
                 let file = resp.get("file").cloned().unwrap_or(Value::Null);
                 if s(resp, "type") != "text" {
+                    return Ok(None);
+                }
+                // A denied file (.env, keys, credentials) is never kept as a
+                // handle or read again from disk, whoever read it first.
+                if crate::sources::path_denied(std::path::Path::new(s(&file, "filePath"))) {
                     return Ok(None);
                 }
                 let windowed = input.get("limit").is_some() || input.get("offset").is_some();
@@ -534,6 +556,9 @@ impl Router {
                     match seg.read {
                         ShellRead::Window { file, from, to, tail } => {
                             let abs = absolute(&file, &seg.dir);
+                            if crate::sources::path_denied(std::path::Path::new(&abs)) {
+                                continue;
+                            }
                             let printed = text.trim_end_matches(['\n', '\r']).lines().count() as u32;
                             if printed == 0 {
                                 continue;

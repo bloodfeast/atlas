@@ -7,7 +7,25 @@ choice. Why this matters, and what it saves, is on [[Token savings and method]].
 A Bash, PowerShell, Read, Grep or Glob result over a threshold (12 KB, or 3 KB for `cargo` build and test
 output) is stored whole under a handle such as `h:3f9a2c1b0e`. The model gets a digest instead: test totals
 and each failure's location and message, compiler errors and warnings by lint, grep hits by file, or a file's
-outline with line ranges. It pulls exactly what it needs:
+outline with line ranges. Test digests know `cargo test`, `cargo nextest`, `go test` (plain, `-v` and `-json`: each
+failing test or subtest with its `file_test.go:LINE` message, a panic with its first frame outside the
+runtime, and package totals), jest and vitest (the runner's own totals, each failing test by its full name
+with the first stack frame in the project and its message, jest's `Expected` and `Received` lines, and file
+totals; colour codes are read through), and `dotnet test` (each failing test with its `Error Message`, the
+first stack frame with a source file, xUnit's `Expected` and `Actual` lines, and the totals of every test
+assembly of a solution's run summed), and pytest (its own totals line, each failing test's report under
+`FAILURES` by the name its header gives, with the first `E` line, a `+ where` line, and the location after
+them; passes and skips are items with `-v`), Maven with Surefire (`mvn`, `mvnw` or `mvnd` running `test`,
+`verify` or `install`: the totals of every module's `Tests run:` line, with Failures and Errors both counted
+as failed and passed derived from them; each failing test, `<<< FAILURE!` or `<<< ERROR!`, with its exception
+and the first frame outside the assertion library; test classes as groups; Surefire lists failures only), and
+Gradle (`gradle` or `gradlew`: each `Class > method() FAILED` with its exception and location, in the short or
+the full exception format, test tasks as groups, and totals from the `N tests completed, M failed` line a
+failing task prints; a passing run prints no count, so its digest says `(Gradle lists failures only)`, and
+passes and skips are items when the build's test logging prints them); other runners are rows of the same table in `src/digest.rs`
+(`RUNNERS`). A `go test -json` digest reads each package's output whole, though packages interleave their
+JSON lines, and its items point at the JSON lines. The
+model pulls exactly what it needs:
 
 ```sh
 atlas slice h:ID --item NAME      # one item of the digest: a test, a file, a function
@@ -24,6 +42,12 @@ turns it off, and `ATLAS_RAW=1` passes one command through.
 One limit: a PowerShell command that exits nonzero is routed only for `cargo` builds and tests on Windows.
 Claude Code offers no read-only PowerShell tail that keeps the exit code, so any other failing PowerShell
 command reaches the model raw.
+
+In auto mode atlas leaves the command as written. Elsewhere it appends a read-only `|| echo
+atlas-exit-nonzero` so a failing read is still digested, but the auto-mode safety classifier judges the
+command the model wrote and refused the changed one, which cost a resend per read. So in auto mode a
+successful read is digested as usual and a failing one arrives as Claude Code's own error text. Atlas never
+approves a call on the classifier's behalf.
 
 A handle id is a pure function of the bytes, the kind and the command, so the same output stored twice is the
 same handle. Every slice is capped (8 KB) and says how many lines it cut. The store keeps 512 MB, least

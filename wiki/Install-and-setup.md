@@ -39,15 +39,45 @@ builds from source (below).
    model file, and prints where everything is. Run it again after an interrupted download to resume. It
    needs `curl`, which ships with Windows 10 and later, macOS and practically every Linux distribution.
 
-   The first session in a folder atlas does not index asks once (through Claude, in one line) whether to
-   add that project as a source; `atlas --setup` asks the same in the terminal for the folder it runs in.
-   Yes runs `atlas settings add-project`, which adds the folder's Markdown as a source (`**/*.md`, without
-   `target` and `node_modules`) and, when it holds Rust or WGSL, the folder as a code root, then indexes the
-   source; the code root is indexed when the server next starts. No keeps the empty `notes` vault. Each
-   folder is asked once; `atlas settings add-project [DIR]` adds one any time. Each of its configuration
-   changes is backed up, and `atlas settings undo` reverts the newest (twice for a project with a code root).
+   The first session in a folder atlas does not index asks once (through Claude, in one line): *create a
+   vault for this project at `<path>`? yes / other folder / no*, yes being the default. `atlas --setup` asks
+   the same in the terminal for the folder it runs in (`[Y]es / [o]ther folder / [n]o`; Enter is yes). Yes
+   runs `atlas settings add-project --vault`, which adds the folder's Markdown as a source (`**/*.md`,
+   without `target` and `node_modules`) and, when it holds code, the folder as a code root, then creates the
+   project's vault and registers it under `vaults`, and indexes the source; the code root is indexed when
+   the server next starts. The vault goes to `vaults/<name>-notes` beside atlas's configuration file (where
+   the first run's `notes` vault is), so atlas's notes and discussion threads never land in the project's
+   repository. It starts with one `README.md` note; open the folder in Obsidian with *Open folder as vault*.
+   Other folder runs `atlas settings add-project --vault-at FOLDER` instead: an existing folder (an Obsidian
+   vault you already have) is registered as it is, nothing written into it, and a folder inside the project
+   is left out of the project's source so no note is indexed twice. No changes nothing. Each folder is asked
+   once, whatever the answer, and the question is recorded as asked when it is put, so a session with no
+   user to answer it (Claude is told to do nothing then) does not ask again; `atlas settings add-project
+   [--vault | --vault-at FOLDER] DIR` adds one any time (`.` for the current folder), and `--vault` on an
+   indexed project adds its vault alone. `--dry-run` shows the change, the file and the project it would go
+   into, and writes nothing; so does `add-project` with no folder named (pass `.` or `--yes` to write). A
+   folder a project already covers (a project root, its project file's folder, a repository) counts as
+   indexed, so it is not asked about. Without a terminal, `atlas --setup` only prints the command and records
+   nothing, and says so: nothing went wrong, there was no terminal to ask in.
+
+   In a configuration with `projects`, add-project writes into the project the folder belongs to (its
+   `projects[]` entry: `sources`, `code.roots`, `vaults`), never the top level, whose lists every project
+   reads; `atlas --project NAME settings add-project DIR` picks the project, else the folder's own, else
+   `default_project`. For a folder in no project, with none named, a
+   terminal lists the configured projects (even one) and cancel, and writes into the one picked; without a
+   terminal, or with `--dry-run`, it is refused before anything is written.
+   Every check runs on the text that would be written before it is written: a refused add-project leaves
+   the configuration byte for byte as it was.
+
+   The source, the code root and the vault are one configuration change, backed up, and `atlas settings
+   undo` reverts the newest change whole. Undo unregisters the vault and says what it did with the folder:
+   a folder atlas created that still holds only its `README.md` is removed; a folder holding anything else,
+   or one that was there before, is kept. Notes are never deleted.
    Backups of atlas's configuration go to `atlas-backups` beside the configuration file; backups of Claude
    Code's `settings.json` go to `atlas-backups` in Claude Code's folder. Undo finds each in its own place.
+   Undo first shows what it would revert (when the change was made, which command made it, and for each file
+   what goes back, with line counts) and asks; without a terminal it reverts only with `--yes`, so a command
+   that changed nothing (and made no backup) never leads undo to revert an older change unseen.
    A folder that holds several git repositories is offered as a multi-repository project instead; see
    [[Projects and multi-repo]].
 
@@ -63,7 +93,7 @@ builds from source (below).
    ```
 
    (`atlas settings on update` turns them back on), or pin a version in `atlas.json` with
-   `"update": {"pin": "0.1.0"}`. A binary you build from source never updates itself.
+   `"update": {"pin": "0.2.0"}`. A binary you build from source never updates itself.
 
 5. Point atlas at your notes: edit `atlas.json` (see [[Configuration reference]]) to add vaults (folders atlas may add
    to) and read-only sources (folders it only indexes), then run `/mcp` and reconnect atlas, or restart

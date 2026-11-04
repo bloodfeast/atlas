@@ -74,8 +74,10 @@ See [[Code index]].
 | `code.roots[].name` | the root's short name |
 | `code.roots[].root` | a Cargo workspace or package for Rust; any folder for WGSL and Protocol Buffers |
 | `code.roots[].build_scripts` | let rust-analyzer run this root's build scripts and proc macros (default false: nothing is compiled) |
+| `code.roots[].scip` | prebuilt SCIP indexes for this root's units, written elsewhere (CI, WSL, Docker): `true` or absent reads an `index.scip` in a unit's folder; `false` reads none; a path is the file for the root's own folder; an object maps a unit folder (below the root, `"."` for the root) to a path, or to `false` to read none there, other folders following the `index.scip` convention. Paths are relative to this file. A source file newer than the prebuilt file is scanned instead (see [[Code index]]). Example: `{"services/api": "ci/api.scip", "tools": false}` |
 | `code.rust_analyzer` | the rust-analyzer binary (default: `rust-analyzer` on `PATH`, else a rustup toolchain's `bin`; each must answer `--version`) |
-| `code.timeout_s` | a rust-analyzer run is killed past this many seconds (default 1800) |
+| `code.indexers` | the SCIP indexers of the other languages (scip-go, scip-typescript, scip-dotnet, scip-python): `false` runs none (every unit is scanned), `true` or absent finds each one (see [[Code index]]), or an object from indexer name to a path, which runs that binary (for scip-typescript and scip-python also its npm package folder or its `.js` script, run with `node`; a path given for scip-python is run on Windows too, so a wrapper script that runs it in WSL or Docker works), or to `false`, which turns that one off; an indexer not named is found as usual. Example: `{"scip-go": "/opt/go/bin/scip-go", "scip-typescript": false}` |
+| `code.timeout_s` | a rust-analyzer or other indexer run is killed past this many seconds (default 1800) |
 | `code.debounce_s` | a changed root is re-indexed once quiet this long (default 20) |
 | `code.defer_lock` | a lock file; background re-indexing waits while it exists (default none). It also waits while a `cargo` process other than atlas's own ancestors runs |
 | `code.dir` | where `.scip` files and the indexer log go (default `code/` beside the database) |
@@ -134,6 +136,7 @@ See [[Memory store and hooks]] and [[Memory tree]].
 | `memory.snapshot_cap_mb` | past this, the oldest snapshots are folded into the archive (default 1024) |
 | `memory.brief_reference` | the rulebook whose size at each subagent start is logged as the "brief without atlas" (default: the first `items` export) |
 | `memory.tree` | the memory index as a tree (off when absent) |
+| `memory.transcripts` | index this project's session transcripts at each compaction as an opt-in source: `recall {key: "turn:<session8>:<line>@hash"}` and `recall {query, kind: "turn"}` (visible text only, secret lines redacted, never served to another project; default false) |
 | `memory.tree.export` | the `memory` export the tree is built for (default the first) |
 | `memory.tree.hub_dir` | the hub folder inside the memory folder (default `index`) |
 | `memory.tree.hub_max` | a hub past this many lines is split (default 24) |
@@ -161,7 +164,7 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | Key | Meaning |
 |---|---|
 | `recall` | the recall gate's settings |
-| `recall.budget_tokens` | the most a recall hook injects per prompt (default 600) |
+| `recall.budget_tokens` | the most a recall hook injects per prompt (default 150) |
 | `recall.lane_budget_tokens` | the budget of `recall {lane}` (default 2,000) |
 | `recall.fts_floor` | the FTS5 score a record must clear without the embedding model |
 | `recall.hybrid_fts_floor` | the FTS5 score a record must clear with the embedding model loaded |
@@ -170,11 +173,24 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `recall.cos_alone` | a cosine at or above this passes on meaning alone |
 | `recall.query_tokens` | the prompt tokens the cosine is taken over (default 32) |
 | `recall.inject_floor` | the cosine below which a hook injects a record not at all (records without a vector are not held to it); tuned on hit data by `atlas --hook-report --tune-floor 1` |
+| `recall.session_budget_tokens` | the tokens one session's (or one subagent's) recall injections may use in all, lanes and pointers together; past it the hooks inject nothing more, and `recall {query}` still answers. 0 (the default) is no cap. Judge it against the "brief without atlas" row of `--token-report`, which now has a `hook injections` line beside it |
+| `recall.pointer_anchors` | whether each `recall {query}` pointer ends with `@src:path:line`, the vault or source, file and line its record's text starts at, so a follow-up can `read_note {vault: src, path, lines}` instead of `recall {key}` (default off; see the anchors rows of `cargo xtask memory-eval`) |
+| `recall.select` | context selection of what the hooks inject (on by default): near-duplicates sent as refs, pointers and older lane entries trimmed to the clauses that match the prompt, each excerpt the record's own text. Measured by the hook rows of `cargo xtask memory-eval` (each floor with selection off, then on) and the `context selection` line of `--token-report` |
+| `recall.select.enabled` | `false` sends every pointer and lane entry whole, as before (the gate and budgets still apply) |
+| `recall.select.dup_cos` | the cosine between two records' vectors at which one may be sent as `- KEY: near-duplicate of OTHER` (default 0.82; without the embedding model nothing collapses) |
+| `recall.select.dup_overlap` | the share of a record's distinct words the record sent before it must hold for it to collapse (default 0.90). One way, so a record that adds something (a memory saying a rule was reversed) is never hidden behind the ref |
+| `recall.select.trim_chars` | the longest excerpt a pointer carries in place of its first line, in characters (default 90, the length of a first-line pointer) |
+| `recall.select.lane_chars` | the longest excerpt of an older lane entry (decision, measurement, commit, note) in a hook's lane brief (default 180; 0 sends them whole). The handoff, brief, open questions and next step are always whole |
 | `cap` | the context-cap guard's settings |
 | `cap.warn_tokens` | a subagent past this is told to finish and write its handoff (default 450,000) |
 | `cap.block_tokens` | past this every tool but `handoff` is denied (default 500,000) |
 | `cap.warn_every` | the warning repeats after this many more tokens (default 25,000) |
 | `cap.main_session` | apply the cap to the main session too (default false) |
+| `compact` | compaction: the checkpoint card and deferral (see `docs/design/compaction.md`). Experimental and off by default |
+| `compact.enabled` | turn on the experimental compaction features: the PreCompact checkpoint, the SessionStart(compact) card and ref report, the Compact instructions offer and `atlas settings compact-md`, and `compact.defer` (default false). Off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript) |
+| `compact.card_tokens` | the budget of the checkpoint PreCompact writes and SessionStart(compact) injects (default 400) |
+| `compact.defer` | block a proactive automatic compaction while a tool chain is running, until the next quiet point, never past the ceiling (the window less three times the largest per-request growth, at least 40,000 tokens); a manual `/compact` is never blocked (default false, pending a live check that a blocked compaction is offered again; needs `compact.enabled`) |
+| `compact.window` | the context window `compact.defer` measures against (default 0: 1,000,000 once the session has held more than 200,000 tokens, else 200,000) |
 
 ## Routing, handles and records (`lean`)
 

@@ -119,9 +119,14 @@ pub struct UserLayer {
     pub projects_dir: Option<PathBuf>,
 }
 
+/// Whether `n` is a valid name for a project or a repository: 1 to 64 characters of a-z A-Z 0-9
+/// `-` `_`, not starting with `_`.
+pub fn valid_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 64 && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') && !n.starts_with('_')
+}
+
 fn check_name(f: &Fields<'_>, n: &str) -> Result<()> {
-    let ok = !n.is_empty() && n.len() <= 64 && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') && !n.starts_with('_');
-    if ok {
+    if valid_name(n) {
         Ok(())
     } else {
         Err(f.bad("name", "1 to 64 characters of a-z A-Z 0-9 - _ (not starting with _)"))
@@ -139,7 +144,9 @@ fn parse_repos(f: &Fields<'_>, at: &str, base: &Path) -> Result<Vec<RepoSpec>> {
         }
         let name = match r.string("name")? {
             Some(n) => n,
-            None => repo_name(path.as_deref(), remote.as_deref()),
+            // A default name is made free in the list: a cut one may meet
+            // another.
+            None => fit_name(&repo_name(path.as_deref(), remote.as_deref()), MAX_SHORT_NAME, |n| !out.iter().any(|o| o.name.eq_ignore_ascii_case(n))),
         };
         check_name(&r, &name)?;
         if out.iter().any(|o| o.name.eq_ignore_ascii_case(&name)) {
@@ -150,8 +157,40 @@ fn parse_repos(f: &Fields<'_>, at: &str, base: &Path) -> Result<Vec<RepoSpec>> {
     Ok(out)
 }
 
+/// The longest vault, source or identifier pattern name (see
+/// `crate::sources::Source::new`).
+pub const MAX_SHORT_NAME: usize = 32;
+
+/// `base` cut to at most `max` bytes (trailing `-` and `_` dropped), and
+/// made free with `-2`, `-3`, ... (still within `max`) when `free` says it
+/// is taken.
+pub fn fit_name(base: &str, max: usize, free: impl Fn(&str) -> bool) -> String {
+    let cut = |n: usize| -> String {
+        let mut end = base.len().min(n);
+        while !base.is_char_boundary(end) {
+            end -= 1;
+        }
+        let s = &base[..end];
+        let t = s.trim_end_matches(['-', '_']);
+        if t.is_empty() { s } else { t }.to_string()
+    };
+    let first = cut(max);
+    if free(&first) {
+        return first;
+    }
+    (2..)
+        .map(|i| {
+            let suffix = format!("-{i}");
+            format!("{}{suffix}", cut(max.saturating_sub(suffix.len())))
+        })
+        .find(|n| free(n))
+        .unwrap_or(first)
+}
+
 /// A repository's default name: its folder's name, else the last part of
-/// its remote, lowercased.
+/// its remote, lowercased, at most [`MAX_SHORT_NAME`] characters (it
+/// becomes a source name; a caller holding a list makes it unique there
+/// with [`fit_name`]).
 pub fn repo_name(path: Option<&Path>, remote: Option<&str>) -> String {
     let from_path = path.and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned());
     let from_remote = remote.map(|r| normalize_remote(r).rsplit('/').next().unwrap_or("").to_string());
@@ -161,7 +200,7 @@ pub fn repo_name(path: Option<&Path>, remote: Option<&str>) -> String {
     if s.is_empty() {
         "repo".into()
     } else {
-        s
+        fit_name(&s, MAX_SHORT_NAME, |_| true)
     }
 }
 
@@ -376,8 +415,13 @@ pub fn child_repos(dir: &Path) -> Vec<(String, PathBuf, Option<String>)> {
         })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut seen = HashSet::new();
-    out.retain(|r| seen.insert(r.0.clone()));
+    // Two folders can share a name once sanitized or cut: each keeps its
+    // own, numbered.
+    let mut seen: Vec<String> = Vec::new();
+    for r in &mut out {
+        r.0 = fit_name(&r.0, MAX_SHORT_NAME, |n| !seen.iter().any(|s| s.eq_ignore_ascii_case(n)));
+        seen.push(r.0.clone());
+    }
     out
 }
 
@@ -777,7 +821,8 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
             let key = path_key(path);
             let has_source = e.sources.iter().map(|s| &s.root).chain(e.vaults.iter().map(|v| &v.path)).any(|p| path_key(p) == key);
             if !has_source {
-                let sname = unique(&r.name, &taken);
+                // A listed name may be up to 64 characters, a source name 32.
+                let sname = fit_name(&r.name, MAX_SHORT_NAME, |n| !taken.contains(n));
                 taken.insert(sname.clone());
                 repo_sources.push(e.sources.len());
                 e.sources.push(SourceSpec {
@@ -794,7 +839,7 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
             if !has_code {
                 let cname = unique(&format!("{}-code", r.name), &taken);
                 taken.insert(cname.clone());
-                e.code.get_or_insert_with(CodeSpec::default).roots.push(CodeRootSpec { name: cname, root: path.clone(), build_scripts: false });
+                e.code.get_or_insert_with(CodeSpec::default).roots.push(CodeRootSpec { name: cname, root: path.clone(), build_scripts: false, scip: Default::default() });
             }
         }
         let has_export = |m: &MemorySpec, n: &str| m.exports.iter().any(|x| x.name == n);
@@ -1211,7 +1256,7 @@ pub fn migrate_value(v: &Value, base: &Path, name: &str, default_db: &Path, clau
         }
     }
     if !proj.contains_key("db") {
-        proj.insert("db".into(), Value::String(default_db.to_string_lossy().into_owned()));
+        proj.insert("db".into(), Value::String(default_db.to_string_lossy().replace('\\', "/")));
     }
     let c = Config::parse_object(v, base, "config", crate::config::TOP_KEYS).ok()?;
     let claude = claude_dir.map(path_key);
@@ -1238,6 +1283,40 @@ pub fn migrate_value(v: &Value, base: &Path, name: &str, default_db: &Path, clau
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_migrated_default_db_is_written_with_forward_slashes() {
+        let v = crate::json::parse(r#"{"vaults": [{"name": "notes", "path": "notes"}]}"#).unwrap();
+        let out = migrate_value(&v, Path::new("/cfg"), "p", Path::new(r"C:\home\state\atlas.sqlite"), None).unwrap();
+        assert_eq!(out["projects"][0]["db"], crate::json!("C:/home/state/atlas.sqlite"), "{out}");
+    }
+
+    #[test]
+    fn a_long_repo_name_is_cut_to_a_source_name_and_kept_unique() {
+        // 33 characters: one over the cap the index puts on a source name.
+        let long = "socket-account-config-manager-cli";
+        assert_eq!(long.len(), 33);
+        let n = repo_name(Some(Path::new("/w").join(long).as_path()), None);
+        assert_eq!(n, "socket-account-config-manager-cl");
+        assert!(n.len() <= MAX_SHORT_NAME);
+        // A cut ending in `-` drops it; a taken name is numbered within the cap.
+        assert_eq!(fit_name("abc-def", 4, |_| true), "abc");
+        let taken = ["socket-account-config-manager-cl".to_string()];
+        let second = fit_name(long, MAX_SHORT_NAME, |x| !taken.contains(&x.to_string()));
+        assert_eq!(second, "socket-account-config-manager-2");
+        assert!(second.len() <= MAX_SHORT_NAME);
+        // Short names are as they were.
+        assert_eq!(repo_name(Some(Path::new("/w/Billing.API")), None), "billing-api");
+    }
+
+    #[test]
+    fn default_repo_names_cut_to_the_same_prefix_stay_distinct() {
+        let base = Path::new("/w");
+        let v = crate::json::parse(r#"{"name": "p", "repos": [{"path": "socket-account-config-manager-cli"}, {"path": "socket-account-config-manager-clx"}]}"#).unwrap();
+        let p = parse_project(&v, base, "project", FILE_KEYS).unwrap();
+        let names: Vec<&str> = p.repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["socket-account-config-manager-cl", "socket-account-config-manager-2"]);
+    }
 
     #[test]
     fn remotes_normalise_across_forms() {

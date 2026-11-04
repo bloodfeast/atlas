@@ -198,6 +198,12 @@ impl RecVecs {
         Some(gemm::dot(isa, q, &self.mat[i * self.dim..(i + 1) * self.dim]))
     }
 
+    /// The cosine of two records, when both have a vector.
+    pub fn pair(&self, isa: gemm::Isa, a: i64, b: i64) -> Option<f32> {
+        let (&i, &j) = (self.row.get(&a)?, self.row.get(&b)?);
+        Some(gemm::dot(isa, &self.mat[i * self.dim..(i + 1) * self.dim], &self.mat[j * self.dim..(j + 1) * self.dim]))
+    }
+
     /// The `k` records nearest the query, best first, as (rid, cosine).
     pub fn top(&self, isa: gemm::Isa, q: &[f32], k: usize) -> Vec<(i64, f32)> {
         let mut scored: Vec<(i64, f32)> =

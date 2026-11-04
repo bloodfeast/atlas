@@ -189,9 +189,139 @@ pub fn more(out: &mut String, shown: usize, total: usize, limit: usize) {
     }
 }
 
+/// A JSON answer as plain text, for the tools without a text form of their
+/// own: an object is `key: value` lines (nulls left out, a nested object
+/// indented under its key), an array of flat objects is a table under its
+/// key, any other array one `- item` block per element. Every element is
+/// written: nothing is cut or counted away.
+///
+/// # Arguments
+///
+/// * `v` - the answer.
+pub fn value(v: &crate::json::Value) -> String {
+    let mut out = String::new();
+    write_value(&mut out, v, "");
+    out
+}
+
+fn scalar(v: &crate::json::Value) -> Option<String> {
+    use crate::json::Value;
+    match v {
+        Value::Null => Some(String::new()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Whether every element is an object of scalars (a table's rows).
+fn flat_rows(a: &[crate::json::Value]) -> bool {
+    a.iter().all(|e| e.as_object().is_some_and(|m| m.values().all(|x| scalar(x).is_some())))
+}
+
+fn write_value(out: &mut String, v: &crate::json::Value, ind: &str) {
+    use crate::json::Value;
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m.iter() {
+                write_entry(out, k, x, ind);
+            }
+        }
+        Value::Array(a) => write_array(out, a, ind),
+        x => {
+            out.push_str(ind);
+            push_text(out, &scalar(x).unwrap_or_default(), ind);
+            out.push('\n');
+        }
+    }
+}
+
+/// A string value: kept whole, its later lines indented like its first.
+fn push_text(out: &mut String, s: &str, ind: &str) {
+    for (i, l) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            out.push_str(ind);
+        }
+        out.push_str(l.trim_end_matches('\r'));
+    }
+}
+
+fn write_entry(out: &mut String, k: &str, x: &crate::json::Value, ind: &str) {
+    use crate::json::Value;
+    match x {
+        Value::Null => {}
+        Value::Array(a) if a.is_empty() => out.push_str(&format!("{ind}{k}: none\n")),
+        Value::Array(a) => {
+            out.push_str(&format!("{ind}{k}: {}\n", a.len()));
+            write_array(out, a, ind);
+        }
+        Value::Object(m) if m.is_empty() => {}
+        Value::Object(_) => {
+            out.push_str(&format!("{ind}{k}:\n"));
+            write_value(out, x, &format!("{ind}  "));
+        }
+        s => {
+            out.push_str(&format!("{ind}{k}: "));
+            push_text(out, &scalar(s).unwrap_or_default(), &format!("{ind}  "));
+            out.push('\n');
+        }
+    }
+}
+
+fn write_array(out: &mut String, a: &[crate::json::Value], ind: &str) {
+    if !a.is_empty() && flat_rows(a) {
+        let mut cols: Vec<&str> = Vec::new();
+        for e in a {
+            for (k, _) in e.as_object().into_iter().flat_map(|m| m.iter()) {
+                if !cols.contains(&k.as_str()) {
+                    cols.push(k);
+                }
+            }
+        }
+        out.push_str(ind);
+        let mut t = Table::new(out, &cols);
+        for e in a {
+            for c in &cols {
+                t.field(&e.get(c).and_then(scalar).unwrap_or_default());
+            }
+        }
+        // Rows are not indented: a tab row is one record at any depth.
+        return;
+    }
+    let deeper = format!("{ind}  ");
+    for e in a {
+        match scalar(e) {
+            Some(s) => {
+                out.push_str(&format!("{ind}- "));
+                push_text(out, &s, &deeper);
+                out.push('\n');
+            }
+            None => {
+                out.push_str(&format!("{ind}-\n"));
+                write_value(out, e, &deeper);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn values_become_lines_and_tables_with_every_element() {
+        let v = crate::json::parse(
+            r#"{"queue":[{"thread":"a:D-1","age":3},{"thread":"b:D-2","age":null}],"n":2,"none":[],"skip":null,"body":"one\ntwo","nested":{"k":"v"},"posts":[{"p":1,"tags":["x","y"]}]}"#,
+        )
+        .unwrap();
+        let t = value(&v);
+        assert!(t.contains("queue: 2\nthread\tage\na:D-1\t3\nb:D-2\t\n"), "{t}");
+        assert!(t.contains("n: 2\n") && t.contains("none: none\n") && !t.contains("skip"), "{t}");
+        assert!(t.contains("body: one\n  two\n") && t.contains("nested:\n  k: v\n"), "{t}");
+        assert!(t.contains("posts: 1\n-\n  p: 1\n  tags: 2\n  - x\n  - y\n"), "{t}");
+    }
 
     #[test]
     fn fields_escape_tabs_and_newlines() {

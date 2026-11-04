@@ -1,0 +1,51 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-9.2.0, pluggy-1.7.0
+rootdir: C:\src\demo
+collected 8 items
+
+test_calc.py .FFs..                                                      [ 75%]
+test_more.py .F                                                          [100%]
+
+================================== FAILURES ===================================
+__________________________________ test_sub ___________________________________
+
+    def test_sub():
+>       assert sub(3, 1) == 2
+E       assert 4 == 2
+E        +  where 4 = sub(3, 1)
+
+test_calc.py:11: AssertionError
+__________________________________ test_div ___________________________________
+
+    def test_div():
+>       assert div(1, 0) == 0
+               ^^^^^^^^^
+
+test_calc.py:15: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+a = 1, b = 0
+
+    def div(a, b):
+>       return a / b
+               ^^^^^
+E       ZeroDivisionError: division by zero
+
+calc.py:10: ZeroDivisionError
+_____________________________ TestText.test_strip _____________________________
+
+self = <test_more.TestText object at 0x0000020ACACF2990>
+
+    def test_strip(self):
+>       assert " a ".strip() == "a "
+E       AssertionError: assert 'a' == 'a '
+E         
+E         - a 
+E         + a
+
+test_more.py:6: AssertionError
+=========================== short test summary info ===========================
+FAILED test_calc.py::test_sub - assert 4 == 2
+FAILED test_calc.py::test_div - ZeroDivisionError: division by zero
+FAILED test_more.py::TestText::test_strip - AssertionError: assert 'a' == 'a '
+=================== 3 failed, 4 passed, 1 skipped in 0.11s ====================

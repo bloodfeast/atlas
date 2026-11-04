@@ -14,10 +14,9 @@
 //! byte-identical output.
 
 use std::cmp::Ordering;
-use std::sync::OnceLock;
 
-use crate::regex::Regex;
 use crate::json::{FromJson, Map, ToJson, Value};
+use crate::lex;
 
 use crate::error::{Error, Result};
 use crate::links;
@@ -240,9 +239,56 @@ pub fn check_glob(g: &str) -> Result<()> {
     Ok(())
 }
 
-fn re_start() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"<!-- vault-mcp:index ([A-Za-z0-9_-]{1,48}) start (\{.*?\}) -->").expect("static regex"))
+/// Every index start marker, left to right (was the `captures_iter` of
+/// `<!-- vault-mcp:index ([A-Za-z0-9_-]{1,48}) start (\{.*?\}) -->`):
+/// groups 0, the name and the spec (to the first `} -->` on its line).
+pub(crate) fn start_markers(s: &str) -> Vec<[lex::Span; 3]> {
+    const OPEN: &str = "<!-- vault-mcp:index ";
+    const NAME: lex::Ascii = lex::Ascii::new(b"_-", &[(b'a', b'z'), (b'A', b'Z'), (b'0', b'9')]);
+    let mut out = Vec::new();
+    let mut q = 0;
+    while let Some(p) = lex::find_str(s, q, OPEN) {
+        q = p + 1;
+        let n0 = p + OPEN.len();
+        let n1 = lex::run_ascii(s, n0, NAME);
+        let Some(b) = (1..=48).contains(&(n1 - n0)).then(|| lex::lit(s, n1, " start {")).flatten().map(|e| e - 1) else { continue };
+        let line_end = lex::line_end(s, b);
+        match lex::find_str(&s[..line_end], b + 1, "} -->") {
+            Some(close) => {
+                out.push([Some((p, close + 5)), Some((n0, n1)), Some((b, close + 1))]);
+                q = close + 5;
+            }
+            // Any later marker on this line searches less of it.
+            None => q = q.max(line_end),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
+    use lex::props::{v, Mode, Site};
+    vec![Site {
+        name: "index start marker",
+        pattern: r"<!-- vault-mcp:index ([A-Za-z0-9_-]{1,48}) start (\{.*?\}) -->".into(),
+        tokens: &[
+            "<!-- vault-mcp:index ",
+            "x",
+            "name-1_",
+            " start ",
+            "{",
+            "}",
+            " -->",
+            "} -->",
+            "{\"a\":1}",
+            "\n",
+            " ",
+            "<",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ],
+        examples: &["<!-- vault-mcp:index open start {\"a\":{}} -->\nx\n<!-- vault-mcp:index open end -->"],
+        mode: Mode::All(|s| start_markers(s).into_iter().map(v).collect()),
+    }]
 }
 
 /// An index region found in a note.
@@ -267,11 +313,12 @@ pub struct Region {
 /// does not parse, or a name appears twice.
 pub fn regions(text: &str) -> Result<Vec<Region>> {
     let mut out: Vec<Region> = Vec::new();
-    for c in re_start().captures_iter(text) {
-        let m = c.get(0).map(|m| (m.start(), m.end())).unwrap_or((0, 0));
-        let name = c[1].to_string();
+    for c in start_markers(text) {
+        let m = c[0].unwrap_or((0, 0));
+        let g = |n: usize| c[n].map_or("", |(a, b)| &text[a..b]);
+        let name = g(1).to_string();
         let spec: Spec =
-            crate::json::from_str(&c[2]).map_err(|e| Error::InvalidArgument(format!("index {name}: spec does not parse: {e}")))?;
+            crate::json::from_str(g(2)).map_err(|e| Error::InvalidArgument(format!("index {name}: spec does not parse: {e}")))?;
         let end_marker = format!("<!-- vault-mcp:index {name} end -->");
         let rel = text[m.1..].find(&end_marker).ok_or_else(|| Error::InvalidArgument(format!("index {name}: end marker missing")))?;
         let end = m.1 + rel + end_marker.len();

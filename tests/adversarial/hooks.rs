@@ -134,7 +134,7 @@ fn hostile_transcript_paths() {
     let s = settings(t.path());
     seed_hostile(&s);
     let bin = t.path().join("binary.jsonl");
-    std::fs::write(&bin, (0..100_000u32).map(|i| (i * 2654435761u32 >> 24) as u8).collect::<Vec<_>>()).unwrap();
+    std::fs::write(&bin, (0..100_000u32).map(|i| (i.wrapping_mul(2654435761u32) >> 24) as u8).collect::<Vec<_>>()).unwrap();
     let huge = t.path().join("huge.jsonl");
     std::fs::write(&huge, "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n".repeat(50_000)).unwrap();
     let lines = t.path().join("lines.jsonl");

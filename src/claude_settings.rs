@@ -49,7 +49,9 @@
 //! `atlas-backups/atlas.YYYYMMDD-HHMMSS.json` beside the configuration file.
 //! A backup ending in `.absent` records that the file did not exist, so undo
 //! removes it. Undo takes the newest backup of either kind, each read from
-//! its own folder.
+//! its own folder. A `vault.YYYYMMDD-HHMMSS.absent` record beside an atlas
+//! backup names a vault folder `add-project --vault` registered; undo keeps
+//! that folder unless atlas created it and it holds only atlas's note.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -231,6 +233,9 @@ pub struct Paths {
     /// The user-level state folder of a configuration with projects: the
     /// offer state and the routing flag live there, shared by every project.
     pub user_state: Option<PathBuf>,
+    /// The project named with `--project` (or `ATLAS_PROJECT`): the one
+    /// `add-project` adds a folder to, over the folder's own project.
+    pub project: Option<String>,
 }
 
 impl Paths {
@@ -250,7 +255,7 @@ impl Paths {
             Some(u) => Some(u.join(OFFER_STATE)),
             None => db.parent().map(|d| d.join(OFFER_STATE)),
         };
-        Some(Paths { claude_dir, atlas_config: atlas_config.map(Path::to_path_buf), state, db: Some(db.to_path_buf()), user_state: user_state.map(Path::to_path_buf) })
+        Some(Paths { claude_dir, atlas_config: atlas_config.map(Path::to_path_buf), state, db: Some(db.to_path_buf()), user_state: user_state.map(Path::to_path_buf), project: None })
     }
 
     /// The folder holding the routing flag: the user-level state folder,
@@ -278,7 +283,7 @@ impl Paths {
     /// Where backups with this stem (`settings` or `atlas`) are kept.
     fn backups_for(&self, stem: &str) -> Result<PathBuf, String> {
         match stem {
-            "atlas" | "project" => self.atlas_backups().ok_or_else(|| "no atlas configuration is in use to back up".to_string()),
+            "atlas" | "project" | "vault" => self.atlas_backups().ok_or_else(|| "no atlas configuration is in use to back up".to_string()),
             _ => Ok(self.backups()),
         }
     }
@@ -544,6 +549,8 @@ pub struct Io<'a> {
     pub interactive: bool,
     /// Claude Code's version (`claude --version`), when known.
     pub version: Option<(u32, u32, u32)>,
+    /// Show what `add-project` would write, and write nothing.
+    pub dry_run: bool,
 }
 
 macro_rules! say {
@@ -670,6 +677,15 @@ fn backup(p: &Paths, stem: &str, path: &Path, core: Option<&str>) -> Result<(Pat
     let dir = p.backups_for(stem)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let ext = if path.exists() { "json" } else { "absent" };
+    if let Some(c) = core {
+        // One change that writes a file twice (a migration, then the
+        // registration) keeps the first backup: undo restores the file as
+        // it was before the whole change.
+        let first = ["json", "absent"].iter().map(|x| dir.join(format!("{stem}.{c}.{x}"))).find(|f| f.exists());
+        if let Some(f) = first {
+            return Ok((f, c.to_string()));
+        }
+    }
     let (dst, core) = match core {
         Some(c) => (dir.join(format!("{stem}.{c}.{ext}")), c.to_string()),
         None => {
@@ -696,10 +712,11 @@ fn backup(p: &Paths, stem: &str, path: &Path, core: Option<&str>) -> Result<(Pat
     Ok((dst, core))
 }
 
-/// The kinds of backup: Claude Code's settings, atlas's configuration, and
-/// a project file atlas created (always an `.absent` backup, holding the
-/// file's path, so undo removes it).
-const STEMS: [&str; 3] = ["settings", "atlas", "project"];
+/// The kinds of backup: Claude Code's settings, atlas's configuration, a
+/// project file atlas created (always an `.absent` backup, holding the
+/// file's path, so undo removes it), and a vault folder atlas registered
+/// (an `.absent` record; see [`undo_vault`]).
+const STEMS: [&str; 5] = ["settings", "atlas", "project", "vault", "claudemd"];
 
 /// The newest backups of any kind, each kind read from its own folder:
 /// one, or the files of one change that wrote several (they share a stamp).
@@ -724,6 +741,16 @@ fn newest_backups(p: &Paths) -> Vec<PathBuf> {
 /// `.absent` record removes the file atlas created.
 fn restore(p: &Paths, io: &mut Io, b: &Path) -> Result<(), String> {
     let name = b.file_name().unwrap_or_default().to_string_lossy().to_string();
+    if name.starts_with("vault.") {
+        let record = std::fs::read_to_string(b).map_err(|e| format!("{}: {e}", b.display()))?;
+        say!(io, "{}", undo_vault(&record));
+        let _ = std::fs::remove_file(b);
+        return Ok(());
+    }
+    if name.starts_with("claudemd.") {
+        say!(io, "{}", undo_compact_md(b));
+        return Ok(());
+    }
     let target = if name.starts_with("project.") {
         // A project file atlas created: the backup holds its path.
         PathBuf::from(std::fs::read_to_string(b).map_err(|e| format!("{}: {e}", b.display()))?.trim())
@@ -762,8 +789,93 @@ fn commit_in(p: &Paths, io: &mut Io, stem: &str, path: &Path, text: &str, label:
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
     crate::fsio::replace_atomic(path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+    note_label(&saved, label);
     say!(io, "{label}; backup {}", saved.display());
     Ok(core)
+}
+
+/// Records what a change was, beside its backup, for `atlas settings undo`
+/// to show (`STEM.STAMP.label`, one line per file the change wrote).
+fn note_label(saved: &Path, label: &str) {
+    let name = saved.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let Some((head, _)) = name.rsplit_once('.') else { return };
+    let f = saved.with_file_name(format!("{head}.label"));
+    let mut text = std::fs::read_to_string(&f).unwrap_or_default();
+    if !text.lines().any(|l| l == label) {
+        text.push_str(label);
+        text.push('\n');
+        let _ = std::fs::write(&f, text);
+    }
+}
+
+/// The label file of a backup (see [`note_label`]).
+fn label_file(b: &Path) -> PathBuf {
+    let name = b.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let head = name.rsplit_once('.').map_or(name.as_str(), |(h, _)| h).to_string();
+    b.with_file_name(format!("{head}.label"))
+}
+
+/// What `atlas settings undo` would revert, for the user to confirm: the
+/// change's time and what it was, then one line per file.
+fn undo_summary(p: &Paths, all: &[PathBuf]) -> String {
+    let core = all.first().and_then(|b| b.file_name()).and_then(|n| backup_key(&n.to_string_lossy())).map(|k| k.0).unwrap_or_default();
+    let d: String = core.chars().filter(char::is_ascii_digit).collect();
+    let when = if d.len() >= 14 { format!("{}-{}-{} {}:{}:{} UTC", &d[..4], &d[4..6], &d[6..8], &d[8..10], &d[10..12], &d[12..14]) } else { core.clone() };
+    let mut labels: Vec<String> = Vec::new();
+    for b in all {
+        for l in std::fs::read_to_string(label_file(b)).unwrap_or_default().lines() {
+            if !labels.iter().any(|x| x == l) {
+                labels.push(l.to_string());
+            }
+        }
+    }
+    let what = if labels.is_empty() { String::new() } else { format!(": {}", labels.join("; ")) };
+    let mut out = format!("atlas settings undo reverts the newest atlas change, made {when}{what}\n");
+    for b in all {
+        let name = b.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let line = if name.starts_with("vault.") {
+            let folder = std::fs::read_to_string(b).unwrap_or_default().lines().next().unwrap_or("").trim().to_string();
+            format!("unregister vault {folder} (its folder is removed only if atlas made it and it holds no notes)")
+        } else if name.starts_with("claudemd.") {
+            let note = std::fs::read_to_string(format!("{}.path", b.display())).ok().or_else(|| std::fs::read_to_string(b).ok()).unwrap_or_default();
+            format!("remove atlas's Compact instructions from {}", note.trim())
+        } else {
+            let target = if name.starts_with("project.") {
+                PathBuf::from(std::fs::read_to_string(b).unwrap_or_default().trim())
+            } else if name.starts_with("atlas.") {
+                p.atlas_config.clone().unwrap_or_default()
+            } else {
+                p.settings()
+            };
+            if name.ends_with(".absent") {
+                format!("remove {} (it did not exist before)", target.display())
+            } else {
+                let now = std::fs::read_to_string(&target).unwrap_or_default();
+                let then = std::fs::read_to_string(b).unwrap_or_default();
+                let (gone, back) = line_changes(&now, &then);
+                format!("restore {} to its earlier copy ({gone} lines removed, {back} lines put back)", target.display())
+            }
+        };
+        out.push_str("  - ");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Lines of `now` missing from `then`, and lines of `then` missing from
+/// `now` (each line counted as often as it occurs).
+fn line_changes(now: &str, then: &str) -> (usize, usize) {
+    let mut count: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for l in now.lines() {
+        *count.entry(l).or_default() += 1;
+    }
+    for l in then.lines() {
+        *count.entry(l).or_default() -= 1;
+    }
+    let gone = count.values().filter(|v| **v > 0).map(|v| *v as usize).sum();
+    let back = count.values().filter(|v| **v < 0).map(|v| (-*v) as usize).sum();
+    (gone, back)
 }
 
 fn manual(s: &Item, v: Option<&Value>) -> String {
@@ -846,25 +958,56 @@ pub fn edit_config(p: &Paths, io: &mut Io, keys: &[&str], val: Option<&Value>, l
 /// [`edit_config`], the backup joining the change stamped `core` when
 /// given (one undo restores both).
 fn edit_config_in(p: &Paths, io: &mut Io, keys: &[&str], val: Option<&Value>, label: &str, manual_edit: &str, core: Option<&str>) -> Result<bool, String> {
+    Ok(!matches!(edit_config_many(p, io, &[(keys, val.cloned())], label, manual_edit, core)?, Written::Refused))
+}
+
+/// What [`edit_config_many`] did.
+enum Written {
+    /// The text could not be changed byte-exactly; the manual edit was shown.
+    Refused,
+    /// The file already held every value.
+    Unchanged,
+    /// Written, under this backup stamp.
+    Stamp(String),
+}
+
+/// atlas's configuration file, its text, and the text after `edits`
+/// spliced in byte-exactly; `None` when that cannot be done.
+///
+/// # Errors
+///
+/// A message when there is no configuration file or it cannot be read.
+fn config_after(p: &Paths, edits: &[(&[&str], Option<Value>)]) -> Result<Option<(PathBuf, String, String)>, String> {
     let path = p.atlas_config.clone().ok_or("atlas's switches live in its configuration file, and none is in use (--vault flags only)")?;
     let doc = load(&path)?;
     let text = doc.text.clone().unwrap_or_else(|| "{}\n".into());
     let mut want = doc.value.clone();
-    set_path(&mut want, keys, val);
-    let spliced = splice(&text, keys, val).filter(|t| crate::json::parse(t).ok().as_ref() == Some(&want));
-    let Some(new) = spliced else {
+    let mut new = Some(text.clone());
+    for (keys, val) in edits {
+        set_path(&mut want, keys, val.as_ref());
+        new = new.and_then(|t| splice(&t, keys, val.as_ref()));
+    }
+    Ok(new.filter(|t| crate::json::parse(t).ok().as_ref() == Some(&want)).map(|n| (path, text, n)))
+}
+
+/// Several [`edit_config`] changes in one write: each is spliced into the
+/// text in turn, so one backup (and one `atlas settings undo`) covers them
+/// all.
+fn edit_config_many(p: &Paths, io: &mut Io, edits: &[(&[&str], Option<Value>)], label: &str, manual_edit: &str, core: Option<&str>) -> Result<Written, String> {
+    let Some((path, text, new)) = config_after(p, edits)? else {
+        let path = p.atlas_config.clone().unwrap_or_default();
         say!(io, "atlas will not rewrite {}: the change could not be made without touching other text.", path.display());
         say!(io, "  make this edit by hand: {manual_edit}");
-        return Ok(false);
+        return Ok(Written::Refused);
     };
     if new == text {
         say!(io, "nothing to change");
-        return Ok(true);
+        return Ok(Written::Unchanged);
     }
     let _ = write!(io.out, "{}", diff(&path.display().to_string(), &text, &new));
-    commit_in(p, io, "atlas", &path, &new, label, core)?;
+    let stamp = commit_in(p, io, "atlas", &path, &new, label, core)?;
     say!(io, "atlas reads its configuration at start: restart Claude Code (or reconnect atlas with /mcp).");
-    Ok(true)
+    Ok(Written::Stamp(stamp))
 }
 
 // ---------------------------------------------------------------- checking
@@ -883,7 +1026,7 @@ fn check(s: &Item, raw: &str) -> Result<Value, String> {
         "version" => {
             let v = raw.strip_prefix('v').unwrap_or(raw);
             let ok = v.split('.').count() == 3 && v.split('.').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()));
-            return if ok { Ok(Value::String(v.to_string())) } else { Err(format!("{}: needs a version like 0.1.0", s.id)) };
+            return if ok { Ok(Value::String(v.to_string())) } else { Err(format!("{}: needs a version like 0.2.0", s.id)) };
         }
         _ => {}
     }
@@ -908,6 +1051,15 @@ fn atlas_config_value(p: &Paths) -> Value {
     p.atlas_config.as_deref().and_then(|c| load(c).ok()).map(|d| d.value).unwrap_or(Value::Object(Map::new()))
 }
 
+/// Whether the experimental compaction features are on (`compact.enabled`
+/// in atlas's configuration; default off).
+pub fn compaction_on(p: &Paths) -> bool {
+    atlas_config_value(p).pointer("/compact/enabled").and_then(Value::as_bool) == Some(true)
+}
+
+/// What `atlas settings compact-md` says while compaction is off.
+pub const COMPACTION_OFF: &str = "The Compact instructions go with atlas's experimental compaction features, which are off. To try them, set \"compact\": {\"enabled\": true} in atlas's configuration, then run this again. Nothing was changed.";
+
 /// atlas's configuration as the switches read it: the file, plus each flag
 /// switch's state under its own key (`routing: false` when routing is off).
 fn atlas_value(p: &Paths) -> Value {
@@ -931,7 +1083,7 @@ fn find<'a>(items: &'a [Item], id: Option<&String>) -> Result<&'a Item, String> 
     }
 }
 
-const HELP: &str = "usage: atlas settings list | set ID VALUE | off ID | undo | offer [--yes ID...] | add-project [--new [--name NAME] | --to PROJECT] [DIR] | migrate-projects NAME";
+const HELP: &str = "usage: atlas settings list | set ID VALUE | off ID | undo [--yes] | offer [--yes ID...] | compact-md [DIR] [--yes] | add-project [--vault | --vault-at FOLDER | --new [--name NAME] [--vault-at FOLDER | --no-vault] | --to PROJECT] [--dry-run] (DIR | --yes) | migrate-projects NAME";
 
 /// Runs one `atlas settings` command against `p`, talking through `io`.
 ///
@@ -1000,7 +1152,27 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             if all.is_empty() {
                 return Err("no atlas backup to restore".into());
             }
+            // Shown first and confirmed: the newest backup can be older and
+            // unrelated to what the user just ran (a command that changed
+            // nothing makes none).
+            let _ = write!(io.out, "{}", undo_summary(p, &all));
+            let yes = args.iter().skip(1).any(|a| a == "--yes");
+            if !yes {
+                if !io.interactive {
+                    say!(io, "Nothing reverted: there is no terminal here to confirm in. Run `atlas settings undo --yes` to revert it.");
+                    return Ok(ExitCode::FAILURE);
+                }
+                let _ = write!(io.out, "Revert it? [y/N] ");
+                let _ = io.out.flush();
+                let mut line = String::new();
+                let _ = io.input.read_line(&mut line);
+                if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    say!(io, "nothing reverted");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
             for b in &all {
+                let _ = std::fs::remove_file(label_file(b));
                 restore(p, io, b)?;
             }
             Ok(ExitCode::SUCCESS)
@@ -1011,28 +1183,68 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             let mut to: Option<String> = None;
             let mut name: Option<String> = None;
             let mut dir: Option<PathBuf> = None;
+            let mut vault: Option<VaultAt> = None;
+            let mut no_vault = false;
+            let mut dry_run = false;
+            let mut yes = false;
             let mut it = args.iter().skip(1);
             while let Some(a) = it.next() {
                 match a.as_str() {
+                    "--vault" => vault = Some(VaultAt::Default),
+                    "--vault-at" => vault = Some(VaultAt::Folder(PathBuf::from(it.next().ok_or("--vault-at needs a folder")?))),
+                    "--no-vault" => no_vault = true,
                     "--new" => new = true,
                     "--to" => to = Some(it.next().ok_or("--to needs a project name")?.clone()),
                     "--name" => name = Some(it.next().ok_or("--name needs a project name")?.clone()),
+                    "--dry-run" => dry_run = true,
+                    "--yes" => yes = true,
                     d if !d.starts_with("--") && dir.is_none() => dir = Some(PathBuf::from(d)),
                     other => return Err(format!("add-project: unknown argument {other:?}\n{HELP}")),
                 }
             }
+            // With no folder named and no --yes, the command only shows what
+            // it would do: a bare `add-project` is a question, not a change.
+            let bare = dir.is_none() && !yes;
             let dir = match dir {
                 Some(d) => d,
                 None => std::env::current_dir().map_err(|e| format!("the current folder: {e}"))?,
             };
+            if bare {
+                say!(
+                    io,
+                    "add-project with no folder named writes nothing; below is what it would do for the current folder ({}). To make the change, name the folder (`atlas settings add-project .` for this one) or pass --yes.\n{HELP}\n",
+                    project_key(&dir)
+                );
+            }
+            io.dry_run = dry_run || bare;
+            if (vault.is_some() || no_vault) && to.is_some() {
+                return Err("add-project: --vault, --vault-at and --no-vault go with a single folder or --new, not with --to".into());
+            }
+            if no_vault && (vault.is_some() || !new) {
+                return Err("add-project: --no-vault goes with --new alone (without --vault, a single folder gets no vault)".into());
+            }
             let ok = if new {
-                add_project_new(p, io, &dir, name.as_deref())?
+                // A new project gets its vault unless told otherwise.
+                let at = if no_vault { None } else { Some(vault.unwrap_or(VaultAt::Default)) };
+                add_project_new(p, io, &dir, name.as_deref(), at.as_ref())?
             } else if let Some(t) = to {
                 add_to_project(p, io, &dir, &t)?
             } else {
-                add_project(p, io, &dir)?
+                add_project_vault(p, io, &dir, vault.as_ref())?
             };
             Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+        }
+        "compact-md" => {
+            if !compaction_on(p) {
+                say!(io, "{COMPACTION_OFF}");
+                return Ok(ExitCode::FAILURE);
+            }
+            let yes = args.iter().any(|a| a == "--yes");
+            let dir = match args.iter().skip(1).find(|a| !a.starts_with("--")) {
+                Some(d) => PathBuf::from(d),
+                None => std::env::current_dir().map_err(|e| format!("the current folder: {e}"))?,
+            };
+            Ok(if compact_md(p, io, &dir, yes)? { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         "migrate-projects" => {
             let name = args.get(1).ok_or("migrate-projects needs the project's name")?;
@@ -1088,12 +1300,25 @@ fn offer(p: &Paths, io: &mut Io, items: &[Item], claude: &Value, atlas: &Value, 
     if yes.is_none() {
         for s in items.iter().filter(|s| s.default_on()) {
             let state = show(effective(s, current(s, claude, atlas)));
+            // A build from source never replaces itself, whatever the
+            // setting says: it is not shown as on.
+            let state = if s.id == "update" && !crate::update::release_build() { format!("{state} in the configuration, but off here: a build from source never updates itself") } else { state };
             say!(io, "\n[{}] {} ({state}; on by default)\n  What: {}\n  Cost: {}\n  Turn off: atlas settings off {}", s.id, s.title, s.what, s.cost, s.id);
         }
     }
-    mark_offered(p, items.iter().map(|s| s.id.as_str()));
+    // Recorded as offered only when someone could answer: without a terminal
+    // (and without --yes) nothing was asked, so the next terminal run asks.
+    if io.interactive || yes.is_some() {
+        mark_offered(p, items.iter().map(|s| s.id.as_str()));
+    }
+    // The project's Compact instructions, asked here too (in the current folder).
+    if yes.is_none() && io.interactive && compaction_on(p) {
+        if let Ok(dir) = std::env::current_dir() {
+            compact_md(p, io, &dir, false)?;
+        }
+    }
     if yes.is_none() && !io.interactive {
-        say!(io, "\nnothing written: run `atlas settings offer` in a terminal to answer, or `atlas settings offer --yes ID...`");
+        say!(io, "\nNothing went wrong. No setting was changed because there is no terminal here to answer in (input is not a terminal), and atlas only changes a setting you say yes to. To choose, run `atlas settings offer` in a terminal, or apply chosen ones with `atlas settings offer --yes ID...`.");
         return Ok(ExitCode::SUCCESS);
     }
     if todo.is_empty() {
@@ -1169,6 +1394,166 @@ pub fn session_start_line(p: &Paths) -> Option<String> {
     Some(line)
 }
 
+// ------------------------------------------- the Compact instructions block
+
+/// The first line of the block atlas adds to a project's `CLAUDE.md`.
+pub const COMPACT_BEGIN: &str = "<!-- atlas:compact-instructions";
+/// Its last line.
+pub const COMPACT_END: &str = "<!-- /atlas:compact-instructions -->";
+
+/// The Compact instructions block: Claude Code's summarizer reads the
+/// project's `CLAUDE.md`, so this is how a compaction summary is steered to
+/// keys and deltas (`docs/design/compaction.md`, section 1).
+pub const COMPACT_BLOCK: &str = "<!-- atlas:compact-instructions (added by `atlas settings compact-md`; `atlas settings undo` removes it) -->
+## Compact instructions
+
+When compacting, write keys and deltas, not restated content. Aim for at most about 1,800 words, spent on identifiers rather than prose:
+- After compaction atlas injects a checkpoint card (lanes, open questions, owed steps, rulings, files touched, the last tool calls with result refs, the pending call). Do not repeat what it lists.
+- Files and code: one line per file, its path, line range and what changed. No code snippets, except the few lines the next step will edit.
+- User messages: keep requirements, corrections and decisions in a few quoted words each; do not list every message.
+- Tool output: never restate it; keep only exact error lines, numbers, commands, paths, ids and record keys the next step needs.
+- Cite atlas records and lines by the key@hash or src:path:a-b@hash refs shown, and say only what changed since.
+- End with the current step and the next action.
+<!-- /atlas:compact-instructions -->
+";
+
+/// The folders already asked about the block (the state's `compact_md`).
+fn offered_compact_md(p: &Paths) -> Vec<String> {
+    let Some(s) = &p.state else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(s) else { return Vec::new() };
+    crate::json::parse(&text).ok().and_then(|v| v.get("compact_md").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())).unwrap_or_default()
+}
+
+/// Records a folder as asked about the block, keeping the state's other keys.
+fn mark_compact_md(p: &Paths, dir: &str) -> bool {
+    let Some(s) = &p.state else { return false };
+    let mut v = std::fs::read_to_string(s).ok().and_then(|t| crate::json::parse(&t).ok()).filter(Value::is_object).unwrap_or(Value::Object(Map::new()));
+    let mut all = offered_compact_md(p);
+    if !all.iter().any(|x| x == dir) {
+        all.push(dir.to_string());
+    }
+    if let Some(o) = v.as_object_mut() {
+        o.insert("compact_md".into(), Value::Array(all.into_iter().map(Value::String).collect()));
+    }
+    if let Some(d) = s.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    crate::fsio::replace_atomic(s, (crate::json::to_string_pretty(&v) + "\n").as_bytes()).is_ok()
+}
+
+/// Whether a `CLAUDE.md` text already holds the block.
+fn has_compact_block(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start().starts_with(COMPACT_BEGIN))
+}
+
+/// `atlas settings compact-md [DIR] [--yes]`: shows the Compact instructions
+/// block and the change to `DIR/CLAUDE.md`, asks once (or applies with
+/// `--yes`), and writes nothing on no. The file is backed up first; `atlas
+/// settings undo` removes the block (and the file, when atlas created it).
+/// Returns false when the write failed.
+///
+/// # Errors
+///
+/// A message when the file cannot be read or written.
+pub fn compact_md(p: &Paths, io: &mut Io, dir: &Path, yes: bool) -> Result<bool, String> {
+    let path = dir.join("CLAUDE.md");
+    let old = match std::fs::read_to_string(&path) {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let key = project_key(dir);
+    mark_compact_md(p, &key);
+    if old.as_deref().is_some_and(has_compact_block) {
+        say!(io, "[compact-md] already in {}", path.display());
+        return Ok(true);
+    }
+    let base = old.clone().unwrap_or_default();
+    let sep = if base.is_empty() || base.ends_with("\n\n") { "" } else if base.ends_with('\n') { "\n" } else { "\n\n" };
+    let new = format!("{base}{sep}{COMPACT_BLOCK}");
+    if !yes {
+        say!(
+            io,
+            "\n[compact-md] Compact instructions for {}\n  What: steers Claude Code's compaction summary to cite atlas refs and write deltas, beside the checkpoint card atlas injects after a compaction.\n  Cost: about 270 tokens of CLAUDE.md in every session of this project.\n  Measured: `atlas --compact-report` (ratio, refs, misses); see docs/design/compaction.md.\n{}",
+            path.display(),
+            diff(&path.display().to_string(), old.as_deref().unwrap_or(""), &new)
+        );
+        if !io.interactive {
+            say!(io, "Nothing went wrong. CLAUDE.md was not changed because there is no terminal here to answer in (input is not a terminal). To choose, run `atlas settings compact-md` in a terminal, or add it with `atlas settings compact-md --yes`.");
+            return Ok(true);
+        }
+        let _ = write!(io.out, "  Add it? [y/N] ");
+        let _ = io.out.flush();
+        let mut line = String::new();
+        let _ = io.input.read_line(&mut line);
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            say!(io, "nothing written");
+            return Ok(true);
+        }
+    }
+    let (saved, _) = backup(p, "claudemd", &path, None)?;
+    // The undo record names the file (a copy alone would not).
+    let note = PathBuf::from(format!("{}.path", saved.display()));
+    std::fs::write(&note, path.display().to_string()).map_err(|e| format!("{}: {e}", note.display()))?;
+    note_label(&saved, &format!("compact-md: added the Compact instructions to {}", path.display()));
+    crate::fsio::replace_atomic(&path, new.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+    say!(io, "[compact-md] added to {}; backup {} (`atlas settings undo` removes the block)", path.display(), saved.display());
+    Ok(true)
+}
+
+/// `CLAUDE.md` text without atlas's block (and the blank line before it).
+pub fn strip_compact_block(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let a = lines.iter().position(|l| l.trim_start().starts_with(COMPACT_BEGIN))?;
+    let b = a + lines[a..].iter().position(|l| l.trim() == COMPACT_END)?;
+    let mut head = lines[..a].concat();
+    if head.ends_with("\n\n") {
+        head.pop();
+    }
+    Some(head + &lines[b + 1..].concat())
+}
+
+/// Undoes a `claudemd` backup: removes the block from the file it names,
+/// and removes the file when atlas created it and nothing else is left.
+fn undo_compact_md(b: &Path) -> String {
+    let absent = b.extension().is_some_and(|x| x == "absent");
+    let note = PathBuf::from(format!("{}.path", b.display()));
+    let path = std::fs::read_to_string(&note).ok().or_else(|| absent.then(|| std::fs::read_to_string(b).ok()).flatten()).map(|s| PathBuf::from(s.trim()));
+    let _ = std::fs::remove_file(b);
+    let _ = std::fs::remove_file(&note);
+    let Some(path) = path else { return "the Compact instructions backup names no file; nothing changed".into() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return format!("{} is gone; nothing to remove", path.display()) };
+    let Some(rest) = strip_compact_block(&text) else { return format!("{} no longer holds atlas's Compact instructions; nothing removed", path.display()) };
+    if absent && rest.trim().is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => format!("removed {} (atlas created it for the Compact instructions)", path.display()),
+            Err(e) => format!("{}: {e}", path.display()),
+        };
+    }
+    match crate::fsio::replace_atomic(&path, rest.as_bytes()) {
+        Ok(()) => format!("removed the Compact instructions from {}", path.display()),
+        Err(e) => format!("{}: {e}", path.display()),
+    }
+}
+
+/// The one-time SessionStart line offering the block for the session's
+/// folder: once per folder, and never when its `CLAUDE.md` already has it.
+pub fn compact_md_line(p: &Paths, cwd: &Path) -> Option<String> {
+    // A project folder only: a repository root or a folder with a CLAUDE.md,
+    // never the home folder.
+    if cwd.as_os_str().is_empty() || !(cwd.join(".git").exists() || cwd.join("CLAUDE.md").is_file()) || !offerable(cwd, &[]) {
+        return None;
+    }
+    let key = project_key(cwd);
+    if offered_compact_md(p).iter().any(|x| x == &key) {
+        return None;
+    }
+    if std::fs::read_to_string(cwd.join("CLAUDE.md")).is_ok_and(|t| has_compact_block(&t)) || !mark_compact_md(p, &key) {
+        return None;
+    }
+    Some("atlas: Compact instructions for this project's CLAUDE.md are offered (compaction summaries cite refs and write deltas); ask the user, then run `atlas settings compact-md --yes` here, or `atlas settings compact-md` to see the change.".into())
+}
+
 // ------------------------------------------------------ the project offer
 
 /// The projects already offered (the state file's `projects`).
@@ -1204,11 +1589,20 @@ fn project_key(dir: &Path) -> String {
 }
 
 /// The folders atlas already indexes: every vault, source and code root of
-/// the configuration.
+/// the configuration and of each of its projects, and each project's roots,
+/// project file folder and repositories (listed path and local checkout).
 pub fn configured_roots(c: &crate::config::Config) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = c.vaults.iter().map(|x| x.path.clone()).chain(c.sources.iter().map(|x| x.root.clone())).collect();
-    if let Some(code) = &c.code {
-        v.extend(code.roots.iter().map(|r| r.root.clone()));
+    let mut v: Vec<PathBuf> = Vec::new();
+    for b in std::iter::once(c).chain(c.user.projects.iter().map(|x| x.body.as_ref())) {
+        v.extend(b.vaults.iter().map(|x| x.path.clone()).chain(b.sources.iter().map(|x| x.root.clone())));
+        if let Some(code) = &b.code {
+            v.extend(code.roots.iter().map(|r| r.root.clone()));
+        }
+    }
+    for p in &c.user.projects {
+        v.extend(crate::project::project_roots(p, &c.user.checkouts));
+        v.extend(p.file.as_ref().and_then(|f| f.parent()).map(Path::to_path_buf));
+        v.extend(p.repos.iter().filter_map(|r| r.path.clone()));
     }
     v
 }
@@ -1237,21 +1631,35 @@ fn same_folder(a: &str, b: &str) -> bool {
 /// The one-time SessionStart line offering the session's folder as a
 /// source, at most once per folder; `None` when it is not offerable, was
 /// offered before, or atlas has no configuration file to add it to.
+///
+/// The question folds in the project's vault: yes adds the source and
+/// creates the vault at the default folder ([`default_vault`]), another
+/// folder puts the vault there, and no changes nothing. The folder is
+/// recorded as asked when the line is made, so no needs no command.
 pub fn project_line(p: &Paths, cwd: &Path, roots: &[PathBuf]) -> Option<String> {
-    p.atlas_config.as_ref()?;
+    let cfg = p.atlas_config.as_ref()?;
     if cwd.as_os_str().is_empty() || !offerable(cwd, roots) {
         return None;
     }
     let key = project_key(cwd);
-    if offered_projects(p).iter().any(|x| same_folder(x, &key)) || !mark_project(p, &key) {
+    if offered_projects(p).iter().any(|x| same_folder(x, &key)) {
+        return None;
+    }
+    let c = crate::config::Config::load(cfg).ok()?;
+    let vault = default_vault(p, &c, &key)?;
+    if !mark_project(p, &key) {
         return None;
     }
     let name = key.rsplit('/').next().unwrap_or(&key);
-    Some(format!("atlas: this project ({name}) is not indexed. Ask the user whether to add it as an atlas source; on yes run `atlas settings add-project` in it, on no do nothing."))
+    let at = project_key(&vault.path);
+    Some(format!(
+        "atlas: this project ({name}) is not indexed. Ask the user once, in one line: \"create a vault for this project at {at}? yes / other folder / no\" (yes is the default; yes and other folder also add the project as a source). On yes run `atlas settings add-project --vault \"{key}\"`, on other folder `atlas settings add-project --vault-at \"FOLDER\" \"{key}\"`, on no nothing (atlas will not ask again); `atlas settings undo` reverses a yes. With no user to ask, do nothing."
+    ))
 }
 
 /// A configuration name for a folder: its last component, lowercased, with
-/// anything but letters, digits and `-` as `-`, made unique against `taken`.
+/// anything but letters, digits and `-` as `-`, at most 32 characters (it
+/// names a source), made unique against `taken`.
 fn project_name(dir: &str, taken: &[String]) -> String {
     let last = dir.rsplit('/').next().unwrap_or("project");
     let mut base: String = last.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
@@ -1260,74 +1668,549 @@ fn project_name(dir: &str, taken: &[String]) -> String {
         base = "project".into();
     }
     let free = |n: &str| !taken.iter().any(|t| t.eq_ignore_ascii_case(n)) && !taken.iter().any(|t| t.eq_ignore_ascii_case(&format!("{n}-code")));
+    crate::project::fit_name(&base, crate::project::MAX_SHORT_NAME, free)
+}
+
+/// Whether a folder holds code the code index would read: Rust, WGSL, or a
+/// language of [`crate::langs`] (a source file or a unit marker such as
+/// `go.mod`).
+fn has_code(dir: &Path) -> bool {
+    dir.join("Cargo.toml").is_file()
+        || crate::code::walk(dir).is_ok_and(|w| !w.rust.is_empty() || !w.wgsl.is_empty() || !w.source.is_empty() || !crate::code::units(&w).is_empty())
+}
+
+// ------------------------------------------------------- the project vault
+
+/// Where `atlas settings add-project` puts the project's vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultAt {
+    /// [`default_vault`]: `vaults/<name>` beside atlas's configuration file.
+    Default,
+    /// A folder the user named (created when absent; relative to the
+    /// current folder).
+    Folder(PathBuf),
+}
+
+/// The note atlas writes into a vault folder it creates.
+pub const VAULT_NOTE: &str = "README.md";
+
+/// A vault about to be registered: its configuration name and folder.
+struct VaultPlan {
+    name: String,
+    path: PathBuf,
+}
+
+/// Every name in use across vaults, sources and code roots (a project's
+/// own included).
+fn taken_names(c: &crate::config::Config) -> Vec<String> {
+    let mut taken: Vec<String> = Vec::new();
+    for b in std::iter::once(c).chain(c.user.projects.iter().map(|x| x.body.as_ref())) {
+        taken.extend(b.vaults.iter().map(|v| v.name.clone()).chain(b.sources.iter().map(|s| s.name.clone())));
+        if let Some(code) = &b.code {
+            taken.extend(code.roots.iter().map(|r| r.name.clone()));
+        }
+    }
+    taken
+}
+
+/// The configured vaults' folders: atlas needs their last components
+/// distinct, so a new vault's folder name must be free too.
+fn vault_folders(c: &crate::config::Config) -> Vec<PathBuf> {
+    std::iter::once(c).chain(c.user.projects.iter().map(|x| x.body.as_ref())).flat_map(|b| b.vaults.iter().map(|v| v.path.clone())).collect()
+}
+
+fn folder_name(p: &Path) -> String {
+    crate::paths::canonical(p).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// A vault name for a project folder: `<folder>-notes`, lowercased, short
+/// enough for a vault name (32 characters), and free against `taken` and
+/// the vault folder names `folders`.
+fn vault_name(key: &str, taken: &[String], folders: &[String]) -> String {
+    let last = key.rsplit('/').next().unwrap_or("project");
+    let mut base: String = last.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+    base.truncate(20);
+    let mut base = base.trim_matches('-').to_string();
+    if base.is_empty() {
+        base = "project".into();
+    }
+    let base = format!("{base}-notes");
+    let free = |n: &str| !taken.iter().chain(folders).any(|t| t.eq_ignore_ascii_case(n));
     if free(&base) {
         return base;
     }
     (2..).map(|i| format!("{base}-{i}")).find(|n| free(n)).unwrap_or(base)
 }
 
-/// Whether a folder holds Rust or WGSL the code index would read.
-fn has_code(dir: &Path) -> bool {
-    dir.join("Cargo.toml").is_file() || crate::code::walk(dir).is_ok_and(|w| !w.rust.is_empty() || !w.wgsl.is_empty())
+/// The vault `add-project --vault` makes for an unindexed project folder
+/// `key`: named after the folder, in `vaults/<name>` beside atlas's
+/// configuration file (where the first run's `notes` vault is), so atlas's
+/// writes never land in the project's repository and its Markdown source
+/// never indexes the vault twice. `None` without a configuration file.
+fn default_vault(p: &Paths, c: &crate::config::Config, key: &str) -> Option<VaultPlan> {
+    let base = p.atlas_config.as_deref()?.parent()?.join("vaults");
+    let mut taken = taken_names(c);
+    // The source add-project adds takes its name first.
+    taken.push(project_name(key, &taken));
+    let folders: Vec<String> = vault_folders(c).iter().map(|f| folder_name(f)).collect();
+    let name = vault_name(key, &taken, &folders);
+    Some(VaultPlan { path: base.join(&name), name })
 }
 
-/// `atlas settings add-project [DIR]`: adds a folder (default: the current
-/// one) to atlas's configuration as a source of its Markdown files and,
-/// when it holds Rust or WGSL, as a code root; then indexes the source.
-/// The code root is indexed by the server's background indexer when it
-/// next starts.
+/// [`default_vault`] named after `label` alone (no source name to step
+/// around): an indexed project's folder key, or a new project's name.
+fn default_vault_named(p: &Paths, c: &crate::config::Config, label: &str) -> Option<VaultPlan> {
+    let base = p.atlas_config.as_deref()?.parent()?.join("vaults");
+    let folders: Vec<String> = vault_folders(c).iter().map(|f| folder_name(f)).collect();
+    let name = vault_name(label, &taken_names(c), &folders);
+    Some(VaultPlan { path: base.join(&name), name })
+}
+
+/// The vault to register for project folder `key`, named after `label`
+/// (the folder key, or a project's name), checked: `None` (said) when that
+/// folder is a vault already.
 ///
 /// # Errors
 ///
-/// A message when there is no configuration file or it cannot be changed.
+/// A message when the folder cannot be a vault: a file, the project folder
+/// or a folder holding it, inside another vault or source, or sharing its
+/// last name with another vault's folder.
+fn plan_vault(p: &Paths, io: &mut Io, c: &crate::config::Config, key: &str, label: &str, indexed: bool, at: &VaultAt) -> Result<Option<VaultPlan>, String> {
+    if *at == VaultAt::Default {
+        // The project's own default vault, registered before: nothing to add
+        // (a second one would only take a numbered name).
+        if let Some(d) = p.atlas_config.as_deref().and_then(Path::parent) {
+            let own = crate::project::path_key(&d.join("vaults").join(vault_name(label, &[], &[])));
+            if vault_folders(c).iter().any(|v| crate::project::path_key(v) == own) {
+                say!(io, "{} has its vault already; no vault to add", key);
+                return Ok(None);
+            }
+        }
+    }
+    let plan = match at {
+        VaultAt::Default if !indexed => default_vault(p, c, key).ok_or("atlas has no configuration file (--vault flags only)")?,
+        // An indexed project: its source keeps its name.
+        VaultAt::Default => default_vault_named(p, c, label).ok_or("atlas has no configuration file (--vault flags only)")?,
+        VaultAt::Folder(f) => {
+            let path = crate::paths::canonical(f);
+            let mut taken = taken_names(c);
+            if !indexed {
+                taken.push(project_name(key, &taken));
+            }
+            VaultPlan { name: vault_name(label, &taken, &[]), path }
+        }
+    };
+    let shown = project_key(&plan.path);
+    if plan.path.is_file() {
+        return Err(format!("{shown}: a file, not a folder"));
+    }
+    let vk = crate::project::path_key(&plan.path);
+    if vault_folders(c).iter().any(|v| crate::project::path_key(v) == vk) {
+        say!(io, "{shown} is a vault already; no vault to add");
+        return Ok(None);
+    }
+    if crate::project::key_within(&crate::project::path_key(Path::new(key)), &vk) {
+        return Err(format!("{shown} is the project folder or holds it; its Markdown is the project's source. Pick a folder inside the project or outside it"));
+    }
+    let inside = vault_folders(c).into_iter().chain(c.sources.iter().map(|s| s.root.clone())).find(|r| crate::project::key_within(&vk, &crate::project::path_key(r)));
+    if let Some(r) = inside {
+        return Err(format!("{shown} is inside {}, which atlas indexes already; pick another folder", project_key(&r)));
+    }
+    let folder = folder_name(&plan.path);
+    if vault_folders(c).iter().any(|v| folder_name(v).eq_ignore_ascii_case(&folder)) {
+        return Err(format!("another vault's folder is also named {folder:?}, and atlas needs vault folder names distinct; pick a folder with another name"));
+    }
+    Ok(Some(plan))
+}
+
+/// The note a new vault starts with.
+fn vault_note(folder: &str, key: &str) -> String {
+    format!(
+        "# {folder}\n\nThe notes vault atlas made for the project at `{key}`. atlas indexes every note here, so Claude finds them\nthrough recall and search, and atlas writes its discussion threads here too.\n\nOpen this folder in Obsidian with \"Open folder as vault\". Delete this note whenever you like.\n"
+    )
+}
+
+/// Creates the vault folder and its note when the folder is absent.
+/// Returns the note's SHA-256 when it created the folder, `None` when the
+/// folder was there (it is used as it is, nothing written into it).
+fn create_vault(plan: &VaultPlan, key: &str) -> Result<Option<String>, String> {
+    if plan.path.is_dir() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(&plan.path).map_err(|e| format!("{}: {e}", plan.path.display()))?;
+    let note = vault_note(&folder_name(&plan.path), key);
+    crate::fsio::create_exclusive(&plan.path.join(VAULT_NOTE), note.as_bytes()).map_err(|e| format!("{}: {e}", plan.path.display()))?;
+    Ok(Some(crate::sha256::hex(note.as_bytes())))
+}
+
+/// Whether a vault folder atlas created still holds only what atlas wrote:
+/// nothing, or its note unchanged.
+fn pristine(folder: &Path, note_sha: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(folder) else { return false };
+    let entries: Vec<std::fs::DirEntry> = rd.filter_map(Result::ok).collect();
+    match entries.as_slice() {
+        [] => true,
+        [e] => e.file_name() == VAULT_NOTE && e.path().is_file() && std::fs::read(e.path()).is_ok_and(|b| crate::sha256::hex(&b) == note_sha),
+        _ => false,
+    }
+}
+
+/// Undoes a vault folder record (`vault.<stamp>.absent`: the folder, then
+/// `created` with the note's SHA-256, or `existed`). The registration
+/// itself goes with the configuration backup of the same stamp. A folder
+/// atlas created that still holds only its note is removed; anything else
+/// is kept, and the message says which: user notes are never deleted.
+fn undo_vault(record: &str) -> String {
+    let mut l = record.lines();
+    let folder = PathBuf::from(l.next().unwrap_or("").trim());
+    let created = l.next().map(str::trim) == Some("created");
+    let sha = l.next().unwrap_or("").trim();
+    let shown = folder.display();
+    if !created {
+        return format!("vault {shown}: unregistered; the folder was there before atlas registered it and is kept");
+    }
+    if !folder.exists() {
+        return format!("vault {shown}: unregistered; the folder is gone already");
+    }
+    if pristine(&folder, sha) {
+        let _ = std::fs::remove_file(folder.join(VAULT_NOTE));
+        if std::fs::remove_dir(&folder).is_ok() {
+            return format!("vault {shown}: unregistered, and its folder removed (atlas created it and it held no notes of yours)");
+        }
+    }
+    format!("vault {shown}: unregistered; the folder is kept because it holds notes (delete it by hand if you no longer want them)")
+}
+
+/// `atlas settings add-project DIR`: adds a folder to atlas's configuration
+/// as a source of its Markdown files and, when it holds code (Rust, WGSL,
+/// Go, TypeScript, JavaScript), as a code root; then indexes the source.
+/// With `projects`, both go into the project's own entry (see
+/// [`target_project`]), never the top level every project reads. The code
+/// root is indexed by the server's background indexer when it next starts.
+/// With [`Io::dry_run`] the change is shown and nothing is written.
+///
+/// # Errors
+///
+/// A message when there is no configuration file, the folder is in no
+/// project of a configuration with projects, or the configuration after
+/// the change would not run (nothing is written then).
 pub fn add_project(p: &Paths, io: &mut Io, dir: &Path) -> Result<bool, String> {
+    add_project_vault(p, io, dir, None)
+}
+
+/// Finishes a configuration write that registered vault `plan` (folder
+/// made first; `created` holds its note's SHA-256 when atlas made it).
+/// Refused: a folder atlas just made goes too (nothing half done), and
+/// `false`. Written: the `vault.<stamp>.absent` record goes beside the
+/// configuration backup of the same stamp, so one undo unregisters the
+/// vault and says what it does with the folder; the vault is reported.
+fn vault_written(p: &Paths, io: &mut Io, written: &Written, plan: Option<&VaultPlan>, created: Option<&str>) -> Result<bool, String> {
+    let Some(v) = plan else { return Ok(!matches!(written, Written::Refused)) };
+    match written {
+        Written::Refused => {
+            if created.is_some_and(|sha| pristine(&v.path, sha)) {
+                let _ = std::fs::remove_file(v.path.join(VAULT_NOTE));
+                let _ = std::fs::remove_dir(&v.path);
+            }
+            return Ok(false);
+        }
+        Written::Stamp(core) => {
+            let record = match created {
+                Some(sha) => format!("{}\ncreated\n{sha}\n", v.path.display()),
+                None => format!("{}\nexisted\n", v.path.display()),
+            };
+            let r = p.backups_for("vault")?.join(format!("vault.{core}.absent"));
+            std::fs::write(&r, record).map_err(|e| format!("{}: {e}", r.display()))?;
+        }
+        Written::Unchanged => {}
+    }
+    let how = if created.is_some() { format!("created, with {VAULT_NOTE}") } else { "an existing folder, left as it is".into() };
+    say!(io, "vault {}: {} ({how}); open it in Obsidian with \"Open folder as vault\"", v.name, project_key(&v.path));
+    Ok(true)
+}
+
+/// [`add_project`], with a vault for the project's notes when `vault` is
+/// given (`--vault`, `--vault-at FOLDER`): the folder is created when
+/// absent, with one note, and registered under `vaults`. The source, the
+/// code root and the vault are one configuration write, so one `atlas
+/// settings undo` reverts them all; the undo removes a vault folder atlas
+/// created only while it holds nothing but that note. An indexed project
+/// gets the vault alone.
+///
+/// # Errors
+///
+/// As [`add_project`], and a message when the vault folder cannot be one
+/// (see [`plan_vault`]) or cannot be created.
+pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&VaultAt>) -> Result<bool, String> {
     let cfg = p.atlas_config.clone().ok_or("atlas has no configuration file to add the project to (--vault flags only)")?;
     let key = project_key(dir);
     if !Path::new(&key).is_dir() {
         return Err(format!("{key}: not a folder"));
     }
     let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
-    if !offerable(Path::new(&key), &configured_roots(&c)) {
+    let indexed = !offerable(Path::new(&key), &configured_roots(&c));
+    if indexed && vault.is_none() {
         say!(io, "{key} is already indexed (or is inside a folder that is); nothing to change");
         return Ok(true);
     }
-    let mut taken: Vec<String> = c.vaults.iter().map(|v| v.name.clone()).chain(c.sources.iter().map(|s| s.name.clone())).collect();
-    if let Some(code) = &c.code {
-        taken.extend(code.roots.iter().map(|r| r.name.clone()));
+    // Where the entries go: the project's own lists (top-level ones are in
+    // every project), or the top level of a configuration without projects.
+    let target = match target_project(p, io, &c, Path::new(&key))? {
+        Target::Top => None,
+        Target::Project(n) => Some(n),
+        Target::Cancelled => {
+            say!(io, "cancelled; nothing written");
+            return Ok(true);
+        }
+    };
+    let plan = match vault {
+        Some(at) => plan_vault(p, io, &c, &key, &key, indexed, at)?,
+        None => None,
+    };
+    if indexed && plan.is_none() {
+        say!(io, "{key} is already indexed (or is inside a folder that is); nothing to change");
+        return Ok(true);
     }
-    let name = project_name(&key, &taken);
+    let name = project_name(&key, &taken_names(&c));
     let doc = load(&cfg)?.value;
-    let mut sources = doc.get("sources").and_then(Value::as_array).cloned().unwrap_or_default();
-    sources.push(crate::json!({"name": name, "root": key, "include": ["**/*.md"], "exclude": ["target/**", "node_modules/**"]}));
-    let manual = format!("add {{\"name\": \"{name}\", \"root\": \"{key}\", \"include\": [\"**/*.md\"]}} to \"sources\"");
-    if !edit_config(p, io, &["sources"], Some(&Value::Array(sources)), &format!("added source {name}"), &manual)? {
+    // The entries to add, by list (`sources`, `code.roots`, `vaults`).
+    let mut adds: Vec<(&[&str], Value)> = Vec::new();
+    let mut did: Vec<String> = Vec::new();
+    let mut manual: Vec<String> = Vec::new();
+    let to = |list: &str| match &target {
+        Some(t) => format!("{list} of project {t:?} (under \"projects\")"),
+        None => list.to_string(),
+    };
+    if !indexed {
+        let mut exclude = vec![Value::String("target/**".into()), Value::String("node_modules/**".into())];
+        // A vault inside the project is the vault's, not the source's.
+        if let Some(v) = &plan {
+            let vk = project_key(&v.path);
+            if crate::project::key_within(&crate::project::path_key(&v.path), &crate::project::path_key(Path::new(&key))) && vk.len() > key.len() {
+                exclude.push(Value::String(format!("{}/**", &vk[key.len() + 1..])));
+            }
+        }
+        adds.push((&["sources"], crate::json!({"name": name.clone(), "root": key.clone(), "include": ["**/*.md"], "exclude": Value::Array(exclude)})));
+        did.push(format!("source {name}"));
+        manual.push(format!("add {{\"name\": \"{name}\", \"root\": \"{key}\", \"include\": [\"**/*.md\"]}} to {}", to("\"sources\"")));
+        if has_code(Path::new(&key)) {
+            adds.push((&["code", "roots"], crate::json!({"name": format!("{name}-code"), "root": key.clone()})));
+            did.push(format!("code root {name}-code"));
+            manual.push(format!("add {{\"name\": \"{name}-code\", \"root\": \"{key}\"}} to {}", to("\"code\".\"roots\"")));
+        }
+    }
+    if let Some(v) = &plan {
+        let vk = project_key(&v.path);
+        adds.push((&["vaults"], crate::json!({"name": v.name.clone(), "path": vk.clone()})));
+        did.push(format!("vault {}", v.name));
+        manual.push(format!("add {{\"name\": \"{}\", \"path\": \"{vk}\"}} to {}", v.name, to("\"vaults\"")));
+    }
+    let edits = list_edits(&doc, target.as_deref(), &adds)?;
+    let manual = manual.join("; ");
+    let label = match &target {
+        Some(t) => format!("project {t}: added {}", did.join(", ")),
+        None => format!("added {}", did.join(", ")),
+    };
+    // Every check that can fail runs on the text that would be written,
+    // before anything is: a refusal leaves the configuration as it was.
+    let Some((_, _, new)) = config_after(p, &edits)? else {
+        say!(io, "atlas will not rewrite {}: the change could not be made without touching other text.", cfg.display());
+        say!(io, "  make this edit by hand: {manual}");
+        return Ok(false);
+    };
+    let base = cfg.parent().map(Path::to_path_buf).unwrap_or_default();
+    let would = |e: String| format!("{label} would leave a configuration atlas cannot run ({e}); nothing written to {}", cfg.display());
+    let next = crate::config::Config::parse(&new, &base).map_err(|e| would(e.to_string()))?;
+    let resolved = crate::project::resolve(&next, Path::new(&key), target.as_deref()).map_err(|e| would(e.to_string()))?.config;
+    let setup = crate::store::AtlasSetup::from_config(&resolved).map_err(|e| would(e.to_string()))?;
+    let specs: Vec<(String, PathBuf)> = resolved.vaults.iter().map(|v| (v.name.clone(), v.path.clone())).collect();
+    // The planned vault's folder is made below; the others are checked now.
+    let existing: Vec<(String, PathBuf)> = specs.iter().filter(|(n, _)| plan.as_ref().is_none_or(|v| &v.name != n)).cloned().collect();
+    if !existing.is_empty() || plan.is_none() {
+        crate::paths::Vaults::new(&existing).map_err(|e| would(e.to_string()))?;
+    }
+    let db = resolved.db.clone().or_else(|| p.db.clone()).ok_or_else(|| would("no database path is known".into()))?;
+    if io.dry_run {
+        let into = match &target {
+            Some(t) => format!("project {t}"),
+            None => "the top level (this configuration has no projects)".into(),
+        };
+        dry_config(p, io, &edits, &label, &into, &manual)?;
+        if let Some(v) = plan.as_ref().filter(|v| !v.path.is_dir()) {
+            say!(io, "dry run: would create the vault folder {} with {VAULT_NOTE}", project_key(&v.path));
+        }
+        if !indexed {
+            say!(io, "dry run: would index source {name} into {}", db.display());
+        }
+        return Ok(true);
+    }
+    let mut created: Option<String> = None;
+    if let Some(v) = &plan {
+        // The folder first: a configured vault whose folder is missing
+        // stops the server.
+        created = create_vault(v, &key)?;
+    }
+    let vaults = match crate::paths::Vaults::new(&specs) {
+        Ok(v) => v,
+        Err(e) => {
+            if let (Some(v), Some(sha)) = (&plan, created.as_deref()) {
+                if pristine(&v.path, sha) {
+                    let _ = std::fs::remove_file(v.path.join(VAULT_NOTE));
+                    let _ = std::fs::remove_dir(&v.path);
+                }
+            }
+            return Err(would(e.to_string()));
+        }
+    };
+    let written = edit_config_many(p, io, &edits, &label, &manual, None)?;
+    if !vault_written(p, io, &written, plan.as_ref(), created.as_deref())? {
         return Ok(false);
     }
     mark_project(p, &key);
-    if has_code(Path::new(&key)) {
-        let root = crate::json!({"name": format!("{name}-code"), "root": key});
-        let doc = load(&cfg)?.value;
-        let (keys, val): (Vec<&str>, Value) = match doc.get("code").and_then(|c| c.get("roots")).and_then(Value::as_array) {
-            Some(r) => {
-                let mut r = r.clone();
-                r.push(root);
-                (vec!["code", "roots"], Value::Array(r))
-            }
-            None if doc.get("code").is_some_and(Value::is_object) => (vec!["code", "roots"], Value::Array(vec![root])),
-            None => (vec!["code"], crate::json!({"roots": [root]})),
-        };
-        let manual = format!("add {{\"name\": \"{name}-code\", \"root\": \"{key}\"}} to \"code\".\"roots\"");
-        edit_config(p, io, &keys, Some(&val), &format!("added code root {name}-code"), &manual)?;
+    if indexed {
+        return Ok(true);
     }
-    // Index the source now; the code root is indexed when the server starts.
-    let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
-    let setup = crate::store::AtlasSetup::from_config(&c).map_err(|e| e.to_string())?;
-    let vaults = crate::paths::Vaults::new(&c.vaults.iter().map(|v| (v.name.clone(), v.path.clone())).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
-    let db = c.db.clone().or_else(|| p.db.clone()).ok_or("no database path is known")?;
+    // Index the source now; the code root is indexed when the server starts,
+    // the vault when a tool first reads it.
     let mut store = crate::store::Store::open_with(&db, vaults, setup).map_err(|e| e.to_string())?;
     let s = store.rescan_sources(Some(&[name.as_str()])).map_err(|e| e.to_string())?;
     say!(io, "indexed source {name}: {} Markdown file{}", s.files, if s.files == 1 { "" } else { "s" });
     Ok(true)
+}
+
+/// Where `add-project` puts a folder's entries (see [`target_project`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    /// The top level: the configuration has no projects.
+    Top,
+    /// This project's entry under `projects`.
+    Project(String),
+    /// The user cancelled the project choice: nothing is written.
+    Cancelled,
+}
+
+/// The project `add-project` adds a folder to: [`Target::Top`] for a
+/// configuration without projects, else the project named with
+/// `--project`, else the folder's own (see [`crate::project::active`]).
+/// A folder in none of them is asked about in a terminal (every configured
+/// project listed, and cancel; one project is asked about too, never
+/// picked silently); without a terminal, or in a dry run, it is refused.
+///
+/// # Errors
+///
+/// A message when the folder is in no project and none is named, chosen or
+/// the default, or its project is a project file not yet registered.
+fn target_project(p: &Paths, io: &mut Io, c: &crate::config::Config, dir: &Path) -> Result<Target, String> {
+    if !c.user.scoped {
+        return Ok(Target::Top);
+    }
+    let named = p.project.as_deref().filter(|n| !n.is_empty());
+    let Some(a) = crate::project::active(c, dir, named).map_err(|e| e.to_string())? else {
+        let names: Vec<String> = c.user.projects.iter().map(|x| x.name.clone()).collect();
+        if io.interactive && !io.dry_run && !names.is_empty() {
+            say!(io, "{} is in no project. Which project should it be added to?", project_key(dir));
+            for (i, n) in names.iter().enumerate() {
+                say!(io, "  {}) {n}", i + 1);
+            }
+            say!(io, "  c) cancel");
+            let _ = write!(io.out, "  Project [1-{}, name, or c]: ", names.len());
+            let _ = io.out.flush();
+            let mut line = String::new();
+            let _ = io.input.read_line(&mut line);
+            return Ok(match pick_project(&names, &line) {
+                Some(n) => Target::Project(n),
+                None => Target::Cancelled,
+            });
+        }
+        return Err(format!(
+            "{} is in no project and the configuration has no default_project, so atlas does not know which project to add it to; nothing written. Run it in a terminal to choose one, name one with `atlas --project NAME settings add-project \"{}\"`, or make a project with `atlas settings add-project --new`",
+            project_key(dir),
+            project_key(dir)
+        ));
+    };
+    if !c.user.projects.iter().any(|x| x.name == a.spec.name) {
+        let file = a.spec.file.as_deref().map(|f| f.display().to_string()).unwrap_or_default();
+        let folder = a.spec.file.as_deref().and_then(Path::parent).map(project_key).unwrap_or_default();
+        return Err(format!("project {:?} comes from {file}, which the atlas configuration does not list; nothing written. Register it first with `atlas settings add-project --new \"{folder}\"`", a.spec.name));
+    }
+    Ok(Target::Project(a.spec.name))
+}
+
+/// The project an answer to the project question picks: its number in
+/// `names` (from 1) or its name (any case); `None` for cancel (`c`,
+/// `cancel`), an empty answer, or anything else.
+fn pick_project(names: &[String], answer: &str) -> Option<String> {
+    let a = answer.trim();
+    if let Ok(i) = a.parse::<usize>() {
+        return i.checked_sub(1).and_then(|i| names.get(i)).cloned();
+    }
+    names.iter().find(|n| n.eq_ignore_ascii_case(a)).cloned()
+}
+
+/// One edit of atlas's configuration: the key path, and the new value (`None`
+/// removes it).
+type ConfigEdit = (&'static [&'static str], Option<Value>);
+
+/// The configuration edits that append each `(list, entry)` of `adds`: to
+/// the top-level lists, or with `project`, to that entry of `projects` (one
+/// edit of `projects`). A list or object missing on the way is made.
+///
+/// # Errors
+///
+/// A message when the project has no entry, or a key on the way is not
+/// what it should be.
+fn list_edits(doc: &Value, project: Option<&str>, adds: &[(&[&str], Value)]) -> Result<Vec<ConfigEdit>, String> {
+    fn append(v: &mut Value, keys: &[&str], item: Value) -> Result<(), String> {
+        let (last, path) = keys.split_last().ok_or("internal: an empty key path")?;
+        let mut at = v;
+        for k in path {
+            let m = at.as_object_mut().ok_or_else(|| format!("{k:?}'s parent is not an object"))?;
+            let e = m.entry_or_null(k);
+            if e.is_null() {
+                *e = Value::Object(Map::new());
+            }
+            at = e;
+        }
+        let m = at.as_object_mut().ok_or_else(|| format!("the parent of {last:?} is not an object"))?;
+        let list = m.entry_or_null(last);
+        if list.is_null() {
+            *list = Value::Array(Vec::new());
+        }
+        list.as_array_mut().ok_or_else(|| format!("{last:?} is not a list"))?.push(item);
+        Ok(())
+    }
+    let mut want = doc.clone();
+    match project {
+        Some(name) => {
+            let projects = want.as_object_mut().and_then(|m| m.get_mut("projects")).and_then(Value::as_array_mut).ok_or("the configuration has no \"projects\" list")?;
+            let entry = projects
+                .iter_mut()
+                .find(|x| x.get("name").and_then(Value::as_str) == Some(name))
+                .ok_or_else(|| format!("project {name:?} has no entry under \"projects\""))?;
+            for (keys, item) in adds {
+                append(entry, keys, item.clone())?;
+            }
+            Ok(vec![(&["projects"], want.get("projects").cloned())])
+        }
+        None => {
+            let had_code = doc.get("code").is_some_and(Value::is_object);
+            let mut out: Vec<ConfigEdit> = Vec::new();
+            for (keys, item) in adds {
+                append(&mut want, keys, item.clone())?;
+            }
+            for (keys, _) in adds {
+                let e: ConfigEdit = match *keys {
+                    ["sources"] => (&["sources"], want.get("sources").cloned()),
+                    ["vaults"] => (&["vaults"], want.get("vaults").cloned()),
+                    ["code", "roots"] if had_code => (&["code", "roots"], want.get("code").and_then(|c| c.get("roots")).cloned()),
+                    ["code", "roots"] => (&["code"], want.get("code").cloned()),
+                    other => return Err(format!("internal: no edit for {other:?}")),
+                };
+                out.push(e);
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// The project offer `atlas --setup` makes after the settings: asks whether
@@ -1347,27 +2230,44 @@ pub fn offer_project_interactive(config: Option<&Path>, db: &Path, user_state: O
     let interactive = stdin.is_terminal();
     let mut input = stdin.lock();
     let mut out = std::io::stdout();
-    let mut io = Io { out: &mut out, input: &mut input, interactive, version: None };
+    let mut io = Io { out: &mut out, input: &mut input, interactive, version: None, dry_run: false };
     project_prompt(&p, &mut io, Path::new(&key))
 }
 
 /// The yes/no question itself (see [`offer_project_interactive`]).
 fn project_prompt(p: &Paths, io: &mut Io, dir: &Path) -> Result<(), String> {
+    let key = project_key(dir);
+    let cfg = p.atlas_config.as_deref().ok_or("atlas has no configuration file")?;
+    let c = crate::config::Config::load(cfg).map_err(|e| e.to_string())?;
+    let at = default_vault(p, &c, &key).map(|v| project_key(&v.path)).ok_or("atlas has no configuration file")?;
     say!(io, "\nThis folder is not indexed: {}", dir.display());
-    say!(io, "  atlas can add it as a source (its Markdown files, and its Rust and WGSL as a code root).");
+    say!(io, "  atlas can add it as a source (its Markdown files, and its code as a code root) and create a vault for its notes.");
     if !io.interactive {
-        say!(io, "  To add it later: atlas settings add-project \"{}\"", dir.display());
+        say!(io, "  To add it later: atlas settings add-project --vault \"{}\" (or --vault-at FOLDER)", dir.display());
         return Ok(());
     }
-    let _ = write!(io.out, "  Add it? [y/N] ");
+    let _ = write!(io.out, "  Create a vault for this project at {at}? [Y]es / [o]ther folder / [n]o: ");
     let _ = io.out.flush();
     let mut line = String::new();
     let _ = io.input.read_line(&mut line);
-    mark_project(p, &project_key(dir));
-    if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        add_project(p, io, dir)?;
-    } else {
-        say!(io, "  kept as it is (the notes vault only); `atlas settings add-project` adds it any time");
+    mark_project(p, &key);
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => {
+            add_project_vault(p, io, dir, Some(&VaultAt::Default))?;
+        }
+        "o" | "other" | "other folder" => {
+            let _ = write!(io.out, "  Folder: ");
+            let _ = io.out.flush();
+            let mut f = String::new();
+            let _ = io.input.read_line(&mut f);
+            let f = f.trim().trim_matches('"');
+            if f.is_empty() {
+                say!(io, "  no folder given; kept as it is. `atlas settings add-project --vault-at FOLDER` adds it any time");
+            } else {
+                add_project_vault(p, io, dir, Some(&VaultAt::Folder(PathBuf::from(f))))?;
+            }
+        }
+        _ => say!(io, "  kept as it is; `atlas settings add-project --vault` adds it any time"),
     }
     Ok(())
 }
@@ -1401,6 +2301,12 @@ impl OfferCtx {
         known.extend(g.roots.iter().cloned());
         OfferCtx { scoped: c.user.scoped, projects: c.user.projects.iter().map(|p| p.name.clone()).collect(), known, project: g.name.clone(), unmapped: g.unmapped.clone() }
     }
+
+    /// The context for a configuration without projects: `roots` are the
+    /// folders it indexes already.
+    pub fn unscoped(roots: &[PathBuf]) -> OfferCtx {
+        OfferCtx { scoped: false, projects: Vec::new(), known: roots.to_vec(), project: String::new(), unmapped: Vec::new() }
+    }
 }
 
 /// The repositories a folder offers as a project: its child git
@@ -1420,13 +2326,22 @@ fn offered_repos(dir: &Path) -> Vec<(String, PathBuf, Option<String>)> {
     kids
 }
 
+/// Whether `dir` is a folder of repositories: not one itself, with at least
+/// one one level down (the SessionStart offer makes it a new project).
+pub fn folder_of_repos(dir: &Path) -> bool {
+    !crate::project::is_repo(dir) && !crate::project::child_repos(dir).is_empty()
+}
+
 /// The one-time SessionStart line for a folder that is no project's root:
 /// the git repositories in it (one level down), and the three answers.
 /// Asked once per folder; `None` when the folder is a known root, holds a
 /// project file, has no repositories, or was asked about before.
 pub fn repos_line(p: &Paths, cwd: &Path, ctx: &OfferCtx) -> Option<String> {
-    p.atlas_config.as_ref()?;
+    let c = crate::config::Config::load(p.atlas_config.as_ref()?).ok()?;
     if cwd.as_os_str().is_empty() || !cwd.is_dir() || cwd.join(crate::project::PROJECT_FILE).is_file() {
+        return None;
+    }
+    if !ctx.scoped && !offerable(cwd, &ctx.known) {
         return None;
     }
     let key = project_key(cwd);
@@ -1443,8 +2358,19 @@ pub fn repos_line(p: &Paths, cwd: &Path, ctx: &OfferCtx) -> Option<String> {
     let plural = if n == 1 { "" } else { "s" };
     let folder = key.rsplit('/').next().unwrap_or(&key);
     let existing = if ctx.projects.is_empty() { "none yet".to_string() } else { ctx.projects.join(", ") };
+    // A new project gets its vault (see add_project_new); the line names
+    // where.
+    let vault = default_vault_named(p, &c, &project_name(&key, &ctx.projects)).map(|v| project_key(&v.path))?;
+    if !ctx.scoped {
+        // No projects yet: add-project --new moves the current setup into
+        // a project of its own first (named after its configuration folder, or
+        // by the user in a terminal), so "add to an existing project" is no answer.
+        return Some(format!(
+            "atlas: this folder ({folder}) holds {n} git repo{plural} ({shown}) and atlas has no projects yet. Ask the user once, in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} (atlas first moves its current setup into a project of its own) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on skip nothing; `atlas settings undo` reverses new, the move included."
+        ));
+    }
     Some(format!(
-        "atlas: this folder ({folder}) is no atlas project and holds {n} git repo{plural} ({shown}). Ask the user once, in one line: new project here with these {n} repo{plural} / add to an existing project ({existing}) / skip. On new run `atlas settings add-project --new \"{key}\"`, on add `atlas settings add-project --to NAME \"{key}\"`, on skip nothing; `atlas settings undo` reverses either."
+        "atlas: this folder ({folder}) is no atlas project and holds {n} git repo{plural} ({shown}). Ask the user once, in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} / add to an existing project ({existing}) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on add `atlas settings add-project --to NAME \"{key}\"`, on skip nothing; `atlas settings undo` reverses either."
     ))
 }
 
@@ -1475,24 +2401,173 @@ pub fn unmapped_line(p: &Paths, ctx: &OfferCtx) -> Option<String> {
     ))
 }
 
+/// The vault a new project `name` (folder `key`) gets: see [`plan_vault`],
+/// named after the project.
+fn plan_project_vault(p: &Paths, io: &mut Io, c: &crate::config::Config, key: &str, name: &str, vault: Option<&VaultAt>) -> Result<Option<VaultPlan>, String> {
+    match vault {
+        Some(at) => plan_vault(p, io, c, key, name, true, at),
+        None => Ok(None),
+    }
+}
+
+/// Registers project `name` (its file in folder `key`) in the user
+/// configuration as `{name, file}`, with `plan` under its `vaults` (the
+/// folder made first). The backups share `core` when given. `Ok(false)`
+/// when the configuration could not be changed byte-exactly (a vault folder
+/// atlas just made is removed again).
+fn register_project(p: &Paths, io: &mut Io, key: &str, name: &str, plan: Option<VaultPlan>, core: Option<&str>) -> Result<bool, String> {
+    let cfg = p.atlas_config.clone().ok_or("atlas has no configuration file (--vault flags only)")?;
+    let file = format!("{key}/{}", crate::project::PROJECT_FILE);
+    let mut entry = Map::new();
+    entry.insert("name".into(), Value::String(name.into()));
+    entry.insert("file".into(), Value::String(file.clone()));
+    let mut manual = format!("add {{\"name\": {name:?}, \"file\": {file:?}");
+    let mut label = format!("project {name}: registered");
+    if let Some(v) = &plan {
+        let vk = project_key(&v.path);
+        entry.insert("vaults".into(), crate::json!([{"name": v.name.clone(), "path": vk.clone()}]));
+        manual.push_str(&format!(", \"vaults\": [{{\"name\": {:?}, \"path\": {vk:?}}}]", v.name));
+        label.push_str(&format!(", with vault {}", v.name));
+    }
+    manual.push_str("} to \"projects\"");
+    let mut projects = load(&cfg)?.value.get("projects").and_then(Value::as_array).cloned().unwrap_or_default();
+    projects.push(Value::Object(entry));
+    let edits: [(&[&str], Option<Value>); 1] = [(&["projects"], Some(Value::Array(projects)))];
+    if io.dry_run {
+        let ok = dry_config(p, io, &edits, &label, &format!("project {name}"), &manual)?;
+        if let Some(v) = plan.as_ref().filter(|v| !v.path.is_dir()) {
+            say!(io, "dry run: would create the vault folder {} with {VAULT_NOTE}", project_key(&v.path));
+        }
+        return Ok(ok);
+    }
+    let created = match &plan {
+        Some(v) => create_vault(v, key)?,
+        None => None,
+    };
+    let written = edit_config_many(p, io, &edits, &label, &manual, core)?;
+    vault_written(p, io, &written, plan.as_ref(), created.as_deref())
+}
+
+/// `--dry-run`: shows the change `edits` would make to atlas's
+/// configuration (into `into`: a project, or the top level) and writes
+/// nothing. False, having shown `manual`, when it could not be made
+/// byte-exactly.
+///
+/// # Errors
+///
+/// A message when there is no configuration file or it cannot be read.
+fn dry_config(p: &Paths, io: &mut Io, edits: &[(&[&str], Option<Value>)], label: &str, into: &str, manual: &str) -> Result<bool, String> {
+    let Some((path, old, new)) = config_after(p, edits)? else {
+        say!(io, "dry run: the change could not be made without touching other text; it would have to be made by hand: {manual}");
+        return Ok(false);
+    };
+    let _ = write!(io.out, "{}", diff(&path.display().to_string(), &old, &new));
+    say!(io, "dry run: would write {} ({label}, into {into}); nothing written", path.display());
+    Ok(true)
+}
+
 /// `atlas settings add-project --new [--name NAME] [DIR]`: writes
 /// `DIR/atlas.project.json` naming the git repositories in DIR (path and
 /// remote each), which makes DIR a project root, and registers it in the
 /// user configuration as `{name, file}`, so a folder inside one of its
 /// repositories' checkouts elsewhere resolves to it and the other projects
-/// read its memory folder. One undo removes both. A project file already
-/// there is registered when it is not yet.
+/// read its memory folder. The project gets its vault with it, unless
+/// `vault` is `None` (`--no-vault`): by default `vaults/<name>-notes`
+/// beside atlas's configuration file, as [`add_project_vault`] places one,
+/// so it is never inside a repository; registered in the project's entry,
+/// so only that project sees it. One undo removes all three (the vault
+/// folder only while it holds nothing but atlas's note). A project file
+/// already there is registered (with its vault) when it is not yet.
 ///
 /// # Errors
 ///
 /// A message when the configuration is not project-scoped, the folder holds
-/// a project file already or no repositories, or the file cannot be written.
-pub fn add_project_new(p: &Paths, io: &mut Io, dir: &Path, name: Option<&str>) -> Result<bool, String> {
+/// a project file already or no repositories, the vault folder cannot be
+/// one (see [`plan_vault`]), or a file cannot be written.
+pub fn add_project_new(p: &Paths, io: &mut Io, dir: &Path, name: Option<&str>, vault: Option<&VaultAt>) -> Result<bool, String> {
     let cfg = p.atlas_config.clone().ok_or("atlas has no configuration file (--vault flags only)")?;
     let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
-    if !c.user.scoped {
-        return Err("this configuration has no projects yet: run `atlas settings migrate-projects NAME` first (it moves the current setup into project NAME)".into());
+    if c.user.scoped {
+        return add_project_new_scoped(p, io, &c, dir, name, vault, None);
     }
+    // A configuration without projects (every fresh install) is moved into
+    // one first, as `migrate-projects` would, under the same backup stamp:
+    // one `atlas settings undo` reverses the move and the new project.
+    let key = project_key(dir);
+    let doc = load(&cfg)?;
+    let old = doc.text.clone().unwrap_or_default();
+    let base = cfg.parent().map(Path::to_path_buf).unwrap_or_default();
+    let db = p.db.clone().unwrap_or_else(crate::dirs::default_db);
+    let new_name = name.map(str::to_string).unwrap_or_else(|| project_name(&key, &[]));
+    let existing = existing_setup_name(io, &base, &new_name);
+    let moved = match crate::project::migrate_value(&doc.value, &base, &existing, &db, Some(&p.claude_dir)) {
+        Some(v) => v,
+        // Nothing to move (no vaults, sources or code yet): an empty list.
+        None => {
+            let mut v = doc.value.clone();
+            v.as_object_mut().ok_or("atlas's configuration is not a JSON object")?.insert("projects".into(), Value::Array(Vec::new()));
+            v
+        }
+    };
+    let text = crate::json::to_string_pretty(&moved) + "\n";
+    let c2 = crate::config::Config::parse(&text, &base).map_err(|e| format!("the configuration moved into projects would not load: {e}"))?;
+    let what = if c2.user.projects.is_empty() { "this configuration has no projects yet: adding the projects list".to_string() } else { format!("this configuration has no projects yet: moving the current setup into project {existing} first (as `atlas settings migrate-projects {existing}` would)") };
+    say!(io, "{what}");
+    let _ = write!(io.out, "{}", diff(&cfg.display().to_string(), &old, &text));
+    if io.dry_run {
+        say!(io, "dry run: would write {} ({}), then the new project; nothing written", cfg.display(), if c2.user.projects.is_empty() { "the projects list" } else { "the move" });
+        return Ok(true);
+    }
+    let core = commit_in(p, io, "atlas", &cfg, &text, &format!("moved the configuration into project {existing}"), None)?;
+    let res = add_project_new_scoped(p, io, &c2, dir, name, vault, Some(&core));
+    if !matches!(res, Ok(true)) {
+        // Nothing half done: the configuration goes back as it was.
+        let _ = crate::fsio::replace_atomic(&cfg, old.as_bytes());
+        if let Ok(d) = p.backups_for("atlas") {
+            let _ = std::fs::remove_file(d.join(format!("atlas.{core}.json")));
+        }
+        say!(io, "the move into projects was reverted");
+    }
+    res
+}
+
+/// The name the existing setup gets when `add-project --new` moves it into
+/// a project. The default is the name of the folder holding atlas's
+/// configuration (`base`), made a valid project name and unique against the
+/// new project's (`-2`, `-3`, ...). In a terminal (not on a dry run) the
+/// user is asked, the default taken on an empty answer or end of input; an
+/// answer that is no valid name, or the new project's, is asked again.
+fn existing_setup_name(io: &mut Io, base: &Path, new_name: &str) -> String {
+    let taken = [new_name.to_string()];
+    let default = project_name(&project_key(base), &taken);
+    if !io.interactive || io.dry_run {
+        return default;
+    }
+    loop {
+        let _ = write!(io.out, "  Name for the project the current setup moves into [{default}]: ");
+        let _ = io.out.flush();
+        let mut line = String::new();
+        if !matches!(io.input.read_line(&mut line), Ok(n) if n > 0) {
+            return default;
+        }
+        let answer = line.trim();
+        if answer.is_empty() {
+            return default;
+        }
+        if !crate::project::valid_name(answer) {
+            say!(io, "  {answer:?} is no project name: 1 to 64 characters of a-z A-Z 0-9 - _ (not starting with _)");
+        } else if answer.eq_ignore_ascii_case(new_name) {
+            say!(io, "  {answer:?} is the new project's name; pick another");
+        } else {
+            return answer.to_string();
+        }
+    }
+}
+
+
+/// [`add_project_new`] on a project-scoped configuration `c`; `core` is the
+/// backup stamp of a move into projects made just before (one undo).
+fn add_project_new_scoped(p: &Paths, io: &mut Io, c: &crate::config::Config, dir: &Path, name: Option<&str>, vault: Option<&VaultAt>, core0: Option<&str>) -> Result<bool, String> {
     let key = project_key(dir);
     let dir = Path::new(&key);
     let file = dir.join(crate::project::PROJECT_FILE);
@@ -1508,10 +2583,8 @@ pub fn add_project_new(p: &Paths, io: &mut Io, dir: &Path, name: Option<&str>) -
         if c.user.projects.iter().any(|x| x.name.eq_ignore_ascii_case(&pname)) {
             return Err(format!("{} names project {pname:?}, and another project has that name", file.display()));
         }
-        let mut projects = load(&cfg)?.value.get("projects").and_then(Value::as_array).cloned().unwrap_or_default();
-        projects.push(crate::json!({"name": pname.clone(), "file": key.clone() + "/" + crate::project::PROJECT_FILE}));
-        let manual = format!("add {{\"name\": {:?}, \"file\": {:?}}} to \"projects\"", pname, file.display().to_string());
-        return edit_config(p, io, &["projects"], Some(&Value::Array(projects)), &format!("project {pname}: registered"), &manual);
+        let plan = plan_project_vault(p, io, c, &key, &pname, vault)?;
+        return register_project(p, io, &key, &pname, plan, core0);
     }
     let repos = offered_repos(dir);
     if repos.is_empty() {
@@ -1525,18 +2598,20 @@ pub fn add_project_new(p: &Paths, io: &mut Io, dir: &Path, name: Option<&str>) -
     if taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
         return Err(format!("a project named {name:?} exists; pass --name or use --to {name}"));
     }
+    // Checked before anything is written.
+    let plan = plan_project_vault(p, io, c, &key, &name, vault)?;
     let text = crate::project::project_file_text(&name, dir, &repos);
     let _ = write!(io.out, "{}", diff(&file.display().to_string(), "", &text));
-    let core = commit_in(p, io, "project", &file, &text, &format!("project {name}: {} repos", repos.len()), None)?;
+    if io.dry_run {
+        say!(io, "dry run: would write {} (project {name}: {} repos); nothing written", file.display(), repos.len());
+        return register_project(p, io, &key, &name, plan, None);
+    }
+    let core = commit_in(p, io, "project", &file, &text, &format!("project {name}: {} repos", repos.len()), core0)?;
     // Registered in the user configuration too, under the same backup
     // stamp (one undo removes both): a folder inside one of its repos'
     // checkouts elsewhere resolves to it, and the other projects read its
     // memory folder for memories marked `scope: user`.
-    let mut projects = load(&cfg)?.value.get("projects").and_then(Value::as_array).cloned().unwrap_or_default();
-    projects.push(crate::json!({"name": name.clone(), "file": key.clone() + "/" + crate::project::PROJECT_FILE}));
-    let manual = format!("add {{\"name\": {:?}, \"file\": {:?}}} to \"projects\"", name, file.display().to_string());
-    let registered = edit_config_in(p, io, &["projects"], Some(&Value::Array(projects)), &format!("project {name}: registered"), &manual, Some(&core))?;
-    if !registered {
+    if !register_project(p, io, &key, &name, plan, Some(&core))? {
         // Nothing half done: the file goes with its backup.
         let _ = std::fs::remove_file(&file);
         if let Ok(d) = p.backups_for("project") {
@@ -1602,6 +2677,9 @@ pub fn add_to_project(p: &Paths, io: &mut Io, dir: &Path, project: &str) -> Resu
         return Ok(true);
     }
     let manual = format!("add the repos of {key} to \"repos\" of project {project:?}");
+    if io.dry_run {
+        return dry_config(p, io, &[(&["projects"], Some(Value::Array(projects)))], &format!("project {project}: added {added} repos"), &format!("project {project}"), &manual);
+    }
     let ok = edit_config(p, io, &["projects"], Some(&Value::Array(projects)), &format!("project {project}: added {added} repos"), &manual)?;
     if ok {
         mark_project(p, &key);
@@ -1664,12 +2742,16 @@ fn claude_version() -> Option<(u32, u32, u32)> {
 /// * `args` - the words after `settings`.
 /// * `config` - atlas's configuration file, when one is in use.
 /// * `db` - the index database (the offer state goes beside it).
+/// * `user_state` - the user-level state folder (a configuration with
+///   projects).
+/// * `project` - the project named with `--project` (or `ATLAS_PROJECT`).
 ///
 /// # Errors
 ///
 /// A message for the user when the subcommand cannot run.
-pub fn cli(args: Vec<String>, config: Option<&Path>, db: &Path, user_state: Option<&Path>) -> Result<ExitCode, String> {
-    let p = Paths::detect_in(config, db, user_state).ok_or("no home folder is known (set HOME, USERPROFILE or CLAUDE_CONFIG_DIR)")?;
+pub fn cli(args: Vec<String>, config: Option<&Path>, db: &Path, user_state: Option<&Path>, project: Option<&str>) -> Result<ExitCode, String> {
+    let mut p = Paths::detect_in(config, db, user_state).ok_or("no home folder is known (set HOME, USERPROFILE or CLAUDE_CONFIG_DIR)")?;
+    p.project = project.map(str::to_string);
     let interactive = std::io::stdin().is_terminal();
     // Only an offer that can write needs the version (the min_version gate).
     let writes = interactive || args.iter().any(|a| a == "--yes");
@@ -1677,7 +2759,7 @@ pub fn cli(args: Vec<String>, config: Option<&Path>, db: &Path, user_state: Opti
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut out = std::io::stdout();
-    run(&args, &p, &mut Io { out: &mut out, input: &mut input, interactive, version })
+    run(&args, &p, &mut Io { out: &mut out, input: &mut input, interactive, version, dry_run: false })
 }
 
 /// The interactive offer `atlas --setup` runs after its model step. Without
@@ -1698,12 +2780,25 @@ pub fn offer_interactive(config: Option<&Path>, db: &Path, user_state: Option<&P
     println!("\nClaude Code settings atlas offers (each is opt-in; `atlas settings` changes them any time):");
     // Without a terminal nothing is written, so Claude Code is not spawned.
     let version = if interactive { claude_version() } else { None };
-    run(&["offer".to_string()], &p, &mut Io { out: &mut out, input: &mut input, interactive, version }).map(|_| ())
+    run(&["offer".to_string()], &p, &mut Io { out: &mut out, input: &mut input, interactive, version, dry_run: false }).map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_project_answer_picks_by_number_or_name_and_anything_else_cancels() {
+        let names = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(pick_project(&names, "2\n"), Some("beta".into()));
+        assert_eq!(pick_project(&names, " Alpha \r\n"), Some("alpha".into()));
+        for a in ["c\n", "cancel", "", "0", "3", "gamma", "-1"] {
+            assert_eq!(pick_project(&names, a), None, "{a:?}");
+        }
+        // One project is still a question: an empty answer picks nothing.
+        assert_eq!(pick_project(&names[..1], "\n"), None);
+        assert_eq!(pick_project(&names[..1], "1"), Some("alpha".into()));
+    }
 
     #[test]
     fn the_manifest_is_well_formed() {
@@ -1771,6 +2866,42 @@ mod tests {
     fn diffs_one_region() {
         let d = diff("f", "{\n  \"a\": 1\n}\n", "{\n  \"a\": 1,\n  \"b\": 2\n}\n");
         assert_eq!(d, "--- f\n+++ f (after)\n {\n-  \"a\": 1\n+  \"a\": 1,\n+  \"b\": 2\n }\n");
+    }
+
+    /// The terminal question `atlas --setup` asks: an empty answer is yes,
+    /// `o` takes a folder, `n` changes nothing, and without a terminal it
+    /// only says how, writing nothing and recording nothing.
+    #[test]
+    fn the_setup_question_defaults_to_yes() {
+        let base = std::env::temp_dir().join(format!("atlas-setup-vault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("atlas");
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        std::fs::write(home.join("atlas.json"), "{\n  \"vaults\": [{\"name\": \"notes\", \"path\": \"notes\"}]\n}\n").unwrap();
+        let p = Paths { claude_dir: base.join("claude"), atlas_config: Some(home.join("atlas.json")), state: Some(home.join("state").join(OFFER_STATE)), db: Some(home.join("state").join("atlas.sqlite")), user_state: None, project: None };
+        let ask = |dir: &Path, answers: &str, interactive: bool| -> String {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("README.md"), "# Readme\n").unwrap();
+            let mut out = Vec::new();
+            let mut input = answers.as_bytes();
+            project_prompt(&p, &mut Io { out: &mut out, input: &mut input, interactive, version: None, dry_run: false }, dir).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let vaults = || crate::config::Config::load(&home.join("atlas.json")).unwrap().vaults.into_iter().map(|v| v.name).collect::<Vec<_>>();
+        let quiet = ask(&base.join("work").join("quiet"), "", false);
+        assert!(quiet.contains("add-project --vault") && !quiet.contains("[Y]es"), "{quiet}");
+        assert!(offered_projects(&p).is_empty(), "no terminal: not recorded as asked");
+        let yes = ask(&base.join("work").join("alpha"), "\n", true);
+        assert!(yes.contains("? [Y]es / [o]ther folder / [n]o: ") && yes.contains("vault alpha-notes:"), "{yes}");
+        assert!(home.join("vaults").join("alpha-notes").join(VAULT_NOTE).is_file());
+        let other = base.join("elsewhere").join("beta-vault");
+        let o = ask(&base.join("work").join("beta"), &format!("o\n{}\n", other.display()), true);
+        assert!(o.contains("Folder: ") && other.join(VAULT_NOTE).is_file(), "{o}");
+        let no = ask(&base.join("work").join("gamma"), "n\n", true);
+        assert!(no.contains("kept as it is"), "{no}");
+        assert_eq!(vaults(), ["notes", "alpha-notes", "beta-notes"]);
+        assert_eq!(offered_projects(&p).len(), 3, "each answer is recorded");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

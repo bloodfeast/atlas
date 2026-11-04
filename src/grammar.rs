@@ -395,7 +395,7 @@ pub fn cli(args: Vec<String>, store: &mut Store, config: Option<&Path>, db: &Pat
             let stdin = std::io::stdin();
             let mut input = stdin.lock();
             let mut out = std::io::stdout();
-            let mut io = crate::claude_settings::Io { out: &mut out, input: &mut input, interactive: false, version: None };
+            let mut io = crate::claude_settings::Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false };
             let label = format!("accepted: kind {:?} regex {:?}", s.kind, s.regex);
             let manual = format!("append {{\"name\": {}, \"regex\": {}}} to \"ids\"", Value::String(s.kind.clone()), Value::String(s.regex.clone()));
             let ok = crate::claude_settings::edit_config(&p, &mut io, &["ids"], Some(&Value::Array(ids)), &label, &manual)?;

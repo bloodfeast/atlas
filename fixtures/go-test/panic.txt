@@ -1,0 +1,30 @@
+--- FAIL: TestAdd (0.00s)
+    calc_test.go:7: Add(1, 2) = 4, want 3
+--- FAIL: TestTable (0.00s)
+    --- FAIL: TestTable/zero (0.00s)
+        calc_test.go:15: got 1, want 0
+    --- FAIL: TestTable/one (0.00s)
+        calc_test.go:15: got 2, want 1
+--- FAIL: TestDivZero (0.00s)
+panic: runtime error: integer divide by zero [recovered]
+	panic: runtime error: integer divide by zero
+
+goroutine 11 [running]:
+testing.tRunner.func1.2({0x1038420, 0x1191b90})
+	/usr/local/go/src/testing/testing.go:1734 +0x219
+testing.tRunner.func1()
+	/usr/local/go/src/testing/testing.go:1737 +0x359
+panic({0x1038420?, 0x1191b90?})
+	/usr/local/go/src/runtime/panic.go:792 +0x132
+example.com/demo/calc.Div(...)
+	/home/dev/demo/calc/calc.go:7
+example.com/demo/calc.TestDivZero(0xc0000e41c0?)
+	/home/dev/demo/calc/panic_test.go:6 +0xa
+testing.tRunner(0xc0000e41c0, 0x106ead8)
+	/usr/local/go/src/testing/testing.go:1792 +0xcb
+created by testing.(*T).Run in goroutine 1
+	/usr/local/go/src/testing/testing.go:1851 +0x3f6
+FAIL	example.com/demo/calc	0.529s
+?   	example.com/demo/empty	[no test files]
+ok  	example.com/demo/shapes	(cached)
+FAIL

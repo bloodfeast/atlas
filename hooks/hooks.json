@@ -14,7 +14,7 @@
     "PreToolUse": [
       {"matcher": "*",
        "hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
-                  "input": {"event": "PreToolUse", "session_id": "${session_id}", "agent_id": "${agent_id}", "tool_name": "${tool_name}", "transcript_path": "${transcript_path}", "cwd": "${cwd}", "tool_prompt": "${tool_input.prompt}", "tool_input": "${tool_input}"}}]}
+                  "input": {"event": "PreToolUse", "session_id": "${session_id}", "agent_id": "${agent_id}", "tool_name": "${tool_name}", "tool_use_id": "${tool_use_id}", "transcript_path": "${transcript_path}", "cwd": "${cwd}", "permission_mode": "${permission_mode}", "tool_prompt": "${tool_input.prompt}", "tool_input": "${tool_input}"}}]}
     ],
     "PostToolUse": [
       {"matcher": "Bash|PowerShell|Read|Grep|Glob|Edit|Write",

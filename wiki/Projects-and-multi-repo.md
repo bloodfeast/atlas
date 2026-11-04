@@ -7,28 +7,42 @@ folder, is imported into every project (a project's own memory of the same name 
 
 ## Quickstart: one repository
 
-Open Claude Code in the repository. The first session asks once, in one line, whether to add the folder; yes
-runs `atlas settings add-project`, which adds the folder's Markdown as a source and, when it holds Rust or
-WGSL, the folder as a code root. To do it by hand:
+Open Claude Code in the repository. The first session asks once, in one line: *create a vault for this
+project at `<path>`? yes / other folder / no*. Yes runs `atlas settings add-project --vault`, which adds the
+folder's Markdown as a source, the folder as a code root when it holds code, and a new vault for the
+project's notes (see [[Install and setup]]). To do it by hand:
 
 ```sh
-atlas settings add-project .
+atlas settings add-project --vault .      # or --vault-at FOLDER; without either, no vault
+atlas settings add-project --dry-run --vault .   # shows the change, the file and the project; writes nothing
 ```
+
+With `projects` configured, the source, code root and vault go into the project's own entry
+(`projects[].sources`, `projects[].code.roots`, `projects[].vaults`), never the top level, which every project
+reads: one client's files never reach another's project. The project is the one `--project NAME` names
+(`atlas --project NAME settings add-project .`), else the folder's own, else `default_project`. For a folder in no
+project, a terminal lists the configured projects (even just one) and cancel, and the entry goes into the one
+picked; without a terminal, or with `--dry-run`, it is refused, with nothing written. A folder a project already covers (a root, its project file's
+folder, a repository) is indexed already: it is not offered, and add-project changes nothing. With no folder
+named and no `--yes`, `add-project` only shows what it would do.
 
 ## Quickstart: a folder of repositories
 
 Open Claude Code in the folder that holds the repositories (each one level down, with its own `.git`). The
-first session offers, in one line: *new project here with these N repos / add to an existing project / skip*.
-New writes `atlas.project.json` in the folder, listing each repository's path and remote, and registers the
-project in your user configuration (`{name, file}` under `projects`), so a session opened inside one of its
+first session offers, in one line: *new project here with these N repos and a vault for its notes at `<path>` /
+add to an existing project / skip*. New writes `atlas.project.json` in the folder, listing each repository's
+path and remote, creates the project's vault at `vaults/<name>-notes` beside atlas's configuration (never inside
+a repository; another folder if you name one), and registers the project in your user configuration (`{name,
+file}` under `projects`, with the vault under its own `vaults`, so only this project sees it), so a session opened inside one of its
 repositories' checkouts elsewhere resolves to it too. Commit the file so everyone working on the project gets the
 same layout. A folder that is itself a git checkout offers only its child repositories; its own checkout is a
 member only when listed in `repos` by hand. By hand:
 
 ```sh
-atlas settings add-project --new .            # a new project from the repositories here
+atlas settings add-project --new .            # a new project from the repositories here, with its vault
+atlas settings add-project --new --vault-at FOLDER .   # its vault in FOLDER (--no-vault: none)
 atlas settings add-project --to NAME .        # or add them to project NAME
-atlas settings undo                           # one undo removes the file and the registration
+atlas settings undo                           # one undo removes the file, the registration and a vault atlas made
 ```
 
 Then describe how the repositories relate, in `atlas.project.json`, with `role` and `talks_to` (below).
@@ -79,13 +93,26 @@ in a meta repository, and be named by a `projects[].file` entry):
 }
 ```
 
+A repository's `name` defaults to its folder's name (else its remote's last part), lowercased and cut to 32
+characters, with `-2`, `-3` added when two cut names meet; its source takes that name (a longer listed name is
+cut the same way for the source). A vault, source or `ids` name over 32 characters is refused when the
+configuration is read, and the message names the file and the key to fix.
+
 A repository is listed by `path` (relative to the file), by `remote`, or both; the remote is identity only,
 read from `.git/config` and never fetched. Its checkout is the `checkouts` entry for its remote, else its path; a
 repository found neither way is reported once at session start and left out. Each located repository is a
-source (its Markdown) and a code root (Rust, WGSL, and `.proto` files, see [[Code index]]). A folder already
+source (its Markdown) and a code root (Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C# and Python files, see [[Code index]]). A folder already
 configured as a source or a code root is not added twice: the repository uses the configured one. Its
 Markdown source also leaves out the files another source or vault already indexes (a `docs` source inside
 it, the `intent` file), so each file is indexed once.
+
+When one repository uses another's code as a package (a Go module, an npm package, a Maven artifact, a
+Python project), `symbol` answers across them: the definition in the repository that defines the package,
+with its references and callers in the repositories that use it, and calls into another repository's
+generated gRPC stubs as rpc call sites (see [[Code index]], References across code roots). Each repository
+is indexed on its own; one whose package changes marks its users for re-indexing. This follows the package
+references the indexers resolve, not `talks_to`: a service that calls another over the network shares no
+package with it, and two repositories that share a package need not list each other.
 
 `role` and `talks_to` are optional: a prompt that names a repository gets one line from the graph (its role,
 what it talks to and depends on, what uses it), `lookup NAME` answers the same, and recall puts records about
@@ -116,6 +143,13 @@ NAME (an absent `db` is written as the path it resolved to, so the database and 
 are), sets its root to the deepest folder holding its vaults and sources, and makes it `default_project`, so
 every session resolves as before. A backup is taken first (`atlas settings undo` restores it), and running it
 again changes nothing.
+
+`atlas settings add-project --new` does this on its own when the configuration has no projects yet (every
+fresh install): the current setup becomes a project of its own. In a terminal atlas asks for its name (an empty
+answer takes the default); without one, and on `--dry-run`, the name is that of the folder holding `atlas.json`,
+made a valid project name (lowercase, other characters as `-`), with `-2`, `-3` and so
+on if the new project takes it. The change is shown first, and one `atlas settings undo` reverses the move and
+the new project together. The first session in a folder of repositories offers it the same way.
 
 ## The user layer
 

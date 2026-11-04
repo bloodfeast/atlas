@@ -33,6 +33,9 @@ pub struct CheckReport {
     pub files: usize,
     /// Every disagreement, one line each, prefixed by its check.
     pub problems: Vec<String>,
+    /// What is wrong but repairs itself, one line each: lines of the copy
+    /// the store never committed, which the next write voids.
+    pub warnings: Vec<String>,
 }
 
 impl CheckReport {
@@ -112,7 +115,21 @@ pub fn check(store: &MemoryStore, specs: &[ExportSpec], dir: Option<&Path>, copy
     }
     // 2. the copy
     if copy && !store.jsonl().as_os_str().is_empty() {
-        let text = std::fs::read_to_string(store.jsonl()).unwrap_or_default();
+        // Only the committed lines: a batch appends before it commits, so a
+        // writer mid-batch (or one that crashed there) has lines past the
+        // recorded end that are not the store's yet. A line the store never
+        // held with committed lines after it (a crash, then an older
+        // writer's append) is left out and reported as repairable.
+        let mut bytes = std::fs::read(store.jsonl()).unwrap_or_default();
+        let tail = store.copy_tail(&bytes)?;
+        bytes.truncate(tail.end.min(bytes.len() as u64) as usize);
+        for r in tail.uncommitted.iter().rev() {
+            let line = bytes[..r.start as usize].iter().filter(|b| **b == b'\n').count() + 1;
+            rep.warnings.push(format!("uncommitted: copy line {line} was never committed (a batch killed before its commit); the next write voids it"));
+            bytes.drain(r.start as usize..r.end as usize);
+        }
+        rep.warnings.reverse();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         let mut replay: HashMap<String, (i64, String, String)> = HashMap::new();
         let mut version_lines = 0usize;
         for (i, line) in text.lines().enumerate() {
@@ -165,12 +182,18 @@ pub fn check(store: &MemoryStore, specs: &[ExportSpec], dir: Option<&Path>, copy
     // 3. disk, 4. round trip
     for spec in specs {
         if let Some(d) = dir {
+            // An export file that would hold no records (it renders as it
+            // does from an empty store) is not missing when atlas never
+            // wrote it: a fresh store's exports are written by its first
+            // write.
+            let empty: Vec<(PathBuf, String)> = export::render(&MemoryStore::in_memory()?, spec)?;
             for (rel, text) in export::render(store, spec)? {
                 rep.files += 1;
                 let full = d.join(&rel);
                 match std::fs::read(&full) {
                     Ok(b) if b == text.as_bytes() => {}
                     Ok(b) => rep.problems.push(format!("disk: {} differs from its export at line {}", full.display(), export::first_diff_line(&b, text.as_bytes()))),
+                    Err(_) if empty.iter().any(|(r, t)| *r == rel && *t == text) && !store.exported(&spec.name, &rel)? => {}
                     Err(_) => rep.problems.push(format!("disk: {} is missing", full.display())),
                 }
             }
@@ -202,15 +225,41 @@ pub struct Snapshot {
 /// snapshots into the archive and removes them (never the one just made;
 /// see [`super::archive::roll_up`]).
 ///
+/// The record count is compared only when no other connection committed
+/// between the live count and the copy (`PRAGMA data_version` unchanged), so
+/// a write from another session is never mistaken for a bad copy. A copy
+/// that raced a commit is removed and tried again, up to three times; if
+/// every try raced, the snapshot is skipped (`Ok(None)`), nothing is
+/// recorded, and the next write tries again.
+///
 /// The file is `memory-YYYYMMDD-HHMMSS.sqlite`, or with `-N` appended when
 /// that name is taken.
 ///
 /// # Errors
 ///
 /// [`Error::Db`] or [`Error::Io`]; [`Error::Io`] also when the copy fails
-/// verification (the bad copy is left in place for inspection).
-pub fn snapshot(store: &MemoryStore, dir: &Path, cap_bytes: u64) -> Result<Snapshot> {
+/// verification (the bad copy is removed).
+pub fn snapshot(store: &MemoryStore, dir: &Path, cap_bytes: u64) -> Result<Option<Snapshot>> {
     std::fs::create_dir_all(dir)?;
+    for _ in 0..SNAPSHOT_TRIES {
+        if let Some((path, records)) = snapshot_once(store, dir)? {
+            let bytes = std::fs::metadata(&path)?.len();
+            let rolled = super::archive::roll_up(dir, cap_bytes, Some(&path))?;
+            store.meta_set("last_snapshot", &super::now())?;
+            let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            store.meta_set("last_snapshot_epoch", &epoch.to_string())?;
+            return Ok(Some(Snapshot { path, bytes, records, rolled }));
+        }
+    }
+    Ok(None)
+}
+
+/// Tries per [`snapshot`] call before it gives up until the next write.
+const SNAPSHOT_TRIES: usize = 3;
+
+/// One copy: `Some((path, records))` when it verified, `None` when another
+/// connection committed during the copy (the copy is removed).
+fn snapshot_once(store: &MemoryStore, dir: &Path) -> Result<Option<(PathBuf, i64)>> {
     let stamp: String = super::now().chars().filter(|c| c.is_ascii_digit()).take(14).collect();
     let base = format!("memory-{}-{}", &stamp[..8.min(stamp.len())], &stamp[8.min(stamp.len())..]);
     let mut path = dir.join(format!("{base}.sqlite"));
@@ -220,19 +269,36 @@ pub fn snapshot(store: &MemoryStore, dir: &Path, cap_bytes: u64) -> Result<Snaps
         n += 1;
     }
     let target = path.to_string_lossy().into_owned();
-    store.conn().execute("VACUUM INTO ?1", [&target])?;
+    let version = |c: &rusqlite::Connection| c.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0));
+    let before = version(store.conn())?;
     let records: i64 = store.conn().query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
-    let copy = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let ic: String = copy.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    let copied: i64 = copy.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
-    drop(copy);
-    if ic != "ok" || copied != records {
-        return Err(Error::Io(format!("snapshot {} failed verification: integrity {ic}, {copied} of {records} records", path.display())));
+    if let Err(e) = store.conn().execute("VACUUM INTO ?1", [&target]) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e.into());
     }
-    let bytes = std::fs::metadata(&path)?.len();
-    let rolled = super::archive::roll_up(dir, cap_bytes, Some(&path))?;
-    store.meta_set("last_snapshot", &super::now())?;
-    let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    store.meta_set("last_snapshot_epoch", &epoch.to_string())?;
-    Ok(Snapshot { path, bytes, records, rolled })
+    let raced = version(store.conn())? != before;
+    let verdict = (|| -> Result<(String, i64)> {
+        let copy = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let ic: String = copy.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let copied: i64 = copy.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
+        Ok((ic, copied))
+    })();
+    let (ic, copied) = match verdict {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+    };
+    if ic == "ok" && raced {
+        // The copy is one consistent read, but the live count may come from
+        // before or after the other commit: try again rather than guess.
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    }
+    if ic != "ok" || copied != records {
+        let _ = std::fs::remove_file(&path);
+        return Err(Error::Io(format!("snapshot {} failed verification: integrity {ic}, {copied} of {records} records (the copy was removed)", path.display())));
+    }
+    Ok(Some((path, records)))
 }

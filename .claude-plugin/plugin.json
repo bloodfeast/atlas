@@ -1,6 +1,6 @@
 {
   "name": "atlas",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "A local index and memory store for agents: identifier lookup, section search, a code index, append-only memory with lane journals and handoffs, relevance-gated recall and a context-cap hook. Stdio MCP; no network at query time (the embedding model is downloaded once at setup).",
   "author": {
     "name": "Brandon White"

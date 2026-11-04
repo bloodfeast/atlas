@@ -90,6 +90,15 @@ CREATE TABLE IF NOT EXISTS hook_inject(
     bytes INTEGER NOT NULL,
     read INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inject_select(
+    id INTEGER PRIMARY KEY,
+    time TEXT NOT NULL,
+    hook TEXT NOT NULL,
+    key TEXT NOT NULL,
+    how TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    full INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS brief_log(
     id INTEGER PRIMARY KEY,
     time TEXT NOT NULL,
@@ -566,6 +575,131 @@ pub fn report(conn: &Connection, bytes_per_token: f64) -> Result<(Vec<ReportRow>
     Ok((q("tool")?, q("day")?))
 }
 
+/// The recall hooks' injections, judged against the "brief without atlas"
+/// row: what the pointers cost in all, per prompt that got any, and the
+/// largest one session spent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InjectRow {
+    /// Keys injected.
+    pub keys: i64,
+    /// Sessions (and subagents) injected into.
+    pub sessions: i64,
+    /// Tokens injected, summed.
+    pub tokens: f64,
+    /// The most tokens one session or subagent was injected.
+    pub max_session: f64,
+}
+
+/// The hooks' injection totals, or `None` when none are logged.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn inject_report(conn: &Connection, bytes_per_token: f64) -> Result<Option<InjectRow>> {
+    conn.execute_batch(TOKEN_TABLE)?;
+    let (keys, sessions, sum): (i64, i64, Option<i64>) =
+        conn.query_row("SELECT COUNT(*), COUNT(DISTINCT session || '/' || agent), SUM(bytes) FROM hook_inject", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    if keys == 0 {
+        return Ok(None);
+    }
+    let max: Option<i64> = conn.query_row("SELECT MAX(b) FROM (SELECT SUM(bytes) AS b FROM hook_inject GROUP BY session, agent)", [], |r| r.get(0))?;
+    Ok(Some(InjectRow { keys, sessions, tokens: sum.unwrap_or(0) as f64 / bytes_per_token, max_session: max.unwrap_or(0) as f64 / bytes_per_token }))
+}
+
+/// Logs what context selection did to one injected record (`inject_select`,
+/// see [`crate::memory::select`]): `how` is `whole`, `trim` or `collapse`;
+/// `full` the bytes it would have taken whole.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn log_select(conn: &Connection, hook: &str, key: &str, how: &str, bytes: usize, full: usize) -> Result<()> {
+    let time = crate::store::utc(SystemTime::now());
+    conn.prepare_cached("INSERT INTO inject_select(time, hook, key, how, bytes, full) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![time, hook, key, how, bytes as i64, full as i64])?;
+    Ok(())
+}
+
+/// One row of the context-selection report: an outcome, how many injected
+/// records had it, and their tokens as sent and whole.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectRow {
+    /// `whole`, `trim` or `collapse`.
+    pub how: String,
+    /// Records.
+    pub n: i64,
+    /// Tokens sent.
+    pub sent: f64,
+    /// Tokens they would have taken whole.
+    pub full: f64,
+}
+
+/// What context selection did to the hooks' injections, by outcome.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn select_report(conn: &Connection, bytes_per_token: f64) -> Result<Vec<SelectRow>> {
+    conn.execute_batch(TOKEN_TABLE)?;
+    let mut st = conn.prepare("SELECT how, COUNT(*), SUM(bytes), SUM(full) FROM inject_select GROUP BY how ORDER BY how")?;
+    let rows = st.query_map([], |r| {
+        Ok(SelectRow { how: r.get(0)?, n: r.get(1)?, sent: r.get::<_, i64>(2)? as f64 / bytes_per_token, full: r.get::<_, i64>(3)? as f64 / bytes_per_token })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// One row of the weekly misses pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissRow {
+    /// The tool, or the hook, that missed.
+    pub what: String,
+    /// The query, or the injected key.
+    pub query: String,
+    /// Times seen in the window.
+    pub count: i64,
+    /// Tokens: what was found elsewhere (misses) or injected (keys).
+    pub tokens: f64,
+    /// The newest time seen.
+    pub last: String,
+}
+
+/// The weekly misses pass: the ten queries atlas missed most often since
+/// `since` (open `report_miss` records, by tool and query), and the ten
+/// injected keys that cost the most tokens in the same window, to check by
+/// hand whether each earned its place.
+///
+/// # Arguments
+///
+/// * `conn` - the index database.
+/// * `since` - UTC time, inclusive (`2026-10-27` or a full timestamp).
+/// * `bytes_per_token` - the ratio.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn weekly_misses(conn: &Connection, since: &str, bytes_per_token: f64) -> Result<(Vec<MissRow>, Vec<MissRow>)> {
+    conn.execute_batch(TOKEN_TABLE)?;
+    let has_misses: bool = conn.query_row("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'misses'", [], |r| r.get(0))?;
+    let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<MissRow> {
+        Ok(MissRow { what: r.get(0)?, query: r.get(1)?, count: r.get(2)?, tokens: r.get::<_, i64>(3)? as f64 / bytes_per_token, last: r.get(4)? })
+    };
+    let misses = if has_misses {
+        let mut st = conn.prepare(
+            "SELECT tool, query, COUNT(*), SUM(LENGTH(found)), MAX(time) FROM misses WHERE status = 'open' AND time >= ?1
+             GROUP BY tool, query ORDER BY COUNT(*) DESC, MAX(time) DESC LIMIT 10",
+        )?;
+        let rows = st.query_map([since], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    } else {
+        Vec::new()
+    };
+    let mut st = conn.prepare(
+        "SELECT hook, key, COUNT(*), SUM(bytes), MAX(time) FROM hook_inject WHERE time >= ?1
+         GROUP BY hook, key ORDER BY SUM(bytes) DESC, key LIMIT 10",
+    )?;
+    let keys = st.query_map([since], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((misses, keys))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,8 +768,55 @@ mod tests {
     }
 
     #[test]
+    fn the_selection_report_sums_each_outcome() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(select_report(&conn, 4.0).unwrap().is_empty());
+        log_select(&conn, "UserPromptSubmit", "rules:r00001", "trim", 80, 120).unwrap();
+        log_select(&conn, "UserPromptSubmit", "rules:r00002", "trim", 40, 80).unwrap();
+        log_select(&conn, "UserPromptSubmit", "mem-a", "collapse", 20, 100).unwrap();
+        log_select(&conn, "SubagentStart", "lane:L-1", "whole", 400, 400).unwrap();
+        let rows = select_report(&conn, 4.0).unwrap();
+        let row = |h: &str| rows.iter().find(|r| r.how == h).cloned().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row("trim"), SelectRow { how: "trim".into(), n: 2, sent: 30.0, full: 50.0 });
+        assert_eq!(row("collapse"), SelectRow { how: "collapse".into(), n: 1, sent: 5.0, full: 25.0 });
+        assert_eq!(row("whole"), SelectRow { how: "whole".into(), n: 1, sent: 100.0, full: 100.0 });
+    }
+
+    #[test]
     fn crlf_lines_print_without_the_cr() {
         let c = measure_file("f", b"a TK\r\nb\r\n", b"tk");
         assert_eq!(c.grep, "f:1:a TK\n".len());
+    }
+
+    #[test]
+    fn the_weekly_pass_ranks_misses_and_costly_injections_in_its_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE misses(id INTEGER PRIMARY KEY, time TEXT NOT NULL, tool TEXT NOT NULL, query TEXT NOT NULL, returned TEXT NOT NULL,
+             found TEXT NOT NULL, reason TEXT NOT NULL, client TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', resolved_time TEXT);",
+        )
+        .unwrap();
+        let miss = |t: &str, q: &str, status: &str| {
+            conn.execute("INSERT INTO misses(time, tool, query, returned, found, reason, client, status) VALUES(?1, 'lookup', ?2, '', 'abcd', 'r', 'c', ?3)", params![t, q, status]).unwrap();
+        };
+        miss("2026-11-01T10:00:00.000Z", "PI-1", "open");
+        miss("2026-11-02T10:00:00.000Z", "PI-1", "open");
+        miss("2026-11-02T11:00:00.000Z", "PI-2", "open");
+        miss("2026-11-02T12:00:00.000Z", "PI-3", "resolved");
+        miss("2026-10-01T10:00:00.000Z", "PI-9", "open");
+        let inj = |t: &str, s: &str, k: &str, b: i64| {
+            conn.execute("INSERT INTO hook_inject(time, session, agent, transcript, hook, key, fts, cos, bytes, read) VALUES(?1, ?2, '', '', 'UserPromptSubmit', ?3, NULL, NULL, ?4, 0)", params![t, s, k, b]).unwrap();
+        };
+        inj("2026-11-02T10:00:00.000Z", "a", "big", 400);
+        inj("2026-11-02T10:00:00.000Z", "b", "small", 40);
+        inj("2026-11-02T10:00:00.000Z", "b", "big", 400);
+        let (m, k) = weekly_misses(&conn, "2026-10-27", 4.0).unwrap();
+        assert_eq!(m.iter().map(|r| (r.query.as_str(), r.count)).collect::<Vec<_>>(), vec![("PI-1", 2), ("PI-2", 1)]);
+        assert_eq!(k.iter().map(|r| (r.query.as_str(), r.count)).collect::<Vec<_>>(), vec![("big", 2), ("small", 1)]);
+        assert_eq!(k[0].tokens, 200.0);
+        let i = inject_report(&conn, 4.0).unwrap().unwrap();
+        assert_eq!((i.keys, i.sessions, i.tokens, i.max_session), (3, 2, 210.0, 110.0));
     }
 }

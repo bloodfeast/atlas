@@ -1,0 +1,42 @@
+Picked up JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=80.0 -XX:+UseContainerSupport
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] ----------------------------< demo:shapes >-----------------------------
+[INFO] Building shapes 0.1.0
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.0:resources (default-resources) @ shapes ---
+[INFO] skip non existing resourceDirectory /work/src/main/resources
+[INFO] 
+[INFO] --- compiler:3.10.1:compile (default-compile) @ shapes ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 3 source files to /work/target/classes
+[INFO] 
+[INFO] --- resources:3.3.0:testResources (default-testResources) @ shapes ---
+[INFO] skip non existing resourceDirectory /work/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.10.1:testCompile (default-testCompile) @ shapes ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 1 source file to /work/target/test-classes
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ shapes ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+Picked up JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=80.0 -XX:+UseContainerSupport
+[INFO] Running shapes.ShapesTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.064 s -- in shapes.ShapesTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  2.196 s
+[INFO] Finished at: 2026-11-03T06:13:07Z
+[INFO] ------------------------------------------------------------------------

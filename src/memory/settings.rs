@@ -34,6 +34,15 @@ pub struct RecallSettings {
     /// The cosine below which a hook injects a record not at all (records
     /// without a vector are not held to it).
     pub inject_floor: f32,
+    /// The tokens one session's (or subagent's) recall injections may use
+    /// in all; past it the hooks inject nothing more and `recall {query}`
+    /// still answers. 0 is no cap.
+    pub session_budget_tokens: usize,
+    /// Whether a `recall {query}` pointer ends with its anchor
+    /// (`@src:path:line`, see [`super::recall::pointer_anchor`]).
+    pub pointer_anchors: bool,
+    /// Context selection of what the hooks inject (see [`super::select`]).
+    pub select: super::select::Select,
 }
 
 impl RecallSettings {
@@ -55,6 +64,27 @@ pub struct CapSettings {
     pub warn_every: u64,
     /// Apply to the main session too.
     pub main_session: bool,
+}
+
+/// Compaction settings (see [`crate::checkpoint`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactSettings {
+    /// The experimental compaction features are on (`compact.enabled`,
+    /// default false). Off, the hooks do no checkpoint, card, ref report,
+    /// Compact instructions offer or deferral.
+    pub enabled: bool,
+    /// Block a proactive automatic compaction while a tool chain runs.
+    pub defer: bool,
+    /// The window `defer` measures against (0: inferred).
+    pub window: u64,
+    /// The checkpoint card's budget in tokens.
+    pub card_tokens: usize,
+}
+
+impl Default for CompactSettings {
+    fn default() -> Self {
+        CompactSettings { enabled: false, defer: false, window: 0, card_tokens: 400 }
+    }
 }
 
 /// Everything the memory tools and hooks need.
@@ -82,6 +112,8 @@ pub struct Settings {
     pub embed_threads: usize,
     /// Context-cap settings.
     pub cap: CapSettings,
+    /// Compaction settings.
+    pub compact: CompactSettings,
     /// Bytes per token (the ledger's ratio).
     pub bytes_per_token: f64,
     /// The index database, for the token log.
@@ -102,6 +134,8 @@ pub struct Settings {
     /// asked-once offer state and the routing switch live there, shared by
     /// every project (else both stay beside the index database).
     pub user_state: Option<PathBuf>,
+    /// The opt-in transcript source (`memory.transcripts`).
+    pub transcripts: bool,
     /// The active project's repositories and links, when there is one.
     pub graph: Option<std::sync::Arc<crate::project::Graph>>,
     /// The memory index as a tree (see [`super::tree`]).
@@ -135,6 +169,10 @@ pub fn floor_scale(records: i64) -> f64 {
 /// 0.56 while each prompt's best was 0.58 to 0.75; 0.10 below the best
 /// drops most of them and keeps every top record.
 pub const DEFAULT_COS_MARGIN: f32 = 0.10;
+
+/// The default [`RecallSettings::pointer_anchors`], measured on the memory
+/// eval (see `cargo xtask memory-eval`, its anchors rows).
+pub const DEFAULT_POINTER_ANCHORS: bool = false;
 
 /// The default [`RecallSettings::inject_floor`], from
 /// `atlas --hook-report --tune-floor 1` ([`crate::hook_hits::tune`]): the
@@ -210,6 +248,19 @@ impl Settings {
                 hybrid_fts_floor: r.hybrid_fts_floor.unwrap_or(DEFAULT_HYBRID_FTS_FLOOR),
                 cos_margin: DEFAULT_COS_MARGIN,
                 inject_floor: r.inject_floor.map_or(DEFAULT_INJECT_FLOOR, |x| x as f32),
+                session_budget_tokens: r.session_budget_tokens.unwrap_or(0),
+                pointer_anchors: r.pointer_anchors.unwrap_or(DEFAULT_POINTER_ANCHORS),
+                select: {
+                    let d = super::select::Select::default();
+                    let x = r.select.clone().unwrap_or_default();
+                    super::select::Select {
+                        enabled: x.enabled.unwrap_or(d.enabled),
+                        dup_cos: x.dup_cos.map_or(d.dup_cos, |v| v as f32),
+                        dup_overlap: x.dup_overlap.map_or(d.dup_overlap, |v| v as f32),
+                        trim_chars: x.trim_chars.unwrap_or(d.trim_chars).max(16),
+                        lane_chars: x.lane_chars.map_or(d.lane_chars, |n| if n == 0 { 0 } else { n.max(16) }),
+                    }
+                },
             },
             model: crate::models::semantic_model(c, db),
             embed_threads: c.and_then(|c| c.semantic.as_ref()).and_then(|s| s.threads).unwrap_or(crate::config::DEFAULT_EMBED_THREADS).max(1),
@@ -219,6 +270,11 @@ impl Settings {
                 warn_every: k.warn_every.unwrap_or(25_000) as u64,
                 main_session: k.main_session.unwrap_or(false),
             },
+            compact: {
+                let x = c.and_then(|c| c.compact.clone()).unwrap_or_default();
+                let d = CompactSettings::default();
+                CompactSettings { enabled: x.enabled.unwrap_or(d.enabled), defer: x.defer.unwrap_or(d.defer), window: x.window.map_or(d.window, |w| w as u64), card_tokens: x.card_tokens.unwrap_or(d.card_tokens) }
+            },
             bytes_per_token: c.and_then(|c| c.bytes_per_token).unwrap_or(crate::tokens::DEFAULT_BYTES_PER_TOKEN),
             index_db: db.to_path_buf(),
             brief_reference,
@@ -226,6 +282,7 @@ impl Settings {
             user_scope_from: m.user_scope_from.clone(),
             user_memory: m.user_memory.clone(),
             user_state: m.user_state.clone(),
+            transcripts: m.transcripts.unwrap_or(false),
             graph: None,
             tree: m.tree.clone(),
         })

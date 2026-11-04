@@ -34,7 +34,8 @@
 //! * `--code-index` indexes the configured code roots now (all, or the
 //!   named ones), in the foreground, and prints one line of stats per root
 //!   (see [`atlas::code_index::index_root`]); `--scip FILE` decodes a SCIP
-//!   file already written instead of running rust-analyzer.
+//!   file already written instead of running rust-analyzer: rust-analyzer's,
+//!   or any other SCIP indexer's for that language's rows.
 //! * `--embed [THREADS]` brings the index up to date, then embeds every
 //!   section without a vector for the semantic model (see
 //!   [`atlas::semantic`]) and prints the count and time.
@@ -51,7 +52,16 @@
 //!   into a small PNG (see [`atlas::crop`]). Neither reads a configuration.
 //! * `--token-report` prints the token ledger's totals by tool and by day:
 //!   tokens returned, the counterfactual, and their ratio (see
-//!   [`atlas::tokens`]), headed by the measured ratio and the upper bound.
+//!   [`atlas::tokens`]), headed by the measured ratio and the upper bound,
+//!   with the brief-without-atlas and hook-injection lines at the end.
+//! * `--compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...]` replays
+//!   every compaction in recorded Claude Code transcripts and prints numbers
+//!   only: the compaction ratio, refs and their dangling rate, post-compaction
+//!   misses, fact fidelity, resume tokens and the ref check's latency (see
+//!   [`atlas::compact`]). The token report ends with the live compaction line.
+//! * `--misses-week [--since TIME]` is the weekly misses pass: the ten open
+//!   misses seen most since TIME (default seven days ago) and the ten
+//!   injected keys that cost the most tokens.
 //! * `--hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE]`
 //!   prints the hooks' hit rate: each injected key, marked hit when the
 //!   session later used it (see [`atlas::hook_hits`]); `--transcripts` adds
@@ -72,10 +82,59 @@ mod bench;
 mod measure;
 
 #[cfg(not(feature = "dev"))]
-const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --token-report | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | settings on|off update | --version]";
+const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --token-report | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | settings on|off update | --version]";
 /// With the `dev` feature: the measuring modes too.
 #[cfg(feature = "dev")]
-const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --bench [RUNS] [--queries FILE] [--before EXE CONFIG] | --token-report | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | --judge FILE [--modes M,M] [--runs N] | --symbol-bench FILE [--runs N] | --recall-scores FILE [--runs N] | settings on|off update | --version]";
+const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --bench [RUNS] [--queries FILE] [--before EXE CONFIG] | --token-report | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | --judge FILE [--modes M,M] [--runs N] | --symbol-bench FILE [--runs N] | --recall-scores FILE [--runs N] | settings on|off update | --version]";
+
+/// `atlas --help`: every mode, subcommand and flag, one per line.
+const HELP: &str = "\
+atlas: the project-memory MCP server. With no mode it serves MCP on stdin and stdout.
+
+Where it reads from (before any mode or subcommand):
+  --config PATH          atlas.json to use (default: ATLAS_CONFIG, else the user configuration)
+  --project NAME         the project of a configuration with projects (default: from the folder)
+  --vault NAME=PATH      serve a vault without a configuration (repeatable)
+  --db PATH              the index database
+
+Modes:
+  --setup                first-run setup: the model, the Claude Code settings offer, the project
+  --rescan               re-index every vault and source, then exit
+  --hook                 a Claude Code command hook: the event JSON on stdin, the answer on stdout
+  --recall-check [--phrase TEXT ...]   every identifier and phrase is found by lookup
+  --token-report         the token ledger: what atlas answered against what reading would cost
+  --misses-week [--since TIME]         lookups that found nothing, this week
+  --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE]
+  --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...]
+  --code-index [NAME ...] [--scip FILE]   index code roots now (or one from a SCIP file)
+  --embed [THREADS]      embed every section for semantic search
+  --embed-check DIR      compare the tokenizer and encoder with reference files in DIR
+  --memory-check         the memory store: chains, the .jsonl copy, exports on disk, the round trip
+  --memory-snapshot      a verified snapshot of the memory store now
+  --memory-as-of KEY TIME   a record as it was at TIME (from the snapshots and archive)
+  --memory-export [--adopt] write every export (--adopt: take over files atlas did not write)
+  --memory-import EXPORT=PATH ...   import hand-written files into the store
+  --memory-tree [DIR] [--check]     rebuild the memory tree in DIR and check it (--check: write nothing)
+  --version, -V          the version
+  --help, -h             this text
+
+Subcommands:
+  atlas run [--digest SHAPE] [--timeout S] [--label TEXT] -- CMD [ARGS...]   run a command, keep its output as a handle
+  atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --digest]
+  atlas slice --list [N]  the newest handles
+  atlas digest [--as SHAPE] FILE|-   a digest of a file or stdin
+  atlas crop IN OUT [--frames A[-B] --of N [--axis x|y]] [--rect X,Y,W,H] [--max W[xH]]   cut a picture
+  atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--date YYYY-MM-DD] [--] TEXT
+  atlas entry --title TITLE [--ref REF ...] [--date YYYY-MM-DD] [--time HH:MM] [--] TEXT
+  atlas grammar list | accept N | reject N   identifier shapes found in the notes
+  atlas settings list | set ID VALUE | off ID | undo [--yes] | offer [--yes ID...]
+  atlas settings compact-md [DIR] [--yes]
+  atlas settings add-project [--vault | --vault-at FOLDER | --new [--name NAME] [--vault-at FOLDER | --no-vault] | --to PROJECT] [--dry-run] (DIR | --yes)
+  atlas settings migrate-projects NAME
+  atlas settings on|off update
+
+SHAPE is test, build, grep, listing, source, summary or generic. More: https://github.com/bloodfeast/atlas/wiki
+";
 
 enum Mode {
     Serve,
@@ -85,8 +144,11 @@ enum Mode {
     #[cfg(feature = "dev")]
     Bench(usize, bench::Opts),
     TokenReport,
+    /// `--misses-week [--since TIME]`: the weekly top-10 misses pass.
+    MissesWeek(String),
     /// `--hook-report [--transcripts DIR] [--since TIME] [--rows]`.
     HookReport { transcripts: Option<PathBuf>, since: String, rows: bool, tune: Option<f64> },
+    CompactReport { transcripts: Option<PathBuf>, since: String, rows: bool, sweep: Vec<u64> },
     CodeIndex(Vec<String>),
     Embed(usize),
     EmbedCheck(PathBuf),
@@ -168,6 +230,238 @@ fn memory_tree(setup: &Setup, dir: Option<PathBuf>, check_only: bool) -> Result<
 /// `--transcripts`, those reconstructed from past transcripts), each marked
 /// hit or not by [`atlas::hook_hits::Judge`]; totals by hook, and with
 /// `--rows` one tab-separated row per key for `scripts/tune_inject_floor.py`.
+/// The vaults and sources by name, for lines refs.
+fn ref_roots(setup: &Setup) -> Vec<atlas::compact::RefRoot> {
+    let mut roots: Vec<atlas::compact::RefRoot> = setup.vaults.iter().map(|(n, r)| atlas::compact::RefRoot::Vault(n.clone(), r.clone())).collect();
+    roots.extend(setup.atlas.sources.iter().map(|s| atlas::compact::RefRoot::Source(s.clone())));
+    roots
+}
+
+/// `--compact-report`: replays every compaction in the transcripts below
+/// `dir` (see [`atlas::compact::replay`]) and prints numbers only; no
+/// transcript text is printed.
+fn compact_report(setup: &Setup, dir: &std::path::Path, since: &str, rows: bool, sweep: &[u64], bpt: f64) -> Result<(), String> {
+    let s = |e: atlas::Error| e.to_string();
+    let mem = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(s)?;
+    let roots = ref_roots(setup);
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            match e.file_type() {
+                // A subagent's transcript never holds the session's compactions.
+                Ok(t) if t.is_dir() && p.file_name().is_some_and(|n| n != "subagents") => stack.push(p),
+                Ok(t) if t.is_file() && p.extension().is_some_and(|x| x == "jsonl") => files.push(p),
+                _ => {}
+            }
+        }
+    }
+    files.sort();
+    let med = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        if v.is_empty() { 0.0 } else { atlas::baseline::median(&v) }
+    };
+    let p95 = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        if v.is_empty() { 0.0 } else { atlas::baseline::quantile(&v, 0.95) }
+    };
+    let (mut n, mut manual, mut pre, mut summ, mut refs, mut dangling, mut changed, mut bare, mut missing) = (0usize, 0usize, 0.0, 0.0, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut after, mut misses, mut named, mut facts, mut kept) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut ratios, mut post_ratios, mut resume, mut check_ms, mut durations) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    if rows {
+        println!("file\ttime\ttrigger\tpre\tpost\tsummary_tokens\tratio\trefs\tdangling\tchanged\tbare\tbare_missing\tlookups_after\tmisses\tmisses_named\tfacts\tfacts_in_summary\tresume_tokens\tcheck_ms");
+    }
+    // A resumed session copies its parent's history, compactions included.
+    let mut counted = std::collections::HashSet::new();
+    // The atlas arm's offline side: the checkpoint card each boundary would
+    // have had, built from the segment before it and the store as of then.
+    let budget = setup.memory.bytes_for(setup.memory.compact.card_tokens);
+    let (mut card_toks, mut ckpt_ms, mut hook_ms, mut hook_share) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut miss_cov, mut fact_cov, mut miss_tok, mut overheads, mut summaries, mut auto_pre) = (0usize, 0usize, 0.0, Vec::new(), Vec::new(), Vec::new());
+    for f in &files {
+        let all = atlas::compact::replay(f);
+        if all.is_empty() {
+            continue;
+        }
+        let session = f.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+        let t_read = std::time::Instant::now();
+        let segs = atlas::checkpoint::segments(f, &session);
+        // A PreCompact hook reads the whole file once; charge each boundary the read.
+        let read_ms = t_read.elapsed().as_secs_f64() * 1e3 / segs.len().max(1) as f64;
+        for (i, c) in all.into_iter().enumerate() {
+            if c.time.as_str() < since || c.summary.is_empty() || c.pre_tokens == 0 || !counted.insert((c.time.clone(), c.pre_tokens)) {
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            let k = atlas::compact::check(&mem, &roots, &c.summary).map_err(s)?;
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let st = c.summary.len() as f64 / bpt;
+            let card = match segs.get(i) {
+                Some((time, tail)) => {
+                    let t1 = std::time::Instant::now();
+                    let state = atlas::checkpoint::state(&mem, &session, &tail.start, time, atlas::checkpoint::Lanes::for_project(setup.memory.graph.as_deref())).map_err(s)?;
+                    let b = atlas::checkpoint::body(&state, tail, budget);
+                    let built = t1.elapsed().as_secs_f64() * 1e3 + read_ms;
+                    ckpt_ms.push(built);
+                    hook_ms.push(built + ms);
+                    if c.duration_ms > 0 {
+                        hook_share.push((built + ms) / c.duration_ms as f64);
+                    }
+                    b
+                }
+                None => String::new(),
+            };
+            card_toks.push(card.len() as f64 / bpt);
+            let both = format!("{}\n{}", c.summary, card).to_lowercase();
+            miss_cov += c.miss_names.iter().filter(|m| !m.is_empty() && both.contains(m.as_str())).count();
+            let both_raw = format!("{}\n{}", c.summary, card);
+            fact_cov += c.fact_list.iter().filter(|t| both_raw.contains(t.as_str())).count();
+            miss_tok += c.miss_bytes as f64 / bpt;
+            summaries.push(st);
+            if c.post_tokens > 0 {
+                overheads.push((c.post_tokens as f64 - st).max(0.0));
+            }
+            if c.trigger == "auto" {
+                auto_pre.push(c.pre_tokens as f64);
+            }
+            n += 1;
+            manual += usize::from(c.trigger == "manual");
+            pre += c.pre_tokens as f64;
+            summ += st;
+            ratios.push(c.pre_tokens as f64 / st.max(1.0));
+            if c.post_tokens > 0 {
+                post_ratios.push(c.pre_tokens as f64 / c.post_tokens as f64);
+            }
+            refs += k.refs;
+            dangling += k.dangling.len();
+            changed += k.changed.len();
+            bare += k.bare;
+            missing += k.bare_missing;
+            after += c.lookups_after;
+            misses += c.misses;
+            named += c.misses_named;
+            facts += c.facts;
+            kept += c.facts_in_summary;
+            if c.resumed {
+                resume.push(c.resume_bytes as f64 / bpt);
+            }
+            check_ms.push(ms);
+            if c.duration_ms > 0 {
+                durations.push(c.duration_ms as f64);
+            }
+            if rows {
+                let stem: String = f.file_stem().map(|x| x.to_string_lossy().chars().take(8).collect()).unwrap_or_default();
+                println!(
+                    "{stem}\t{}\t{}\t{}\t{}\t{st:.0}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{ms:.1}",
+                    c.time.get(..16).unwrap_or(&c.time),
+                    c.trigger,
+                    c.pre_tokens,
+                    c.post_tokens,
+                    c.pre_tokens as f64 / st.max(1.0),
+                    k.refs,
+                    k.dangling.len(),
+                    k.changed.len(),
+                    k.bare,
+                    k.bare_missing,
+                    c.lookups_after,
+                    c.misses,
+                    c.misses_named,
+                    c.facts,
+                    c.facts_in_summary,
+                    c.resume_bytes as f64 / bpt
+                );
+            }
+        }
+    }
+    let pct = |a: usize, b: usize| if b > 0 { 100.0 * a as f64 / b as f64 } else { 0.0 };
+    println!("compact report: {n} compactions ({manual} manual) in {} transcripts; tokens at {bpt} bytes per token", files.len());
+    if n == 0 {
+        return Ok(());
+    }
+    println!("ratio pre/summary: {:.1}x pooled, {:.1}x median; pre/post (Claude Code's postTokens): {:.1}x median", pre / summ, med(ratios), med(post_ratios));
+    println!(
+        "refs: {refs} key@hash refs, {dangling} dangling ({:.1}%), {changed} changed; bare record keys {bare}, {missing} not found ({:.1}%)",
+        pct(dangling, refs),
+        pct(missing, bare)
+    );
+    println!("post-compaction misses: {misses} of {after} lookups in the {} calls after each boundary ({:.1}%), {named} of them named in the summary", atlas::compact::MISS_WINDOW, pct(misses, after));
+    println!("fidelity: {kept} of {facts} facts used after a boundary are in its summary ({:.1}%)", pct(kept, facts));
+    println!("resume tokens (tool results before the first edit, write or commit): median {:.0} over {} resumed compactions", med(resume.clone()), resume.len());
+    println!(
+        "latency: ref check median {:.1} ms, p95 {:.1} ms; Claude Code's compaction median {:.0} ms",
+        med(check_ms.clone()),
+        p95(check_ms),
+        med(durations.clone())
+    );
+    // The atlas arm, offline: the checkpoint card beside the same summary.
+    println!(
+        "checkpoint card: median {:.0} tokens, p95 {:.0}, max {:.0} (budget {}); ratio pre/(summary+card) {:.1}x pooled",
+        med(card_toks.clone()),
+        p95(card_toks.clone()),
+        card_toks.iter().copied().fold(0.0, f64::max),
+        setup.memory.compact.card_tokens,
+        pre / (summ + card_toks.iter().sum::<f64>())
+    );
+    println!("checkpoint coverage: misses named in summary or card {miss_cov} of {misses} ({:.1}%; summary alone {named}); facts in summary or card {fact_cov} of {facts} ({:.1}%; summary alone {kept})", pct(miss_cov, misses), pct(fact_cov, facts));
+    println!(
+        "hook latency (checkpoint build incl. transcript read, plus ref check): median {:.1} ms, p95 {:.1} ms; checkpoint alone p95 {:.1} ms; share of compaction time median {:.3}%, max {:.3}%",
+        med(hook_ms.clone()),
+        p95(hook_ms),
+        p95(ckpt_ms),
+        100.0 * med(hook_share.clone()),
+        100.0 * hook_share.iter().copied().fold(0.0, f64::max)
+    );
+    if !sweep.is_empty() {
+        threshold_sweep(&files, sweep, med(overheads), med(summaries), med(card_toks), miss_tok / n as f64, med(auto_pre));
+    }
+    Ok(())
+}
+
+/// `--sweep T,T,...`: the token side of each compaction point, with and
+/// without atlas (see [`atlas::checkpoint::simulate`]). At every threshold a
+/// plain arm and an atlas arm replay the same sessions; each atlas row is
+/// judged against plain at the same threshold. The atlas arm's summary is
+/// the plain median plus the card (its steered summary needs live runs, so
+/// this is its worst case). Plain at Claude Code's default point (the median
+/// `preTokens` of recorded automatic compactions) is printed as a labelled
+/// reference row only.
+fn threshold_sweep(files: &[PathBuf], thresholds: &[u64], overhead: f64, summary: f64, card: f64, reread: f64, auto_pre: f64) {
+    use atlas::checkpoint::{simulate, Arm, Cost};
+    let mut seen = std::collections::HashSet::new();
+    let curves: Vec<atlas::checkpoint::Curve> = files.iter().map(|f| atlas::checkpoint::curve(f, &mut seen)).filter(|c| c.points.len() > 1).collect();
+    let requests: usize = curves.iter().map(|c| c.points.len()).sum();
+    println!(
+        "sweep: {} sessions, {requests} requests; overhead {overhead:.0}, summary {summary:.0}, card {card:.0}, re-read per compaction {reread:.0} tokens (both arms)",
+        curves.len()
+    );
+    let run = |t: u64, s: f64| -> Cost {
+        let arm = Arm { threshold: t, overhead: overhead as u64, summary: s as u64, reread: reread as u64 };
+        curves.iter().map(|c| simulate(c, &arm)).fold(Cost::default(), |a, b| Cost { compactions: a.compactions + b.compactions, raw: a.raw + b.raw, weighted: a.weighted + b.weighted })
+    };
+    let pct = |a: f64, b: f64| 100.0 * (a / b.max(1.0) - 1.0);
+    println!("threshold\tarm\tcompactions\tinput_tokens\tweighted\tmisses_reread\tatlas_vs_plain_raw\tatlas_vs_plain_weighted");
+    let mut wins = Vec::new();
+    for &t in thresholds {
+        let p = run(t, summary);
+        let a = run(t, summary + card);
+        println!("{t}\tplain\t{}\t{:.0}\t{:.0}\t{:.0}\t\t", p.compactions, p.raw, p.weighted, p.compactions as f64 * reread);
+        println!("{t}\tatlas\t{}\t{:.0}\t{:.0}\t{:.0}\t{:+.2}%\t{:+.2}%", a.compactions, a.raw, a.weighted, a.compactions as f64 * reread, pct(a.raw, p.raw), pct(a.weighted, p.weighted));
+        if a.raw <= p.raw && a.weighted <= p.weighted {
+            wins.push(t);
+        }
+    }
+    if auto_pre > 0.0 {
+        let d = run(auto_pre as u64, summary);
+        println!("reference: plain at Claude Code's default point {} (median preTokens of recorded auto compactions): {} compactions, {:.0} input, {:.0} weighted", auto_pre as u64, d.compactions, d.raw, d.weighted);
+    }
+    println!(
+        "thresholds where atlas wins its pair on tokens: {}; the offered point is chosen among the thresholds where atlas wins its pair on tokens and on the live sample's accuracy",
+        if wins.is_empty() { "none (offline the card is pure cost: the steered summary is live-only)".to_string() } else { wins.iter().map(u64::to_string).collect::<Vec<_>>().join(", ") }
+    );
+}
+
 fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str, rows: bool, tune: Option<f64>) -> Result<(), String> {
     use atlas::hook_hits::{self, Injection};
     let s = |e: atlas::Error| e.to_string();
@@ -387,22 +681,30 @@ fn run() -> Result<ExitCode, String> {
             "--rescan" => mode = Mode::Rescan,
             "--setup" => mode = Mode::Setup,
             "--token-report" => mode = Mode::TokenReport,
+            "--misses-week" => mode = Mode::MissesWeek(String::new()),
             "--hook-report" => mode = Mode::HookReport { transcripts: None, since: String::new(), rows: false, tune: None },
             "--tune-floor" => match &mut mode {
                 Mode::HookReport { tune, .. } => *tune = Some(args.next().and_then(|s| s.parse().ok()).ok_or("--tune-floor needs the hit scale (1 for the upper bound)")?),
                 _ => return Err("--tune-floor goes after --hook-report".into()),
             },
+            "--compact-report" => mode = Mode::CompactReport { transcripts: None, since: String::new(), rows: false, sweep: Vec::new() },
+            "--sweep" => match &mut mode {
+                Mode::CompactReport { sweep, .. } => {
+                    *sweep = args.next().ok_or("--sweep needs thresholds, e.g. 150000,250000,400000")?.split(',').map(|t| t.trim().parse::<u64>().map_err(|_| format!("--sweep: {t:?} is not a token count"))).collect::<Result<_, _>>()?
+                }
+                _ => return Err("--sweep goes after --compact-report".into()),
+            },
             "--transcripts" => match &mut mode {
-                Mode::HookReport { transcripts, .. } => *transcripts = Some(PathBuf::from(args.next().ok_or("--transcripts needs a folder")?)),
-                _ => return Err("--transcripts goes after --hook-report".into()),
+                Mode::HookReport { transcripts, .. } | Mode::CompactReport { transcripts, .. } => *transcripts = Some(PathBuf::from(args.next().ok_or("--transcripts needs a folder")?)),
+                _ => return Err("--transcripts goes after --hook-report or --compact-report".into()),
             },
             "--since" => match &mut mode {
-                Mode::HookReport { since, .. } => *since = args.next().ok_or("--since needs a time")?,
-                _ => return Err("--since goes after --hook-report".into()),
+                Mode::HookReport { since, .. } | Mode::MissesWeek(since) | Mode::CompactReport { since, .. } => *since = args.next().ok_or("--since needs a time")?,
+                _ => return Err("--since goes after --hook-report, --compact-report or --misses-week".into()),
             },
             "--rows" => match &mut mode {
-                Mode::HookReport { rows, .. } => *rows = true,
-                _ => return Err("--rows goes after --hook-report".into()),
+                Mode::HookReport { rows, .. } | Mode::CompactReport { rows, .. } => *rows = true,
+                _ => return Err("--rows goes after --hook-report or --compact-report".into()),
             },
             "--code-index" => {
                 let mut names = Vec::new();
@@ -503,7 +805,7 @@ fn run() -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
             "-h" | "--help" => {
-                println!("{USAGE}");
+                print!("{HELP}");
                 return Ok(ExitCode::SUCCESS);
             }
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
@@ -660,7 +962,7 @@ fn run() -> Result<ExitCode, String> {
             "settings" if rest.len() == 2 && matches!(rest[0].as_str(), "on" | "off") && rest[1] == "update" => {
                 settings_mode(config.as_deref(), rest[0] == "on", "update")
             }
-            "settings" => atlas::claude_settings::cli(rest, config.as_deref(), &setup.db, setup.memory.user_state.as_deref()),
+            "settings" => atlas::claude_settings::cli(rest, config.as_deref(), &setup.db, setup.memory.user_state.as_deref(), project.as_deref()),
             "ruling" | "entry" => {
                 let mut store = setup.open()?;
                 atlas::records::cli(&word, rest, &mut store, &setup.memory, config.as_deref())
@@ -682,7 +984,10 @@ fn run() -> Result<ExitCode, String> {
                 h.set_project_roots(Some(atlas::claude_settings::configured_roots(c)));
                 h.set_offer_ctx(offer_ctx.clone());
             }
+            h.set_roots(ref_roots(&setup));
             print!("{}", h.handle(&ev).to_json(&ev.event));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            h.index_transcripts();
             Ok(ExitCode::SUCCESS)
         }
         #[cfg(feature = "dev")]
@@ -707,12 +1012,18 @@ fn run() -> Result<ExitCode, String> {
             for p in &r.problems {
                 println!("{p}");
             }
+            for w in &r.warnings {
+                println!("warning: {w}");
+            }
             Ok(if r.ok() { ExitCode::SUCCESS } else { ExitCode::from(1) })
         }
         Mode::MemorySnapshot => {
             let m = &setup.memory;
             let store = atlas::memory::MemoryStore::open(&m.store).map_err(|e| e.to_string())?;
-            let s = atlas::memory::check::snapshot(&store, &m.snapshot_dir, m.snapshot_cap).map_err(|e| e.to_string())?;
+            let Some(s) = atlas::memory::check::snapshot(&store, &m.snapshot_dir, m.snapshot_cap).map_err(|e| e.to_string())? else {
+                println!("snapshot skipped: another session kept writing during three tries; run it again");
+                return Ok(ExitCode::from(1));
+            };
             println!("snapshot {} ({} bytes, {} records verified); {} older folded into the archive", s.path.display(), s.bytes, s.records, s.rolled.len());
             for f in &s.rolled {
                 println!("folded {}: {} versions, {} new to the archive", f.snapshot.display(), f.versions, f.added);
@@ -823,8 +1134,20 @@ fn run() -> Result<ExitCode, String> {
                 let c = atlas::recall::code_check(store.conn(), &code.roots).map_err(|e| e.to_string())?;
                 println!(
                     "code recall: {} rust and {} wgsl files, {} definitions by grep ({} more in comments or strings): {} indexed, {} from the line scan only, {} missing",
-                    c.files.0, c.files.1, c.truth, c.excluded, c.indexed, c.scan_only, c.misses.len()
+                    c.files.0,
+                    c.files.1,
+                    c.truth,
+                    c.excluded,
+                    c.indexed,
+                    c.scan_only,
+                    c.misses.iter().filter(|m| m.lang == "rust" || m.lang == "wgsl").count()
                 );
+                for l in &c.langs {
+                    println!(
+                        "code recall {}: {} files, {} definitions by grep ({} more in comments or strings): {} indexed, {} from the scanner only, {} missing",
+                        l.lang, l.files, l.truth, l.excluded, l.indexed, l.scan_only, l.missing
+                    );
+                }
                 for m in &c.misses {
                     println!("code miss: {} {} at {}:{}:{}", m.keyword, m.name, m.root, m.path, m.line);
                 }
@@ -837,6 +1160,11 @@ fn run() -> Result<ExitCode, String> {
         }
         Mode::HookReport { transcripts, since, rows, tune } => {
             hook_report(&setup, transcripts.as_deref(), &since, rows, tune)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Mode::CompactReport { transcripts, since, rows, sweep } => {
+            let dir = transcripts.ok_or("--compact-report needs --transcripts DIR")?;
+            compact_report(&setup, &dir, &since, rows, &sweep, bytes_per_token)?;
             Ok(ExitCode::SUCCESS)
         }
         Mode::TokenReport => {
@@ -869,6 +1197,78 @@ fn run() -> Result<ExitCode, String> {
             match atlas::tokens::brief_report(&conn, bytes_per_token).map_err(|e| e.to_string())? {
                 Some(b) => println!("brief without atlas (rulebook read in full, per subagent start; not in the ratios above)\tstarts {}\ttokens {:.0}\tlatest {:.0}", b.starts, b.tokens, b.latest),
                 None => println!("brief without atlas: no subagent starts logged"),
+            }
+            // What the recall hooks inject, judged against that row: the
+            // pointers a session gets in place of a brief that loads it all.
+            match atlas::tokens::inject_report(&conn, bytes_per_token).map_err(|e| e.to_string())? {
+                Some(i) => println!(
+                    "hook injections (recall pointers; judge against the brief row above)\tkeys {}\tsessions {}\ttokens {:.0}\tper session {:.0}\tlargest session {:.0}",
+                    i.keys,
+                    i.sessions,
+                    i.tokens,
+                    i.tokens / i.sessions.max(1) as f64,
+                    i.max_session
+                ),
+                None => println!("hook injections: none logged"),
+            }
+            // What context selection did to those injections: pointers trimmed
+            // to their matching clauses, near-duplicates sent as refs, lane
+            // briefs with older entries trimmed.
+            let sel = atlas::tokens::select_report(&conn, bytes_per_token).map_err(|e| e.to_string())?;
+            if sel.is_empty() {
+                println!("context selection: none logged");
+            } else {
+                let mut line = String::from("context selection (hook injections; tokens whole -> sent)");
+                let (mut full, mut sent) = (0.0, 0.0);
+                for s in &sel {
+                    line.push_str(&format!("	{} {} ({:.0} -> {:.0})", s.how, s.n, s.full, s.sent));
+                    full += s.full;
+                    sent += s.sent;
+                }
+                line.push_str(&format!("	saved {:.0} of {:.0} ({:.1}%)", full - sent, full, if full > 0.0 { (full - sent) / full * 100.0 } else { 0.0 }));
+                println!("{line}");
+            }
+            // Compactions, as SessionStart(compact) saw them, and the
+            // lookups made again after one.
+            match atlas::compact::totals(&conn, bytes_per_token).map_err(|e| e.to_string())? {
+                Some(c) => {
+                    let rate = if c.refs > 0 { c.dangling as f64 / c.refs as f64 } else { 0.0 };
+                    println!(
+                        "compactions\tn {}\tratio pre/summary {:.1}x\tpre/post {:.1}x\trefs {}\tdangling {} ({:.1}%)\tchanged {}\tbare keys {} (missing {})\tpost-compaction misses {}\tslowest hook {:.0} ms",
+                        c.n,
+                        if c.summary > 0.0 { c.pre / c.summary } else { 0.0 },
+                        if c.post > 0.0 { c.pre_with_post / c.post } else { 0.0 },
+                        c.refs,
+                        c.dangling,
+                        rate * 100.0,
+                        c.changed,
+                        c.bare,
+                        c.bare_missing,
+                        c.misses,
+                        c.max_ms
+                    );
+                }
+                None => println!("compactions: none logged"),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Mode::MissesWeek(since) => {
+            let since = if since.is_empty() {
+                atlas::store::utc(std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86_400))
+            } else {
+                since
+            };
+            let conn = rusqlite::Connection::open(&setup.db).map_err(|e| e.to_string())?;
+            let (misses, keys) = atlas::tokens::weekly_misses(&conn, &since, bytes_per_token).map_err(|e| e.to_string())?;
+            println!("weekly misses pass since {since}: the open misses seen most, then the injected keys that cost the most");
+            for (title, rows) in [("missed (report_miss, open)", misses), ("injected (hook_inject)", keys)] {
+                println!("{title}\ttimes\ttokens\tlast\tquery or key");
+                if rows.is_empty() {
+                    println!("none");
+                }
+                for r in rows {
+                    println!("{}\t{}\t{:.0}\t{}\t{}", r.what, r.count, r.tokens, r.last.get(..16).unwrap_or(&r.last), r.query.replace(['\t', '\n'], " "));
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -937,11 +1337,12 @@ fn run() -> Result<ExitCode, String> {
             let mut result = Ok(ExitCode::SUCCESS);
             for r in code.roots.iter().filter(|r| names.is_empty() || names.contains(&r.name)) {
                 match atlas::code_index::index_root(code, &mut conn, r, &rust) {
-                    Ok(rep) => println!(
-                        "{}: {} | ra {} | scip {} bytes, decode {:.1} ms, {} bytes in memory, {} docs {} occurrences {} symbols | rows {:?} | wrote {:?} in {:.0} ms | total {:.0} ms",
+                    Ok(rep) => {
+                        println!(
+                        "{}: {} | ra {} | scip {} bytes, decode {:.1} ms, {} bytes in memory, {} docs {} occurrences {} symbols | rows: {} | wrote {} in {:.0} ms | total {:.0} ms",
                         rep.root,
                         rep.rust,
-                        rep.ra.as_ref().map_or("-".to_string(), |x| format!("{:.1} s exit {:?}{}", x.seconds, x.code, if x.timed_out { " timed out" } else { "" })),
+                        rep.ra.as_ref().map_or("-".to_string(), |x| format!("{:.1} s exit {}{}", x.seconds, x.code.map_or_else(|| "none".to_string(), |c| c.to_string()), if x.timed_out { " timed out" } else { "" })),
                         rep.scip_bytes,
                         rep.decode_ms,
                         rep.decode_mem,
@@ -952,7 +1353,11 @@ fn run() -> Result<ExitCode, String> {
                         rep.write,
                         rep.write_ms,
                         rep.total_ms
-                    ),
+                        );
+                        for (unit, x) in &rep.runs {
+                            println!("{}: {unit}: indexer {:.1} s exit {}{}", rep.root, x.seconds, x.code.map_or_else(|| "none".to_string(), |c| c.to_string()), if x.timed_out { " timed out" } else { "" });
+                        }
+                    }
                     Err(e) => {
                         eprintln!("{}: {e}", r.name);
                         result = Ok(ExitCode::FAILURE);

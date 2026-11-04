@@ -12,7 +12,8 @@ One Rust binary, one dependency (SQLite, bundled), no network at query time.
   `atlas --hook` is the same logic as a command hook, reading the event on stdin. SessionStart is that
   command hook, because Claude Code runs no `mcp_tool` hook at SessionStart (measured on 2.1.316). Its
   only output is one-time: the settings offer and, once per folder atlas does not index, a line asking the
-  model to ask the user whether to add the project as a source (`atlas settings add-project`).
+  model to ask the user whether to create a vault for the project, default yes, which also adds the project
+  as a source (`atlas settings add-project --vault`).
 - **The CLI** (`atlas run`, `atlas slice`, `atlas settings`, `atlas grammar`, `atlas --setup`, and the
   `--` maintenance modes). The plugin's `bin/` folder is on the Bash tool's `PATH`, so the model runs
   `atlas slice` as a bare command.
@@ -60,6 +61,14 @@ Routing is deterministic: hooks decide, not the model. It is on by default; `lea
     PowerShell command gets the inert `Write-Output ''`, and a nonzero native exit passes raw, so a silent
     failure (`git diff --quiet`, a `findstr` with no match) is never reported as a success. Its digests
     say "exit status unknown (inferred: ...)".
+  - In auto mode (`permission_mode: "auto"` in the PreToolUse input) no tail is added. The auto-mode
+    classifier judges the command the model wrote, not a hook's `updatedInput`: Claude Code checks
+    permission rules against `updatedInput`, but no hook output reaches the classifier before the call
+    (PostToolUse `classifierContext` is about results). A tail made the classifier refuse every routed
+    command once, a resend per read. Untailed, a success still reaches PostToolUse and is digested; a
+    failure fires PostToolUseFailure and arrives as Claude Code's own error text. An input without the
+    field keeps the tail, which is a read-only `echo` and never widens what runs. Atlas never answers
+    `allow` to get past the classifier. `ATLAS_RAW=1` skips the tail in every mode.
 - **The store.** Bytes live in `<data dir>/handles/<sha[0..2]>/<sha>`, written as `.part` then renamed.
   The id is `h:` plus 10 hex characters of a hash over the bytes, the kind and the command. The same
   output is therefore the same handle, and a hook's answer is a pure function of its input.
@@ -126,6 +135,18 @@ backup of either kind by them alone, each read from its own folder.
 
 Ruled: `add-project` writes the configuration, indexes the new Markdown source at once, and leaves the new
 code root to be indexed when the server next starts.
+
+Ruled (v0.2): the first-session question folds in a vault, asked once, default yes. `add-project --vault`
+writes the source, the code root and the vault in one configuration change (one backup, one undo). The
+vault folder is created before the configuration names it, because a configured vault whose folder is
+missing stops the server. Beside the configuration backup goes `vault.STAMP.absent`, recording the folder
+and whether atlas created it (with its note's SHA-256): undo removes a folder atlas created only while it
+holds nothing but that unchanged note, and keeps any other.
+
+Ruled (v0.2): with `projects`, the vault folds into the new-project answer rather than a second question.
+`add-project --new` creates the project's vault at the same default (`vaults/<name>-notes` beside the
+configuration, named after the project) and registers it under that project's entry, in the same
+configuration write as `{name, file}`; `--vault-at FOLDER` and `--no-vault` change or drop it.
 
 ## Owned inference
 

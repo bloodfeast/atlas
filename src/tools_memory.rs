@@ -18,7 +18,11 @@ use crate::memory::{Draft, LogFilter, MemoryStore, Place, Provenance, ENTRIES};
 use crate::project::USER_EXPORT as USER;
 use crate::text::Table;
 
-use super::{arg_str, opt_bool, opt_str, opt_uint, Answer, Server};
+use super::{arg_nonblank, arg_str, opt_bool, opt_str, opt_uint, Answer, Server};
+
+/// The lowest score a `recall {query}` pointer is listed at (it prints as
+/// `0.1`; below, it matched next to nothing).
+const MIN_POINTER_SCORE: f64 = 0.05;
 
 /// The line before a `recall {query}` answer's pointers.
 const QUERY_HEAD: &str = "more records, best first (key score: title; read one with recall key=KEY):\n";
@@ -79,6 +83,44 @@ fn check_slug(k: &str) -> Result<()> {
     }
 }
 
+/// A rule's body as one list item of an items export, so the export splits
+/// back into exactly its records: a body that is not a `- ` item already
+/// becomes `- YYYY-MM-DD AUTHOR: text`, and its later lines are indented as
+/// the item's continuation.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] for an empty body, a blank line inside it, or
+/// a body holding more than one item.
+fn rule_body(body: &str, author: &str) -> Result<String> {
+    let text = body.trim_matches(['\n', '\r']);
+    if text.trim().is_empty() {
+        return Err(Error::InvalidArgument("body is empty".into()));
+    }
+    let mut out = String::with_capacity(text.len() + 32);
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            return Err(Error::InvalidArgument("a rule is one list item: no blank lines inside its body".into()));
+        }
+        if i == 0 {
+            if !line.starts_with("- ") {
+                let day: String = crate::memory::now().chars().take(10).collect();
+                out.push_str(&format!("- {day} {author}: "));
+            }
+            out.push_str(line);
+        } else if line.starts_with("- ") {
+            return Err(Error::InvalidArgument("a rule is one list item: remember each rule on its own".into()));
+        } else if line.starts_with(' ') || line.starts_with('\t') {
+            out.push_str(line);
+        } else {
+            out.push_str("  ");
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 fn with_newline(mut s: String) -> String {
     if !s.ends_with('\n') {
         s.push('\n');
@@ -101,7 +143,63 @@ impl Server {
         Ok(m)
     }
 
+    /// A memory tool's answer; with `format: "json"`, JSON: a record recalled
+    /// by key and the lane status as structured fields, every other answer
+    /// (writes, query and lane recalls, the log) as `{"text": ...}` around
+    /// its text. The hook answers in JSON already.
     pub(super) fn run_memory(&mut self, name: &str, a: &Map) -> Result<Answer> {
+        let json = match opt_str(a, "format")? {
+            None | Some("text") => false,
+            Some("json") => true,
+            Some(o) => return Err(Error::InvalidArgument(format!("format {o:?}; use text or json"))),
+        };
+        if !json || name == "hook" {
+            return self.run_memory_text(name, a);
+        }
+        match name {
+            "journal_status" => return self.journal_status_json(a).map(Answer::Json),
+            "recall" => {
+                if let Some(v) = self.recall_record_json(a)? {
+                    return Ok(Answer::Json(v));
+                }
+            }
+            _ => {}
+        }
+        Ok(match self.run_memory_text(name, a)? {
+            Answer::Text(t) => Answer::Json(crate::json!({"text": t})),
+            other => other,
+        })
+    }
+
+    /// `recall {key}` as fields, for a key that names a record (not a ref
+    /// and not `history`); `None` leaves the answer to the text form.
+    fn recall_record_json(&mut self, a: &Map) -> Result<Option<Value>> {
+        let Some(k) = opt_str(a, "key")? else { return Ok(None) };
+        if opt_bool(a, "history", false)? {
+            return Ok(None);
+        }
+        let synced = self.store.memory_sync_sources();
+        if !synced.is_empty() {
+            self.store.freshness_with(&synced, crate::store::Refresh::Auto, false)?;
+        }
+        let m = self.mem()?;
+        let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
+        let Some(h) = store.head(k)? else { return Ok(None) };
+        let mut v = crate::json!({
+            "key": h.key, "kind": h.kind, "sub": h.sub, "scope": h.scope, "status": h.status,
+            "version": h.seq, "time": h.time, "sha": h.sha, "title": h.title, "meta": h.meta, "body": h.body,
+        });
+        if let (Some(o), Some(by)) = (v.as_object_mut(), &h.superseded_by) {
+            o.insert("superseded_by".into(), Value::String(by.clone()));
+            o.insert("superseded_time".into(), Value::String(h.superseded_time.clone().unwrap_or_default()));
+        }
+        if let (Some(o), Some(anchor)) = (v.as_object_mut(), &h.anchor) {
+            o.insert("anchor".into(), Value::String(anchor.clone()));
+        }
+        Ok(Some(v))
+    }
+
+    fn run_memory_text(&mut self, name: &str, a: &Map) -> Result<Answer> {
         match name {
             "hook" => {
                 let ev = HookEvent::from_value(&Value::Object(a.clone()));
@@ -132,12 +230,96 @@ impl Server {
     fn recall(&mut self, a: &Map) -> Result<String> {
         let limit = opt_uint(a, "limit", 8, 200)?;
         let history = opt_bool(a, "history", false)?;
+        // The opt-in transcript source: a turn ref, or a search of turns.
+        let turn_key = opt_str(a, "key")?.and_then(crate::compact::parse_ref).filter(|r| matches!(r.target, crate::compact::Target::Turn { .. }));
+        if turn_key.is_some() || opt_str(a, "kind")? == Some("turn") {
+            let (on, idx) = {
+                let m = self.mem()?;
+                (m.settings.transcripts, m.settings.index_db.clone())
+            };
+            if !on {
+                return Err(Error::InvalidArgument("the transcript source is off (memory.transcripts); turn refs and kind turn need it on".into()));
+            }
+            let conn = rusqlite::Connection::open(&idx)?;
+            // This project's turns only: the folder Claude Code files this
+            // session's transcripts under.
+            let project = crate::transcripts::project_of_cwd(&std::env::current_dir()?);
+            if let Some(r) = turn_key {
+                let crate::compact::Target::Turn { session8, line } = &r.target else { unreachable!() };
+                let t = crate::transcripts::get(&conn, &project, session8, *line)?.ok_or_else(|| Error::NotFound(format!("{} is not indexed in this project (turns are indexed at each compaction)", r.text)))?;
+                if !t.hash.starts_with(&r.hash) {
+                    return Err(Error::NotFound(format!("ref {:?} is dangling: {} hashes to {}", r.text, t.id, t.hash)));
+                }
+                return Ok(format!("{}@{} {} (current)\n{}\n", t.id, t.hash, t.role, t.text));
+            }
+            let q = arg_str(a, "query").map_err(|_| Error::InvalidArgument("kind turn needs a query".into()))?;
+            let mut out = String::new();
+            for t in crate::transcripts::search(&conn, &project, q, limit)? {
+                let first: String = t.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(160).collect();
+                out.push_str(&format!("- {}@{} {}: {first}\n", t.id, t.hash, t.role));
+            }
+            return Ok(if out.is_empty() { "no turns match in this project\n".into() } else { out });
+        }
+        // `src:path:a-b@hash`: those lines, verbatim, when the hash still
+        // names them; else the current lines and their new ref (the design:
+        // a file keeps no old versions). Read as `read_note` reads, through
+        // the vault's or the source's own checks, so a ref reaches nothing
+        // `read_note` would refuse.
+        if let Some(r) = opt_str(a, "key")?.and_then(crate::compact::parse_ref) {
+            if let crate::compact::Target::Lines { src, path, a: from, b: to } = &r.target {
+                if self.store.vaults().get(src).is_ok() || self.store.sources().iter().any(|s| &s.name == src) {
+                    let text = match self.read_confined(src, path) {
+                        Ok((_, _, bytes)) => String::from_utf8(bytes).map_err(|_| Error::InvalidArgument(format!("{src}:{path} is not valid UTF-8")))?,
+                        Err(e) => return Err(Error::NotFound(format!("ref {:?} is dangling: {src}:{path} is not readable ({e})", r.text))),
+                    };
+                    let status = crate::compact::lines_status(&text, src, path, *from, *to, &r.hash);
+                    let lines: Vec<&str> = text.lines().skip(from - 1).take(to + 1 - from).collect();
+                    let head = match status {
+                        crate::compact::Status::Current => format!("{} (current)", r.text),
+                        crate::compact::Status::Changed(now) => format!("{} (changed: these are the current lines, {now}; the old text is gone from the file)", r.text),
+                        _ => return Err(Error::NotFound(format!("ref {:?} is dangling: {src}:{path} has no lines {from}-{to}", r.text))),
+                    };
+                    return Ok(format!("{head}\n{}\n", lines.join("\n")));
+                }
+            }
+        }
         let m = self.mem()?;
         let bpt = m.settings.bytes_per_token;
         let lane_budget = m.settings.recall.lane_budget_tokens;
+        let anchors = m.settings.recall.pointer_anchors;
+        let has_exports = m.settings.export_dir.is_some() && !m.settings.exports.is_empty();
         let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
         let mut out = String::new();
         if let Some(k) = opt_str(a, "key")? {
+            // `key@hash`: that exact version, verbatim, or a clear dangling.
+            if store.head(k)?.is_none() {
+                if let Some(r) = crate::compact::parse_ref(k) {
+                    if let crate::compact::Target::Record(key) = &r.target {
+                        let (status, version) = crate::compact::resolve_record(store, key, &r.hash)?;
+                        let Some(v) = version else {
+                            return Err(Error::NotFound(format!("ref {k:?} is dangling: no version of {key:?} has that hash; recall {{key: {key:?}}} for the current text")));
+                        };
+                        let head = match &status {
+                            crate::compact::Status::Changed(now) => {
+                                format!("{} v{} {} ref {} (changed: the current text is {now})", v.key, v.seq, v.time.get(..16).unwrap_or(&v.time), crate::compact::record_ref(&v.key, &v.sha))
+                            }
+                            // The current version reads as `recall {key}` does
+                            // (its anchor and metadata too), with its ref.
+                            _ => {
+                                if let Some(h) = store.head(key)? {
+                                    recall::render(&mut out, &h);
+                                    out.push_str(&format!("ref {} (current)\n", crate::compact::record_ref(&v.key, &v.sha)));
+                                    return Ok(out);
+                                }
+                                format!("{} v{} {} ref {} (current)", v.key, v.seq, v.time.get(..16).unwrap_or(&v.time), crate::compact::record_ref(&v.key, &v.sha))
+                            }
+                        };
+                        let body = if v.meta.trim().is_empty() { v.body.clone() } else { format!("{}\n{}", v.meta.trim_end(), v.body) };
+                        recall::frame(&mut out, &head, (!v.title.is_empty()).then(|| v.title.trim_end()), &body);
+                        return Ok(out);
+                    }
+                }
+            }
             let h = store.head(k)?.ok_or_else(|| Error::NotFound(format!("record {k:?}; try recall {{query}} or grep the exports")))?;
             if history {
                 for v in store.history(k)? {
@@ -160,7 +342,12 @@ impl Server {
         let terms = recall::terms(q);
         let hits = store.search(&terms, opt_str(a, "kind")?, opt_str(a, "scope")?, limit)?;
         if hits.is_empty() {
-            return Ok("no records match; grep the exports and report_miss what grep finds\n".into());
+            let records: i64 = store.conn().query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
+            return Ok(match (records, has_exports) {
+                (0, _) => "no records match: the store holds none yet\n".into(),
+                (_, true) => "no records match; grep the exports and report_miss what grep finds\n".into(),
+                (_, false) => "no records match; report_miss what you looked for\n".into(),
+            });
         }
         // The leading records whole, the rest as pointers, best first. A
         // record leads when it scores within LEAD_RATIO of the best (at most
@@ -181,11 +368,19 @@ impl Server {
                     continue;
                 }
             }
+            // A pointer that would read `0.0` matched next to nothing.
+            if *score < MIN_POINTER_SCORE {
+                continue;
+            }
             if !headed {
                 out.push_str(QUERY_HEAD);
                 headed = true;
             }
-            let one = format!("- {} {score:.1}: {}\n", h.key, crate::hooks::pointer_title(h));
+            // With `recall.pointer_anchors`, the pointer ends with where the
+            // record's text sits (`@src:path:line`), so a follow-up can read
+            // those lines (`read_note`) instead of the record.
+            let at = if anchors { recall::pointer_anchor(h).map(|a| format!(" @{a}")).unwrap_or_default() } else { String::new() };
+            let one = format!("- {} {score:.1}: {}{at}\n", h.key, crate::hooks::pointer_title(h));
             if out.len() + one.len() > budget {
                 more += 1;
                 continue;
@@ -199,11 +394,30 @@ impl Server {
     }
 
     fn journal_status(&mut self, a: &Map) -> Result<String> {
+        let mut out = String::new();
+        let mut t = Table::new(&mut out, &["lane", "entries", "last", "last_commit", "open_questions", "handoffs"]);
+        for l in self.status_lanes(a)? {
+            t.field(&l.lane).num(l.entries).field(l.last.get(..16).unwrap_or(&l.last)).field(&l.last_commit).num(l.open_questions).num(l.handoffs);
+        }
+        Ok(out)
+    }
+
+    fn journal_status_json(&mut self, a: &Map) -> Result<Value> {
+        let lanes: Vec<Value> = self
+            .status_lanes(a)?
+            .into_iter()
+            .map(|l| crate::json!({"lane": l.lane, "entries": l.entries, "last": l.last, "last_commit": l.last_commit, "open_questions": l.open_questions, "handoffs": l.handoffs}))
+            .collect();
+        Ok(crate::json!({"lanes": lanes}))
+    }
+
+    /// The lanes `journal_status` lists: every lane, or with `repo` those
+    /// about the repositories it covers.
+    fn status_lanes(&mut self, a: &Map) -> Result<Vec<crate::memory::LaneStatus>> {
         let covered = self.repo_coverage(a)?;
         let m = self.mem()?;
         let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
-        let mut out = String::new();
-        let mut t = Table::new(&mut out, &["lane", "entries", "last", "last_commit", "open_questions", "handoffs"]);
+        let mut out = Vec::new();
         for l in store.lanes()? {
             if let Some(c) = &covered {
                 // A lane is about a repository when its name or one of its
@@ -214,7 +428,7 @@ impl Server {
                     continue;
                 }
             }
-            t.field(&l.lane).num(l.entries).field(l.last.get(..16).unwrap_or(&l.last)).field(&l.last_commit).num(l.open_questions).num(l.handoffs);
+            out.push(l);
         }
         Ok(out)
     }
@@ -272,12 +486,12 @@ impl Server {
         let mut user_write: Option<(String, Vec<String>)> = None;
         let written = match name {
             "journal" => {
-                let lane = arg_str(a, "lane")?;
+                let lane = arg_nonblank(a, "lane")?;
                 let entry = arg_str(a, "entry")?;
                 if !ENTRIES.contains(&entry) {
                     return Err(Error::InvalidArgument(format!("entry {entry:?}; use one of {}", ENTRIES.join(", "))));
                 }
-                let text = arg_str(a, "text")?;
+                let text = arg_nonblank(a, "text")?;
                 let (head, rest) = text.split_once('\n').unwrap_or((text, ""));
                 let key = w.next_key(&format!("journal:{lane}:"), 4)?;
                 let meta = opt_str(a, "meta")?.map(|s| with_newline(s.to_string())).unwrap_or_default();
@@ -288,10 +502,24 @@ impl Server {
                 r
             }
             "handoff" => {
-                let lane = arg_str(a, "lane")?;
+                let lane = arg_nonblank(a, "lane")?;
                 let key = w.next_key(&format!("handoff:{lane}:"), 3)?;
                 let place = settings.handoff_export().map(|e| (e.name.as_str(), Place::End));
-                let d = draft(one_line(arg_str(a, "title")?), String::new(), with_newline(arg_str(a, "text")?.to_string()));
+                let text = arg_str(a, "text")?;
+                // No title: the text's first line is the title, as in a
+                // journal entry, and the rest is the body.
+                let (title, body) = match opt_str(a, "title")?.map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(t) => (one_line(t), text.to_string()),
+                    None => {
+                        let text = text.trim_start();
+                        let (head, rest) = text.split_once('\n').unwrap_or((text, ""));
+                        if head.trim().is_empty() {
+                            return Err(Error::InvalidArgument("title is required: pass title, or a text whose first line is the title".into()));
+                        }
+                        (one_line(head), rest.to_string())
+                    }
+                };
+                let d = draft(title, String::new(), with_newline(body));
                 let r = if prior.is_empty() { w.create(&key, "handoff", "", lane, &d, place)? } else { w.supersede(&prior, &key, "handoff", "", lane, &d, place)? };
                 let mut all = refs.clone();
                 all.push(("lane".into(), lane.to_string()));
@@ -314,7 +542,7 @@ impl Server {
                 if !["memory", "rule", "decision"].contains(&kind.as_str()) {
                     return Err(Error::InvalidArgument(format!("kind {kind:?}; use memory, rule or decision")));
                 }
-                let body = arg_str(a, "body")?.to_string();
+                let body = arg_nonblank(a, "body")?.to_string();
                 // A record in the user layer: its scope says so, or (with no
                 // scope given) the record it revises or replaces is in it.
                 let named_key = opt_str(a, "key")?.map(str::to_string);
@@ -395,7 +623,7 @@ impl Server {
                             None => w.next_key(&prefix, 5)?,
                         };
                         let title = opt_str(a, "title")?.map(one_line).unwrap_or_else(|| one_line(body.trim_start_matches('-').trim()));
-                        (key, draft(title, String::new(), with_newline(body)))
+                        (key, draft(title, String::new(), rule_body(&body, &author)?))
                     }
                     _ => {
                         let key = match opt_str(a, "key")? {
@@ -455,22 +683,42 @@ impl Server {
                     names.insert(e.name.clone());
                 }
             }
+            // The exports are rendered and written under the store's write
+            // lock: no other session commits between the render and the
+            // file, so the export written last always shows the newest
+            // commit (without it, two sessions could leave a stale file).
+            // The write is committed already, so a failure here is reported
+            // in the answer, not as an error.
+            let locked = store.conn().execute_batch("BEGIN IMMEDIATE");
             for spec in settings.exports.iter().filter(|e| names.contains(&e.name)) {
-                let rep = export::write(store, spec, dir, false)?;
-                for (p, why) in rep.refused {
-                    out.push_str(&format!("export refused: {}: {why}\n", p.display()));
+                match export::write(store, spec, dir, false) {
+                    Ok(rep) => {
+                        for (p, why) in rep.refused {
+                            out.push_str(&format!("export refused: {}: {why}\n", p.display()));
+                        }
+                        if !rep.written.is_empty() {
+                            out.push_str(&format!("exported {}: {} files\n", spec.name, rep.written.len()));
+                        }
+                    }
+                    Err(e) => out.push_str(&format!("export {} not written: {e} (--memory-check reports the gap)\n", spec.name)),
                 }
-                if !rep.written.is_empty() {
-                    out.push_str(&format!("exported {}: {} files\n", spec.name, rep.written.len()));
-                }
+            }
+            if locked.is_ok() {
+                let _ = store.conn().execute_batch("COMMIT");
             }
         }
         if settings.snapshot_secs > 0 {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            let last: u64 = store.meta_get("last_snapshot_epoch")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+            let last: u64 = store.meta_get("last_snapshot_epoch").ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(0);
             if now.saturating_sub(last) >= settings.snapshot_secs {
-                let s = crate::memory::check::snapshot(store, &settings.snapshot_dir, settings.snapshot_cap)?;
-                out.push_str(&format!("snapshot {} ({} records)\n", s.path.display(), s.records));
+                // The write is committed: a snapshot that cannot be made now
+                // is reported, never turned into an error, and the next write
+                // tries again.
+                match crate::memory::check::snapshot(store, &settings.snapshot_dir, settings.snapshot_cap) {
+                    Ok(Some(s)) => out.push_str(&format!("snapshot {} ({} records)\n", s.path.display(), s.records)),
+                    Ok(None) => out.push_str("snapshot skipped: another session was writing (the next write tries again)\n"),
+                    Err(e) => out.push_str(&format!("snapshot not taken: {e} (the next write tries again)\n")),
+                }
             }
         }
         Ok(out)

@@ -43,10 +43,9 @@
 //! by post number.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
-use crate::regex::Regex;
 use crate::json::{Map, Value};
+use crate::lex;
 
 use crate::error::{Error, Result};
 use crate::markdown;
@@ -98,16 +97,97 @@ pub struct Thread {
     pub end: usize,
 }
 
-fn re_heading() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^### P-(\d{1,6}) (.+) - ([a-z]+)\s*$").expect("static regex"))
+/// A post heading, `### P-N author - kind` (was
+/// `^### P-(\d{1,6}) (.+) - ([a-z]+)\s*$`): groups 0, the number, the
+/// author (the longest that leaves ` - kind`) and the kind.
+pub(crate) fn post_heading(s: &str) -> Option<[lex::Span; 4]> {
+    let n0 = lex::lit(s, 0, "### P-")?;
+    let (n1, count) = lex::run_max(s, n0, 7, lex::digit);
+    if !(1..=6).contains(&count) {
+        return None;
+    }
+    let a0 = lex::lit(s, n1, " ")?;
+    // The kind is the run of `a-z` that ends the line before trailing space.
+    let t = s.trim_end_matches(lex::space).len();
+    let k0 = s[..t].char_indices().rev().find(|&(_, c)| !c.is_ascii_lowercase()).map_or(0, |(i, c)| i + c.len_utf8());
+    if k0 >= t || k0 < a0 + 4 || &s.as_bytes()[k0 - 3..k0] != b" - " || s[a0..k0 - 3].contains('\n') {
+        return None;
+    }
+    Some([Some((0, s.len())), Some((n0, n1)), Some((a0, k0 - 3)), Some((k0, t))])
 }
 
-fn re_meta() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(r"^\*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)(?: \| re: P-(\d{1,6}))? \| sha: ([0-9a-f]{16})\*\s*$").expect("static regex")
-    })
+/// A post's metadata line, `*TIME | re: P-N | sha: HASH*` (was
+/// `^\*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)(?: \| re: P-(\d{1,6}))? \| sha: ([0-9a-f]{16})\*\s*$`):
+/// groups 0, the time, the `re` number and the hash.
+pub(crate) fn post_meta(s: &str) -> Option<[lex::Span; 4]> {
+    let t0 = lex::lit(s, 0, "*")?;
+    let mut i = t0;
+    for (n, sep) in [(4, "-"), (2, "-"), (2, "T"), (2, ":"), (2, ":"), (2, "Z")] {
+        let (j, got) = lex::run_max(s, i, n, lex::digit);
+        if got != n {
+            return None;
+        }
+        i = lex::lit(s, j, sep)?;
+    }
+    let time = (t0, i);
+    let mut re = None;
+    if let Some(r0) = lex::lit(s, i, " | re: P-") {
+        let (r1, count) = lex::run_max(s, r0, 7, lex::digit);
+        if !(1..=6).contains(&count) {
+            return None;
+        }
+        re = Some((r0, r1));
+        i = r1;
+    }
+    let h0 = lex::lit(s, i, " | sha: ")?;
+    let (h1, count) = lex::run_max(s, h0, 16, |c| matches!(c, '0'..='9' | 'a'..='f'));
+    if count != 16 {
+        return None;
+    }
+    let e = lex::lit(s, h1, "*")?;
+    (lex::spaces(s, e) == s.len()).then_some([Some((0, s.len())), Some(time), re, Some((h0, h1))])
+}
+
+#[cfg(test)]
+pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
+    use lex::props::{v, Mode, Site};
+    vec![
+        Site {
+            name: "discussion heading",
+            pattern: r"^### P-(\d{1,6}) (.+) - ([a-z]+)\s*$".into(),
+            tokens: &[
+                "### P-", "### P-1 ", "1", "123456", "1234567", "\u{663}", " - ", " -", "- ", "claim", "a", "Z", " ", "\t", "\n", "alice",
+            ],
+            examples: &["### P-12 alice - claim", "### P-3 bob - x - y - reply  ", "### P-123456 a b - c\t"],
+            mode: Mode::One(|s| post_heading(s).map(v)),
+        },
+        Site {
+            name: "discussion meta",
+            pattern: r"^\*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)(?: \| re: P-(\d{1,6}))? \| sha: ([0-9a-f]{16})\*\s*$".into(),
+            tokens: &[
+                "*",
+                "2026-01-01T00:00:00Z",
+                "2026",
+                "-",
+                "T",
+                ":",
+                "Z",
+                "00",
+                "\u{663}",
+                " | re: P-",
+                "12",
+                "1234567",
+                " | sha: ",
+                "0123456789abcdef",
+                "f",
+                "*",
+                " ",
+                "\n",
+            ],
+            examples: &["*2026-01-01T00:00:00Z | sha: 0123456789abcdef*", "*2026-11-02T10:20:30Z | re: P-4 | sha: ffffffffffffffff* "],
+            mode: Mode::One(|s| post_meta(s).map(v)),
+        },
+    ]
 }
 
 /// The hash of one post: its number, author, kind, time, `re` and body.
@@ -133,21 +213,26 @@ pub fn parse(text: &str) -> Thread {
         lines.push((pos, l.trim_end_matches(['\n', '\r'])));
         pos += l.len();
     }
-    let heads: Vec<usize> = lines.iter().enumerate().filter(|(_, (_, l))| re_heading().is_match(l)).map(|(i, _)| i).collect();
+    let heads: Vec<(usize, [lex::Span; 4])> = lines.iter().enumerate().filter_map(|(i, (_, l))| post_heading(l).map(|c| (i, c))).collect();
     let mut posts = Vec::new();
-    for (k, &i) in heads.iter().enumerate() {
-        let c = re_heading().captures(lines[i].1).expect("matched above");
-        let n: u32 = c[1].parse().unwrap_or(0);
-        let author = c[2].trim().to_string();
-        let kind = c[3].to_string();
-        let stop = heads.get(k + 1).copied().unwrap_or(lines.len());
+    for (k, &(i, c)) in heads.iter().enumerate() {
+        let l = lines[i].1;
+        let g = |n: usize| c[n].map_or("", |(a, b)| &l[a..b]);
+        let n: u32 = g(1).parse().unwrap_or(0);
+        let author = g(2).trim().to_string();
+        let kind = g(3).to_string();
+        let stop = heads.get(k + 1).map_or(lines.len(), |h| h.0);
         // The metadata line is the first non-blank line after the heading.
         let mut j = i + 1;
         while j < stop && lines[j].1.trim().is_empty() {
             j += 1;
         }
-        let (time, re, sha, body_from) = match lines.get(j).filter(|_| j < stop).and_then(|(_, l)| re_meta().captures(l)) {
-            Some(m) => (m[1].to_string(), m.get(2).and_then(|x| x.as_str().parse().ok()), m[3].to_string(), j + 1),
+        let meta = lines.get(j).filter(|_| j < stop).and_then(|&(_, l)| post_meta(l).map(|m| (l, m)));
+        let (time, re, sha, body_from) = match meta {
+            Some((l, m)) => {
+                let g = |n: usize| m[n].map(|(a, b)| &l[a..b]);
+                (g(1).unwrap_or("").to_string(), g(2).and_then(|x| x.parse().ok()), g(3).unwrap_or("").to_string(), j + 1)
+            }
             None => (String::new(), None, String::new(), i + 1),
         };
         let body_lines: Vec<&str> = lines[body_from.min(stop)..stop].iter().map(|(_, l)| *l).collect();
@@ -238,7 +323,7 @@ pub fn check_body(body: &str) -> Result<String> {
         if (1..=3).contains(&hashes) && t[hashes..].starts_with([' ', '\t']) {
             return Err(Error::InvalidArgument(format!("post bodies may not contain level 1-3 headings ({l:?}); use #### or bold text")));
         }
-        if re_meta().is_match(l) {
+        if post_meta(l).is_some() {
             return Err(Error::InvalidArgument("post bodies may not contain a post metadata line".into()));
         }
     }
@@ -294,7 +379,7 @@ pub fn utc_now_ms() -> String {
     format!("{}.{:03}Z", &s[..s.len() - 1], d.subsec_millis())
 }
 
-fn civil(secs: i64) -> String {
+pub(crate) fn civil(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     // Civil from days (H. Hinnant).

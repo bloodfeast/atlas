@@ -38,6 +38,51 @@ pub fn memchr_scalar(b: u8, hay: &[u8]) -> Option<usize> {
     hay.iter().position(|&x| x == b)
 }
 
+/// The first position of `a` or `b` in `hay`.
+#[inline]
+pub fn memchr2(a: u8, b: u8, hay: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if hay.len() >= 16 {
+            if avx2() {
+                // SAFETY: AVX2 was detected at run time just above.
+                return unsafe { x86::memchr2_avx2(a, b, hay) };
+            }
+            // SAFETY: SSE2 is part of the x86_64 baseline.
+            return unsafe { x86::memchr2_sse2(a, b, hay) };
+        }
+    }
+    memchr2_swar(a, b, hay)
+}
+
+/// The scalar [`memchr2`], the reference the others are tested against.
+#[inline]
+pub fn memchr2_scalar(a: u8, b: u8, hay: &[u8]) -> Option<usize> {
+    hay.iter().position(|&x| x == a || x == b)
+}
+
+/// [`memchr2`] eight bytes at a time in a `u64` (SWAR), for CPUs without
+/// a vector path: a byte equal to `a` becomes zero after `xor`, and
+/// `(x - 0x01..) & !x & 0x80..` flags the lowest zero byte exactly.
+#[inline]
+pub fn memchr2_swar(a: u8, b: u8, hay: &[u8]) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let zero = |x: u64| x.wrapping_sub(LO) & !x & HI;
+    let (va, vb) = (LO * a as u64, LO * b as u64);
+    let mut i = 0;
+    while i + 8 <= hay.len() {
+        let w = u64::from_le_bytes(hay[i..i + 8].try_into().expect("8 bytes"));
+        // The lowest flagged byte of each half is exact; take the lower.
+        let m = zero(w ^ va).trailing_zeros().min(zero(w ^ vb).trailing_zeros());
+        if m < 64 {
+            return Some(i + m as usize / 8);
+        }
+        i += 8;
+    }
+    memchr2_scalar(a, b, &hay[i..]).map(|k| i + k)
+}
+
 /// The first byte of `hay` a JSON string scan must stop at: a quote, a
 /// backslash or a control byte; `hay.len()` when there is none.
 #[inline]
@@ -125,6 +170,64 @@ mod x86 {
             if m != 0 {
                 return Some(j + m.trailing_zeros() as usize);
             }
+        }
+        None
+    }
+
+    /// # Safety
+    ///
+    /// SSE2 (the x86_64 baseline); `hay` at least 16 bytes. Loads never
+    /// read past `hay`.
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn memchr2_sse2(a: u8, b: u8, hay: &[u8]) -> Option<usize> {
+        let n = hay.len();
+        let p = hay.as_ptr();
+        let (va, vb) = (_mm_set1_epi8(a as i8), _mm_set1_epi8(b as i8));
+        let mask = |x: __m128i| _mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(x, va), _mm_cmpeq_epi8(x, vb))) as u32;
+        let mut i = 0;
+        while i + 16 <= n {
+            // SAFETY: i + 16 <= n.
+            let m = mask(unsafe { _mm_loadu_si128(p.add(i).cast()) });
+            if m != 0 {
+                return Some(i + m.trailing_zeros() as usize);
+            }
+            i += 16;
+        }
+        if i < n {
+            let j = n - 16;
+            // SAFETY: n >= 16, so the last full block is inside `hay`.
+            let m = mask(unsafe { _mm_loadu_si128(p.add(j).cast()) }) >> (i - j) << (i - j);
+            if m != 0 {
+                return Some(j + m.trailing_zeros() as usize);
+            }
+        }
+        None
+    }
+
+    /// # Safety
+    ///
+    /// AVX2 (checked at run time by the caller); `hay` at least 16 bytes.
+    /// Loads never read past `hay`.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn memchr2_avx2(a: u8, b: u8, hay: &[u8]) -> Option<usize> {
+        let n = hay.len();
+        let p = hay.as_ptr();
+        let (va, vb) = (_mm256_set1_epi8(a as i8), _mm256_set1_epi8(b as i8));
+        let mut i = 0;
+        while i + 32 <= n {
+            // SAFETY: i + 32 <= n.
+            let x = unsafe { _mm256_loadu_si256(p.add(i).cast()) };
+            let m = _mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(x, va), _mm256_cmpeq_epi8(x, vb))) as u32;
+            if m != 0 {
+                return Some(i + m.trailing_zeros() as usize);
+            }
+            i += 32;
+        }
+        if i < n {
+            let rest = &hay[i..];
+            // SAFETY: AVX2 implies SSE2.
+            let r = if rest.len() >= 16 { unsafe { memchr2_sse2(a, b, rest) } } else { super::memchr2_scalar(a, b, rest) };
+            return r.map(|k| i + k);
         }
         None
     }
@@ -244,11 +347,24 @@ mod tests {
                 let hay: Vec<u8> = (0..len).map(|_| b'a' + (xorshift(&mut s) % alphabet as u64) as u8).collect();
                 for b in [b'a', b'b', b'c', b'f', b'z', 0] {
                     assert_eq!(memchr(b, &hay), memchr_scalar(b, &hay), "len {len} byte {b}");
+                    for c in [b'a', b'c', b'e', 0xff] {
+                        let want = memchr2_scalar(b, c, &hay);
+                        assert_eq!(memchr2(b, c, &hay), want, "len {len} bytes {b} {c}");
+                        assert_eq!(memchr2_swar(b, c, &hay), want, "swar len {len} bytes {b} {c}");
+                    }
                 }
                 let nl = 1 + (xorshift(&mut s) % 3) as usize;
                 let needle: Vec<u8> = (0..nl).map(|_| b'a' + (xorshift(&mut s) % alphabet as u64) as u8).collect();
                 let want = hay.windows(needle.len()).position(|w| w == needle.as_slice());
                 assert_eq!(find(&hay, &needle), want, "{hay:?} {needle:?}");
+            }
+        }
+        // Any byte values, so SWAR borrows across bytes are exercised.
+        for len in 0..200 {
+            let hay: Vec<u8> = (0..len).map(|_| xorshift(&mut s) as u8 % 5 * 63).collect();
+            for (a, b) in [(0, 63), (126, 252), (189, 1), (0, 0)] {
+                assert_eq!(memchr2(a, b, &hay), memchr2_scalar(a, b, &hay), "{hay:?}");
+                assert_eq!(memchr2_swar(a, b, &hay), memchr2_scalar(a, b, &hay), "{hay:?}");
             }
         }
         assert_eq!(find(b"abc", b""), Some(0));

@@ -134,7 +134,8 @@ pub struct Watcher {
 
 impl Watcher {
     /// Starts watching each root. A root that cannot be watched is marked
-    /// unhealthy; nothing here fails.
+    /// unhealthy; nothing here fails. Each healthy root's watch is armed
+    /// when this returns: a change made after it is reported.
     ///
     /// # Arguments
     ///

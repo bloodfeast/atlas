@@ -39,6 +39,13 @@ mod lean_tools;
 
 #[path = "tools_intake.rs"]
 mod intake_tools;
+
+#[path = "tools_dedup.rs"]
+pub mod dedup;
+
+#[path = "tools_surface.rs"]
+mod surface;
+pub use surface::{help, ops, HELP_URI};
 pub use memory_tools::MemState;
 use memory_tools::MEMORY_TOOLS;
 
@@ -120,9 +127,14 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "read_note",
-        description: "A note's text, sha256 and frontmatter.",
+        description: "A note's text and sha256; lines or budget_tokens for part of it.",
         read_only: true,
-        schema: || obj(json!({"vault": s(""), "path": s("")}), &["vault", "path"]),
+        schema: || {
+            obj(
+                json!({"vault": s(""), "path": s(""), "lines": s("A-B, A- or A: only these lines (from 1)."), "budget_tokens": n("Whole lines up to about this many tokens; a +N more lines line names the rest.")}),
+                &["vault", "path"],
+            )
+        },
     },
     ToolDef {
         name: "search",
@@ -159,7 +171,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "symbol",
-        description: "Rust/WGSL symbol: definitions, references with their caller, impls.",
+        description: "Code symbol (Rust, WGSL, Protobuf, Go, TS/JS, C#, Python, Java; Kotlin and other files definitions only): definitions, references with their caller, impls.",
         read_only: true,
         schema: || obj(with_fmt(json!({"name": s("Name or Type::name."), "limit": n("References, default 10.")})), &["name"]),
     },
@@ -406,7 +418,7 @@ const TOOLS: &[ToolDef] = &[
         read_only: false,
         schema: || {
             obj(
-                json!({"kind": e(&["memory", "rule", "decision"]), "key": s("Memory slug; rules and decisions get one."), "title": s("One line."), "summary": s("Memory: index description."), "body": s(""), "sub": s("Memory type (user, feedback, project, reference)."), "scope": s("user: the shared user layer, seen in every project (memories only)."), "refs": strs("kind:target, e.g. lane:x, commit:abc."), "expected_sha": s("Head sha, to revise."), "export": s("Export to place it in."), "after": s("Place right after this key."), "author": s("Who asked.")}),
+                json!({"kind": e(&["memory", "rule", "decision"]), "key": s("Memory slug; rules and decisions get one."), "title": s("One line."), "summary": s("Memory: index description."), "body": s(""), "sub": s("Memory type (user, feedback, project, reference)."), "scope": s("user: the shared user layer, seen in every project (memories only)."), "refs": strs("kind:target, e.g. lane:x, commit:abc."), "expected_sha": s("Head sha (or its first 12+ hex digits), to revise."), "export": s("Export to place it in."), "after": s("Place right after this key."), "author": s("Who asked.")}),
                 &["kind", "body"],
             )
         },
@@ -443,7 +455,7 @@ const TOOLS: &[ToolDef] = &[
         name: "handoff",
         description: "Write a lane handoff (allowed past the context cap). A fresh agent starts from recall lane=<id>.",
         read_only: false,
-        schema: || obj(json!({"lane": s(""), "title": s("One line."), "text": s(""), "refs": strs("prior:<key>, commit:<hash>, rule:<key>.")}), &["lane", "title", "text"]),
+        schema: || obj(json!({"lane": s(""), "title": s("One line; default the text's first line."), "text": s(""), "refs": strs("prior:<key>, commit:<hash>, rule:<key>.")}), &["lane", "text"]),
     },
     ToolDef {
         name: "journal_status",
@@ -460,10 +472,10 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "hook",
         description: "Hook entry point for Claude Code mcp_tool hooks; not for models.",
-        read_only: true,
+        read_only: false,
         schema: || {
             obj(
-                json!({"event": s(""), "session_id": s(""), "agent_id": s(""), "agent_type": s(""), "transcript_path": s(""), "prompt": s(""), "tool_name": s(""), "tool_prompt": s(""), "trigger": s(""), "source": s(""), "cwd": s(""), "tool_input": s("JSON text."), "tool_response": s("JSON text.")}),
+                json!({"event": s(""), "session_id": s(""), "agent_id": s(""), "agent_type": s(""), "transcript_path": s(""), "prompt": s(""), "tool_name": s(""), "tool_prompt": s(""), "trigger": s(""), "source": s(""), "cwd": s(""), "permission_mode": s(""), "tool_input": s("JSON text."), "tool_response": s("JSON text.")}),
                 &["event"],
             )
         },
@@ -588,7 +600,7 @@ const DISCUSSION_DESC: &str = "Thread this comes from (vault:D-004).";
 
 /// Write tools whose post body serves as the audit reason, so they take no
 /// `reason` argument.
-const SELF_REASONED: &[&str] = &["open_discussion", "post", "journal", "handoff"];
+const SELF_REASONED: &[&str] = &["open_discussion", "post", "journal", "handoff", "hook"];
 /// Write tools that act on a thread, so the thread is their `discussion`.
 const THREAD_WRITES: &[&str] = &["open_discussion", "post", "conclude_discussion", "mark_unresolved", "record_decision", "remember", "supersede", "journal", "handoff"];
 
@@ -616,21 +628,30 @@ fn input_schema(t: &ToolDef) -> Value {
 /// deferring them behind a tool search. Every other tool stays deferred.
 pub const ALWAYS_LOADED: &[&str] = &["lookup", "search", "recall", "section", "grep", "symbol"];
 
+/// One tool as `tools/list` writes it. A read-only tool says so; a write
+/// tool says it destroys nothing (the MCP default for a non-read-only tool
+/// is destructive).
+fn listed(t: &ToolDef, schema: Value) -> Value {
+    let annotations = if t.read_only { json!({"readOnlyHint": true}) } else { json!({"destructiveHint": false}) };
+    let mut v = json!({"name": t.name, "description": t.description, "inputSchema": schema, "annotations": annotations});
+    if ALWAYS_LOADED.contains(&t.name) {
+        v["_meta"] = json!({"anthropic/alwaysLoad": true});
+    }
+    v
+}
+
 /// The tool list for `tools/list`, kept short: every byte of it is sent
-/// each time a client loads the tools.
+/// each time a client loads the tools. A few tools with an `op` argument
+/// (see [`surface`]); the full tools behind them stay callable by name.
 pub fn tool_list() -> Vec<Value> {
-    all_tools()
-        .map(|t| {
-            // A read-only tool says so; a write tool says it destroys nothing
-            // (the MCP default for a non-read-only tool is destructive).
-            let annotations = if t.read_only { json!({"readOnlyHint": true}) } else { json!({"destructiveHint": false}) };
-            let mut v = json!({"name": t.name, "description": t.description, "inputSchema": input_schema(t), "annotations": annotations});
-            if ALWAYS_LOADED.contains(&t.name) {
-                v["_meta"] = json!({"anthropic/alwaysLoad": true});
-            }
-            v
-        })
-        .collect()
+    surface::LISTED.iter().map(|t| listed(t, (t.schema)())).collect()
+}
+
+/// Every full tool with its whole schema, every argument described: what
+/// the listed tools run, and the names kept callable as aliases. The help
+/// text ([`help`]) is written from it.
+pub fn full_tool_list() -> Vec<Value> {
+    all_tools().map(|t| listed(t, input_schema(t))).collect()
 }
 
 /// Every tool: the core list, then the handle tools and the intake tools.
@@ -650,6 +671,14 @@ fn arg_str<'a>(a: &'a Map, k: &str) -> Result<&'a str> {
         Some(_) => Err(Error::InvalidArgument(format!("{k} must be a string"))),
         None => Err(Error::InvalidArgument(format!("{k} is required"))),
     }
+}
+/// [`arg_str`] that refuses an empty or blank value.
+fn arg_nonblank<'a>(a: &'a Map, k: &str) -> Result<&'a str> {
+    let s = arg_str(a, k)?;
+    if s.trim().is_empty() {
+        return Err(Error::InvalidArgument(format!("{k} is empty")));
+    }
+    Ok(s)
 }
 fn opt_str<'a>(a: &'a Map, k: &str) -> Result<Option<&'a str>> {
     match a.get(k) {
@@ -798,6 +827,11 @@ pub struct Server {
     semantic: Option<SemState>,
     /// The memory store and hooks, when set up.
     memory: Option<MemState>,
+    /// Repeat answers per agent (see [`dedup`]).
+    dedup: dedup::Dedup,
+    /// Whether a `symbol` answer this session has carried the code roots'
+    /// coverage notes (definitions only, scan only); later ones leave them out.
+    symbol_coverage_shown: bool,
 }
 
 /// Semantic search state: the model and vectors, loaded on first use.
@@ -844,7 +878,7 @@ pub struct CodeState {
 impl Server {
     /// Wraps a store.
     pub fn new(store: Store) -> Server {
-        Server { store, client: "unknown".to_string(), reason: String::new(), discussion: String::new(), ledger: None, code: None, semantic: None, memory: None }
+        Server { store, client: "unknown".to_string(), reason: String::new(), discussion: String::new(), ledger: None, code: None, semantic: None, memory: None, dedup: dedup::Dedup::default(), symbol_coverage_shown: false }
     }
 
     fn actor(&self) -> Actor {
@@ -866,11 +900,12 @@ impl Server {
     pub fn instructions(&self) -> String {
         let names: Vec<String> = self.store.vaults().all().iter().map(|v| format!("{} ({})", v.name, v.folder)).collect();
         let sources: Vec<&str> = self.store.sources().iter().map(|s| s.name.as_str()).collect();
-        if sources.is_empty() {
-            format!("Obsidian vaults served: {}.", names.join(", "))
+        let head = if sources.is_empty() {
+            format!("Markdown vaults served: {}.", names.join(", "))
         } else {
-            format!("Obsidian vaults served: {}. Read-only sources: {}.", names.join(", "), sources.join(", "))
-        }
+            format!("Markdown vaults served: {}. Read-only sources: {}.", names.join(", "), sources.join(", "))
+        };
+        format!("{head} Every op and argument: resource {HELP_URI} or note op=help.")
     }
 
     fn vault(&self, name: &str) -> Result<Vault> {
@@ -895,7 +930,10 @@ impl Server {
     /// [`Error::NotFound`] for an unknown tool, [`Error::InvalidArgument`]
     /// for unknown or malformed arguments, and whatever the tool refuses.
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
-        match self.run(name, args, true)? {
+        let Some((name, args)) = surface::route(name, args)? else {
+            return Ok(json!({ "text": help() }));
+        };
+        match self.run(&name, &args, true)? {
             Answer::Json(v) => Ok(v),
             // Read back for callers that want a value (tests); the client
             // path, `answer`, never parses.
@@ -920,10 +958,64 @@ impl Server {
     /// A JSON value is written once here, and that one text goes both to
     /// the ledger and to the client ([`Answer::JsonText`]).
     pub fn answer(&mut self, name: &str, args: &Value) -> Result<Answer> {
-        let answer = match self.run(name, args, false)? {
+        self.answer_call(name, args, None)
+    }
+
+    /// The handle a thread that reads hook calls itself (the hook worker's
+    /// reader) notes them through, so the calls they announce get their
+    /// callers (see [`dedup`]).
+    pub fn announcer(&self) -> dedup::Announcer {
+        self.dedup.announcer()
+    }
+
+    /// The stream place of the message about to be answered, for a server
+    /// whose hooks are noted ahead by the reading thread (see
+    /// [`dedup::Announcer`]); None sees every hook noted.
+    pub fn set_horizon(&mut self, horizon: Option<u64>) {
+        self.dedup.set_horizon(horizon);
+    }
+
+    /// [`Server::answer`] for a call the client sent with a tool_use_id
+    /// (`_meta`), which picks the agent that announced it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Server::call`].
+    pub fn answer_call(&mut self, name: &str, args: &Value, use_id: Option<&str>) -> Result<Answer> {
+        // The hook names the agent behind the next call (see [`dedup`]).
+        if name == "hook" {
+            self.dedup.hook(args);
+        }
+        let caller = if name == "hook" { None } else { self.dedup.caller(name, args, use_id) };
+        // `fresh` is taken by every tool: the whole answer, never a reference.
+        let (fresh, args) = match args.as_object().filter(|m| m.contains_key("fresh")) {
+            Some(m) => {
+                let fresh = matches!(m.get("fresh"), Some(Value::Bool(true)));
+                let mut m = m.clone();
+                m.remove("fresh");
+                (fresh, Value::Object(m))
+            }
+            None => (false, args.clone()),
+        };
+        // A listed tool's op runs its full tool, and the ledger counts it
+        // under that name (its counterfactual is the full tool's).
+        let Some((routed, routed_args)) = surface::route(name, &args)? else {
+            return Ok(Answer::Text(help()));
+        };
+        let (name, args) = (routed.as_str(), &routed_args);
+        let mut answer = match self.run(name, args, false)? {
             Answer::Json(v) => Answer::JsonText(v.to_string()),
             a => a,
         };
+        if let Some(c) = caller {
+            let read_only = all_tools().find(|t| t.name == name).is_some_and(|t| t.read_only);
+            let reuse = !fresh && dedup::dedupable(name, read_only, args);
+            answer = match answer {
+                Answer::Text(t) => Answer::Text(self.dedup.answer(&c, name, args, t, reuse)),
+                Answer::JsonText(t) => Answer::JsonText(self.dedup.answer(&c, name, args, t, reuse)),
+                a => a,
+            };
+        }
         if let Some(l) = &self.ledger {
             let returned = match &answer {
                 Answer::Text(t) | Answer::JsonText(t) => t.len(),
@@ -974,7 +1066,8 @@ impl Server {
         };
         let schema = input_schema(def);
         let props = schema["properties"].as_object().cloned().unwrap_or_default();
-        if let Some(k) = a.keys().find(|k| !props.contains_key(*k)) {
+        // `format` is taken by every tool: text by default, JSON on request.
+        if let Some(k) = a.keys().find(|k| !props.contains_key(*k) && !matches!(k.as_str(), "format" | "fresh")) {
             return Err(Error::InvalidArgument(format!("unknown argument {k:?} for {name}")));
         }
         // A write without a usable reason is refused before anything is read or written.
@@ -1017,7 +1110,11 @@ impl Server {
             "ids" => self.ids(a, fmt),
             "list_sources" => self.list_sources(fmt),
             "misses" => self.misses(a, fmt),
-            _ => j(self.run_json(name, a)),
+            "read_note" if !fmt.json => self.read_note_text(a),
+            _ if fmt.json => j(self.run_json(name, a)),
+            // The full tools without a text form of their own: their JSON
+            // as lines and tables, every element kept.
+            _ => self.run_json(name, a).map(|v| Answer::Text(crate::text::value(&v))),
         }
     }
 
@@ -1105,14 +1202,95 @@ impl Server {
     }
 
     fn read_note(&self, a: &Map) -> Result<Value> {
-        let v = self.vault(arg_str(a, "vault")?)?;
-        let res = paths::resolve_existing(&v, arg_str(a, "path")?)?;
-        let bytes = fsio::read_capped(&res.full)?;
+        let n = self.note_window(a)?;
+        let mut v = json!({"vault": n.vault, "path": n.path, "sha256": n.sha, "size": n.size, "frontmatter": markdown::parse_frontmatter(&n.whole), "content": n.text()});
+        if n.cut() {
+            v["lines"] = json!(format!("{}-{}", n.first, n.last));
+            v["total_lines"] = json!(n.total);
+        }
+        Ok(v)
+    }
+
+    /// A note as text: one `vault:path sha256=... bytes=N` line, then the
+    /// note exactly as written (its frontmatter once, where it is, rather
+    /// than again parsed beside it as the JSON answer has it). With `lines`
+    /// or `budget_tokens`, the header names the lines shown, and a cut by
+    /// the budget ends with a `+N more lines (lines=A-B)` line.
+    fn read_note_text(&self, a: &Map) -> Result<Answer> {
+        let n = self.note_window(a)?;
+        let mut out = format!("{}:{} sha256={} bytes={}", n.vault, n.path, n.sha, n.size);
+        if n.cut() {
+            out.push_str(&format!(" lines {}-{} of {}", n.first, n.last, n.total));
+        }
+        out.push('\n');
+        out.push_str(&n.text());
+        if n.last < n.until {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!("+{} more lines (lines={}-{})\n", n.until - n.last, n.last + 1, n.until));
+        }
+        Ok(Answer::Text(out))
+    }
+
+    /// A vault note or a read-only source's file, read through the vault's
+    /// or the source's own path checks (dot names, the deny-list on the
+    /// path and on what it resolves to, a source's globs): the vault or
+    /// source name, the path, the bytes.
+    pub(crate) fn read_confined(&self, name: &str, rel: &str) -> Result<(String, String, Vec<u8>)> {
+        Ok(match (self.vault(name), self.store.sources().iter().find(|s| s.name == name)) {
+            (Err(_), Some(s)) => (s.name.clone(), rel.to_string(), s.read(rel)?.0),
+            (v, _) => {
+                let v = v?;
+                let res = paths::resolve_existing(&v, rel)?;
+                (v.name, res.rel, fsio::read_capped(&res.full)?)
+            }
+        })
+    }
+
+    /// The note `read_note` names and the lines it shows: `lines` (`A-B`,
+    /// `A-` or `A`, 1-based and inclusive), then whole lines up to about
+    /// `budget_tokens`, the first line always.
+    fn note_window(&self, a: &Map) -> Result<NoteWindow> {
+        let name = arg_str(a, "vault")?;
+        let rel = arg_str(a, "path")?;
+        // A read-only source's file reads as a note does (a recall pointer's
+        // anchor names one), through the source's own path checks.
+        let (vault, path, bytes) = self.read_confined(name, rel)?;
         let sha = crate::sha256::hex(&bytes);
         let size = bytes.len();
-        let text = String::from_utf8(bytes).map_err(|_| Error::InvalidArgument("note is not valid UTF-8".into()))?;
-        let fm = markdown::parse_frontmatter(&text);
-        Ok(json!({"vault": v.name, "path": res.rel, "sha256": sha, "size": size, "frontmatter": fm, "content": text}))
+        let whole = String::from_utf8(bytes).map_err(|_| Error::InvalidArgument("note is not valid UTF-8".into()))?;
+        let starts: Vec<usize> = std::iter::once(0).chain(whole.match_indices('\n').map(|(i, _)| i + 1)).filter(|&i| i < whole.len()).collect();
+        let total = starts.len();
+        let (from, until) = match opt_str(a, "lines")? {
+            None => (1, total),
+            Some(r) => {
+                let bad = || Error::InvalidArgument(format!("lines {r:?}; use A-B, A- or A (from 1)"));
+                let (x, y) = r.split_once('-').unwrap_or((r, r));
+                let x: usize = x.trim().parse().map_err(|_| bad())?;
+                let y: usize = if y.trim().is_empty() { total } else { y.trim().parse().map_err(|_| bad())? };
+                if x == 0 || y < x {
+                    return Err(bad());
+                }
+                (x, y.min(total))
+            }
+        };
+        let budget = match a.get("budget_tokens") {
+            None | Some(Value::Null) => usize::MAX,
+            Some(_) => (opt_uint(a, "budget_tokens", 0, 1_000_000)? as f64 * crate::tokens::DEFAULT_BYTES_PER_TOKEN) as usize,
+        };
+        let end_of = |l: usize| if l < total { starts[l] } else { whole.len() };
+        // The first line always; then each next line while the budget holds.
+        let last = if from > until {
+            from - 1
+        } else {
+            let mut last = from;
+            while last < until && end_of(last + 1) - starts[from - 1] <= budget {
+                last += 1;
+            }
+            last
+        };
+        Ok(NoteWindow { vault, path, sha, size, total, first: from, last, until, starts, whole })
     }
 
     fn scope(&self, a: &Map) -> Result<(Option<String>, String)> {
@@ -1230,6 +1408,11 @@ impl Server {
         }
         if truncated {
             out.push_str(&format!("+more (limit={limit})\n"));
+        }
+        // These modes read vault notes only: an empty answer says where
+        // the read-only sources are searched.
+        if results.is_empty() && !self.store.sources().is_empty() {
+            out.push_str("no match in vault notes (this mode reads vaults only; sources: mode sections, or grep)\n");
         }
         Ok(Answer::Text(out))
     }
@@ -1680,5 +1863,42 @@ fn short_text(s: &str, n: usize) -> String {
         flat
     } else {
         format!("{}...", flat.chars().take(n).collect::<String>())
+    }
+}
+
+/// The lines of a note `read_note` shows (see `Server::note_window`).
+struct NoteWindow {
+    vault: String,
+    path: String,
+    sha: String,
+    size: usize,
+    /// Lines in the note.
+    total: usize,
+    /// The first line shown, from 1.
+    first: usize,
+    /// The last line shown (below `first` when none is).
+    last: usize,
+    /// The last line asked for.
+    until: usize,
+    /// Byte offset of each line.
+    starts: Vec<usize>,
+    /// The whole note.
+    whole: String,
+}
+
+impl NoteWindow {
+    /// Whether less than the whole note is shown.
+    fn cut(&self) -> bool {
+        self.first > 1 || self.last < self.total
+    }
+
+    /// The lines shown, as written.
+    fn text(&self) -> String {
+        if self.last < self.first {
+            return String::new();
+        }
+        let a = self.starts[self.first - 1];
+        let b = if self.last < self.total { self.starts[self.last] } else { self.whole.len() };
+        self.whole[a..b].to_string()
     }
 }

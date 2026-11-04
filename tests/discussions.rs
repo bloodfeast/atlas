@@ -381,7 +381,7 @@ fn twelve_processes_post_to_one_thread() {
                 writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"clientInfo": {"name": format!("proc-{p}")}}})).unwrap();
                 for i in 0..EACH {
                     let msg = json!({"jsonrpc": "2.0", "id": 1 + i, "method": "tools/call", "params": {"name": "post", "arguments": {
-                        "thread": t, "author": format!("agent{p}"), "kind": "answer", "re": 1, "body": format!("answer {i} from agent {p}, long enough")}}});
+                        "thread": t, "author": format!("agent{p}"), "kind": "answer", "re": 1, "body": format!("answer {i} from agent {p}, long enough"), "format": "json"}}});
                     writeln!(stdin, "{msg}").unwrap();
                 }
             }

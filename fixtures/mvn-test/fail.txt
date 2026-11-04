@@ -1,0 +1,79 @@
+Picked up JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=80.0 -XX:+UseContainerSupport
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] ----------------------------< demo:shapes >-----------------------------
+[INFO] Building shapes 0.1.0
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.0:resources (default-resources) @ shapes ---
+[INFO] skip non existing resourceDirectory /work/src/main/resources
+[INFO] 
+[INFO] --- compiler:3.10.1:compile (default-compile) @ shapes ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 3 source files to /work/target/classes
+[INFO] 
+[INFO] --- resources:3.3.0:testResources (default-testResources) @ shapes ---
+[INFO] skip non existing resourceDirectory /work/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.10.1:testCompile (default-testCompile) @ shapes ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 1 source file to /work/target/test-classes
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ shapes ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+Picked up JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=80.0 -XX:+UseContainerSupport
+[INFO] Running shapes.ShapesTest
+[ERROR] Tests run: 5, Failures: 1, Errors: 1, Skipped: 1, Time elapsed: 0.103 s <<< FAILURE! -- in shapes.ShapesTest
+[ERROR] shapes.ShapesTest.kindIsMissing -- Time elapsed: 0.010 s <<< ERROR!
+java.lang.IllegalArgumentException: No enum constant shapes.Square.Kind.HUGE
+	at java.base/java.lang.Enum.valueOf(Enum.java:273)
+	at shapes.Square$Kind.valueOf(Square.java:33)
+	at shapes.ShapesTest.kindIsMissing(ShapesTest.java:26)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:569)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1511)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1511)
+
+[ERROR] shapes.ShapesTest.areaIsWrong -- Time elapsed: 0.005 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: area of a 2 by 2 square ==> expected: <5.0> but was: <4.0>
+	at org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
+	at org.junit.jupiter.api.AssertionFailureBuilder.buildAndThrow(AssertionFailureBuilder.java:132)
+	at org.junit.jupiter.api.AssertEquals.failNotEqual(AssertEquals.java:197)
+	at org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:70)
+	at org.junit.jupiter.api.Assertions.assertEquals(Assertions.java:929)
+	at shapes.ShapesTest.areaIsWrong(ShapesTest.java:21)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:569)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1511)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1511)
+
+[INFO] 
+[INFO] Results:
+[INFO] 
+[ERROR] Failures: 
+[ERROR]   ShapesTest.areaIsWrong:21 area of a 2 by 2 square ==> expected: <5.0> but was: <4.0>
+[ERROR] Errors: 
+[ERROR]   ShapesTest.kindIsMissing:26 » IllegalArgument No enum constant shapes.Square.Kind.HUGE
+[INFO] 
+[ERROR] Tests run: 5, Failures: 1, Errors: 1, Skipped: 1
+[INFO] 
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  10.067 s
+[INFO] Finished at: 2026-11-03T06:12:47Z
+[INFO] ------------------------------------------------------------------------
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test (default-test) on project shapes: There are test failures.
+[ERROR] 
+[ERROR] Please refer to /work/target/surefire-reports for the individual test results.
+[ERROR] Please refer to dump files (if any exist) [date].dump, [date]-jvmRun[N].dump and [date].dumpstream.
+[ERROR] -> [Help 1]
+[ERROR] 
+[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.
+[ERROR] Re-run Maven using the -X switch to enable full debug logging.
+[ERROR] 
+[ERROR] For more information about the errors and possible solutions, please read the following articles:
+[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException

@@ -13,10 +13,15 @@ vaults, which open only in Obsidian (elsewhere they are plain text); links withi
 `[[wikilinks]]`.
 
 **Languages.** Memory, recall and history, search over Markdown notes and sources, discussions, the work
-queue, projects and multi-repo, and the hooks work for any language, as does `.proto` indexing (rpc call
+queue, projects and multi-repo, and the hooks work whatever programming language a project uses, as does `.proto` indexing (rpc call
 sites are found in any language's files). The code index (`symbol`, item ranges on reads, grep annotations)
-covers Rust, WGSL and `.proto` today; build and test digests recognise `cargo test` and `nextest` output,
-and other runners get the generic digest. More languages are planned.
+covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C# and Python (through scip-go, scip-typescript,
+scip-dotnet and scip-python when they are installed, or a prebuilt `index.scip` from CI, WSL or Docker, else
+an owned scanner), and any language with a SCIP indexer from a `.scip` file; build and test digests recognise `cargo test`, `nextest`, `go test` (plain and `-json`), jest,
+vitest, `dotnet test` and pytest output, and other
+runners get the generic digest. More languages are planned.
+Ranked search (`fts`, `sections`, `recall`) splits words on spaces and punctuation, so text written without
+spaces (Chinese, Japanese, Thai) is found with `search` in `substring` mode or `grep` instead.
 
 ## What it saves
 
@@ -27,6 +32,7 @@ processed 290 more times. Measured on real sessions:
 |---|---|---|
 | Large tool output (first measured sessions) | 236 KB into context | 8.2 KB of digests |
 | One 87 KB source file, read for review | 87 KB | 3.7 KB outline + 12 KB of targeted windows |
+| The tool list, loaded with every session | 47 tools, 5,930 tokens (v0.1) | 14 tools, 1,480 tokens; the full reference is one fetched resource |
 | A lookup (median of 2,082 pre-atlas episodes) | 624 tokens of grep and reads | 288 tokens: 2.2x smaller |
 | Memory questions (100-question evaluation) | the whole rulebook loaded | 100/100 answered when the agent follows a result to its source, 99/100 reading only the first result; median 504 tokens each |
 
@@ -61,15 +67,20 @@ update` turns them off). Building from source, uninstalling and the data folders
    atlas --setup
    ```
 
-3. Open a session in your project. atlas asks once, in one line, whether to add the folder; say yes. Its
-   Markdown becomes a searchable source and, when it holds Rust or WGSL, the folder becomes a code root.
+3. Open a session in your project. atlas asks once, in one line: *create a vault for this project at
+   `<path>`? yes / other folder / no*; say yes. Its Markdown becomes a searchable source, a folder holding
+   code becomes a code root, and a new vault (an Obsidian-compatible folder) holds the project's notes and
+   discussion threads. `atlas settings undo` reverts it all; it never deletes a note.
 4. Work as usual. Large Bash, Read and Grep results now arrive as digests with a handle; Claude pulls what it
    needs with `atlas slice h:ID --item NAME` or `--failures`. Grep and Read results name the enclosing item and
    its line range.
 5. Ask Claude to remember a decision (`remember`), and start the next session: relevant records are recalled
-   on each prompt, within a 600-token budget.
+   on each prompt, within a 150-token budget (`recall.budget_tokens`).
 6. Optionally, `atlas settings offer` proposes the Claude Code settings that cut cost (the 1-hour subagent
-   cache, an early compaction point). Nothing is written without a yes, and `atlas settings undo` reverts.
+   cache, an early compaction point). Nothing is written without a yes, and `atlas settings undo` reverts (it shows the change and asks first;
+   `--yes` without a terminal).
+   With the experimental compaction features on (`"compact": {"enabled": true}`, off by default),
+   `atlas settings compact-md` offers a Compact instructions block for a project's `CLAUDE.md` the same way.
 
 ## Projects
 
@@ -79,7 +90,7 @@ work queue see only the active project. A shared user layer is imported into eve
 **One repository.** Open Claude Code in it and answer yes, or run:
 
 ```sh
-atlas settings add-project .
+atlas settings add-project --vault .      # or --vault-at FOLDER; without either, no vault
 ```
 
 **A folder of repositories.** Open Claude Code in the folder that holds them (each one level down). atlas
@@ -89,7 +100,8 @@ offers to make it a project, or run:
 atlas settings add-project --new .
 ```
 
-That writes `atlas.project.json`, listing each repository by path and remote; commit it so the whole team
+That writes `atlas.project.json`, listing each repository by path and remote, and creates the project's vault
+beside atlas's configuration (`--vault-at FOLDER` for another folder, `--no-vault` for none); commit the file so the whole team
 gets the same layout. Describe how the repositories relate, and a prompt that names one gets its role and
 neighbours, while recall puts records about the repository you are working in first:
 
@@ -104,7 +116,10 @@ neighbours, while recall puts records about the repository you are working in fi
 }
 ```
 
-An existing setup moves into a project with `atlas settings migrate-projects NAME`. Everything else is on
+On a fresh install, `add-project --new` first moves the current setup into a project of its own (shown, backed
+up, and reversed by the same `atlas settings undo`). In a terminal it asks for that project's name; otherwise the
+name is the folder holding `atlas.json`, made a valid project name (`-2` if the new project takes it). An existing
+setup moves into a project of another name with `atlas settings migrate-projects NAME`. Everything else is on
 [Projects and multi-repo](https://github.com/bloodfeast/atlas/wiki/Projects-and-multi-repo).
 
 ## Minimal configuration
@@ -131,7 +146,8 @@ edit, run `/mcp` and reconnect atlas, or restart Claude Code. Every key is on
 - **Confined.** Every path is checked to stay inside a configured folder, lexically and after resolving links;
   dot folders are refused.
 - **A fixed deny-list.** `.env*`, keys, keystores and credential files are never read, whatever the
-  configuration says.
+  configuration says: not in a source, not in a vault (nor written there), not by `atlas digest` or `atlas crop`,
+  and never kept as a handle when Claude Code reads one.
 - **Nothing lost.** No delete or rename tool exists; writes are additive or exact, atomic and audited with a
   stated reason. The memory store is append-only.
 

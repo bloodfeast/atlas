@@ -1,0 +1,13 @@
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"start","Package":"example.com/demo/shapes"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"run","Package":"example.com/demo/shapes","Test":"TestArea"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"output","Package":"example.com/demo/shapes","Test":"TestArea","Output":"=== RUN   TestArea\n"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"output","Package":"example.com/demo/shapes","Test":"TestArea","Output":"--- PASS: TestArea (0.00s)\n"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"pass","Package":"example.com/demo/shapes","Test":"TestArea","Elapsed":0}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"run","Package":"example.com/demo/shapes","Test":"TestPerimeter"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"output","Package":"example.com/demo/shapes","Test":"TestPerimeter","Output":"=== RUN   TestPerimeter\n"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"output","Package":"example.com/demo/shapes","Test":"TestPerimeter","Output":"    shapes_test.go:12: not written yet\n"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"output","Package":"example.com/demo/shapes","Test":"TestPerimeter","Output":"--- SKIP: TestPerimeter (0.00s)\n"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"skip","Package":"example.com/demo/shapes","Test":"TestPerimeter","Elapsed":0}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"output","Package":"example.com/demo/shapes","Output":"PASS\n"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"output","Package":"example.com/demo/shapes","Output":"ok  \texample.com/demo/shapes\t(cached)\n"}
+{"Time":"2026-11-02T21:42:11.1917263-05:00","Action":"pass","Package":"example.com/demo/shapes","Elapsed":0}

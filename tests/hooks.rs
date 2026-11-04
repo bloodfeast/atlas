@@ -24,6 +24,15 @@ fn settings(dir: &Path) -> Settings {
     s
 }
 
+/// [`settings`] with the experimental compaction features on, in a project
+/// (whose store is its own, so the card lists its lanes).
+fn compaction(dir: &Path) -> Settings {
+    let mut s = settings(dir);
+    s.compact.enabled = true;
+    s.graph = Some(std::sync::Arc::new(atlas::project::Graph { name: "proj".into(), ..atlas::project::Graph::default() }));
+    s
+}
+
 fn seed(s: &Settings) {
     let mut store = MemoryStore::open(&s.store).unwrap();
     let mut w = store.writer().unwrap();
@@ -69,6 +78,33 @@ fn recall_is_gated_budgeted_and_not_repeated() {
 }
 
 #[test]
+fn a_session_budget_stops_injection_once_spent() {
+    let t = Temp::new("hook-session-budget");
+    let mut s = settings(t.path());
+    seed(&s);
+    let widget = "why does the widget cache evict entries past sixty four widgets";
+    let gadget = "how does the gadget exporter write with temp files and rename them";
+    // No cap (the default): both prompts get their record.
+    let mut h = Hooks::open(s.clone()).unwrap();
+    assert!(h.handle(&HookEvent { prompt: widget.into(), ..ev("UserPromptSubmit") }).context.contains("widget-cache"));
+    assert!(h.handle(&HookEvent { prompt: gadget.into(), ..ev("UserPromptSubmit") }).context.contains("rules:r00001"));
+    // A cap the first injection spends: the second prompt gets nothing.
+    s.recall.session_budget_tokens = 1;
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let first = h.handle(&HookEvent { prompt: widget.into(), ..ev("UserPromptSubmit") });
+    assert!(first.context.is_empty() || first.context.len() <= s.bytes_for(s.recall.budget_tokens) + 128, "{}", first.context);
+    s.recall.session_budget_tokens = 40;
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let first = h.handle(&HookEvent { prompt: widget.into(), ..ev("UserPromptSubmit") });
+    assert!(first.context.contains("widget-cache"), "{}", first.context);
+    let second = h.handle(&HookEvent { prompt: gadget.into(), ..ev("UserPromptSubmit") });
+    assert!(second.context.is_empty(), "the session spent its budget: {}", second.context);
+    // Another session has its own.
+    let other = h.handle(&HookEvent { prompt: gadget.into(), session_id: "s2".into(), ..ev("UserPromptSubmit") });
+    assert!(other.context.contains("rules:r00001"), "{}", other.context);
+}
+
+#[test]
 fn a_subagent_gets_recall_from_the_parents_brief_and_its_lane() {
     let t = Temp::new("hook-brief");
     let s = settings(t.path());
@@ -97,6 +133,101 @@ fn a_subagent_gets_recall_from_the_parents_brief_and_its_lane() {
     assert!(first.context.contains("lane build-7"), "{}", first.context);
     let second = h.handle(&HookEvent { agent_id: "a2".into(), tool_name: "Bash".into(), transcript_path: parent.to_string_lossy().into_owned(), ..ev("PreToolUse") });
     assert!(second.context.is_empty());
+}
+
+/// A `<task-notification>` as Claude Code sends it (shapes read from real
+/// transcripts 2026-11-03): an interim stop while the agent's own
+/// background work runs, or a real finish.
+fn task_note(id: &str, interim: bool) -> String {
+    let (summary, note) = if interim {
+        ("is waiting on its own background work", "This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.")
+    } else {
+        ("finished", "A task-notification fires each time this agent stops with no live background children of its own.")
+    };
+    format!("<task-notification>\n<task-id>{id}</task-id>\n<status>completed</status>\n<summary>Agent \"x\" {summary}</summary>\n<note>{note}</note>\n<result>r</result>\n</task-notification>")
+}
+
+fn journal_entry(s: &Settings, key: &str, lane: &str) {
+    let mut store = MemoryStore::open(&s.store).unwrap();
+    let mut w = store.writer().unwrap();
+    let d = Draft { title: "an entry".into(), reason: "hook test".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+    w.create(key, "journal", "note", lane, &d, None).unwrap();
+    w.commit().unwrap();
+}
+
+/// #79: an interim stop says nothing; a real finish with no entry names the
+/// lane the brief assigns, not a neighbouring or more recent lane it also
+/// mentions; an entry since the start quiets it; a brief that names no one
+/// lane gives no warning.
+#[test]
+fn the_end_of_agent_check_skips_interim_stops_and_resolves_the_agents_own_lane() {
+    let t = Temp::new("hook-finish");
+    let s = settings(t.path());
+    seed(&s);
+    // A more recent neighbouring lane, the one the old check picked.
+    journal_entry(&s, "journal:SIDE-TASKS:0001", "SIDE-TASKS");
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let spawn = |h: &mut Hooks, id: &str, brief: &str| {
+        h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: brief.into(), ..ev("PreToolUse") });
+        h.handle(&HookEvent { agent_id: id.into(), ..ev("SubagentStart") });
+    };
+    let note = |h: &mut Hooks, id: &str, interim: bool| h.handle(&HookEvent { prompt: task_note(id, interim), ..ev("UserPromptSubmit") }).context;
+    spawn(&mut h, "fd1", "You are builder LF1, a builder. Journal lane: LIGHT-FADE (atlas `journal` tool). See SIDE-TASKS and lane build-7 for context.");
+    assert_eq!(note(&mut h, "fd1", true), "", "an interim stop is not a finish");
+    let w = note(&mut h, "fd1", false);
+    assert!(w.contains("agent fd1 finished") && w.contains("lane LIGHT-FADE"), "{w}");
+    assert!(!w.contains("SIDE-TASKS") && !w.contains("build-7"), "{w}");
+    journal_entry(&s, "journal:LIGHT-FADE:0001", "LIGHT-FADE");
+    assert_eq!(note(&mut h, "fd1", false), "", "an entry since the start");
+    // Two lanes and none assigned: no lane resolves, no warning.
+    spawn(&mut h, "rv1", "Review what build-7 and SIDE-TASKS changed.");
+    assert_eq!(note(&mut h, "rv1", false), "");
+    // One lane mentioned: that lane.
+    spawn(&mut h, "b7", "Continue build-7: the gadget exporter.");
+    assert!(note(&mut h, "b7", false).contains("lane build-7"));
+    // An unknown task (a background command): nothing.
+    assert_eq!(note(&mut h, "bqu7y4h25", false), "");
+}
+
+/// #79: the lane the agent itself wrote under (its own journal calls, read
+/// from its transcript) wins over the brief, and a server that never saw
+/// the agent start reads its start and brief from the transcript.
+#[test]
+fn the_end_of_agent_check_reads_the_agents_own_transcript() {
+    let t = Temp::new("hook-finish-transcript");
+    let s = settings(t.path());
+    seed(&s);
+    let dir = t.path().join("proj");
+    let parent = dir.join("sess.jsonl");
+    std::fs::create_dir_all(dir.join("sess").join("subagents")).unwrap();
+    std::fs::write(&parent, "").unwrap();
+    let call = json!({"type": "assistant", "timestamp": "2020-01-01T00:00:05.000Z", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "mcp__atlas__journal", "input": {"lane": "GADGET-2", "entry": "brief", "text": "x"}}]}});
+    let user = json!({"type": "user", "timestamp": "2020-01-01T00:00:00.000Z", "message": {"role": "user", "content": "You are a builder. Continue build-7."}});
+    std::fs::write(dir.join("sess").join("subagents").join("agent-w1.jsonl"), format!("{user}\n{call}\n")).unwrap();
+    std::fs::write(dir.join("sess").join("subagents").join("agent-w2.jsonl"), format!("{user}\n")).unwrap();
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let tp = parent.to_string_lossy().into_owned();
+    let note = |h: &mut Hooks, id: &str| h.handle(&HookEvent { prompt: task_note(id, false), transcript_path: tp.clone(), ..ev("UserPromptSubmit") }).context;
+    // It called journal for GADGET-2 (the call failed: no entry exists).
+    let w = note(&mut h, "w1");
+    assert!(w.contains("lane GADGET-2") && !w.contains("build-7"), "{w}");
+    // No journal calls: the brief's lane, with the start from the transcript
+    // (build-7's seeded entries are newer than it, so it is quiet).
+    assert_eq!(note(&mut h, "w2"), "");
+}
+
+#[test]
+fn a_brief_names_its_own_lane() {
+    let known = vec!["SIDE-TASKS".to_string(), "build-7".to_string(), "COMPACT-FIX".to_string()];
+    let lane = |b: &str| atlas::hooks::brief_lane(b, &known);
+    assert_eq!(lane("You are LANE HOOK-FIX. Journal under lane HOOK-FIX. The warning says 'for lane Y since'."), Some("HOOK-FIX".into()));
+    assert_eq!(lane("You are builder LF1. Journal lane: LIGHT-FADE. Builds on SIDE-TASKS."), Some("LIGHT-FADE".into()));
+    assert_eq!(lane("COMPACT-FIX filed a note; journal lane `HOOK-FIX`."), Some("HOOK-FIX".into()));
+    assert_eq!(lane("Compare lane COMPACT-FIX with lane SIDE-TASKS."), None);
+    assert_eq!(lane("Your lane is free: see build-7 and COMPACT-FIX."), None);
+    assert_eq!(lane("Continue build-7."), Some("build-7".into()));
+    assert_eq!(lane("lane journals are append-only"), None);
+    assert!(atlas::hooks::is_interim(&task_note("a", true)) && !atlas::hooks::is_interim(&task_note("a", false)));
 }
 
 fn usage_line(id: &str, ctx: u64) -> String {
@@ -405,7 +536,7 @@ fn an_edit_reindexes_the_file_once_the_answer_is_out() {
     write(&notes.join("n.md"), "# N\n\nfirst words\n");
     let vaults = || atlas::paths::Vaults::new(&[("notes".to_string(), notes.clone())]).unwrap();
     drop(atlas::store::Store::open(&s.index_db, vaults()).unwrap());
-    let spec = atlas::config::CodeSpec { roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: root.clone(), build_scripts: false }], ..Default::default() };
+    let spec = atlas::config::CodeSpec { roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: root.clone(), build_scripts: false, scip: Default::default() }], ..Default::default() };
     let code = atlas::code::CodeSetup::from_spec(&spec, &s.index_db, false);
     let mut conn = rusqlite::Connection::open(&s.index_db).unwrap();
     atlas::code_index::index_root(&code, &mut conn, &code.roots[0], &atlas::code_index::RustSource::ScanOnly("test".into())).unwrap();
@@ -457,4 +588,457 @@ fn an_edit_reindexes_the_file_once_the_answer_is_out() {
 
 fn h_reindex(path: &str, s: &Settings) -> atlas::code::Reindexed {
     atlas::hook_rewrite::Router::new(s).reindex_code(path).unwrap()
+}
+/// A transcript holding one compaction: the boundary with Claude Code's
+/// metadata, then the summary.
+fn compacted_transcript(path: &Path, summary: &str) {
+    let mut f = std::fs::File::create(path).unwrap();
+    let boundary = json!({"type": "system", "subtype": "compact_boundary", "timestamp": "2020-01-01T00:00:00.000Z",
+        "compactMetadata": {"trigger": "auto", "preTokens": 200000, "postTokens": 10000, "durationMs": 40000}});
+    let s = json!({"type": "user", "isCompactSummary": true, "message": {"role": "user", "content": summary}});
+    write!(f, "{}\n{}\n", boundary, s).unwrap();
+}
+
+#[test]
+fn after_a_compaction_the_summary_refs_are_checked_and_logged() {
+    let t = Temp::new("hook-compact");
+    let s = compaction(t.path());
+    seed(&s);
+    let mut store = MemoryStore::open(&s.store).unwrap();
+    let old = store.head("widget-cache").unwrap().unwrap().sha;
+    {
+        let mut w = store.writer().unwrap();
+        let d = Draft { title: "- [Widget cache](widget-cache.md) - bound".into(), body: "\nThe widget cache evicts past ninety widgets.\n".into(), reason: "compaction test".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+        w.revise("widget-cache", None, &d).unwrap();
+        w.commit().unwrap();
+    }
+    let new = store.head("widget-cache").unwrap().unwrap().sha;
+    let rule = store.head("rules:r00001").unwrap().unwrap().sha;
+    let summary = format!(
+        "Work so far: rules:r00001@{} holds; cache bound was widget-cache@{}; also rules:r00009@0123456789ab.",
+        &rule[..12],
+        &old[..12]
+    );
+    let tp = t.path().join("session.jsonl");
+    compacted_transcript(&tp, &summary);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let a = h.handle(&HookEvent { source: "compact".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("SessionStart") });
+    assert!(a.context.contains(&format!("atlas ref changed: widget-cache@{} -> widget-cache@{}", &old[..12], &new[..12])), "{}", a.context);
+    assert!(a.context.contains("atlas ref dangling: rules:r00009@0123456789ab"), "{}", a.context);
+    assert!(!a.context.contains("rules:r00001@"), "a current ref is not reported: {}", a.context);
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let row: (i64, i64, i64, i64, i64) = conn
+        .query_row("SELECT pre_tokens, post_tokens, refs, changed, dangling FROM compact_log", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap();
+    assert_eq!(row, (200000, 10000, 3, 1, 1));
+    let tot = atlas::compact::totals(&conn, 4.0).unwrap().unwrap();
+    assert_eq!((tot.n, tot.refs, tot.dangling), (1, 3, 1));
+    // A startup SessionStart checks nothing.
+    let a = h.handle(&HookEvent { source: "startup".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("SessionStart") });
+    assert!(!a.context.contains("atlas ref"), "{}", a.context);
+}
+
+#[test]
+fn a_lookup_made_again_after_a_compaction_is_a_logged_miss() {
+    let t = Temp::new("hook-compact-miss");
+    let s = compaction(t.path());
+    seed(&s);
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        let read = |p: &str| HookEvent { tool_name: "Read".into(), tool_input: json!({"file_path": p}), ..ev("PreToolUse") };
+        h.handle(&read("src/a.rs"));
+        h.handle(&read("src/a.rs"));
+        h.handle(&HookEvent { trigger: "auto".into(), ..ev("PreCompact") });
+        h.handle(&read("src/a.rs"));
+        h.handle(&read("src/b.rs"));
+        // A subagent's lookups are not the session's.
+        h.handle(&HookEvent { agent_id: "x".into(), ..read("src/a.rs") });
+    }
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let mut n = 0i64;
+    for _ in 0..200 {
+        n = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'compact:miss'", [], |r| r.get(0)).unwrap_or(0);
+        if n > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    n = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'compact:miss'", [], |r| r.get(0)).unwrap_or(n);
+    assert_eq!(n, 1);
+}
+
+/// A synthetic session segment: a prompt, a read with its result, an edit,
+/// then a running tool call (no result yet). Nothing here is a real
+/// transcript.
+fn working_transcript(path: &Path, ctx: u64) {
+    let rec = |kind: &str, id: &str, content: atlas::json::Value, c: u64| {
+        json!({"type": kind, "timestamp": "2020-01-01T00:00:00.000Z", "message": {"id": id, "usage": {"input_tokens": c}, "content": content}})
+    };
+    let lines = [
+        rec("user", "", json!([{"type": "text", "text": "fix the exporter"}]), 0),
+        rec("assistant", "m1", json!([{"type": "thinking", "thinking": "private chain of thought"}, {"type": "text", "text": "I will read the exporter first."}]), ctx - 30000),
+        rec("assistant", "m2", json!([{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "src/export.rs"}}]), ctx - 20000),
+        rec("user", "", json!([{"type": "tool_result", "tool_use_id": "t1", "content": "fn export() {}"}]), 0),
+        rec("assistant", "m3", json!([{"type": "tool_use", "id": "t2", "name": "Edit", "input": {"file_path": "src/export.rs"}}]), ctx - 10000),
+        rec("user", "", json!([{"type": "tool_result", "tool_use_id": "t2", "content": "ok"}]), 0),
+        rec("assistant", "m4", json!([{"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "cargo test --no-fail-fast"}}]), ctx),
+    ];
+    let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    std::fs::write(path, text.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn precompact_writes_a_checkpoint_and_the_card_follows_the_compaction() {
+    let t = Temp::new("hook-checkpoint");
+    let s = compaction(t.path());
+    seed(&s);
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let a = h.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    assert!(a.block.is_none(), "compact.defer is off by default");
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().expect("a checkpoint");
+    assert_eq!((ck.kind.as_str(), ck.sub.as_str()), ("journal", "checkpoint"));
+    assert!(ck.title.contains("at 300000 context tokens"), "{}", ck.title);
+    let next = store.head("journal:build-7:0002").unwrap().unwrap();
+    let r00001 = store.head("rules:r00001").unwrap().unwrap();
+    for want in [
+        format!("lanes: build-7 (step journal:build-7:0002@{})", &next.sha[..12]),
+        format!("owed: journal:build-7:0002@{}", &next.sha[..12]),
+        format!("rules:r00001@{}", &r00001.sha[..12]),
+        "files: src/export.rs".to_string(),
+        "tools: Read src/export.rs -> turn:s1:4@".to_string(),
+        "pending: Bash cargo test --no-fail-fast".to_string(),
+        "intent: I will read the exporter first.".to_string(),
+    ] {
+        assert!(ck.body.contains(&want), "missing {want:?} in\n{}", ck.body);
+    }
+    assert!(!ck.body.contains("chain of thought"), "thinking is never stored");
+    // After the compaction: the card, with the checkpoint's own ref.
+    compacted_transcript(&t.path().join("after.jsonl"), "summary text");
+    let a = h.handle(&HookEvent { source: "compact".into(), transcript_path: t.path().join("after.jsonl").to_string_lossy().into_owned(), ..ev("SessionStart") });
+    assert!(a.context.starts_with(&format!("atlas checkpoint {}@{}", ck.key, &ck.sha[..12])), "{}", a.context);
+    assert!(a.context.contains("pending: Bash cargo test"), "{}", a.context);
+    // Every ref in the card resolves.
+    let check = atlas::compact::check(&store, &[], &a.context).unwrap();
+    assert!(check.dangling.is_empty() && check.changed.is_empty() && check.refs >= 4, "{check:?}");
+    // A second checkpoint points at the first.
+    drop(store);
+    h.handle(&HookEvent { trigger: "manual".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck2 = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
+    assert!(ck2.body.starts_with(&format!("since: {}@{}", ck.key, &ck.sha[..12])), "{}", ck2.body);
+}
+
+#[test]
+fn compact_defer_blocks_an_auto_compaction_mid_task_only() {
+    let t = Temp::new("hook-defer");
+    let mut s = compaction(t.path());
+    s.compact.defer = true;
+    seed(&s);
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let pre = |trigger: &str| HookEvent { trigger: trigger.into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") };
+    let a = h.handle(&pre("auto"));
+    let reason = a.block.clone().expect("blocked mid-task");
+    assert!(reason.contains("next quiet point"), "{reason}");
+    assert_eq!(atlas::json::parse(&a.to_json("PreCompact")).unwrap()["decision"].as_str(), Some("block"));
+    let store = MemoryStore::open(&s.store).unwrap();
+    assert!(atlas::checkpoint::newest(&store, "s1").unwrap().is_none(), "no checkpoint for a deferred compaction");
+    drop(store);
+    // A manual compaction is never blocked.
+    assert!(h.handle(&pre("manual")).block.is_none());
+    // Past the ceiling (1M less 40k of headroom), the compaction goes ahead.
+    working_transcript(&tp, 970_000);
+    assert!(h.handle(&pre("auto")).block.is_none());
+}
+
+#[test]
+fn with_the_transcript_source_on_precompact_indexes_turns_and_turn_refs_are_checked() {
+    let t = Temp::new("hook-turns");
+    let mut s = compaction(t.path());
+    s.transcripts = true;
+    seed(&s);
+    let dir = t.path().join("H--work-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tp = dir.join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    h.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    h.after();
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let turn = atlas::transcripts::get(&conn, "H--work-proj", "s1", 4).unwrap().expect("the read's result is indexed");
+    assert_eq!(turn.text, "fn export() {}");
+    // The card's result ref is that turn's.
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
+    assert!(ck.body.contains(&format!("turn:s1:4@{}", turn.hash)), "{}", ck.body);
+    drop(store);
+    // A summary citing it resolves; a wrong hash is dangling.
+    let after = dir.join("after.jsonl");
+    compacted_transcript(&after, &format!("read turn:s1:4@{} and turn:s1:4@0123456789ab", turn.hash));
+    let a = h.handle(&HookEvent { source: "compact".into(), transcript_path: after.to_string_lossy().into_owned(), ..ev("SessionStart") });
+    assert!(a.context.contains("atlas ref dangling: turn:s1:4@0123456789ab"), "{}", a.context);
+    assert!(!a.context.contains(&format!("dangling: turn:s1:4@{}", turn.hash)), "{}", a.context);
+}
+
+#[test]
+fn with_compaction_off_the_hooks_write_and_inject_nothing_for_it() {
+    let t = Temp::new("hook-compact-off");
+    let s = settings(t.path());
+    assert!(!s.compact.enabled, "compaction is off by default");
+    seed(&s);
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let a = h.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    assert!(a.block.is_none() && a.to_json("PreCompact").is_empty());
+    let store = MemoryStore::open(&s.store).unwrap();
+    assert!(atlas::checkpoint::newest(&store, "s1").unwrap().is_none(), "no checkpoint while off");
+    assert!(store.lane("session:s1").unwrap().is_empty(), "nothing written in the session lane");
+    drop(store);
+    // After the compaction: no card, no ref report, nothing logged.
+    let after = t.path().join("after.jsonl");
+    compacted_transcript(&after, "cache bound was widget-cache@0123456789ab");
+    let a = h.handle(&HookEvent { source: "compact".into(), transcript_path: after.to_string_lossy().into_owned(), ..ev("SessionStart") });
+    assert!(!a.context.contains("atlas checkpoint") && !a.context.contains("atlas ref"), "{}", a.context);
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM compact_log", [], |r| r.get(0)).unwrap_or(0);
+    assert_eq!(n, 0);
+    // defer does nothing without the switch either.
+    let mut s2 = settings(t.path());
+    s2.compact.defer = true;
+    let mut h2 = Hooks::open(s2).unwrap();
+    assert!(h2.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") }).block.is_none());
+}
+
+#[test]
+fn without_a_project_the_card_lists_no_other_lanes() {
+    // One store shared by every folder (no `projects`): another project's
+    // lanes and rulings are in it, so the card keeps to the session.
+    let t = Temp::new("hook-card-noproject");
+    let mut s = settings(t.path());
+    s.compact.enabled = true;
+    seed(&s);
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let pre = HookEvent { trigger: "manual".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") };
+    h.handle(&pre);
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
+    assert!(!ck.body.contains("build-7") && !ck.body.contains("rules:"), "{}", ck.body);
+    assert!(ck.body.contains("files: src/export.rs"), "the transcript side stays: {}", ck.body);
+    drop(store);
+    // The session's own lane still links the previous checkpoint.
+    h.handle(&pre);
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck2 = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
+    assert!(ck2.body.starts_with(&format!("since: {}@", ck.key)), "{}", ck2.body);
+}
+
+#[test]
+fn an_empty_start_is_bounded_never_all_time() {
+    let t = Temp::new("hook-since-empty");
+    let s = settings(t.path());
+    seed(&s);
+    let mut store = MemoryStore::open(&s.store).unwrap();
+    {
+        let mut w = store.writer().unwrap();
+        let d = Draft { title: "an old lane".into(), reason: "test".into(), author: "t".into(), client: "t".into(), time: Some("2020-01-01T00:00:00.000Z".into()), ..Draft::default() };
+        w.create("journal:OLD-LANE:0001", "journal", "next", "OLD-LANE", &d, None).unwrap();
+        w.commit().unwrap();
+    }
+    let lanes = |st: &atlas::checkpoint::State| st.lanes.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
+    // Unknown start, live: the last day only (build-7 was written now).
+    let st = atlas::checkpoint::state(&store, "s1", "", "", atlas::checkpoint::Lanes::Store).unwrap();
+    assert_eq!(lanes(&st), ["build-7"]);
+    // Unknown start, as of a past time: the day before it.
+    let st = atlas::checkpoint::state(&store, "s1", "", "2020-01-01T12:00:00Z", atlas::checkpoint::Lanes::Store).unwrap();
+    assert_eq!(lanes(&st), ["OLD-LANE"]);
+    let st = atlas::checkpoint::state(&store, "s1", "", "2020-01-03T00:00:00Z", atlas::checkpoint::Lanes::Store).unwrap();
+    assert!(lanes(&st).is_empty(), "{:?}", lanes(&st));
+    // A known start reaches back as far as it says.
+    let st = atlas::checkpoint::state(&store, "s1", "2019-12-31T00:00:00Z", "", atlas::checkpoint::Lanes::Store).unwrap();
+    assert_eq!(lanes(&st), ["build-7", "OLD-LANE"]);
+    // The hook path: a PreCompact with no transcript lists no old lane.
+    let mut s = s.clone();
+    s.compact.enabled = true;
+    s.graph = Some(std::sync::Arc::new(atlas::project::Graph { name: "proj".into(), ..atlas::project::Graph::default() }));
+    drop(store);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.handle(&HookEvent { trigger: "manual".into(), transcript_path: t.path().join("none").join("x.jsonl").to_string_lossy().into_owned(), ..ev("PreCompact") });
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
+    assert!(ck.body.contains("build-7") && !ck.body.contains("OLD-LANE"), "{}", ck.body);
+}
+
+#[test]
+fn a_transcript_not_yet_written_is_read_from_its_parent_or_said_unread() {
+    let t = Temp::new("hook-race");
+    let s = compaction(t.path());
+    seed(&s);
+    let dir = t.path().join("H--work-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The forked session's own file does not exist yet; its parent does.
+    let fork = dir.join("s1.jsonl");
+    working_transcript(&dir.join("parent0.jsonl"), 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let pre = HookEvent { trigger: "manual".into(), transcript_path: fork.to_string_lossy().into_owned(), ..ev("PreCompact") };
+    h.handle(&pre);
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
+    assert!(ck.title.contains("at 300000 context tokens"), "{}", ck.title);
+    assert!(ck.meta.contains("tail_from:") && ck.meta.contains("parent0.jsonl"), "{}", ck.meta);
+    for want in ["files: src/export.rs", "tools: Read src/export.rs -> turn:parent0:4@", "pending: Bash cargo test", "intent: I will read the exporter first."] {
+        assert!(ck.body.contains(want), "missing {want:?} in\n{}", ck.body);
+    }
+    drop(store);
+    // Two recent siblings: which one is the parent is unknown, so the card
+    // says the transcript was unread instead of claiming 0 context tokens.
+    working_transcript(&dir.join("other.jsonl"), 100_000);
+    h.handle(&pre);
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck2 = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
+    assert!(ck2.title.contains("transcript unread") && !ck2.title.contains("0 context tokens"), "{}", ck2.title);
+    assert!(ck2.body.contains(atlas::checkpoint::UNREAD_LINE), "{}", ck2.body);
+    assert!(!ck2.body.contains("files:"), "{}", ck2.body);
+    // The store side is still there: the previous checkpoint.
+    assert!(ck2.body.starts_with(&format!("since: {}@", ck.key)), "{}", ck2.body);
+    drop(store);
+    // Written late, within the wait: the session's own file is read.
+    let late = dir.join("s2.jsonl");
+    let late2 = late.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        working_transcript(&late2, 200_000);
+    });
+    let (tail, from) = atlas::checkpoint::tail_settled(&late, "s2", atlas::checkpoint::SETTLE_WAIT);
+    writer.join().unwrap();
+    assert_eq!(from, atlas::checkpoint::TailFrom::Own);
+    assert_eq!(tail.last_ctx, 200_000);
+}
+
+/// Context selection (`recall.select`): a record whose words the one sent
+/// before it holds, at a cosine over `dup_cos`, is sent as a ref to it; a
+/// pointer carries the clause that matches the prompt, verbatim; a lane
+/// brief keeps its state whole and trims older entries; and with selection
+/// off every pointer is as before.
+#[test]
+fn context_selection_collapses_trims_and_keeps_lane_state_whole() {
+    use atlas::hooks::Sel;
+    use atlas::memory::vectors;
+    let t = Temp::new("hook-select");
+    let mut s = settings(t.path());
+    std::fs::create_dir_all(s.model.parent().unwrap()).unwrap();
+    std::fs::write(&s.model, atlas::embed::tiny_model_bytes(true, 7)).unwrap();
+    s.recall.cos_floor = -1.0;
+    s.recall.cos_alone = 2.0;
+    s.recall.cos_margin = 2.0;
+    s.recall.budget_tokens = 600;
+    let zebra = "- 2026-11-02 Tess: the opening line of this rule is about the barn roof. The zebra quota is twelve per pen. A closing sentence about the gate paint.";
+    {
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let mut add = |key: &str, kind: &str, scope: &str, sub: &str, title: &str, body: &str| {
+            let d = Draft { title: title.into(), body: body.into(), reason: "select test".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+            w.create(key, kind, sub, scope, &d, None).unwrap();
+        };
+        add("rules:r00011", "rule", "rules", "", "", "- The wombat ledger rotates every ninety days.");
+        add("wombat-ledger", "memory", "", "feedback", "- [Wombat ledger](wombat-ledger.md) - rotates every ninety days", "The wombat ledger rotates every ninety days.");
+        add("rules:r00012", "rule", "rules", "", "", zebra);
+        add("journal:zoo-3:0001", "journal", "zoo-3", "brief", "Count the zebra pens", "Brief body stays whole: every pen, every zebra.");
+        add("journal:zoo-3:0002", "journal", "zoo-3", "measurement", "pen census", "Pens one to four hold the herd. The zebra quota held at twelve per pen in every census. Fence posts were repainted on Tuesday.");
+        w.commit().unwrap();
+        let m = atlas::embed::Model::load(&s.model).unwrap();
+        while vectors::embed_pending(&store, &m, 8, 1).unwrap() > 0 {}
+    }
+    // Collapse by words alone (any cosine), then never (no cosine reaches 1.01).
+    s.recall.select.dup_cos = -1.0;
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let a = h.handle(&HookEvent { prompt: "how often does the wombat ledger rotate, every ninety days?".into(), ..ev("UserPromptSubmit") });
+    let lines: Vec<&str> = a.context.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(lines.len(), 2, "{}", a.context);
+    let first = if lines[0].starts_with("- rules:r00011:") { "rules:r00011" } else { "wombat-ledger" };
+    assert!(lines[1].ends_with(&format!(": near-duplicate of {first}")), "{}", a.context);
+    let how: Vec<Sel> = h.last_injected().iter().map(|k| k.how).collect();
+    assert!(how.contains(&Sel::Collapsed), "{how:?}");
+    s.recall.select.dup_cos = 1.01;
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let a = h.handle(&HookEvent { prompt: "how often does the wombat ledger rotate, every ninety days?".into(), ..ev("UserPromptSubmit") });
+    assert!(!a.context.contains("near-duplicate"), "{}", a.context);
+    // Trim: the matching clause after the dated lead, verbatim.
+    let a = h.handle(&HookEvent { prompt: "what is the zebra quota per pen?".into(), session_id: "s-trim".into(), ..ev("UserPromptSubmit") });
+    assert!(a.context.contains("- rules:r00012: 2026-11-02 Tess: ... The zebra quota is twelve per pen. ...\n"), "{}", a.context);
+    // Off: the first line, as before.
+    let mut off = s.clone();
+    off.recall.select.enabled = false;
+    let mut h0 = Hooks::open(off).unwrap();
+    let a = h0.handle(&HookEvent { prompt: "what is the zebra quota per pen?".into(), session_id: "s-trim".into(), ..ev("UserPromptSubmit") });
+    assert!(a.context.contains("- rules:r00012: 2026-11-02 Tess: the opening line of this rule is about the barn roof. The zebra quota ...
+"), "{}", a.context);
+    let b = h0.handle(&HookEvent { prompt: "what did zoo-3 count about the zebra quota per pen?".into(), session_id: "s-lane".into(), ..ev("UserPromptSubmit") });
+    assert!(b.context.contains("Fence posts were repainted"), "off, the lane entry is whole: {}", b.context);
+    // A lane brief: the brief whole, the measurement cut to its matching clause.
+    let a = h.handle(&HookEvent { prompt: "what did zoo-3 count about the zebra quota per pen?".into(), session_id: "s-lane".into(), ..ev("UserPromptSubmit") });
+    assert!(a.context.contains("Brief body stays whole: every pen, every zebra.\n"), "{}", a.context);
+    assert!(a.context.contains("pen census\n... The zebra quota held at twelve per pen in every census. ...\n"), "{}", a.context);
+    assert!(!a.context.contains("Fence posts"), "{}", a.context);
+    assert!(a.context.contains("+1 trimmed above"), "{}", a.context);
+    let lane = h.last_injected().iter().find(|k| k.key == "lane:zoo-3").unwrap();
+    assert_eq!(lane.how, Sel::Trimmed);
+    assert!(lane.full > lane.bytes, "{lane:?}");
+}
+
+/// `atlas --hook` as Claude Code runs it, one process per event: each
+/// answer's ledger row is in `token_log` when the process has exited (the
+/// log thread is joined, not left to die with the process), and a fresh
+/// state folder is left with a whole database, not an empty file beside a
+/// hot journal.
+#[test]
+fn command_hook_rows_reach_the_token_log_before_the_process_exits() {
+    let t = Temp::new("hook-cmd-log");
+    write(&t.path().join("vault").join("Index.md"), "# Index\n");
+    let cfg = t.path().join("atlas.json");
+    write(&cfg, r#"{"db": "state/atlas.sqlite", "vaults": [{"name": "notes", "path": "vault"}], "models": {"auto_download": false, "files": []}}"#);
+    const RUNS: i64 = 4;
+    for i in 0..RUNS {
+        let mut child = Command::new(bin())
+            .arg("--config")
+            .arg(&cfg)
+            .arg("--hook")
+            .current_dir(t.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ev = json!({"hook_event_name": if i == 0 { "SessionStart" } else { "UserPromptSubmit" }, "prompt": format!("a prompt about nothing in particular {i}"), "session_id": "s-cmd", "cwd": t.path().to_string_lossy().into_owned()});
+        child.stdin.take().unwrap().write_all(ev.to_string().as_bytes()).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+    }
+    let db = t.path().join("state").join("atlas.sqlite");
+    assert!(!db.with_file_name("atlas.sqlite-journal").exists(), "a hot journal was left behind");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool LIKE 'hook:%'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, RUNS, "one ledger row per hook answer");
+}
+
+/// The hook tool writes journal entries (context caps, checkpoints), so it
+/// is not annotated read-only.
+#[test]
+fn the_hook_tool_is_not_marked_read_only() {
+    for list in [atlas::tools::full_tool_list(), atlas::tools::tool_list()] {
+        let hook = list.iter().find(|t| t["name"] == json!("hook")).expect("hook is listed");
+        assert_ne!(hook["annotations"]["readOnlyHint"], json!(true), "{hook}");
+    }
 }

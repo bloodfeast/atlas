@@ -159,11 +159,11 @@ fn snapshots_verify_and_roll_up_oldest_past_the_cap() {
     let f = fixture("mem-snap");
     let store = import_all(&f);
     let dir = f.out.join("snaps");
-    let a = snapshot(&store, &dir, u64::MAX).unwrap();
+    let a = snapshot(&store, &dir, u64::MAX).unwrap().unwrap();
     assert!(a.bytes > 0);
     assert_eq!(a.records, 10);
     // Same second: the second name takes a counter and still sorts after.
-    let b = snapshot(&store, &dir, a.bytes + a.bytes / 2).unwrap();
+    let b = snapshot(&store, &dir, a.bytes + a.bytes / 2).unwrap().unwrap();
     assert_eq!(b.rolled.iter().map(|r| r.snapshot.clone()).collect::<Vec<_>>(), vec![a.path.clone()]);
     assert_eq!((b.rolled[0].versions, b.rolled[0].added), (10, 10));
     assert!(b.path.exists() && !a.path.exists());
@@ -209,9 +209,9 @@ fn roll_up_loses_no_version_and_keeps_every_answer() {
     let f = fixture("mem-archive");
     let mut store = import_all(&f);
     let dir = f.out.join("snaps");
-    let mut snaps = vec![snapshot(&store, &dir, u64::MAX).unwrap().path];
+    let mut snaps = vec![snapshot(&store, &dir, u64::MAX).unwrap().unwrap().path];
     revise(&mut store, "widget-cache", "\nThe widget cache holds 128 entries.\n");
-    snaps.push(snapshot(&store, &dir, u64::MAX).unwrap().path);
+    snaps.push(snapshot(&store, &dir, u64::MAX).unwrap().unwrap().path);
     {
         let mut w = store.writer().unwrap();
         w.supersede(&["rules:r00001".into()], "rules:r00004", "rule", "", "rules", &draft("- 2026-02-01 alpha2: bounded at 128.\n"), Some(("rules", Place::After("rules:r00001".into()))))
@@ -220,10 +220,10 @@ fn roll_up_loses_no_version_and_keeps_every_answer() {
         w.add_refs("journal:track-x:0001", &[("lane".into(), "track-x".into())]).unwrap();
         w.commit().unwrap();
     }
-    snaps.push(snapshot(&store, &dir, u64::MAX).unwrap().path);
+    snaps.push(snapshot(&store, &dir, u64::MAX).unwrap().unwrap().path);
     revise(&mut store, "widget-cache", "\nThe widget cache holds 256 entries.\n");
     revise(&mut store, "journal:track-x:0001", "first entry, corrected\n");
-    let last = snapshot(&store, &dir, u64::MAX).unwrap();
+    let last = snapshot(&store, &dir, u64::MAX).unwrap().unwrap();
     snaps.push(last.path.clone());
 
     let before = archive::sources(&dir, None).unwrap();
@@ -267,8 +267,8 @@ fn a_damaged_snapshot_is_not_folded_or_removed() {
     let f = fixture("mem-archive-bad");
     let store = import_all(&f);
     let dir = f.out.join("snaps");
-    let a = snapshot(&store, &dir, u64::MAX).unwrap();
-    let b = snapshot(&store, &dir, u64::MAX).unwrap();
+    let a = snapshot(&store, &dir, u64::MAX).unwrap().unwrap();
+    let b = snapshot(&store, &dir, u64::MAX).unwrap().unwrap();
     {
         let c = rusqlite::Connection::open(&a.path).unwrap();
         c.execute_batch("DROP TRIGGER versions_no_update; UPDATE versions SET body = body || 'x' WHERE vid = 1;").unwrap();
@@ -474,4 +474,444 @@ fn a_new_handoff_supersedes_the_last_and_resume_shows_the_newest() {
     let hs = store.heads(Some("handoff"), Some("build-9")).unwrap();
     let st: Vec<(&str, &str)> = hs.iter().map(|h| (h.title.as_str(), h.status.as_str())).collect();
     assert!(st.contains(&("first stop", "superseded")) && st.contains(&("second stop", "active")), "{st:?}");
+}
+
+/// #80: a handoff with no title takes the text's first line as its title,
+/// is filed as a handoff and shows in `journal_status` and the lane view;
+/// one with no first line either is refused naming the field.
+#[test]
+fn a_handoff_without_a_title_takes_its_first_line() {
+    let f = fixture("mem-handoff-notitle");
+    let (mut s, _fx) = server(&f);
+    call(&mut s, "journal", json!({"lane": "build-8", "entry": "brief", "text": "Build the gizmo."}));
+    let h = text(call(&mut s, "handoff", json!({"lane": "build-8", "text": "Handoff: PR #7, head abc1234\nTests pass; the gate is off."})));
+    assert!(h.contains("handoff:build-8:001"), "{h}");
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let hs = store.heads(Some("handoff"), Some("build-8")).unwrap();
+    assert_eq!(hs.len(), 1);
+    assert_eq!(hs[0].title, "Handoff: PR #7, head abc1234");
+    assert!(hs[0].body.contains("Tests pass; the gate is off.") && !hs[0].body.contains("PR #7"), "{}", hs[0].body);
+    let st = text(call(&mut s, "journal_status", json!({})));
+    let row = st.lines().find(|l| l.starts_with("build-8\t")).unwrap_or_else(|| panic!("{st}"));
+    assert!(row.ends_with("\t1"), "one handoff: {row}");
+    let lane = text(call(&mut s, "recall", json!({"lane": "build-8"})));
+    assert!(lane.contains("# handoff") && lane.contains("Handoff: PR #7, head abc1234"), "{lane}");
+    // A blank text has no first line to take: the error names the field.
+    let e = call_err(&mut s, "handoff", json!({"lane": "build-8", "text": "  \n"}));
+    assert!(e.contains("title is required"), "{e}");
+    assert_eq!(store.heads(Some("handoff"), Some("build-8")).unwrap().len(), 1);
+}
+
+#[test]
+fn recall_of_a_key_at_hash_returns_that_version_verbatim() {
+    let f = fixture("mem-refs");
+    let mut store = import_all(&f);
+    let old = store.head("widget-cache").unwrap().unwrap();
+    revise(&mut store, "widget-cache", "\nThe widget cache now holds ninety widgets.\n");
+    let new = store.head("widget-cache").unwrap().unwrap().sha;
+    drop(store);
+    let (mut s, _fx) = server(&f);
+    // The old version, exact, with the current ref beside it.
+    let r = s.answer("recall", &json!({"key": format!("widget-cache@{}", &old.sha[..12])})).unwrap().into_text();
+    assert!(r.contains(old.body.trim()), "{r}");
+    assert!(r.contains(&format!("changed: the current text is widget-cache@{}", &new[..12])), "{r}");
+    // The head, by its own ref.
+    let r = s.answer("recall", &json!({"key": format!("widget-cache@{}", &new[..12])})).unwrap().into_text();
+    assert!(r.contains("ninety widgets") && r.contains("(current)"), "{r}");
+    // A hash no version has.
+    let e = s.answer("recall", &json!({"key": "widget-cache@0123456789ab"})).unwrap_err().to_string();
+    assert!(e.contains("dangling"), "{e}");
+}
+
+#[test]
+fn recall_of_a_lines_ref_returns_those_lines_or_says_they_changed() {
+    let f = fixture("mem-lines-ref");
+    let (mut s, fx) = server(&f);
+    let name = fx.specs[0].0.clone();
+    let root = fx.perf();
+    // A ref path holds no spaces.
+    let note = root.join("lines-ref.md");
+    std::fs::write(&note, "# Lines
+
+The frame budget is 4.2 ms.
+Third line.
+").unwrap();
+    let rel = note.file_name().unwrap().to_string_lossy().to_string();
+    let text = std::fs::read_to_string(&note).unwrap();
+    let h = atlas::compact::lines_hash(&text, 1, 2).unwrap();
+    let r = s.answer("recall", &json!({"key": format!("{name}:{rel}:1-2@{h}")})).unwrap().into_text();
+    let want: Vec<&str> = text.lines().take(2).collect();
+    assert!(r.contains("(current)") && r.contains(want.join("\n").as_str()), "{r}");
+    let r = s.answer("recall", &json!({"key": format!("{name}:{rel}:1-2@0123456789ab")})).unwrap().into_text();
+    assert!(r.contains(&format!("changed: these are the current lines, {name}:{rel}:1-2@{h}")), "{r}");
+}
+
+#[test]
+fn the_transcript_source_is_off_by_default_and_serves_this_project_only() {
+    let f = fixture("mem-turns");
+    let tmp = Temp::new("mem-turns-t");
+    // This process's project, as Claude Code names its folder, and another.
+    let here = atlas::transcripts::project_of_cwd(&std::env::current_dir().unwrap());
+    let mine = tmp.path().join(&here).join("abcdef12-0000.jsonl");
+    let theirs = tmp.path().join("Z--other-project").join("abcdef12-0000.jsonl");
+    // Synthesized records only.
+    let rec = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"build failed: error E0599 in frame_pacer at step 7311"}]}}"#;
+    for p in [&mine, &theirs] {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, format!("{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n{rec}\n")).unwrap();
+    }
+    std::fs::create_dir_all(f.settings.index_db.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&f.settings.index_db).unwrap();
+    atlas::transcripts::index(&conn, &mine).unwrap();
+    atlas::transcripts::index(&conn, &theirs).unwrap();
+    let hash = atlas::transcripts::get(&conn, &here, "abcdef12", 2).unwrap().unwrap().hash;
+    let r = format!("turn:abcdef12:2@{hash}");
+    // Off by default: refused, nothing served.
+    let (mut s, _fx) = server(&f);
+    let e = s.answer("recall", &json!({"key": r})).unwrap_err().to_string();
+    assert!(e.contains("transcript source is off"), "{e}");
+    // On: the exact turn, and search over this project's turns only.
+    let mut on = f.settings.clone();
+    on.transcripts = true;
+    s.set_memory(on);
+    let t = s.answer("recall", &json!({"key": r})).unwrap().into_text();
+    assert!(t.contains("(current)") && t.contains("error E0599 in frame_pacer at step 7311"), "{t}");
+    let found = s.answer("recall", &json!({"query": "frame_pacer 7311", "kind": "turn"})).unwrap().into_text();
+    assert_eq!(found.lines().count(), 1, "the other project's copy is never served: {found}");
+    let e = s.answer("recall", &json!({"key": "turn:abcdef12:2@0123456789ab"})).unwrap_err().to_string();
+    assert!(e.contains("dangling"), "{e}");
+}
+
+/// A fresh store whose exports were never written passes the check: a file
+/// that would hold no records is not "missing" until atlas has written it.
+/// Then rules written without a leading dash, in one line or several, keep
+/// the items export splitting back into its records.
+#[test]
+fn plain_rule_bodies_keep_the_items_export_round_trip_and_a_fresh_store_checks_clean() {
+    let f = fixture("mem-plain-rules");
+    {
+        let store = MemoryStore::open(&f.settings.store).unwrap();
+        let rep = check(&store, &specs(), Some(&f.out), true).unwrap();
+        assert!(rep.ok(), "fresh store: {:?}", rep.problems);
+    }
+    let (mut s, _fx) = server(&f);
+    for body in ["Plain rule without a dash.", "Another plain rule.\nIt runs on to a second line.", "- 2026-03-04 gamma: a dashed rule stays as written."] {
+        let r = text(call(&mut s, "remember", json!({"kind": "rule", "body": body, "author": "tester"})));
+        assert!(r.starts_with("ok rules:r"), "{r}");
+    }
+    let rules = fs::read_to_string(f.out.join("RULES.md")).unwrap();
+    let day: String = atlas::memory::now().chars().take(10).collect();
+    assert!(rules.contains(&format!("- {day} tester: Plain rule without a dash.\n")), "{rules}");
+    assert!(rules.contains(&format!("- {day} tester: Another plain rule.\n  It runs on to a second line.\n")), "{rules}");
+    assert!(rules.contains("- 2026-03-04 gamma: a dashed rule stays as written.\n"), "{rules}");
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let rep = check(&store, &specs(), Some(&f.out), true).unwrap();
+    assert!(rep.ok(), "{:?}", rep.problems);
+    // What cannot be one item is refused, not stored.
+    for (body, why) in [("First rule.\n\nSecond paragraph.", "no blank lines"), ("- One rule.\n- Two rules.", "each rule on its own")] {
+        let e = call_err(&mut s, "remember", json!({"kind": "rule", "body": body}));
+        assert!(e.contains(why), "{body:?}: {e}");
+    }
+}
+
+/// The ok line prints 16 hex digits of the new head: that prefix (any of at
+/// least 12, any case) revises the record, a shorter one is refused, and a
+/// stale one gets memory wording (recall the record), not a note's.
+#[test]
+fn expected_sha_takes_the_printed_prefix() {
+    let f = fixture("mem-sha-prefix");
+    let (mut s, _fx) = server(&f);
+    let r = text(call(&mut s, "remember", json!({"kind": "memory", "key": "prefix-test", "body": "first"})));
+    let sha16 = r.split("sha=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    assert_eq!(sha16.len(), 16, "{r}");
+    let r2 = text(call(&mut s, "remember", json!({"kind": "memory", "key": "prefix-test", "body": "second", "expected_sha": sha16})));
+    assert!(r2.starts_with("ok prefix-test v2"), "{r2}");
+    let sha12 = r2.split("sha=").nth(1).unwrap()[..12].to_ascii_uppercase();
+    let r3 = text(call(&mut s, "remember", json!({"kind": "memory", "key": "prefix-test", "body": "third", "expected_sha": sha12})));
+    assert!(r3.starts_with("ok prefix-test v3"), "{r3}");
+    let e = call_err(&mut s, "remember", json!({"kind": "memory", "key": "prefix-test", "body": "fourth", "expected_sha": &r3.split("sha=").nth(1).unwrap()[..8]}));
+    assert!(e.contains("at least its first 12 hex digits"), "{e}");
+    let e = call_err(&mut s, "remember", json!({"kind": "memory", "key": "prefix-test", "body": "fourth", "expected_sha": sha16}));
+    assert!(e.contains("stale revision") && e.contains("recall") && !e.contains("read the note"), "{e}");
+}
+
+/// Empty or blank lanes, texts and bodies are refused, not stored.
+#[test]
+fn empty_lanes_and_bodies_are_refused() {
+    let f = fixture("mem-empty");
+    let (mut s, _fx) = server(&f);
+    for (tool, args, field) in [
+        ("journal", json!({"lane": "", "entry": "note", "text": "x"}), "lane is empty"),
+        ("journal", json!({"lane": "  ", "entry": "note", "text": "x"}), "lane is empty"),
+        ("journal", json!({"lane": "some-lane", "entry": "note", "text": " \n"}), "text is empty"),
+        ("handoff", json!({"lane": "", "title": "t", "text": "x"}), "lane is empty"),
+        ("remember", json!({"kind": "rule", "body": ""}), "body is empty"),
+        ("remember", json!({"kind": "decision", "body": "   "}), "body is empty"),
+        ("remember", json!({"kind": "memory", "key": "empty-one", "body": ""}), "body is empty"),
+    ] {
+        let e = call_err(&mut s, tool, args.clone());
+        assert!(e.contains(field), "{tool} {args}: {e}");
+    }
+    let log = text(call(&mut s, "memory_log", json!({"limit": 50})));
+    assert!(!log.contains("empty-one"), "{log}");
+}
+
+/// `format: "json"` on the memory tools: a record by key and the lane status
+/// as fields, every other answer as `{"text": ...}`.
+#[test]
+fn memory_tools_answer_json_when_asked() {
+    let f = fixture("mem-json");
+    let (mut s, _fx) = server(&f);
+    let parse = |v: Value| -> Value {
+        let t = v.as_str().map(str::to_string).or_else(|| v["text"].as_str().map(str::to_string)).unwrap_or_else(|| v.to_string());
+        json::parse(&t).unwrap_or(v)
+    };
+    let w = call(&mut s, "remember", json!({"kind": "memory", "key": "json-rec", "title": "Json rec", "body": "a body", "format": "json"}));
+    let w = parse(w);
+    assert!(w["text"].as_str().is_some_and(|t| t.starts_with("ok json-rec v1")), "{w}");
+    let r = parse(call(&mut s, "recall", json!({"key": "json-rec", "format": "json"})));
+    assert_eq!((r["key"].as_str(), r["kind"].as_str(), r["version"].as_i64(), r["status"].as_str()), (Some("json-rec"), Some("memory"), Some(1), Some("active")), "{r}");
+    assert!(r["body"].as_str().unwrap().contains("a body") && r["sha"].as_str().unwrap().len() == 64, "{r}");
+    call(&mut s, "journal", json!({"lane": "json-lane", "entry": "note", "text": "a note"}));
+    let st = parse(call(&mut s, "recall", json!({"op": "status", "format": "json"})));
+    let lanes = st["lanes"].as_array().unwrap_or_else(|| panic!("{st}"));
+    assert!(lanes.iter().any(|l| l["lane"] == json!("json-lane") && l["entries"] == json!(1)), "{st}");
+    let e = call_err(&mut s, "recall", json!({"key": "json-rec", "format": "xml"}));
+    assert!(e.contains("use text or json"), "{e}");
+}
+
+/// `recall {query}` lists no pointer that scores 0.0, and an empty store
+/// says it holds no records instead of pointing at exports.
+#[test]
+fn recall_query_drops_zero_pointers_and_names_an_empty_store() {
+    let f = fixture("mem-zero-pointers");
+    let (mut s, _fx) = server(&f);
+    let t = text(call(&mut s, "recall", json!({"query": "anything at all"})));
+    assert_eq!(t, "no records match: the store holds none yet\n");
+    drop(import_all(&f));
+    let t = text(call(&mut s, "recall", json!({"query": "widget cache entries evict"})));
+    assert!(!t.contains(" 0.0: "), "{t}");
+}
+
+/// Review finding 3: a lines ref was read by its given name alone, so it
+/// reached dot folders, files the vault never serves and (through a link)
+/// denied files, and a wrong hash still returned the current lines.
+#[test]
+fn a_lines_ref_reaches_only_what_read_note_serves() {
+    let f = fixture("mem-lines-ref-confined");
+    let (mut s, fx) = server(&f);
+    let name = fx.specs[0].0.clone();
+    let root = fx.perf();
+    let secret = "orchidlantern5523";
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git").join("config"), format!("[remote]\n  url = {secret}\n")).unwrap();
+    std::fs::write(root.join("notes.txt"), format!("plain {secret}\n")).unwrap();
+    std::fs::write(root.join("Ops.env"), format!("TOKEN={secret}\n")).unwrap();
+    let mut asks = vec![format!("{name}:.git/config:1-2@000000000000"), format!("{name}:notes.txt:1-1@000000000000"), format!("{name}:Ops.env:1-1@000000000000")];
+    // A note that is a link to a denied file, where links can be made.
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(root.join("Ops.env"), root.join("linked.md")).is_ok();
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(root.join("Ops.env"), root.join("linked.md")).is_ok();
+    if linked {
+        asks.push(format!("{name}:linked.md:1-1@000000000000"));
+    } else {
+        eprintln!("no symlink privilege here: the link case is checked by read_below's unit test only");
+    }
+    for key in asks {
+        let (refused, text) = match s.answer("recall", &json!({"key": key.clone()})) {
+            Ok(a) => (false, a.into_text()),
+            Err(e) => (true, e.to_string()),
+        };
+        assert!(!text.contains(secret), "{key}: {text}");
+        assert!(refused, "{key} must be refused: {text}");
+    }
+    // The hook's ref check reads through the same confinement.
+    for rel in [".git/config", "notes.txt", "Ops.env"] {
+        assert_eq!(atlas::compact::resolve_lines(&[atlas::compact::RefRoot::Vault(name.clone(), root.clone())], &name, rel, 1, 1, "000000000000"), atlas::compact::Status::Dangling, "{rel}");
+    }
+}
+
+/// Review finding 4: an atlas older than 0.2 on the same store commits and
+/// appends without moving `jsonl_end`, and the next 0.2 write cut that
+/// committed line off, so `--memory-check` reported it missing. A crash
+/// leftover (lines the store never committed) is still cut.
+#[test]
+fn a_line_an_older_writer_committed_past_the_recorded_end_is_kept() {
+    let f = fixture("mem-mixed-writers");
+    let mut store = import_all(&f);
+    let end0 = store.jsonl_end().unwrap().unwrap();
+    // The older writer: a committed record, and the recorded end left where it was.
+    let mut w = store.writer().unwrap();
+    w.create("older-writer-note", "memory", "", "", &draft("written by an older atlas\n"), None).unwrap();
+    w.commit().unwrap();
+    store.conn().execute("UPDATE mem_meta SET value = ?1 WHERE key = 'jsonl_end'", [end0.to_string()]).unwrap();
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok(), "the older writer's line is the store's: {:?}", rep.problems);
+    // The next write keeps it.
+    let mut w = store.writer().unwrap();
+    w.create("newer-writer-note", "memory", "", "", &draft("written by this atlas\n"), None).unwrap();
+    w.commit().unwrap();
+    let copy = fs::read_to_string(store.jsonl()).unwrap();
+    assert!(copy.contains("older-writer-note") && copy.contains("newer-writer-note"), "{copy}");
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok(), "{:?}", rep.problems);
+    // A batch that appended and never committed, plus a torn line, are cut.
+    let last = copy.lines().last().unwrap().replace("newer-writer-note", "never-committed-note");
+    fs::write(store.jsonl(), format!("{copy}{last}\n{{\"op\":\"crea")).unwrap();
+    let mut w = store.writer().unwrap();
+    w.create("after-the-crash", "memory", "", "", &draft("written after a crash\n"), None).unwrap();
+    w.commit().unwrap();
+    let copy = fs::read_to_string(store.jsonl()).unwrap();
+    assert!(!copy.contains("never-committed-note") && !copy.contains("{\"op\":\"crea\n") && copy.contains("after-the-crash"), "{copy}");
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok(), "{:?}", rep.problems);
+}
+
+/// A fresh store's first batch killed between its append and its commit
+/// left its line in the copy with no recorded end at all, which read as "a
+/// store written before the end was recorded": the line was never cut,
+/// the next batch recorded its end past it, and `--memory-check` counted a
+/// version the store never held (Windows CI, where the first write is the
+/// one a 150 ms kill lands on).
+#[test]
+fn a_fresh_stores_first_batch_killed_before_its_commit_is_cut() {
+    let f = fixture("mem-fresh-crash");
+    // The crashed batch's line, as it would have been appended.
+    let other = MemoryStore::open(&f.settings.store.with_extension("other")).unwrap();
+    let line = {
+        let mut o = other;
+        let mut w = o.writer().unwrap();
+        w.create("never-committed-note", "memory", "", "", &draft("appended, never committed\n"), None).unwrap();
+        w.commit().unwrap();
+        fs::read_to_string(o.jsonl()).unwrap()
+    };
+    let mut store = MemoryStore::open(&f.settings.store).unwrap();
+    assert_eq!(store.jsonl_end().unwrap(), Some(0), "a fresh store records its copy's end when opened");
+    fs::write(store.jsonl(), &line).unwrap();
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok(), "an uncommitted line is not the store's: {:?}", rep.problems);
+    let mut w = store.writer().unwrap();
+    w.create("after-the-crash", "memory", "", "", &draft("written after a crash\n"), None).unwrap();
+    w.commit().unwrap();
+    let copy = fs::read_to_string(store.jsonl()).unwrap();
+    assert!(!copy.contains("never-committed-note") && copy.contains("after-the-crash"), "{copy}");
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok(), "{:?}", rep.problems);
+}
+
+/// A line of `store`'s copy as another store would have appended it for
+/// `key`: a batch that appended and never committed here.
+fn foreign_line(f: &Fix, key: &str, refs: &[(String, String)]) -> String {
+    let mut o = MemoryStore::open(&f.settings.store.with_extension(format!("{key}.other"))).unwrap();
+    let mut w = o.writer().unwrap();
+    w.create(key, "memory", "", "", &draft("appended, never committed\n"), None).unwrap();
+    w.add_refs(key, refs).unwrap();
+    w.commit().unwrap();
+    fs::read_to_string(o.jsonl()).unwrap()
+}
+
+/// Commits `key` as an atlas older than 0.2 would: its line appended past
+/// whatever the copy holds, and the recorded end left at `end`.
+fn older_writer_commit(store: &mut MemoryStore, key: &str, end: u64) {
+    let len = fs::metadata(store.jsonl()).unwrap().len();
+    store.conn().execute("UPDATE mem_meta SET value = ?1 WHERE key = 'jsonl_end'", [len.to_string()]).unwrap();
+    let mut w = store.writer().unwrap();
+    w.create(key, "memory", "", "", &draft("written by an older atlas\n"), None).unwrap();
+    w.commit().unwrap();
+    store.conn().execute("UPDATE mem_meta SET value = ?1 WHERE key = 'jsonl_end'", [end.to_string()]).unwrap();
+}
+
+/// An older writer's committed line, then a batch killed before its commit:
+/// the uncommitted lines are cut and the committed one kept. (Before, any
+/// line the store held past the end kept everything past it, so the
+/// uncommitted version was counted from then on.)
+#[test]
+fn uncommitted_lines_after_an_older_writers_line_are_cut_and_it_kept() {
+    let f = fixture("mem-older-then-crash");
+    let mut store = import_all(&f);
+    let end0 = store.jsonl_end().unwrap().unwrap();
+    older_writer_commit(&mut store, "older-writer-note", end0);
+    let mut copy = fs::read_to_string(store.jsonl()).unwrap();
+    copy.push_str(&foreign_line(&f, "never-committed-note", &[("lane".into(), "x".into())]));
+    fs::write(store.jsonl(), &copy).unwrap();
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok() && rep.warnings.is_empty(), "{:?} {:?}", rep.problems, rep.warnings);
+    let mut w = store.writer().unwrap();
+    w.create("after-the-crash", "memory", "", "", &draft("written after a crash\n"), None).unwrap();
+    w.commit().unwrap();
+    let copy = fs::read_to_string(store.jsonl()).unwrap();
+    assert!(copy.contains("older-writer-note") && !copy.contains("never-committed-note") && copy.contains("after-the-crash"), "{copy}");
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok() && rep.warnings.is_empty(), "{:?} {:?}", rep.problems, rep.warnings);
+}
+
+/// A batch killed before its commit, then an older writer's committed line
+/// after it: the committed line is never cut, so the uncommitted ones
+/// cannot be cut off the end either. `--memory-check` leaves them out and
+/// warns (repairable), and the next write overwrites them in place with
+/// `void` lines of the same length, so nothing committed moves.
+#[test]
+fn uncommitted_lines_before_an_older_writers_line_are_voided_in_place() {
+    let f = fixture("mem-crash-then-older");
+    let mut store = import_all(&f);
+    let end0 = store.jsonl_end().unwrap().unwrap();
+    let mut copy = fs::read_to_string(store.jsonl()).unwrap();
+    copy.push_str(&foreign_line(&f, "never-committed-note", &[("lane".into(), "x".into())]));
+    fs::write(store.jsonl(), &copy).unwrap();
+    older_writer_commit(&mut store, "older-writer-note", end0);
+    let before = fs::read(store.jsonl()).unwrap();
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok(), "{:?}", rep.problems);
+    assert_eq!(rep.warnings.len(), 2, "the uncommitted create and its refs: {:?}", rep.warnings);
+    assert!(rep.warnings[0].contains("never committed") && rep.warnings[0].contains("next write voids it"), "{:?}", rep.warnings);
+    let mut w = store.writer().unwrap();
+    w.create("after-the-crash", "memory", "", "", &draft("written after a crash\n"), None).unwrap();
+    w.commit().unwrap();
+    let after = fs::read(store.jsonl()).unwrap();
+    let copy = String::from_utf8(after.clone()).unwrap();
+    assert!(copy.contains("older-writer-note") && !copy.contains("never-committed-note") && copy.contains("after-the-crash"), "{copy}");
+    assert!(after.len() > before.len(), "nothing was cut");
+    let older = |b: &[u8]| String::from_utf8_lossy(b).find("older-writer-note").unwrap();
+    assert_eq!(older(&before), older(&after), "the committed line did not move");
+    assert_eq!(copy.lines().filter(|l| l.starts_with("{\"op\":\"void\"}")).count(), 2, "{copy}");
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok() && rep.warnings.is_empty(), "{:?} {:?}", rep.problems, rep.warnings);
+}
+
+/// An uncommitted revise of a record the store holds, with a refs line the
+/// store holds a row like (from the record's earlier batch): the refs line
+/// came in the same batch, so it is cut with the version.
+#[test]
+fn an_uncommitted_versions_refs_go_with_it_though_the_store_has_a_like_row() {
+    let f = fixture("mem-crash-refs");
+    let mut store = import_all(&f);
+    let refs = [("lane".to_string(), "x".to_string())];
+    let mut w = store.writer().unwrap();
+    let a = w.create("refs-note", "memory", "", "", &draft("first\n"), None).unwrap();
+    w.add_refs("refs-note", &refs).unwrap();
+    w.commit().unwrap();
+    let committed = fs::read_to_string(store.jsonl()).unwrap();
+    // The same revise committed, its lines taken, and the store put back.
+    let snap = f.settings.store.with_extension("snap");
+    store.conn().execute("VACUUM INTO ?1", [snap.to_string_lossy()]).unwrap();
+    let mut w = store.writer().unwrap();
+    w.revise("refs-note", Some(&a.sha), &draft("second\n")).unwrap();
+    w.add_refs("refs-note", &refs).unwrap();
+    w.commit().unwrap();
+    let lines = fs::read_to_string(store.jsonl()).unwrap()[committed.len()..].to_string();
+    assert_eq!(lines.lines().count(), 2, "{lines}");
+    drop(store);
+    let jsonl = atlas::memory::jsonl_path(&f.settings.store);
+    for ext in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{ext}", f.settings.store.display()));
+    }
+    fs::copy(&snap, &f.settings.store).unwrap();
+    fs::write(&jsonl, format!("{committed}{lines}")).unwrap();
+    let mut store = MemoryStore::open(&f.settings.store).unwrap();
+    let rep = check(&store, &specs(), None, true).unwrap();
+    assert!(rep.ok() && rep.warnings.is_empty(), "{:?} {:?}", rep.problems, rep.warnings);
+    let w = store.writer().unwrap();
+    w.commit().unwrap();
+    assert_eq!(fs::read_to_string(&jsonl).unwrap(), committed);
 }
