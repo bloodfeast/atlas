@@ -852,7 +852,12 @@ impl Hooks {
                         }
                         Err(e) => self.router.miss(ev, &e),
                     },
-                    Err(e) => self.router.miss(ev, &e),
+                    Err(e) => {
+                        self.router.miss(ev, &e);
+                        // The raw result carries only the tail's marker; say
+                        // it plainly (issue bloodfeast/atlas#3).
+                        a.context = crate::hook_rewrite::exit_note(ev).unwrap_or_default().to_string();
+                    }
                 }
             }
             // Nothing, except once: the settings offer (at most 60 tokens).

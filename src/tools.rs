@@ -475,7 +475,7 @@ const TOOLS: &[ToolDef] = &[
         read_only: false,
         schema: || {
             obj(
-                json!({"event": s(""), "session_id": s(""), "agent_id": s(""), "agent_type": s(""), "transcript_path": s(""), "prompt": s(""), "tool_name": s(""), "tool_prompt": s(""), "trigger": s(""), "source": s(""), "cwd": s(""), "permission_mode": s(""), "tool_input": s("JSON text."), "tool_response": s("JSON text.")}),
+                json!({"event": s(""), "session_id": s(""), "agent_id": s(""), "agent_type": s(""), "transcript_path": s(""), "prompt": s(""), "tool_name": s(""), "tool_use_id": s(""), "tool_prompt": s(""), "trigger": s(""), "source": s(""), "cwd": s(""), "permission_mode": s(""), "tool_input": s("JSON text."), "tool_response": s("JSON text."), "last_assistant_message": s(""), "stop_hook_active": s("true or false.")}),
                 &["event"],
             )
         },

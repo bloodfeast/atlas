@@ -10,6 +10,27 @@ wiki's Changelog page. A section has these parts, in this order, and leaves out 
 
 `cargo xtask release` refuses to release a version whose section is missing, empty or has no highlights.
 
+## v0.2.1
+
+A patch release with two fixes for the hooks.
+
+### Highlights
+
+- **Every hook call is accepted again.** Claude Code sends `tool_use_id` (and, on SubagentStop,
+  `last_assistant_message` and `stop_hook_active`) to the `hook` tool, which did not declare them, so every
+  PreToolUse hook call failed its schema check. The schema now declares every input `hooks/hooks.json` sends,
+  and a test checks each one through `tools/call`.
+- **Git writes are no longer routed.** The routing hook sent any command starting with `git` through its
+  digest, so a failing `git push` or `git commit` came back as a tail with exit 0 and the failure was easy to
+  miss (bloodfeast/atlas#3). Only read-only git subcommands (`status`, `log`, `diff`, `show` and the like) are
+  routed now; a write anywhere in the command (after `&&`, `;`, `sudo`, `env`, inside `$( )`, backticks or
+  `bash -c`) runs unrouted. A routed command that fails says so in the context with its exit code.
+
+### Known limits
+
+- A read behind a quoted `-C` value (`git -C "$(git rev-parse --show-toplevel)" log`) also runs unrouted:
+  the safe direction, losing only the digest.
+
 ## v0.2.0
 
 The code index reaches past Rust to six more languages, the tools and hooks cost fewer tokens for the same

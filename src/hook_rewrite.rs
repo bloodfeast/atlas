@@ -120,33 +120,150 @@ pub fn routing_on_in(dir: &Path, lean: Option<&Value>) -> bool {
     cfg && !off_flag_in(dir).exists()
 }
 
+/// The marker as a literal, for [`EXIT_MARK`] and [`OR_ECHO`].
+macro_rules! exit_mark {
+    () => {
+        "atlas-exit-nonzero"
+    };
+}
+
 /// The line a rewritten one-line command prints when it exits nonzero.
-pub const EXIT_MARK: &str = "atlas-exit-nonzero";
+pub const EXIT_MARK: &str = exit_mark!();
+
+/// The Bash exit tail.
+const OR_ECHO: &str = concat!(" || echo ", exit_mark!());
 
 /// The PowerShell tail after a cargo build or test: a read-only native
 /// command that prints nothing and exits 0 (see [`rewrite`]).
 pub const PS_RESET: &str = "where.exe /Q where.exe";
 
 /// The command words whose output is routed (R10: shell reads and
-/// searches, and cargo builds and tests).
+/// searches, and cargo builds and tests). `git` is routed only for the
+/// subcommands in [`GIT_READS`].
 const ROUTED: &[&str] = &[
-    "cat", "sed", "head", "tail", "grep", "rg", "find", "ls", "tree", "wc", "nl", "git", "Get-Content", "gc", "Select-String", "sls",
+    "cat", "sed", "head", "tail", "grep", "rg", "find", "ls", "tree", "wc", "nl", "Get-Content", "gc", "Select-String", "sls",
     "Get-ChildItem", "gci", "dir", "type",
 ];
 
+/// The git subcommands that only read. Any other subcommand (push, commit,
+/// merge, an alias) runs untailed, so its exit status reaches the caller
+/// as it is (issue bloodfeast/atlas#3).
+const GIT_READS: &[&str] = &[
+    "log", "diff", "show", "status", "blame", "annotate", "grep", "ls-files", "ls-tree", "ls-remote", "rev-parse", "rev-list", "shortlog",
+    "describe", "cat-file", "name-rev", "merge-base", "for-each-ref", "show-ref", "diff-tree", "diff-index", "diff-files", "range-diff",
+    "whatchanged", "count-objects",
+];
+
+/// The git global options that take their value as the next word.
+const GIT_VALUE_OPTS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source", "--shallow-file"];
+
+/// The command word of one step, without its path or `.exe`.
+fn command_word(step: &str) -> &str {
+    let first = step.split_whitespace().next().unwrap_or("");
+    first.rsplit(['/', '\\']).next().unwrap_or(first).trim_end_matches(".exe")
+}
+
+/// Whether the words after `git` run a read-only subcommand, skipping the
+/// global options first (`-C dir`, `-c k=v`, `--no-pager`, `--git-dir=x`).
+fn git_reads(mut rest: &str) -> bool {
+    while let Some((w, r)) = next_word(rest) {
+        rest = r;
+        if GIT_VALUE_OPTS.contains(&w) {
+            rest = next_word(rest).map_or("", |(_, r)| r);
+        } else if !w.starts_with('-') {
+            return GIT_READS.contains(&w);
+        }
+    }
+    false
+}
+
+/// A byte that ends a word inside a piece of a command.
+fn word_sep(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '!' | '{' | '}' | '<' | '>')
+}
+
+/// The next word of a piece, a quoted span kept whole and its outer quotes
+/// dropped, and the rest of the piece. A backslash outside quotes keeps the
+/// next character in the word, as the shell does (`a\ log` is one word).
+fn next_word(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start_matches(word_sep);
+    if s.is_empty() {
+        return None;
+    }
+    let mut quote = None;
+    let mut end = s.len();
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '\\' => escaped = true,
+            None if word_sep(c) => {
+                end = i;
+                break;
+            }
+            None => {}
+        }
+    }
+    Some((s[..end].trim_matches(['"', '\'']), &s[end..]))
+}
+
+/// Whether a `git` anywhere in one piece runs other than to read. Every
+/// word is checked, not only the first, so git behind `sudo`, `env`,
+/// `time`, `xargs` or `!` is caught, and a quoted word is checked as a
+/// command of its own (`bash -c "git push"`). A quoted value stays one
+/// word, so `-C "a log"` cannot pass for a subcommand.
+fn piece_writes(mut rest: &str) -> bool {
+    while let Some((w, r)) = next_word(rest) {
+        rest = r;
+        if (w.contains(char::is_whitespace) && piece_writes(w)) || (command_word(w).eq_ignore_ascii_case("git") && !git_reads(r)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a `git` anywhere in the command runs other than to read: the
+/// tail follows the whole command, so it would hide that git's failure.
+/// The command is cut into pieces at chain, pipe and substitution
+/// boundaries first, so an option value never eats an inner command
+/// (`git -C "$(git rev-parse --show-toplevel)" push`); the cost is that the
+/// same form with a read is unrouted too. A `git` in prose
+/// (`grep "git push"`) reads as a write and only loses its digest.
+fn git_writes(cmd: &str) -> bool {
+    cmd.split(['&', '|', ';', '(', ')', '`', '$', '\n']).any(piece_writes)
+}
+
 /// Whether a shell command is one routing rewrites: its first command word
 /// (after `cd ... &&` and environment assignments) is a reader or search,
-/// or `cargo` building or testing.
+/// `git` reading, or `cargo` building or testing; and no piece of it runs
+/// git to write.
 pub fn routable(cmd: &str) -> bool {
     let step = crate::digest::last_step(cmd);
-    let mut words = step.split_whitespace();
-    let first = words.next().unwrap_or("");
-    let first = first.rsplit(['/', '\\']).next().unwrap_or(first).trim_end_matches(".exe");
-    if first == "cargo" {
-        let sub = words.find(|w| !w.starts_with('+') && !w.starts_with('-')).unwrap_or("");
-        return matches!(sub, "build" | "b" | "test" | "t" | "check" | "c" | "clippy" | "nextest");
-    }
-    ROUTED.iter().any(|w| w.eq_ignore_ascii_case(first))
+    let first = command_word(step);
+    let routed = if first == "cargo" {
+        let sub = step.split_whitespace().skip(1).find(|w| !w.starts_with('+') && !w.starts_with('-')).unwrap_or("");
+        matches!(sub, "build" | "b" | "test" | "t" | "check" | "c" | "clippy" | "nextest")
+    } else {
+        // A first word of `git` is routed only because git_writes below
+        // refuses every git that is not a read.
+        first.eq_ignore_ascii_case("git") || ROUTED.iter().any(|w| w.eq_ignore_ascii_case(first))
+    };
+    routed && !git_writes(cmd)
+}
+
+/// The `additionalContext` line for a tailed command that printed
+/// [`EXIT_MARK`]. Only for a result routing failed on
+/// ([`Router::post_tool_use`] erred), which reaches the model raw; a
+/// routed result already says `Exit code nonzero` or `exit nonzero`.
+pub fn exit_note(ev: &HookEvent) -> Option<&'static str> {
+    let stdout = s(&ev.tool_response, "stdout");
+    (ev.tool_name == "Bash" && unwrite(s(&ev.tool_input, "command"), stdout).1 == Some(-1)).then_some("atlas: exit nonzero")
 }
 
 /// The routed form of a command (see [`Router::pre_tool_use`]).
@@ -177,15 +294,14 @@ pub fn rewrite(shell: &str, cmd: &str) -> Option<String> {
         }
         return Some(format!("{cmd}\nWrite-Output ''"));
     }
-    (!cmd.contains('\n') && !cmd.contains('#') && !cmd.contains("<<")).then(|| format!("{cmd} || echo {EXIT_MARK}"))
+    (!cmd.contains('\n') && !cmd.contains('#') && !cmd.contains("<<")).then(|| format!("{cmd}{OR_ECHO}"))
 }
 
 /// The command as the model wrote it, and what the tail says of its exit:
 /// `Some(0)`, `Some(-1)` (nonzero, code unknown), or `None` (no tail, or
 /// one that cannot tell).
 pub fn unwrite<'a>(cmd: &'a str, stdout: &str) -> (&'a str, Option<i64>) {
-    let or_echo = format!(" || echo {EXIT_MARK}");
-    if let Some(c) = cmd.strip_suffix(or_echo.as_str()) {
+    if let Some(c) = cmd.strip_suffix(OR_ECHO) {
         let failed = marked(stdout);
         return (c, Some(if failed { -1 } else { 0 }));
     }

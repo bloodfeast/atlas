@@ -1042,3 +1042,43 @@ fn the_hook_tool_is_not_marked_read_only() {
         assert_ne!(hook["annotations"]["readOnlyHint"], json!(true), "{hook}");
     }
 }
+
+/// A tailed failure is said once. A routed result says it itself (the
+/// `Exit code nonzero` prefix, the digest's `exit nonzero`), so it gets no
+/// context line; a result routing failed on reaches the model raw, with
+/// only the marker, and gets one (issue bloodfeast/atlas#3).
+#[test]
+fn a_tailed_failure_is_said_in_the_context_only_when_routing_failed() {
+    let t = Temp::new("h-exit");
+    let cmd = atlas::hook_rewrite::rewrite("Bash", "git log -1").unwrap();
+    let post = |stdout: &str| HookEvent {
+        event: "PostToolUse".into(),
+        session_id: "s1".into(),
+        tool_name: "Bash".into(),
+        tool_input: json!({"command": cmd}),
+        tool_response: json!({"stdout": stdout, "stderr": "", "interrupted": false, "isImage": false}),
+        ..HookEvent::default()
+    };
+    let mark = atlas::hook_rewrite::EXIT_MARK;
+    let big = format!("{}{mark}\n", "fatal: bad object\n".repeat(4000));
+    let mut h = Hooks::open(settings(t.path())).unwrap();
+    let small = h.handle(&post(&format!("fatal: bad revision\n{mark}\n")));
+    assert!(small.context.is_empty() && small.to_json("PostToolUse").contains("Exit code nonzero"), "{}", small.to_json("PostToolUse"));
+    let digested = h.handle(&post(&big));
+    assert!(digested.context.is_empty() && digested.to_json("PostToolUse").contains("exit nonzero"), "{}", digested.to_json("PostToolUse"));
+    // Handles that cannot open: routing fails and the result passes raw.
+    let mut s = settings(t.path());
+    std::fs::write(t.path().join("blocker"), "a file, not a folder").unwrap();
+    s.index_db = t.path().join("blocker").join("index.sqlite");
+    let mut h = Hooks::open(s).unwrap();
+    let raw = h.handle(&post(&big));
+    assert_eq!(raw.updated_output, None);
+    assert_eq!(raw.context, "atlas: exit nonzero");
+    assert!(raw.to_json("PostToolUse").contains(r#""additionalContext":"atlas: exit nonzero""#), "{}", raw.to_json("PostToolUse"));
+    // A success, a marker inside the output, or no tail: no line.
+    let long_ok = "commit abc\n".repeat(4000);
+    assert!(h.handle(&post(&long_ok)).context.is_empty());
+    assert!(h.handle(&post(&format!("{long_ok}a line naming {mark} here\n"))).context.is_empty());
+    let untailed = HookEvent { tool_input: json!({"command": "git log -1"}), ..post(&big) };
+    assert!(h.handle(&untailed).context.is_empty());
+}
