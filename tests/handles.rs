@@ -377,3 +377,104 @@ fn a_failed_rewritten_command_says_so_small_or_large() {
     assert!(d.contains("cargo test exit nonzero,") && d.contains("): failed\n"), "{d}");
     assert!(!d.contains(EXIT_MARK), "{d}");
 }
+
+/// Only git's reads are routed: a write keeps its own exit status, whatever
+/// global options come first or wherever it sits in a chain (issue
+/// bloodfeast/atlas#3).
+#[test]
+fn git_reads_are_routed_and_git_writes_keep_their_exit_status() {
+    for cmd in [
+        "git log --oneline -5",
+        "git diff HEAD~1",
+        "git show HEAD:src/a.rs",
+        "git status --short",
+        "git blame -L 1,20 src/a.rs",
+        "git grep -n fn",
+        "git ls-files src",
+        "git rev-parse HEAD",
+        "git shortlog -sn",
+        "git describe --tags",
+        "git cat-file -p HEAD",
+        "git ls-tree HEAD",
+        "git -C H:/w log -3",
+        "git -c core.pager=cat diff",
+        "git --no-pager log -1",
+        "git --git-dir=.git status",
+        "/usr/bin/git.exe status",
+        "cd /w && git log -1",
+        "cd /w && GIT_PAGER=cat git --no-pager -C x show HEAD",
+        "git log -1 | head -5",
+        "git status && git diff --stat",
+        "git -C \"a b\" status",
+        "cat `git ls-files | head -1`",
+    ] {
+        assert!(routable(cmd), "{cmd}");
+    }
+    for cmd in [
+        "git push",
+        "git push origin main",
+        "git commit -m 'x'",
+        "git merge main",
+        "git rebase origin/main",
+        "git tag v1",
+        "git reset --hard",
+        "git checkout main",
+        "git switch -c b",
+        "git stash",
+        "git pull",
+        "git fetch",
+        "git add .",
+        "git rm a",
+        "git mv a b",
+        "git branch -d b",
+        "git lg",
+        "git",
+        "git --no-pager",
+        "git -C H:/w push",
+        "git -C log push",
+        "git -c user.name=x commit -m y",
+        "git --no-pager -c k=v merge x",
+        "git --git-dir .git push",
+        "cd /w && git push",
+        "cd /w && GIT_TRACE=1 git commit -m x",
+        "git push && gh pr create",
+        "git status && git push",
+        "cat a && git commit -m x",
+        "git log -1; git tag v2",
+        "ls || git push",
+        "(git fetch) && git log",
+        // git that is not the first word of its step.
+        "cat l | xargs git add",
+        "ls && sudo git push",
+        "ls && time git push",
+        "ls; env git push",
+        "cat `git push`",
+        "cat $(git commit -m x)",
+        "ls && ! git push",
+        "ls && !git push",
+        "ls && bash -c \"git push\"",
+        "ls && sh -c 'git -C x merge y'",
+        "git --attr-source log push",
+        "git --shallow-file log push",
+        r"git -C a\ log push",
+        // An option value never eats an inner command or a quoted word.
+        "git -C \"$(git rev-parse --show-toplevel)\" push origin HEAD",
+        "git -C \"a log\" push",
+        "cargo test && git push",
+    ] {
+        assert!(!routable(cmd), "{cmd}");
+    }
+    // A git write gets no tail in any mode.
+    let t = Temp::new("gitw");
+    let mut r = Router::with_db(&t.path().join("index.sqlite"), None);
+    for mode in ["", "default", "bypassPermissions"] {
+        let ev = HookEvent {
+            event: "PreToolUse".into(),
+            tool_name: "Bash".into(),
+            permission_mode: mode.into(),
+            tool_input: json!({"command": "git push && gh pr create", "description": "d"}),
+            ..HookEvent::default()
+        };
+        assert_eq!(r.pre_tool_use(&ev).unwrap(), None, "{mode}");
+    }
+}

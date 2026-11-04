@@ -263,3 +263,70 @@ fn interleaved_agents_under_load_keep_their_own_calls() {
     }
     assert!(fails.is_empty(), "{} of {} runs failed", fails.len(), runs * threads);
 }
+
+/// Every `mcp_tool` input the plugin's hooks/hooks.json sends, for every
+/// event and every tool its matcher covers, is taken by the `hook` tool's
+/// schema through `tools/call` (bloodfeast/atlas-dev#104: an undeclared
+/// `tool_use_id` failed every PreToolUse hook). PreToolUse stays on `*`:
+/// the context cap blocks every tool but the handoff in a capped agent.
+#[test]
+fn every_hooks_json_input_is_taken_by_the_hook_tool() {
+    let fx = Fx::new("surface-hooks-json");
+    let mut s = fx.server();
+    s.set_memory(atlas::memory::settings::Settings::from_config(None, &fx.db).unwrap());
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/hooks/hooks.json")).unwrap();
+    let v = atlas::json::parse(&text).unwrap();
+    let cwd = fx.tmp.path().to_string_lossy().to_string();
+    // The PreToolUse consumers: routing (Bash, PowerShell), the review gate
+    // (Bash), the agent cap (every tool), the orchestrator (Agent, Task,
+    // SendMessage), the report backstop (SubagentHandback), the lane journal
+    // and dedup (mcp__atlas__*), and any other server's tools.
+    let any = ["Bash", "PowerShell", "Read", "Grep", "Agent", "Task", "SendMessage", "SubagentHandback", "mcp__atlas__journal", "mcp__atlas__note", "mcp__other__tool"];
+    let mut sent = 0;
+    let mut id = 0;
+    for (event, groups) in v["hooks"].as_object().unwrap() {
+        for g in groups.as_array().unwrap() {
+            let matcher = g.get("matcher").and_then(atlas::json::Value::as_str).unwrap_or("");
+            let tools: Vec<&str> = match matcher {
+                "" => vec![""],
+                "*" => any.to_vec(),
+                m => m.split('|').collect(),
+            };
+            for h in g["hooks"].as_array().unwrap() {
+                if h["type"] != json!("mcp_tool") {
+                    continue;
+                }
+                assert_eq!(h["tool"], json!("hook"), "{event}");
+                for tool in &tools {
+                    let tool_input = match *tool {
+                        "Bash" | "PowerShell" => json!({"command": "git status", "description": "d"}).to_string(),
+                        "Agent" | "Task" => json!({"prompt": "Lane: X\nbuild it", "description": "d"}).to_string(),
+                        _ => json!({"file_path": "a.rs"}).to_string(),
+                    };
+                    let fill = |k: &str, val: &atlas::json::Value| {
+                        let Some(p) = val.as_str().filter(|p| p.starts_with("${")) else { return val.clone() };
+                        json!(match p {
+                            "${tool_name}" => tool.to_string(),
+                            "${tool_input}" => tool_input.clone(),
+                            "${tool_input.prompt}" => "build it".to_string(),
+                            "${tool_response}" => json!({"stdout": "ok", "stderr": ""}).to_string(),
+                            "${stop_hook_active}" => "false".to_string(),
+                            "${cwd}" => cwd.clone(),
+                            "${permission_mode}" => "default".to_string(),
+                            "${transcript_path}" => format!("{cwd}/none.jsonl"),
+                            _ => format!("{k}-1"),
+                        })
+                    };
+                    let args: atlas::json::Map = h["input"].as_object().unwrap().iter().map(|(k, val)| (k.clone(), fill(k, val))).collect();
+                    let args = atlas::json::Value::Object(args);
+                    id += 1;
+                    let msg = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "hook", "arguments": args}});
+                    let r = atlas::protocol::handle(&mut s, &msg).unwrap();
+                    assert!(r.get("error").is_none() && r["result"]["isError"] != json!(true), "{event} {tool}: {r}");
+                    sent += 1;
+                }
+            }
+        }
+    }
+    assert!(sent >= 20, "{sent} hook inputs sent");
+}
