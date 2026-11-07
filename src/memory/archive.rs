@@ -359,7 +359,9 @@ pub fn sources(dir: &Path, store: Option<&Path>) -> Result<Vec<PathBuf>> {
 
 type Candidate = (String, i64, String, AsOf);
 
-fn from_source(conn: &Connection, key: &str, t: &str) -> Result<(Option<Candidate>, Option<(String, String)>)> {
+type FromSource = (Option<Candidate>, Option<(String, String)>);
+
+fn from_source(conn: &Connection, key: &str, t: &str) -> Result<FromSource> {
     let is_archive: bool = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'rolled'", [], |r| r.get::<_, i64>(0))? > 0;
     let (vsql, ssql) = if is_archive {
         (

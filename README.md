@@ -3,8 +3,9 @@
 atlas makes long Claude Code sessions cheaper without changing how you work. It is a local MCP server and a
 set of Claude Code hooks: large tool output stays on disk under a short handle and the model gets a digest,
 code reads get exact item ranges instead of guessed windows, and memory (rules, decisions, journals,
-handoffs) is recalled by relevance instead of loaded whole. It runs on your machine, depends on SQLite and
-an ed25519 signature check and nothing else, and makes no network calls at query time.
+handoffs) is recalled by relevance instead of loaded whole. It runs on your machine, has two direct
+dependencies, SQLite (`rusqlite`) and an ed25519 signature check, plus the crates those two pull in (every one
+is in `Cargo.lock`), and makes no network calls at query time.
 
 **You do not need Obsidian.** A vault is any folder of Markdown files: atlas reads and writes the files
 itself and never touches Obsidian's `.obsidian` settings folder. Obsidian is optional, as a reader for the
@@ -30,11 +31,9 @@ processed 290 more times. Measured on real sessions:
 
 | | Without atlas | With atlas |
 |---|---|---|
-| Large tool output (first measured sessions) | 236 KB into context | 8.2 KB of digests |
-| One 87 KB source file, read for review | 87 KB | 3.7 KB outline + 12 KB of targeted windows |
-| The tool list, loaded with every session | 47 tools, 5,930 tokens (v0.1) | 14 tools, 1,480 tokens; the full reference is one fetched resource |
-| A lookup (median of 2,082 pre-atlas episodes) | 624 tokens of grep and reads | 288 tokens: 2.2x smaller |
-| Memory questions (100-question evaluation) | the whole rulebook loaded | 100/100 answered when the agent follows a result to its source, 99/100 reading only the first result; median 504 tokens each |
+| The tool list, loaded with every session | 47 tools, 5,930 tokens (v0.1) | 14 tools, 5,934 bytes (about 1,480 tokens, at 4 bytes a token); the full reference is one fetched resource |
+| A lookup (median per answer, measured at v0.1.0) | 624 tokens of grep and reads | 288 tokens: 2.2x smaller |
+| Memory questions (100-question evaluation, at v0.2.0) | the whole rulebook loaded | 100/100 answered when the agent follows a result to its source, 99/100 reading only the first result; median 504 tokens each |
 
 Shell reads are 36% of what a builder session processes and startup context another 35%; those are the
 buckets atlas targets. How each number was measured, and how to measure your own sessions with
@@ -61,23 +60,31 @@ update` turns them off). Building from source, uninstalling and the data folders
 
 1. Install the plugin (above) and restart Claude Code.
 2. Optionally run the setup in the foreground to see each step; Claude can run it for you, since the plugin's
-   `bin` folder is on the Bash tool's `PATH`:
+   `bin` folder is on the Bash tool's `PATH` (not on your own terminal's):
 
    ```sh
    atlas --setup
    ```
 
-3. Open a session in your project. atlas asks once, in one line: *create a vault for this project at
-   `<path>`? yes / other folder / no*; say yes. Its Markdown becomes a searchable source, a folder holding
-   code becomes a code root, and a new vault (an Obsidian-compatible folder) holds the project's notes and
-   discussion threads. `atlas settings undo` reverts it all; it never deletes a note.
+   Run by Claude, it has no terminal, so it lists its questions instead of asking them and records nothing;
+   Claude puts them to you at the next session. In auto mode, Claude Code's classifier may block `atlas --setup`
+   and `atlas settings` commands (with "No reason provided") until you tell Claude you allow them.
+
+3. Open a session in your project. Claude asks you about atlas: *create a vault for this project at
+   `<path>`? yes / other folder / no*, and, unless `atlas --setup` asked already, whether to work in orchestrated mode (caps on how many
+   agents run at once; no is fine). It may also offer Claude Code settings. Say yes to the first: its Markdown becomes a searchable source, a folder holding code becomes
+   a code root, and a new vault (an Obsidian-compatible folder) holds the project's notes and discussion threads.
+   `atlas settings undo` reverts it all; it never deletes a note. A question you do not answer comes back at your
+   next new session, until you answer it, and Claude may not always put it. A session with no user (`claude -p`, the
+   SDK) asks nothing and counts as nothing asked, and atlas stays silent if it could not record your answer. `atlas settings add-project .` and
+   `atlas settings orchestrate` do the same from a terminal. The vault question is per folder.
 4. Work as usual. Large Bash, Read and Grep results now arrive as digests with a handle; Claude pulls what it
    needs with `atlas slice h:ID --item NAME` or `--failures`. Grep and Read results name the enclosing item and
    its line range.
 5. Ask Claude to remember a decision (`remember`), and start the next session: relevant records are recalled
    on each prompt, within a 150-token budget (`recall.budget_tokens`).
 6. Optionally, `atlas settings offer` proposes the Claude Code settings that cut cost (the 1-hour subagent
-   cache, an early compaction point). Nothing is written without a yes, and `atlas settings undo` reverts (it shows the change and asks first;
+   cache, fewer goal check-ins). Nothing is written without a yes, and `atlas settings undo` reverts (it shows the change and asks first;
    `--yes` without a terminal).
    With the experimental compaction features on (`"compact": {"enabled": true}`, off by default),
    `atlas settings compact-md` offers a Compact instructions block for a project's `CLAUDE.md` the same way.
@@ -146,8 +153,9 @@ edit, run `/mcp` and reconnect atlas, or restart Claude Code. Every key is on
 - **Confined.** Every path is checked to stay inside a configured folder, lexically and after resolving links;
   dot folders are refused.
 - **A fixed deny-list.** `.env*`, keys, keystores and credential files are never read, whatever the
-  configuration says: not in a source, not in a vault (nor written there), not by `atlas digest` or `atlas crop`,
-  and never kept as a handle when Claude Code reads one.
+  configuration says: not in a source, not in a vault (nor written there), not by `atlas digest` or `atlas crop`.
+  A file Claude Code reads with such a name is never kept as a handle, and neither is the output of a shell command,
+  `atlas run` or Grep that names one. That catches named files only, since a shell command can hide a path.
 - **Nothing lost.** No delete or rename tool exists; writes are additive or exact, atomic and audited with a
   stated reason. The memory store is append-only.
 
@@ -170,6 +178,7 @@ The wiki is the full manual:
 - [Identifiers and freshness](https://github.com/bloodfeast/atlas/wiki/Identifiers-and-freshness): the registry, freshness and misses
 - [Memory store and hooks](https://github.com/bloodfeast/atlas/wiki/Memory-store-and-hooks): the store, exports, sync and the hooks
 - [Memory tree](https://github.com/bloodfeast/atlas/wiki/Memory-tree): the memory index as a tree
+- [Memory and rule files](https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files): experimental, off by default: what atlas does with your rules and memories once you turn it on, and how to turn it off
 - [Discussions](https://github.com/bloodfeast/atlas/wiki/Discussions): reviewer threads and the decision queue
 - [Generated indices](https://github.com/bloodfeast/atlas/wiki/Generated-indices): indices between markers
 - [Cross-vault links](https://github.com/bloodfeast/atlas/wiki/Cross-vault-links): links between vaults

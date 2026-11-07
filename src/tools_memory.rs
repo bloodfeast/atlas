@@ -70,8 +70,19 @@ fn refs(a: &Map) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-fn one_line(s: &str) -> String {
-    s.lines().next().unwrap_or("").trim().chars().take(200).collect()
+use crate::memory::{short_title, title_and_body, TITLE_CHARS};
+
+/// The longest memory summary (its index hook).
+const SUMMARY_CHARS: usize = 200;
+
+/// A title or summary given as its own argument: one line of at most `max`
+/// characters, refused rather than cut, since nothing else keeps the rest.
+fn given_line(s: &str, what: &str, max: usize) -> Result<String> {
+    let t = s.trim();
+    if t.contains('\n') || t.chars().count() > max {
+        return Err(Error::InvalidArgument(format!("{what} must be one line of at most {max} characters; put the detail in the text")));
+    }
+    Ok(t.to_string())
 }
 
 fn check_slug(k: &str) -> Result<()> {
@@ -205,7 +216,10 @@ impl Server {
                 let ev = HookEvent::from_value(&Value::Object(a.clone()));
                 let m = self.mem()?;
                 if m.hooks.is_none() {
-                    m.hooks = Some(Hooks::open(m.settings.clone())?);
+                    let mut h = Hooks::open(m.settings.clone())?;
+                    // As in `protocol`: a tool call does not say a user is there.
+                    h.set_unattended(true);
+                    m.hooks = Some(h);
                 }
                 let h = m.hooks.as_mut().ok_or_else(|| Error::Db("hooks".into()))?;
                 Ok(Answer::Text(h.handle(&ev).to_json(&ev.event)))
@@ -230,6 +244,23 @@ impl Server {
     fn recall(&mut self, a: &Map) -> Result<String> {
         let limit = opt_uint(a, "limit", 8, 200)?;
         let history = opt_bool(a, "history", false)?;
+        // A compaction card's chain key (a group's range, a record's part,
+        // a link): resolved from this project's transcript itself, never
+        // the index ([`crate::chain`]). Off unless the transcript source or
+        // the compaction work is on.
+        if let Some(k) = opt_str(a, "key")?.filter(|k| crate::chain::parse_key(k).is_some()) {
+            let on = {
+                let m = self.mem()?;
+                m.settings.transcripts || m.settings.compact.enabled
+            };
+            if !on {
+                return Err(Error::InvalidArgument("chain keys read this project's transcript, which is off (memory.transcripts and compact.enabled)".into()));
+            }
+            let dir = crate::chain::projects_dir()
+                .ok_or_else(|| Error::NotFound("no Claude Code folder: set CLAUDE_CONFIG_DIR".into()))?
+                .join(crate::transcripts::project_of_cwd(&std::env::current_dir()?));
+            return crate::chain::resolve(&dir, k);
+        }
         // The opt-in transcript source: a turn ref, or a search of turns.
         let turn_key = opt_str(a, "key")?.and_then(crate::compact::parse_ref).filter(|r| matches!(r.target, crate::compact::Target::Turn { .. }));
         if turn_key.is_some() || opt_str(a, "kind")? == Some("turn") {
@@ -245,8 +276,17 @@ impl Server {
             // session's transcripts under.
             let project = crate::transcripts::project_of_cwd(&std::env::current_dir()?);
             if let Some(r) = turn_key {
-                let crate::compact::Target::Turn { session8, line } = &r.target else { unreachable!() };
-                let t = crate::transcripts::get(&conn, &project, session8, *line)?.ok_or_else(|| Error::NotFound(format!("{} is not indexed in this project (turns are indexed at each compaction)", r.text)))?;
+                let crate::compact::Target::Turn { session8, at } = &r.target else { unreachable!() };
+                let not_indexed = || Error::NotFound(format!("{} is not indexed in this project (turns are indexed at each compaction)", r.text));
+                // A checkpoint's byte ref: its line, from the indexed transcript.
+                let line = match *at {
+                    crate::compact::TurnAt::Line(n) => n,
+                    crate::compact::TurnAt::Byte(o) => {
+                        let path = crate::transcripts::path_of(&conn, &project, session8)?.ok_or_else(not_indexed)?;
+                        crate::transcripts::line_at(&path, o).ok_or_else(|| Error::NotFound(format!("ref {:?} is dangling: no record starts at byte {o} of {}", r.text, path.display())))?
+                    }
+                };
+                let t = crate::transcripts::get(&conn, &project, session8, line)?.ok_or_else(not_indexed)?;
                 if !t.hash.starts_with(&r.hash) {
                     return Err(Error::NotFound(format!("ref {:?} is dangling: {} hashes to {}", r.text, t.id, t.hash)));
                 }
@@ -287,6 +327,8 @@ impl Server {
         let bpt = m.settings.bytes_per_token;
         let lane_budget = m.settings.recall.lane_budget_tokens;
         let anchors = m.settings.recall.pointer_anchors;
+        let rules = m.settings.recall.rules;
+        let min_terms = m.settings.recall.min_terms;
         let has_exports = m.settings.export_dir.is_some() && !m.settings.exports.is_empty();
         let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
         let mut out = String::new();
@@ -339,14 +381,43 @@ impl Server {
         }
         let q = arg_str(a, "query").map_err(|_| Error::InvalidArgument("recall needs key, lane or query".into()))?;
         let budget = (opt_uint(a, "budget_tokens", 1500, 100_000)? as f64 * bpt) as usize;
-        let terms = recall::terms(q);
-        let hits = store.search(&terms, opt_str(a, "kind")?, opt_str(a, "scope")?, limit)?;
+        let (kind, scope) = (opt_str(a, "kind")?, opt_str(a, "scope")?);
+        // A filtered search keeps every word up to the terms' cap, so past it words
+        // go unsearched by position, and only the answer can say so.
+        let (terms, unsearched) = if kind.is_some() || scope.is_some() { recall::terms_and_rest(q) } else { (recall::terms(q), 0) };
+        let unsearched = (unsearched > 0).then(|| format!("{unsearched} more word{} not searched: a filter searches a query's first {} words", if unsearched == 1 { " was" } else { "s were" }, crate::memory::FILTERED_TERMS));
+        let live = rules == crate::memory::rules::Mode::Live;
+        // One past the limit, to know whether the limit cut anything. Zero stays
+        // what it was: no limit but the search's own window.
+        let cap = if limit == 0 { crate::memory::UNLIMITED_ROWS } else { limit };
+        let mut raw = store.search_with(&terms, kind, scope, cap + 1, rules)?;
+        let past_limit = raw.len() > cap;
+        raw.truncate(cap);
+        let mut hits: Vec<(crate::memory::Head, f64)> = Vec::with_capacity(raw.len());
+        let mut tags: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        let mut sure: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        if live {
+            let need = min_terms.min(terms.len().max(1));
+            for x in crate::memory::rules::live_hits(store, raw, &terms, kind, scope, need)? {
+                if x.sure {
+                    sure.insert(x.head.rid);
+                }
+                tags.insert(x.head.rid, x.tags);
+                hits.push((x.head, x.score));
+            }
+        } else {
+            hits.extend(raw.into_iter().map(|(h, score, _)| (h, score)));
+        }
         if hits.is_empty() {
             let records: i64 = store.conn().query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
-            return Ok(match (records, has_exports) {
+            let none: String = match (records, has_exports) {
                 (0, _) => "no records match: the store holds none yet\n".into(),
                 (_, true) => "no records match; grep the exports and report_miss what grep finds\n".into(),
                 (_, false) => "no records match; report_miss what you looked for\n".into(),
+            };
+            return Ok(match unsearched {
+                Some(u) if records > 0 => format!("{none}+{u}\n"),
+                _ => none,
             });
         }
         // The leading records whole, the rest as pointers, best first. A
@@ -358,18 +429,25 @@ impl Server {
         // away (measured 2026-11-02: bodies were half of all answer tokens,
         // and most were never used).
         let top = hits[0].1;
-        let (mut more, mut headed) = (0, false);
-        for (i, (h, score, _)) in hits.iter().enumerate() {
+        let (mut more, mut weak, mut headed) = (0, 0, false);
+        for (i, (h, score)) in hits.iter().enumerate() {
             if i < LEAD_BODIES && *score >= top * LEAD_RATIO {
                 let mut one = String::new();
                 recall::render(&mut one, h);
+                if let Some(t) = tags.get(&h.rid).filter(|t| !t.is_empty()) {
+                    one.push_str(&format!("[{}]\n", t.join("; ")));
+                }
                 if out.len() + one.len() <= budget || out.is_empty() {
                     out.push_str(&one);
                     continue;
                 }
             }
-            // A pointer that would read `0.0` matched next to nothing.
-            if *score < MIN_POINTER_SCORE {
+            // A pointer that would read `0.0` is left out, and counted: it
+            // can be a real match, since in a small store every word scores
+            // next to nothing.
+            let kept = sure.contains(&h.rid);
+            if *score < MIN_POINTER_SCORE && !kept {
+                weak += 1;
                 continue;
             }
             if !headed {
@@ -380,8 +458,9 @@ impl Server {
             // record's text sits (`@src:path:line`), so a follow-up can read
             // those lines (`read_note`) instead of the record.
             let at = if anchors { recall::pointer_anchor(h).map(|a| format!(" @{a}")).unwrap_or_default() } else { String::new() };
-            let one = format!("- {} {score:.1}: {}{at}\n", h.key, crate::hooks::pointer_title(h));
-            if out.len() + one.len() > budget {
+            let tag = tags.get(&h.rid).filter(|t| !t.is_empty()).map(|t| format!(" [{}]", t.join("; "))).unwrap_or_default();
+            let one = format!("- {} {score:.1}: {}{tag}{at}\n", h.key, crate::hooks::pointer_title(h));
+            if out.len() + one.len() > budget && !kept {
                 more += 1;
                 continue;
             }
@@ -389,6 +468,15 @@ impl Server {
         }
         if more > 0 {
             out.push_str(&format!("+{more} more over budget_tokens\n"));
+        }
+        if weak > 0 {
+            out.push_str(&format!("+{weak} more scoring near zero; a narrower query finds them\n"));
+        }
+        if let Some(u) = unsearched {
+            out.push_str(&format!("+{u}\n"));
+        }
+        if past_limit {
+            out.push_str(&if limit == 0 { format!("+more (limit=0 shows the best {cap})\n") } else { format!("+more (limit={limit})\n") });
         }
         Ok(out)
     }
@@ -460,7 +548,7 @@ impl Server {
         let mut out = String::new();
         let mut t = Table::new(&mut out, &["time", "key", "kind", "v", "author", "title", "reason"]);
         for v in store.log(&f)? {
-            t.field(v.time.get(..19).unwrap_or(&v.time)).field(&v.key).field(&v.kind).num(v.seq).field(&v.author).field(&one_line(&v.title)).field(&v.reason);
+            t.field(v.time.get(..19).unwrap_or(&v.time)).field(&v.key).field(&v.kind).num(v.seq).field(&v.author).field(&short_title(&v.title)).field(&v.reason);
         }
         Ok(out)
     }
@@ -473,11 +561,17 @@ impl Server {
         let m = self.mem()?;
         let settings = m.settings.clone();
         let store = m.store.as_mut().ok_or_else(|| Error::Db("store".into()))?;
-        // A new handoff supersedes the lane's active one, so a resume finds
-        // exactly one current handoff.
-        let prior: Vec<String> = match (name, opt_str(a, "lane")?) {
-            ("handoff", Some(lane)) => store.heads(Some("handoff"), Some(lane))?.into_iter().filter(|h| h.status == "active").map(|h| h.key).collect(),
-            _ => Vec::new(),
+        // A `queued` journal entry is planned work: read and checked as
+        // `atlas queue plan` does, and filed with the same meta lines.
+        let planned_meta = match (name, opt_str(a, "entry")?, opt_str(a, "amend")?) {
+            ("journal", Some(crate::queue::ENTRY), None) => {
+                let text = arg_nonblank(a, "text")?;
+                let (head, rest) = text.split_once('\n').unwrap_or((text, ""));
+                let p = crate::queue::planned_from_meta(arg_nonblank(a, "lane")?, head, rest, opt_str(a, "meta")?.unwrap_or("")).map_err(Error::InvalidArgument)?;
+                crate::queue::check_planned(store, &p).map_err(Error::InvalidArgument)?;
+                Some(crate::queue::planned_meta(&p))
+            }
+            _ => None,
         };
         let mut w = store.writer()?;
         let draft = |title: String, meta: String, body: String| Draft { title, meta, body, reason: reason.clone(), author: author.clone(), client: client.clone(), provenance: None, time: None };
@@ -491,15 +585,39 @@ impl Server {
                 if !ENTRIES.contains(&entry) {
                     return Err(Error::InvalidArgument(format!("entry {entry:?}; use one of {}", ENTRIES.join(", "))));
                 }
+                let review_meta = opt_str(a, "meta")?.unwrap_or("");
+                // An amend keeps the entry's meta, so a review's is not asked again.
+                let amend = opt_str(a, "amend")?;
+                if entry == crate::reviews::ENTRY && amend.is_none() && (crate::reviews::Review::parse(review_meta).is_none() || !crate::reviews::verdicts_known(review_meta)) {
+                    return Err(Error::InvalidArgument(
+                        "a review entry needs meta lines `role:` (or several, comma-separated), `pr:`, `head:` (the sha it read, 7 or more hex digits) and `verdict:` (pass, merge, merge with follow-ups or request changes, each with an optional `(role)`); `report:` is kept".into(),
+                    ));
+                }
                 let text = arg_nonblank(a, "text")?;
                 let (head, rest) = text.split_once('\n').unwrap_or((text, ""));
-                let key = w.next_key(&format!("journal:{lane}:"), 4)?;
-                let meta = opt_str(a, "meta")?.map(|s| with_newline(s.to_string())).unwrap_or_default();
-                let r = w.create(&key, "journal", entry, lane, &draft(one_line(head), meta, rest.to_string()), None)?;
-                let mut all = refs.clone();
-                all.push(("lane".into(), lane.to_string()));
-                w.add_refs(&key, &all)?;
-                r
+                // `amend: KEY` rewrites that entry's title and body as a new
+                // version; its lane and entry must be the ones given, and its
+                // meta lines and refs stay as they are.
+                if let Some(key) = amend {
+                    let sha = opt_str(a, "expected_sha")?.ok_or_else(|| Error::InvalidArgument(format!("amend {key}: pass expected_sha, the head's sha (recall {{key}} shows it)")))?;
+                    if opt_str(a, "meta")?.is_some() || !refs.is_empty() {
+                        return Err(Error::InvalidArgument("amend rewrites the text only: its meta lines and refs are kept, so pass neither".into()));
+                    }
+                    let (title, body) = title_and_body(head, rest);
+                    w.amend_journal(key, sha, lane, entry, &draft(title, String::new(), body))?
+                } else {
+                    let key = w.next_key(&format!("journal:{lane}:"), 4)?;
+                    let meta = match &planned_meta {
+                        Some(m) => with_newline(m.clone()),
+                        None => opt_str(a, "meta")?.map(|s| with_newline(s.to_string())).unwrap_or_default(),
+                    };
+                    let (title, body) = title_and_body(head, rest);
+                    let r = w.create(&key, "journal", entry, lane, &draft(title, meta, body), None)?;
+                    let mut all = refs.clone();
+                    all.push(("lane".into(), lane.to_string()));
+                    w.add_refs(&key, &all)?;
+                    r
+                }
             }
             "handoff" => {
                 let lane = arg_nonblank(a, "lane")?;
@@ -509,17 +627,22 @@ impl Server {
                 // No title: the text's first line is the title, as in a
                 // journal entry, and the rest is the body.
                 let (title, body) = match opt_str(a, "title")?.map(str::trim).filter(|t| !t.is_empty()) {
-                    Some(t) => (one_line(t), text.to_string()),
+                    Some(t) => title_and_body(t, text),
                     None => {
                         let text = text.trim_start();
                         let (head, rest) = text.split_once('\n').unwrap_or((text, ""));
                         if head.trim().is_empty() {
                             return Err(Error::InvalidArgument("title is required: pass title, or a text whose first line is the title".into()));
                         }
-                        (one_line(head), rest.to_string())
+                        title_and_body(head, rest)
                     }
                 };
                 let d = draft(title, String::new(), with_newline(body));
+                // A new handoff supersedes the lane's active one, so a resume
+                // finds exactly one current handoff. Read under the write lock:
+                // read before it, another session's handoff in between gets this
+                // one refused, or leaves two active on an empty lane.
+                let prior: Vec<String> = w.heads(Some("handoff"), Some(lane))?.into_iter().filter(|h| h.status == "active").map(|h| h.key).collect();
                 let r = if prior.is_empty() { w.create(&key, "handoff", "", lane, &d, place)? } else { w.supersede(&prior, &key, "handoff", "", lane, &d, place)? };
                 let mut all = refs.clone();
                 all.push(("lane".into(), lane.to_string()));
@@ -602,8 +725,8 @@ impl Server {
                             None => return Err(Error::InvalidArgument("a memory needs a key (its file name)".into())),
                         };
                         check_slug(&key)?;
-                        let title = opt_str(a, "title")?.map(one_line).unwrap_or_else(|| key.clone());
-                        let summary = opt_str(a, "summary")?.map(one_line).unwrap_or_default();
+                        let title = opt_str(a, "title")?.map(|t| given_line(t, "a memory's title", TITLE_CHARS)).transpose()?.unwrap_or_else(|| key.clone());
+                        let summary = opt_str(a, "summary")?.map(|t| given_line(t, "a memory's summary", SUMMARY_CHARS)).transpose()?.unwrap_or_default();
                         let meta = format!("---\nname: {key}\ndescription: {summary}\nmetadata:\n  type: {sub}\n---\n");
                         let line = if summary.is_empty() { format!("- [{title}]({key}.md)") } else { format!("- [{title}]({key}.md) - {summary}") };
                         let body = if body.starts_with('\n') { with_newline(body) } else { format!("\n{}", with_newline(body)) };
@@ -622,7 +745,10 @@ impl Server {
                             Some(k) => k.to_string(),
                             None => w.next_key(&prefix, 5)?,
                         };
-                        let title = opt_str(a, "title")?.map(one_line).unwrap_or_else(|| one_line(body.trim_start_matches('-').trim()));
+                        let title = match opt_str(a, "title")? {
+                            Some(t) => given_line(t, "a rule's title", TITLE_CHARS)?,
+                            None => short_title(body.trim_start_matches('-').trim()),
+                        };
                         (key, draft(title, String::new(), rule_body(&body, &author)?))
                     }
                     _ => {
@@ -630,7 +756,12 @@ impl Server {
                             Some(k) => k.to_string(),
                             None => w.next_key("decision:", 4)?,
                         };
-                        let title = opt_str(a, "title")?.map(one_line).unwrap_or_else(|| one_line(&body));
+                        // A long given title stays whole in the body, as a
+                        // first line does.
+                        let (title, body) = match opt_str(a, "title")? {
+                            Some(t) => title_and_body(t, &body),
+                            None => (short_title(&body), body.to_string()),
+                        };
                         (key, draft(title, String::new(), with_newline(body)))
                     }
                 };

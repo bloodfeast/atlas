@@ -136,7 +136,14 @@ See [[Memory store and hooks]] and [[Memory tree]].
 | `memory.snapshot_cap_mb` | past this, the oldest snapshots are folded into the archive (default 1024) |
 | `memory.brief_reference` | the rulebook whose size at each subagent start is logged as the "brief without atlas" (default: the first `items` export) |
 | `memory.tree` | the memory index as a tree (off when absent) |
-| `memory.transcripts` | index this project's session transcripts at each compaction as an opt-in source: `recall {key: "turn:<session8>:<line>@hash"}` and `recall {query, kind: "turn"}` (visible text only, secret lines redacted, never served to another project; default false) |
+| `memory.transcripts` | index this project's session transcripts at each compaction as an opt-in source: `recall {key: "turn:<session8>:<line>@hash"}` and `recall {query, kind: "turn"}` (visible text only, secret lines redacted, never served to another project; default false). On, `recall` also resolves a compaction card's chain keys (`turn:<session>:b<first>-b<last>@hash`, `turn:<session>:b<offset>#<k>@hash`, `compact:<session>:b<offset>@hash`), read from the transcript and not indexed, without `compact.enabled` |
+| `memory.resume_card` | at a new or cleared session (SessionStart `startup` or `clear`), inject the resume card (at most 1,160 bytes): live lanes, their open questions, running agents after a `/clear`, the work queue's head, an unmet goal and other handoffs, as keys, then a multiple-choice question about what to do first (an empty store gives none; default true) |
+| `memory.rules` | experimental, off by default: whether atlas manages the memory folder and rule files. Unset keeps what is named by hand, `true` finds them and answers with the ruling that holds, `false` also stops sync and recall of what is named by hand and keeps the store. See [[Memory and rule files]] |
+| `memory.ideas.enabled` | idea capture, off by default: the one switch for capture, surfaces and questions. See [[Memory store and hooks]] |
+| `memory.ideas.weights` | a weights file in place of the built-in frozen ones |
+| `memory.ideas.band_below` | how far below the threshold a score is still unsure (default 0.25) |
+| `memory.ideas.band_above` | how far above the threshold a score may still be asked about (default 0.5) |
+| `memory.ideas.asks_per_day` | questions per UTC day (default 0 until the route is proven live; 0 asks nothing and turns the band off) |
 | `memory.tree.export` | the `memory` export the tree is built for (default the first) |
 | `memory.tree.hub_dir` | the hub folder inside the memory folder (default `index`) |
 | `memory.tree.hub_max` | a hub past this many lines is split (default 24) |
@@ -156,7 +163,7 @@ See [[Memory store and hooks]] and [[Memory tree]].
 | `memory.tree.branches[].types` | `metadata.type` values that count toward the branch |
 | `memory.tree.branches[].repo` | the repository a memory filed under this branch is about, for recall's boost (see [[Projects and multi-repo]]) |
 
-## Recall and the context cap
+## Recall, the context cap and orchestrator mode
 
 See the Hooks section of [[Memory store and hooks]]. The floors are set by `cargo xtask calibrate-recall`
 and `atlas --hook-report --tune-floor`, never by hand.
@@ -182,13 +189,34 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `recall.select.trim_chars` | the longest excerpt a pointer carries in place of its first line, in characters (default 90, the length of a first-line pointer) |
 | `recall.select.lane_chars` | the longest excerpt of an older lane entry (decision, measurement, commit, note) in a hook's lane brief (default 180; 0 sends them whole). The handoff, brief, open questions and next step are always whole |
 | `cap` | the context-cap guard's settings |
-| `cap.warn_tokens` | a subagent past this is told to finish and write its handoff (default 450,000) |
-| `cap.block_tokens` | past this every tool but `handoff` is denied (default 500,000) |
+| `cap.warn_tokens` | the handoff point: an agent past this is told to wrap up and write its handoff at its next clean stopping point. It applies to every agent kind without its own `handoff`, and to the main session (default 285,000 scaled to the context window) |
+| `cap.block_tokens` | the hard limit: past this every tool but `handoff` is denied. It applies to every agent kind without its own `limit`, and to the main session (default 450,000 scaled to the context window) |
 | `cap.warn_every` | the warning repeats after this many more tokens (default 25,000) |
 | `cap.main_session` | apply the cap to the main session too (default false) |
+| `orchestrate` | orchestrator mode: caps on how many agents of each kind run at once, and per-kind context limits (see the `orchestrate` skill and `docs/design/orchestrate.md`) |
+| `orchestrate.enabled` | turn the agent caps on (default false). Context limits apply without it. `atlas --setup` and `atlas settings orchestrate` ask for it and store the answers |
+| `orchestrate.window` | the context window the limits scale to (default 0: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else 200,000 when `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set, else 1,000,000) |
+| `orchestrate.stale_minutes` | an unfinished agent whose transcript has not changed for this long is not counted (default 360) |
+| `orchestrate.resources` | the work queue's shared resources and how many items may hold each at once, e.g. `{"gpu": 1, "compile": 1}` (the default); other names allow 1, and 0 never serializes |
+| `orchestrate.aging_minutes` | minutes a queued item waits before it rises one priority class (default 60; 0 turns aging off) |
+| `orchestrate.reviews` | the required-reviews merge gate: a `gh pr merge` in a shell command needs a passing review of the PR's head from each role (see `docs/design/reviews.md`) |
+| `orchestrate.reviews.roles` | the review roles every PR needs, named by job, e.g. `["simplicity", "cost"]` (default none: the gate is off) |
+| `orchestrate.reviews.mode` | `enforced` denies the merge, `advisory` adds a warning, `off` does nothing (default `advisory`) |
+| `orchestrate.default_kind` | the kind of an agent no rule classifies: `builder`, `reviewer`, `research` or `none` (default `builder`). Rules, in order: a `Kind:` line in the brief's first 40 lines, `orchestrate.types`, an agent with `isolation: "worktree"` is a builder |
+| `orchestrate.types` | agent type to kind, over the built-in map (`Explore`, `Plan` and `claude-code-guide` are research; `statusline-setup` is none) |
+| `orchestrate.mode` | how context limits apply to a kind that sets none: `enforced` (past the hard limit every tool but the handoff is denied, and so is a SendMessage to the agent), `advisory` (told only) or `off` (default `enforced`) |
+| `orchestrate.fresh` | when an agent that passed its handoff point finishes, the orchestrator is told to start a fresh agent from its handoff (`auto`) or to ask the user first (`ask`) (default `auto`) |
+| `orchestrate.kinds` | per-kind settings: `orchestrate.kinds.builder`, `orchestrate.kinds.reviewer` and `orchestrate.kinds.research`, each with the keys below |
+| `orchestrate.kinds.builder.max`, `orchestrate.kinds.reviewer.max`, `orchestrate.kinds.research.max` | agents of this kind at once (defaults 2, 2 and 1); clamped to Claude Code's `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (20 by default); 0 launches none |
+| `orchestrate.kinds.builder.window`, `orchestrate.kinds.reviewer.window`, `orchestrate.kinds.research.window` | the context window this kind's limits scale to (default `orchestrate.window`) |
+| `orchestrate.kinds.builder.limit`, `orchestrate.kinds.reviewer.limit`, `orchestrate.kinds.research.limit` | the hard limit in context tokens (default `cap.block_tokens`, else 450,000 scaled to the window) |
+| `orchestrate.kinds.builder.handoff`, `orchestrate.kinds.reviewer.handoff`, `orchestrate.kinds.research.handoff` | the handoff point in context tokens, at most the limit (default `handoff_pct` of the limit, else `cap.warn_tokens`, else 285,000 scaled to the window) |
+| `orchestrate.kinds.builder.handoff_pct`, `orchestrate.kinds.reviewer.handoff_pct`, `orchestrate.kinds.research.handoff_pct` | the handoff point as 1 to 100 percent of the limit |
+| `orchestrate.kinds.builder.mode`, `orchestrate.kinds.reviewer.mode`, `orchestrate.kinds.research.mode` | `enforced`, `advisory` or `off` (default `orchestrate.mode`) |
+| `orchestrate.kinds.builder.fresh`, `orchestrate.kinds.reviewer.fresh`, `orchestrate.kinds.research.fresh` | `auto` or `ask` (default `orchestrate.fresh`) |
 | `compact` | compaction: the checkpoint card and deferral (see `docs/design/compaction.md`). Experimental and off by default |
-| `compact.enabled` | turn on the experimental compaction features: the PreCompact checkpoint, the SessionStart(compact) card and ref report, the Compact instructions offer and `atlas settings compact-md`, and `compact.defer` (default false). Off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript) |
-| `compact.card_tokens` | the budget of the checkpoint PreCompact writes and SessionStart(compact) injects (default 400) |
+| `compact.enabled` | turn on the experimental compaction features: the PreCompact checkpoint with its chain card and the instructions it returns for the summary, the SessionStart(compact) card and ref report, `atlas settings compact-md`, and `compact.defer` (default false). Off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript) and returns no text, and `recall` refuses a chain key unless `memory.transcripts` is on |
+| `compact.card_tokens` | the budget of the checkpoint PreCompact writes and SessionStart(compact) injects, not counting the chain card appended to it (default 400) |
 | `compact.defer` | block a proactive automatic compaction while a tool chain is running, until the next quiet point, never past the ceiling (the window less three times the largest per-request growth, at least 40,000 tokens); a manual `/compact` is never blocked (default false, pending a live check that a blocked compaction is offered again; needs `compact.enabled`) |
 | `compact.window` | the context window `compact.defer` measures against (default 0: 1,000,000 once the session has held more than 200,000 tokens, else 200,000) |
 

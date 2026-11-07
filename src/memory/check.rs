@@ -10,9 +10,19 @@
 //! 3. **Disk:** each export renders to the bytes in the export folder.
 //! 4. **Round trip:** each rendered export splits back into exactly its
 //!    records (see [`super::export::round_trip`]).
+//!
+//! Another session may be writing throughout. Chains, copy and round trip read
+//! one snapshot of the store (a read transaction), so what they find stands
+//! whatever writers do. The disk check cannot: exports are written after the
+//! commit, under a lock of their own, so a file can be newer or older than any
+//! snapshot. It compares first with no lock, then takes each mismatch again
+//! under the store's write lock, where no commit can arrive, and again past the
+//! longest write seen, reporting only what persists. Writers running is never
+//! a reason to skip or soften a finding.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::json::Value;
@@ -60,7 +70,9 @@ impl CheckReport {
 pub fn check(store: &MemoryStore, specs: &[ExportSpec], dir: Option<&Path>, copy: bool) -> Result<CheckReport> {
     let mut rep = CheckReport::default();
     let conn = store.conn();
-    // 1. chains
+    // One snapshot from its first read on; a drop on an early `?` ends it.
+    let snapshot = conn.unchecked_transaction()?;
+    // 1. chains (the first read: the copy below must not be older than it)
     let mut heads: HashMap<String, (i64, String, String)> = HashMap::new();
     {
         let mut st = conn.prepare(
@@ -179,30 +191,117 @@ pub fn check(store: &MemoryStore, specs: &[ExportSpec], dir: Option<&Path>, copy
             }
         }
     }
-    // 3. disk, 4. round trip
+    // 4. round trip
     for spec in specs {
-        if let Some(d) = dir {
-            // An export file that would hold no records (it renders as it
-            // does from an empty store) is not missing when atlas never
-            // wrote it: a fresh store's exports are written by its first
-            // write.
-            let empty: Vec<(PathBuf, String)> = export::render(&MemoryStore::in_memory()?, spec)?;
-            for (rel, text) in export::render(store, spec)? {
-                rep.files += 1;
-                let full = d.join(&rel);
-                match std::fs::read(&full) {
-                    Ok(b) if b == text.as_bytes() => {}
-                    Ok(b) => rep.problems.push(format!("disk: {} differs from its export at line {}", full.display(), export::first_diff_line(&b, text.as_bytes()))),
-                    Err(_) if empty.iter().any(|(r, t)| *r == rel && *t == text) && !store.exported(&spec.name, &rel)? => {}
-                    Err(_) => rep.problems.push(format!("disk: {} is missing", full.display())),
-                }
-            }
-        }
         for e in export::round_trip(store, spec)? {
             rep.problems.push(format!("round trip: {e}"));
         }
     }
+    drop(snapshot);
+    // 3. disk, outside any snapshot
+    if let Some(d) = dir {
+        disk_check(store, specs, d, &mut rep)?;
+    }
     Ok(rep)
+}
+
+/// How long a disk mismatch is taken again: past the longest write seen beside
+/// this check (4.1 s), between a commit and its export.
+const DISK_SETTLE: Duration = Duration::from_secs(6);
+/// The pause between two looks at the mismatches left.
+const DISK_PAUSE: Duration = Duration::from_millis(100);
+
+/// What is wrong with an export's file on disk, given what it should hold.
+fn disk_problem(store: &MemoryStore, spec: &ExportSpec, dir: &Path, rel: &Path, text: &str, empty: &[(PathBuf, String)]) -> Result<Option<String>> {
+    let full = dir.join(rel);
+    Ok(match std::fs::read(&full) {
+        Ok(b) if b == text.as_bytes() => None,
+        Ok(b) => Some(format!("disk: {} differs from its export at line {}", full.display(), export::first_diff_line(&b, text.as_bytes()))),
+        // An export file that would hold no records (it renders as it does
+        // from an empty store) is not missing when atlas never wrote it: a
+        // fresh store's exports are written by its first write.
+        Err(_) if empty.iter().any(|(r, t)| r == rel && t == text) && !store.exported(&spec.name, rel)? => None,
+        Err(_) => Some(format!("disk: {} is missing", full.display())),
+    })
+}
+
+/// A file's bytes as a stamp, to see whether it changed between two looks.
+fn stamp(path: &Path) -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(h.finish())
+}
+
+/// The disk check. One pass with no lock, which a quiet store passes at once;
+/// then each mismatch again under the write lock, one export at a time, so the
+/// lock is never held across a full render of every export, until it clears
+/// or [`DISK_SETTLE`] has passed.
+///
+/// A mismatched file whose bytes change between two looks is being exported to:
+/// with writers never pausing, a commit can always be ahead of its export, and an
+/// export replaces the whole file, so whatever was wrong is gone. Only a file that
+/// stays wrong and stays still is reported.
+fn disk_check(store: &MemoryStore, specs: &[ExportSpec], dir: &Path, rep: &mut CheckReport) -> Result<()> {
+    type Left = (usize, Vec<PathBuf>, Vec<(PathBuf, String)>);
+    let mut left: Vec<Left> = Vec::new();
+    let mut found: HashMap<(usize, PathBuf), String> = HashMap::new();
+    let mut seen: HashMap<(usize, PathBuf), Option<u64>> = HashMap::new();
+    for (i, spec) in specs.iter().enumerate() {
+        let empty = export::render(&MemoryStore::in_memory()?, spec)?;
+        let mut bad = Vec::new();
+        for (rel, text) in export::render(store, spec)? {
+            rep.files += 1;
+            if let Some(p) = disk_problem(store, spec, dir, &rel, &text, &empty)? {
+                found.insert((i, rel.clone()), p);
+                seen.insert((i, rel.clone()), stamp(&dir.join(&rel)));
+                bad.push(rel);
+            }
+        }
+        if !bad.is_empty() {
+            left.push((i, bad, empty));
+        }
+    }
+    let start = Instant::now();
+    while !left.is_empty() && start.elapsed() < DISK_SETTLE {
+        for (i, bad, empty) in &mut left {
+            let spec = &specs[*i];
+            // Busy past the store's own timeout: this round says nothing.
+            let Ok(locked) = rusqlite::Transaction::new_unchecked(store.conn(), rusqlite::TransactionBehavior::Immediate) else { continue };
+            let now: HashMap<PathBuf, String> = export::render(store, spec)?.into_iter().collect();
+            let mut still = Vec::new();
+            for rel in bad.iter() {
+                // A file the render no longer has is not expected any more.
+                let Some(text) = now.get(rel) else {
+                    found.remove(&(*i, rel.clone()));
+                    continue;
+                };
+                match disk_problem(store, spec, dir, rel, text, empty)? {
+                    Some(_) if seen.get(&(*i, rel.clone())) != Some(&stamp(&dir.join(rel))) => {
+                        found.remove(&(*i, rel.clone()));
+                    }
+                    Some(p) => {
+                        found.insert((*i, rel.clone()), p);
+                        still.push(rel.clone());
+                    }
+                    None => {
+                        found.remove(&(*i, rel.clone()));
+                    }
+                }
+            }
+            drop(locked);
+            *bad = still;
+        }
+        left.retain(|(_, bad, _)| !bad.is_empty());
+        if !left.is_empty() {
+            std::thread::sleep(DISK_PAUSE);
+        }
+    }
+    let mut problems: Vec<((usize, PathBuf), String)> = found.into_iter().collect();
+    problems.sort();
+    rep.problems.extend(problems.into_iter().map(|(_, p)| p));
+    Ok(())
 }
 
 /// What a snapshot did.

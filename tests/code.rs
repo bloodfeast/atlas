@@ -372,7 +372,7 @@ fn file_items_map_a_path_to_its_items_and_skip_stale_or_foreign_files() {
         assert!(code::file_items(&conn, &back).unwrap().is_some());
     }
     // The router's Grep annotation over the real index.
-    let grep = format!("src/multi.rs:7:        let n = self.n;\nsrc/multi.rs-8-        n + 1\nsrc/nothere.rs:1:x");
+    let grep = "src/multi.rs:7:        let n = self.n;\nsrc/multi.rs-8-        n + 1\nsrc/nothere.rs:1:x".to_string();
     let out = atlas::hook_rewrite::annotate_grep(&grep, &f.root.to_string_lossy(), None, &mut |p| code::file_items(&conn, p)).unwrap();
     assert_eq!(out, "src/multi.rs:7:        let n = self.n; [fn Cache::get 6-9]\nsrc/multi.rs-8-        n + 1\nsrc/nothere.rs:1:x");
     // A file outside every root, and a file written after the indexing.

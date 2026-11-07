@@ -278,12 +278,11 @@ fn run(read: &mut Read, index: usize, shared: &dyn Sink, stop: &AtomicBool) {
 pub(crate) fn parse(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut at = 0usize;
-    loop {
-        let Some(head) = bytes.get(at..at + 12) else { break };
+    while let Some(head) = bytes.get(at..at + 12) {
         let next = u32::from_ne_bytes([head[0], head[1], head[2], head[3]]) as usize;
         let len = u32::from_ne_bytes([head[8], head[9], head[10], head[11]]) as usize;
         if let Some(name) = bytes.get(at + 12..at + 12 + len) {
-            let units: Vec<u16> = name.chunks_exact(2).map(|c| u16::from_ne_bytes([c[0], c[1]])).collect();
+            let units: Vec<u16> = name.as_chunks::<2>().0.iter().map(|c| u16::from_ne_bytes(*c)).collect();
             out.push(String::from_utf16_lossy(&units).replace('\\', "/"));
         }
         if next == 0 {

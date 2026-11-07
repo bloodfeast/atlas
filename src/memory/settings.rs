@@ -43,22 +43,31 @@ pub struct RecallSettings {
     pub pointer_anchors: bool,
     /// Context selection of what the hooks inject (see [`super::select`]).
     pub select: super::select::Select,
+    /// `memory.rules`, experimental and off by default: what recall does with rules and memories (see
+    /// [`super::rules::Mode`]).
+    pub rules: super::rules::Mode,
 }
 
 impl RecallSettings {
     /// The gate these settings describe.
     pub fn gate(&self, hybrid: bool) -> super::recall::Gate {
         let fts_floor = if hybrid { self.hybrid_fts_floor } else { self.fts_floor };
-        super::recall::Gate { fts_floor, min_terms: self.min_terms, cos_floor: self.cos_floor, cos_alone: self.cos_alone }
+        super::recall::Gate { rules: self.rules, fts_floor, min_terms: self.min_terms, cos_floor: self.cos_floor, cos_alone: self.cos_alone }
     }
 }
 
-/// Context-cap thresholds.
+/// Context-cap thresholds: of every agent with orchestrated mode off (the
+/// v0.2 cap), and of the main session (`cap.main_session`). In
+/// orchestrated mode each subagent kind has its own in
+/// [`crate::orchestrate::OrchSettings`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapSettings {
-    /// Warn at this many context tokens.
+    /// Warn at this many context tokens (`cap.warn_tokens`; default
+    /// 450,000, or in orchestrated mode 285,000 scaled to the window).
     pub warn_tokens: u64,
-    /// Block every tool but `handoff` at this many.
+    /// Block every tool but `handoff` at this many (`cap.block_tokens`;
+    /// default 500,000, or in orchestrated mode 450,000 scaled to the
+    /// window).
     pub block_tokens: u64,
     /// Warn again after this many more tokens.
     pub warn_every: u64,
@@ -66,12 +75,16 @@ pub struct CapSettings {
     pub main_session: bool,
 }
 
+/// The context cap of v0.2, kept with orchestrated mode off.
+const V02_WARN: u64 = 450_000;
+const V02_BLOCK: u64 = 500_000;
+
 /// Compaction settings (see [`crate::checkpoint`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactSettings {
     /// The experimental compaction features are on (`compact.enabled`,
-    /// default false). Off, the hooks do no checkpoint, card, ref report,
-    /// Compact instructions offer or deferral.
+    /// default false). Off, the hooks do no checkpoint, card, ref report or
+    /// deferral.
     pub enabled: bool,
     /// Block a proactive automatic compaction while a tool chain runs.
     pub defer: bool,
@@ -112,6 +125,8 @@ pub struct Settings {
     pub embed_threads: usize,
     /// Context-cap settings.
     pub cap: CapSettings,
+    /// Orchestrator mode: agent caps and per-kind context limits.
+    pub orchestrate: crate::orchestrate::OrchSettings,
     /// Compaction settings.
     pub compact: CompactSettings,
     /// Bytes per token (the ledger's ratio).
@@ -136,6 +151,10 @@ pub struct Settings {
     pub user_state: Option<PathBuf>,
     /// The opt-in transcript source (`memory.transcripts`).
     pub transcripts: bool,
+    /// The resume card at a new or cleared session (`memory.resume_card`).
+    pub resume_card: bool,
+    /// Idea capture and its surfaces (`memory.ideas`), off by default.
+    pub ideas: crate::ideas::IdeaSettings,
     /// The active project's repositories and links, when there is one.
     pub graph: Option<std::sync::Arc<crate::project::Graph>>,
     /// The memory index as a tree (see [`super::tree`]).
@@ -212,6 +231,7 @@ impl Settings {
         let r = c.and_then(|c| c.recall.clone()).unwrap_or_default();
         let k = c.and_then(|c| c.cap.clone()).unwrap_or_default();
         let store = m.store.clone().unwrap_or_else(|| beside.join("memory.sqlite"));
+        let orchestrate = crate::orchestrate::resolve(c.and_then(|c| c.orchestrate.as_ref()), k.warn_tokens, k.block_tokens, |n| std::env::var(n).ok());
         let mut exports = Vec::new();
         for e in &m.exports {
             exports.push(ExportSpec {
@@ -227,7 +247,7 @@ impl Settings {
         let snapshot_dir = m.snapshot_dir.clone().unwrap_or_else(|| store.parent().unwrap_or(Path::new(".")).join("snapshots"));
         let brief_reference = m.brief_reference.clone().or_else(|| {
             let dir = m.export_dir.as_ref()?;
-            exports.iter().find(|e| e.shape == Shape::Items).map(|e| dir.join(&e.path))
+            exports.iter().find(|e| e.shape == Shape::Items && e.name != super::rules::CLAUDE_MD).map(|e| dir.join(&e.path))
         });
         Ok(Settings {
             store,
@@ -250,6 +270,7 @@ impl Settings {
                 inject_floor: r.inject_floor.map_or(DEFAULT_INJECT_FLOOR, |x| x as f32),
                 session_budget_tokens: r.session_budget_tokens.unwrap_or(0),
                 pointer_anchors: r.pointer_anchors.unwrap_or(DEFAULT_POINTER_ANCHORS),
+                rules: super::rules::Mode::of(m.rules),
                 select: {
                     let d = super::select::Select::default();
                     let x = r.select.clone().unwrap_or_default();
@@ -265,11 +286,12 @@ impl Settings {
             model: crate::models::semantic_model(c, db),
             embed_threads: c.and_then(|c| c.semantic.as_ref()).and_then(|s| s.threads).unwrap_or(crate::config::DEFAULT_EMBED_THREADS).max(1),
             cap: CapSettings {
-                warn_tokens: k.warn_tokens.unwrap_or(450_000) as u64,
-                block_tokens: k.block_tokens.unwrap_or(500_000) as u64,
+                warn_tokens: if orchestrate.enabled { orchestrate.other.handoff } else { k.warn_tokens.map_or(V02_WARN, |w| w as u64) },
+                block_tokens: if orchestrate.enabled { orchestrate.other.limit } else { k.block_tokens.map_or(V02_BLOCK, |b| b as u64) },
                 warn_every: k.warn_every.unwrap_or(25_000) as u64,
                 main_session: k.main_session.unwrap_or(false),
             },
+            orchestrate,
             compact: {
                 let x = c.and_then(|c| c.compact.clone()).unwrap_or_default();
                 let d = CompactSettings::default();
@@ -283,6 +305,8 @@ impl Settings {
             user_memory: m.user_memory.clone(),
             user_state: m.user_state.clone(),
             transcripts: m.transcripts.unwrap_or(false),
+            resume_card: m.resume_card.unwrap_or(true),
+            ideas: m.ideas.clone().unwrap_or_default(),
             graph: None,
             tree: m.tree.clone(),
         })

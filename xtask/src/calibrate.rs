@@ -15,7 +15,9 @@
 //! 1. Transcripts: every `*.jsonl` below `--transcripts` (main sessions and
 //!    `subagents/`), read only. Only tool calls timestamped before
 //!    `--before` count, and a transcript stops counting at its first call to
-//!    an atlas tool (`mcp__atlas__*`).
+//!    an atlas tool (`mcp__atlas__*`, `mcp__plugin_atlas_*`) or to its
+//!    ancestor, the vault server (`mcp__vault__*`), which served the same
+//!    vaults.
 //! 2. Lookup targets: the configuration's vault and source roots: a path
 //!    below a vault root, a path below a source root that one of its
 //!    `include` globs matches, or a file whose name matches the handoff
@@ -159,16 +161,52 @@ impl Targets {
                 if part.is_empty() || part.starts_with('-') {
                     continue;
                 }
+                // `NAME=VALUE` (a variable set for later words): its value.
+                let part = match part.split_once('=') {
+                    Some((k, v)) if !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => v,
+                    _ => part,
+                };
+                if part.is_empty() {
+                    continue;
+                }
                 let n = norm(part);
                 let base = base_name(&n);
+                // A source root with include globs named as a folder (`cd ROOT`,
+                // `grep -r x .`) says nothing about which files are read.
+                if self.is_globbed_root(part, cwd) {
+                    continue;
+                }
                 if self.names.iter().any(|x| x == base) || self.handoff.is_match(base) || self.is_target(part, cwd) {
                     hit = true;
-                } else if file_word(base) && !n.starts_with("/dev/") {
+                } else if !n.starts_with("/dev/")
+                    && (file_word(base)
+                        // An absolute path outside every target (a scratch
+                        // folder, a build log), or a path through a
+                        // variable (unknown): not only targets.
+                        || (absolute(&n) && !self.holds_a_root(&n))
+                        || (n.starts_with('$') && n.contains('/')))
+                {
                     return false;
                 }
             }
         }
         hit
+    }
+
+    /// Whether a path (absolute, or relative to `cwd`) is a source root that
+    /// has include globs.
+    pub fn is_globbed_root(&self, path: &str, cwd: &str) -> bool {
+        let mut p = norm(path);
+        if !absolute(&p) && !cwd.is_empty() {
+            p = norm(&format!("{cwd}/{p}"));
+        }
+        self.roots.iter().any(|(r, inc)| inc.is_some() && *r == p)
+    }
+
+    /// Whether a normalised absolute path is a folder above a target root
+    /// (`cd R:/work && grep ... repo/docs/a.md`).
+    fn holds_a_root(&self, p: &str) -> bool {
+        self.roots.iter().any(|(r, _)| r.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
     }
 }
 
@@ -233,7 +271,7 @@ fn has_word(hay: &str, words: &[&str]) -> bool {
 /// Whether a command also writes (see the module docs).
 fn writes(cmd: &str) -> bool {
     let l = cmd.to_lowercase();
-    if ["sed -i", "out-file", "set-content", "python"].iter().any(|w| l.contains(w)) || has_word(&l, &["git", "py"]) {
+    if ["sed -i", "out-file", "set-content", "python", "perl -pi", "perl -i"].iter().any(|w| l.contains(w)) || has_word(&l, &["git", "py", "tee", "mv", "cp", "rm"]) {
         return true;
     }
     // A `>` redirect to a file: not `2>`, `&>`, `>&`.
@@ -265,7 +303,10 @@ pub fn classify(name: &str, input: &Value, cwd: &str, t: &Targets) -> Option<Kin
     match name {
         "Grep" => {
             let p = if s("path").is_empty() { cwd } else { s("path") };
-            (!p.is_empty() && t.is_target(p, cwd)).then_some(Kind::Search)
+            // A globbed source root searched whole is a code search unless the
+            // search is limited to Markdown.
+            let md_only = s("glob").contains(".md") || s("type") == "md";
+            (!p.is_empty() && t.is_target(p, cwd) && (md_only || !t.is_globbed_root(p, cwd))).then_some(Kind::Search)
         }
         "Read" => (!s("file_path").is_empty() && t.is_target(s("file_path"), cwd)).then_some(Kind::Read),
         "Bash" | "PowerShell" => {
@@ -292,10 +333,44 @@ fn result_bytes(c: Option<&Value>) -> usize {
     }
 }
 
+/// Whether a tool is atlas's, or its ancestor's (the vault server served
+/// the same vaults before atlas): a transcript stops counting at the first.
+pub fn is_atlas_tool(name: &str) -> bool {
+    ["mcp__atlas__", "mcp__plugin_atlas_", "mcp__vault__"].iter().any(|p| name.starts_with(p))
+}
+
+/// One pre-atlas lookup episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Episode {
+    /// The bytes the agent read.
+    pub bytes: usize,
+    /// The first call's timestamp.
+    pub time: String,
+    /// Each call: the tool and its target, for an audit.
+    pub calls: Vec<String>,
+}
+
+fn call_line(name: &str, input: &Value) -> String {
+    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+    let what = match name {
+        "Grep" => format!("{} in {}", s("pattern"), s("path")),
+        "Read" => s("file_path").to_string(),
+        _ => s("command").to_string(),
+    };
+    let what: String = what.replace(['\n', '\t'], " ").chars().take(400).collect();
+    format!("{name}: {what}")
+}
+
 /// The byte totals of the lookup episodes of one transcript.
+#[cfg(test)]
 pub fn scan(path: &Path, before: &str, t: &Targets) -> Vec<usize> {
+    scan_episodes(path, before, t).into_iter().map(|e| e.bytes).collect()
+}
+
+/// The lookup episodes of one transcript (see the module docs).
+pub fn scan_episodes(path: &Path, before: &str, t: &Targets) -> Vec<Episode> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
-    let mut calls: Vec<(String, Option<Kind>)> = Vec::new();
+    let mut calls: Vec<(String, Option<Kind>, String, String)> = Vec::new();
     let mut results: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut stopped = false;
     for line in text.lines() {
@@ -311,12 +386,14 @@ pub fn scan(path: &Path, before: &str, t: &Targets) -> Vec<usize> {
             match x.get("type").and_then(Value::as_str) {
                 Some("tool_use") if !stopped => {
                     let name = id("name");
-                    if ts >= before || name.starts_with("mcp__atlas__") {
+                    if ts >= before || is_atlas_tool(&name) {
                         stopped = true;
                         continue;
                     }
                     let input = x.get("input").cloned().unwrap_or(Value::Null);
-                    calls.push((id("id"), classify(&name, &input, cwd, t)));
+                    let kind = classify(&name, &input, cwd, t);
+                    let line = if kind.is_some() { call_line(&name, &input) } else { String::new() };
+                    calls.push((id("id"), kind, line, ts.to_string()));
                 }
                 Some("tool_result") => {
                     results.insert(id("tool_use_id"), result_bytes(x.get("content")));
@@ -325,17 +402,20 @@ pub fn scan(path: &Path, before: &str, t: &Targets) -> Vec<usize> {
             }
         }
     }
-    let mut episodes: Vec<usize> = Vec::new();
+    let mut episodes: Vec<Episode> = Vec::new();
     let mut prev: Option<Kind> = None;
-    for (id, kind) in calls {
+    for (id, kind, line, ts) in calls {
         let Some(k) = kind else {
             prev = None;
             continue;
         };
         let b = results.get(&id).copied().unwrap_or(0);
         match (k, prev, episodes.last_mut()) {
-            (Kind::Read, Some(_), Some(last)) => *last += b,
-            _ => episodes.push(b),
+            (Kind::Read, Some(_), Some(last)) => {
+                last.bytes += b;
+                last.calls.push(format!("{line} ({b} B)"));
+            }
+            _ => episodes.push(Episode { bytes: b, time: ts, calls: vec![format!("{line} ({b} B)")] }),
         }
         prev = Some(k);
     }
@@ -361,14 +441,29 @@ pub fn transcripts(dir: &Path) -> Vec<PathBuf> {
 
 /// Measures every transcript below `dir`, reporting progress on stderr
 /// every 50 files.
+#[cfg(test)]
 pub fn measure(dir: &Path, before: &str, t: &Targets) -> Baseline {
-    let files = transcripts(dir);
+    measure_audited(dir, before, t, &[], None)
+}
+
+/// [`measure`] over the transcripts whose path holds none of `skip`
+/// (replays and eval runs are not real sessions), also writing one line per episode to `audit` (transcript,
+/// time, bytes, then each call) for a hand check.
+pub fn measure_audited(dir: &Path, before: &str, t: &Targets, skip: &[String], mut audit: Option<&mut dyn std::io::Write>) -> Baseline {
+    use std::io::Write as _;
+    let mut files = transcripts(dir);
+    files.retain(|p| !skip.iter().any(|s| p.to_string_lossy().contains(s.as_str())));
     let mut all: Vec<f64> = Vec::new();
     let mut used = 0;
     for (i, p) in files.iter().enumerate() {
-        let e = scan(p, before, t);
+        let e = scan_episodes(p, before, t);
         used += usize::from(!e.is_empty());
-        all.extend(e.into_iter().map(|b| b as f64));
+        if let Some(w) = audit.as_mut() {
+            for x in &e {
+                let _ = writeln!(w, "{}	{}	{}	{}", p.display(), x.time, x.bytes, x.calls.join(" | "));
+            }
+        }
+        all.extend(e.into_iter().map(|x| x.bytes as f64));
         if (i + 1) % 50 == 0 || i + 1 == files.len() {
             eprintln!("[{}/{}] transcripts scanned, {} lookup episodes", i + 1, files.len(), all.len());
         }
@@ -477,7 +572,17 @@ mod tests {
         assert_eq!(c("grep -n x RULES.md 2>/dev/null"), Some(Kind::Search));
         assert_eq!(c("git log RULES.md"), None);
         assert_eq!(c("ls docs"), None);
+        // A scratch path, set in a variable or named outright, is not a target.
+        assert_eq!(c("S=/c/tmp/scratch; grep -n x $S/notes RULES.md"), None);
+        assert_eq!(c("grep -n x /c/tmp/scratch/out RULES.md"), None);
+        // A globbed source root named as a folder says nothing; code is not a target.
+        assert_eq!(c("cd /r/repo/docs && grep -rn x --include=*.rs src"), None);
+        assert_eq!(c("perl -pi -e s/a/b/ RULES.md"), None);
+        // A folder above a target root is not a read of anything else.
+        assert_eq!(c("cd /r && grep -n x repo/.claude/RULES.md"), Some(Kind::Search));
         let g = classify("Grep", &atlas::json!({"pattern": "x", "path": "R:/repo/docs"}), "", &t);
+        assert_eq!(g, None, "a globbed root searched whole");
+        let g = classify("Grep", &atlas::json!({"pattern": "x", "path": "R:/repo/docs", "glob": "*.md"}), "", &t);
         assert_eq!(g, Some(Kind::Search));
         assert_eq!(classify("Read", &atlas::json!({"file_path": "R:/repo/src/a.rs"}), "", &t), None);
     }
@@ -496,7 +601,7 @@ mod tests {
         let use_ = |id: &str, name: &str, input: Value, ts: &str| atlas::json!({"type": "assistant", "timestamp": ts, "cwd": "R:/repo", "message": {"content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}}).to_string();
         let res = |id: &str, n: usize| atlas::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": "x".repeat(n)}]}}).to_string();
         let lines = [
-            use_("1", "Grep", atlas::json!({"pattern": "a", "path": "R:/repo/docs"}), "2026-01-01T00:00:00Z"),
+            use_("1", "Grep", atlas::json!({"pattern": "a", "path": "R:/repo/docs", "glob": "*.md"}), "2026-01-01T00:00:00Z"),
             res("1", 100),
             use_("2", "Read", atlas::json!({"file_path": "R:/repo/docs/a.md"}), "2026-01-01T00:00:01Z"),
             res("2", 1000),
@@ -504,6 +609,7 @@ mod tests {
             res("3", 5),
             use_("4", "Read", atlas::json!({"file_path": "R:/repo/.claude/RULES.md"}), "2026-01-01T00:00:03Z"),
             res("4", 40),
+            use_("4b", "mcp__vault__read_note", atlas::json!({}), "2026-01-01T00:00:03Z"),
             use_("5", "mcp__atlas__recall", atlas::json!({}), "2026-01-01T00:00:04Z"),
             use_("6", "Read", atlas::json!({"file_path": "R:/repo/.claude/RULES.md"}), "2026-01-01T00:00:05Z"),
             res("6", 7),

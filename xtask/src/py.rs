@@ -29,13 +29,13 @@ pub fn repr(x: f64) -> String {
     if (-4..16).contains(&exp) {
         if exp < 0 {
             out.push_str("0.");
-            out.extend(std::iter::repeat('0').take((-exp - 1) as usize));
+            out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
             out.push_str(&digits);
         } else {
             let point = exp as usize + 1;
             if digits.len() <= point {
                 out.push_str(&digits);
-                out.extend(std::iter::repeat('0').take(point - digits.len()));
+                out.extend(std::iter::repeat_n('0', point - digits.len()));
                 out.push_str(".0");
             } else {
                 out.push_str(&digits[..point]);
@@ -235,7 +235,7 @@ pub fn truthy(v: Option<&atlas::json::Value>) -> bool {
         Some(Value::Number(n)) => n.as_f64() != Some(0.0),
         Some(Value::String(s)) => !s.is_empty(),
         Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => m.len() > 0,
+        Some(Value::Object(m)) => !m.is_empty(),
     }
 }
 
@@ -275,7 +275,7 @@ mod tests {
     fn sum_compensates_floats_like_cpython() {
         // Values checked against CPython 3.13: sum([0.1] * 10) == 1.0, and
         // the naive left fold is 0.9999999999999999.
-        assert_eq!(sum(std::iter::repeat(Num::Float(0.1)).take(10)), Num::Float(1.0));
+        assert_eq!(sum(std::iter::repeat_n(Num::Float(0.1), 10)), Num::Float(1.0));
         assert_eq!(sum([Num::Int(2), Num::Int(3)]), Num::Int(5));
     }
 

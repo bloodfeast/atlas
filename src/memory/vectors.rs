@@ -72,7 +72,8 @@ pub fn pending(store: &MemoryStore, model: &str, limit: usize) -> Result<Vec<(St
 ///
 /// # Errors
 ///
-/// [`crate::Error::Db`].
+/// [`crate::Error::Db`]; [`crate::Error::InvalidArgument`] if the model
+/// returns a different number of vectors than texts.
 pub fn embed_pending(store: &MemoryStore, model: &Model, limit: usize, threads: usize) -> Result<usize> {
     let todo = pending(store, &model.id, limit)?;
     if todo.is_empty() {
@@ -80,6 +81,13 @@ pub fn embed_pending(store: &MemoryStore, model: &Model, limit: usize, threads: 
     }
     let texts: Vec<String> = todo.iter().map(|t| t.1.clone()).collect();
     let vecs = model.embed_many(&texts, threads);
+    // `embed_many` returns one vector per text today. A short batch would
+    // leave records pending while this reported them embedded, and
+    // `embed_all_pending` (xtask memory_eval.rs), which loops until this
+    // returns 0, would never end: fail instead.
+    if vecs.len() != todo.len() {
+        return Err(crate::Error::InvalidArgument(format!("embedded {} vectors for {} texts", vecs.len(), todo.len())));
+    }
     let tx = rusqlite::Transaction::new_unchecked(store.conn(), rusqlite::TransactionBehavior::Immediate)?;
     {
         let mut st = tx.prepare_cached("INSERT OR REPLACE INTO rec_vec(model, sha, vec) VALUES(?1, ?2, ?3)")?;
@@ -175,7 +183,7 @@ impl RecVecs {
                 rusqlite::types::ValueRef::Blob(b) if b.len() == dim * 4 => {
                     v.row.insert(rid, v.rids.len());
                     v.rids.push(rid);
-                    v.mat.extend(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+                    v.mat.extend(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
                 }
                 _ => v.missing += 1,
             }

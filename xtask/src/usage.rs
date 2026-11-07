@@ -120,7 +120,8 @@ pub fn scan(path: &Path, since: &str, t: &Targets, mut replay: Option<&mut Repla
     let Ok(text) = std::fs::read_to_string(path) else { return Use::default() };
     // In order: (call id, atlas mode, kind) for tool calls; assistant text
     // and inputs with their order, for the use rule.
-    let mut calls: Vec<(String, Option<String>, Option<Kind>, usize, Option<usize>)> = Vec::new();
+    type Call = (String, Option<String>, Option<Kind>, usize, Option<usize>);
+    let mut calls: Vec<Call> = Vec::new();
     let mut later: Vec<(usize, Vec<u64>)> = Vec::new();
     let mut results: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut order = 0usize;

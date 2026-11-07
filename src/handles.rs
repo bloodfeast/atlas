@@ -467,9 +467,20 @@ fn find_items<'a>(items: &'a [Item], name: &str) -> Vec<&'a Item> {
         .collect()
 }
 
-/// Numbered lines of the ranges, capped at `cap` bytes, with a
-/// "truncated" line naming the next range when cut.
+/// Numbered lines of the ranges (sorted by start), with `--` between
+/// ranges that do not touch, capped at `cap` bytes with a "truncated" line
+/// naming the next range when cut. Overlapping ranges (a test's
+/// failure block and a compiler error inside it, both `--failures` items)
+/// are shown once.
 fn render(id: &str, lines: &[&str], ranges: &[(usize, usize)], note: &str, cap: usize) -> String {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(a, b) in ranges {
+        match merged.last_mut() {
+            Some(last) if b >= a && last.1 >= last.0 && a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let ranges = &merged[..];
     // An empty range (b < a) counts no lines.
     let total: usize = ranges.iter().map(|(a, b)| (b + 1).saturating_sub(*a)).sum();
     let mut out = String::from(note);
@@ -544,7 +555,8 @@ pub fn parse_sel(words: &[String]) -> std::result::Result<Sel, String> {
     })
 }
 
-const SLICE_USAGE: &str = "usage: atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --digest]\n       atlas slice --list [N]";
+/// The usage of `atlas slice`.
+pub const SLICE_USAGE: &str = "usage: atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --digest]\n       atlas slice --list [N]";
 
 /// The `atlas slice` subcommand: one slice of a stored output.
 ///
@@ -612,5 +624,13 @@ mod tests {
         assert!(out.starts_with("1\tline 1\n"));
         assert!(out.contains("truncated, "));
         assert!(out.trim_end().ends_with("-100)"));
+    }
+
+    #[test]
+    fn overlapping_ranges_are_shown_once() {
+        let lines: Vec<String> = (1..=12).map(|i| format!("l{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let out = render("h:1", &refs, &[(2, 6), (4, 5), (5, 8), (11, 12)], "", 10_000);
+        assert_eq!(out, "2\tl2\n3\tl3\n4\tl4\n5\tl5\n6\tl6\n7\tl7\n8\tl8\n--\n11\tl11\n12\tl12\n");
     }
 }

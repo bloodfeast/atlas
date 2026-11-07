@@ -274,6 +274,10 @@ pub fn serve_with_hooks(
                     if hooks.is_none() {
                         match crate::hooks::Hooks::open(settings.clone()) {
                             Ok(mut h) => {
+                                // A hook over this route may come from anyone's
+                                // tools/call, and the server outlives any one
+                                // session: nothing says a user is there to answer.
+                                h.set_unattended(true);
                                 h.set_index_opener(index.take());
                                 h.warm();
                                 *hooks = Some(h);
@@ -360,14 +364,12 @@ pub fn serve_with_hooks(
         }
     }
     server.set_horizon(None);
-    if result.is_err() {
-        // The reader may be blocked on input; it ends with the process.
-        return result;
-    }
+    // On an error the reader may be blocked on input; it ends with the process.
+    result?;
     drop(warm_tx);
     let read = reader.join().unwrap_or_else(|_| Err(io::Error::other("reader thread panicked")));
     if let Some(w) = hook_worker {
         let _ = w.join();
     }
-    result.and(read)
+    read
 }

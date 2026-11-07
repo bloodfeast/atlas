@@ -378,6 +378,9 @@ pub fn help() -> String {
             "lookup" => out.push_str("  - without `id` runs `ids`\n"),
             "remember" => out.push_str("  - with `old` runs `supersede`\n"),
             "edit" => out.push_str("  - op `link`: `vault` and `path` are the note the link is written into\n"),
+            "journal" => out.push_str(
+                "  - entry `queued` files planned work, as `atlas queue plan` does: the text's first line is the title, the rest its scope; `meta` lines `kind:`, `priority:`, `uses:`, `after:` (queue keys or free text) and `order:` are checked, other lines kept\n  - entry `review` files a review for the merge gate (`orchestrate.reviews`): `meta` lines `role:`, `pr:`, `head:` (the sha read), `verdict:` (pass, merge, merge with follow-ups, request changes) and `report:`\n  - `amend: KEY` with `expected_sha` (the head's sha) rewrites that entry's title and body as a new version; its lane, entry, meta lines and refs stay (pass the same `lane` and `entry`, no `meta` or `refs`)\n",
+            ),
             _ => {}
         }
     }

@@ -14,9 +14,13 @@
 //! owed: journal:build-7:0010@...
 //! rulings: rules:r00412@...
 //! files: src/a.rs, src/b.rs
-//! tools: Read src/a.rs -> turn:1a2b3c4d:812@...; Bash cargo test -> turn:...
 //! pending: Bash cargo test --no-fail-fast
 //! intent: Next I will run the tests and fix the failing one.
+//! groups (recall a key for its digest and text):
+//! - turn:1a2b:b81200-b90410@... a.rs
+//! chain_depth: 4 chain_index: 4
+//! links (recall a key for that segment's card and digest):
+//! - compact:1a2b:b70011@... 2026-11-05T09:12..10:40 b.rs, c.md
 //! ```
 //!
 //! Only visible state is read: user prompts, assistant text, tool calls and
@@ -24,11 +28,14 @@
 //! line taken from the transcript (a tool target, the last assistant line)
 //! passes [`crate::redact`] first.
 //!
-//! A tool result's ref is `turn:<session8>:<n>@hash`: `n` is the 1-based line
-//! of the transcript record holding the result, `hash` the first 12 hex
-//! digits of SHA-256 over that record's visible text ([`turn_text`], the text
-//! and tool-result blocks joined with `\n`). Transcripts are append-only, so a
-//! turn ref stays valid for the transcript's life.
+//! The tool calls of the segment are not listed one by one: the hook
+//! appends the chain card ([`crate::chain::card`]), which names every
+//! part of the current sub-segment by a group key
+//! (`turn:<session8>:b<first>-b<last>@hash`, byte offsets of the first and
+//! last record) and the older sub-segments by their links
+//! (`compact:<session8>:b<offset>@hash`). One `recall` resolves any of
+//! them from the transcript, which is append-only, so a key stays valid
+//! for the transcript's life.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -127,6 +134,14 @@ pub struct Step {
 pub struct Tail {
     /// The segment's first record's time (UTC, as the transcript writes it).
     pub start: String,
+    /// The segment's newest record's time: what the session has seen up to.
+    /// The card is bounded by it: live, it is about now, and it drops only
+    /// records the session has not seen (another lane's writes while the
+    /// session was idle before a manual /compact). In the compact-live
+    /// harness it does not bound the cut: the harness's own `/goal clear`
+    /// is appended with the run's time before /compact, so there the
+    /// per-job store prune keeps later records out.
+    pub end: String,
     /// Files edited or written, newest first, each once.
     pub files: Vec<String>,
     /// The last [`TOOLS`] tool calls, oldest first.
@@ -168,10 +183,11 @@ pub fn turn_text(v: &Value) -> String {
     out.join("\n")
 }
 
-/// The ref of a transcript turn: `turn:<session8>:<line>@hash`.
-pub fn turn_ref(session: &str, line: usize, text: &str) -> String {
+/// The ref of a transcript turn by its record's byte offset:
+/// `turn:<session8>:b<offset>@hash`.
+pub fn turn_ref(session: &str, offset: u64, text: &str) -> String {
     let s8: String = session.chars().take(8).collect();
-    format!("turn:{s8}:{line}@{}", &crate::sha256::hex(text.as_bytes())[..HASH_LEN])
+    format!("turn:{s8}:b{offset}@{}", &crate::sha256::hex(text.as_bytes())[..HASH_LEN])
 }
 
 /// One line, cut to `n` characters on a char boundary.
@@ -205,31 +221,215 @@ pub fn target(tool: &str, input: &Value) -> String {
 /// Reads a transcript's segment since its last compaction boundary.
 /// Subagent (sidechain) records are skipped. Fails open: an unreadable file
 /// is an empty tail.
+///
+/// Only the segment is read, once, and parsed: the newest boundary is found
+/// by reading back from the end, and the bytes before it are never read
+/// (a result's ref carries its record's byte offset, not its line).
+/// `max_ctx` is the segment's; the whole session's is
+/// [`history_max_context`], which only the deferral needs.
 pub fn tail(path: &Path, session: &str) -> Tail {
-    let Ok(bytes) = std::fs::read(path) else { return Tail::default() };
-    let text = String::from_utf8_lossy(&bytes);
     // The record after the newest boundary starts the segment: a main-chain
     // record whose subtype is compact_boundary, as `segments` reads it (the
     // bare word may sit in any field, a Grep pattern for one).
-    let mut end = text.len();
-    let mut found = None;
-    while let Some(at) = text[..end].rfind("\"compact_boundary\"") {
-        let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
-        let stop = text[at..].find('\n').map_or(text.len(), |i| at + i + 1);
-        if is_boundary(&text[start..stop]) {
-            found = Some((start, stop));
+    let (from, len) = match last_line_span(path, u64::MAX, "\"compact_boundary\"", is_boundary) {
+        Some((_, end, len)) => ((end + 1).min(len), len),
+        None => (0, std::fs::metadata(path).map_or(0, |m| m.len())),
+    };
+    scan_file(path, from, len, session).unwrap_or_default()
+}
+
+/// [`scan`] over bytes `from` to `len` of a file, streamed through one
+/// reused buffer (the segment is never held whole: fresh pages for a 57 MB
+/// segment cost more than the read). `None` when the file cannot be read.
+fn scan_file(path: &Path, from: u64, len: u64, session: &str) -> Option<Tail> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut r = f.take(len.saturating_sub(from));
+    let mut s = Scanner::default();
+    let mut buf = vec![0u8; 4 << 20];
+    // `buf[..have]` holds the file from byte `at`, ending in a partial line.
+    let (mut have, mut at) = (0usize, from);
+    loop {
+        if have == buf.len() {
+            // A line longer than the buffer.
+            buf.resize(buf.len() * 2, 0);
+        }
+        let k = r.read(&mut buf[have..]).ok()?;
+        have += k;
+        let mut start = 0;
+        while let Some(j) = crate::scan::memchr(b'\n', &buf[start..have]) {
+            s.record(&buf[start..start + j], at + start as u64);
+            start += j + 1;
+        }
+        if k == 0 {
+            if start < have {
+                s.record(&buf[start..have], at + start as u64);
+            }
             break;
         }
-        end = start;
+        buf.copy_within(start..have, 0);
+        have -= start;
+        at += start as u64;
     }
-    let (from, first_line) = match found {
-        Some((start, stop)) => (stop, text.as_bytes()[..start].iter().filter(|b| **b == b'\n').count() + 2),
-        None => (0, 1),
-    };
-    let max_ctx = max_context(&text[..from]);
-    let mut t = scan(&text[from..], first_line, session);
-    t.max_ctx = t.max_ctx.max(max_ctx);
-    t
+    Some(s.finish(session, |o, n| {
+        let mut l = vec![0u8; n];
+        let mut f = std::fs::File::open(path).ok()?;
+        read_at(&mut f, o, &mut l)?;
+        Some(l)
+    }))
+}
+
+/// The largest context of any main-chain request in a whole transcript,
+/// the history before its boundaries included (0 when unreadable): what
+/// the deferral's window guess ([`window`]) reads. [`tail`] leaves it out,
+/// since it means reading the whole session.
+pub fn history_max_context(path: &Path) -> u64 {
+    std::fs::read(path).map_or(0, |b| max_context(&String::from_utf8_lossy(&b)))
+}
+
+/// The newest whole line of a file that holds `needle` and that `accept`
+/// takes (given the line without its newline), searched back from the end,
+/// from at most `cap` bytes before the end. Returns the line's byte offset
+/// and the file from that line to its end ([`last_line_span`]'s line, read
+/// once into a buffer of its exact size).
+pub(crate) fn last_line_where(path: &Path, cap: u64, needle: &str, accept: impl Fn(&str) -> bool) -> Option<(u64, Vec<u8>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (start, _, len) = last_line_span(path, cap, needle, accept)?;
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut rest = Vec::with_capacity((len - start) as usize);
+    f.take(len - start).read_to_end(&mut rest).ok()?;
+    (rest.len() as u64 == len - start).then_some((start, rest))
+}
+
+/// [`last_line_where`]'s line without the read after it: its start, its end
+/// (its newline, or the file's end) and the file's length when searched.
+///
+/// The search is on raw bytes, block by block through one reused buffer:
+/// only a line holding `needle` is read whole, decoded and handed to
+/// `accept`, so the cost is the read and one vector scan for the needle's
+/// rarest letter. (Decoding every line, and growing one buffer as the
+/// search went back, cost 130 ms over a 57 MB segment.)
+pub(crate) fn last_line_span(path: &Path, cap: u64, needle: &str, accept: impl Fn(&str) -> bool) -> Option<(u64, u64, u64)> {
+    // The first block is small (a boundary is often near the end: the
+    // SessionStart after a compaction), later ones up to 4 MiB.
+    const BLOCK: u64 = 4 << 20;
+    let mut size = 1u64 << 20;
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return None;
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let floor = len.saturating_sub(cap);
+    let mut buf = vec![0u8; BLOCK as usize + n.len()];
+    // Every occurrence starting at or past `hi` has been judged.
+    let mut hi = len;
+    while hi > floor {
+        // The block holds every occurrence that starts in [from, hi) whole.
+        let from = hi.saturating_sub(size).max(floor);
+        size = (size * 2).min(BLOCK);
+        let to = (hi + n.len() as u64 - 1).min(len);
+        let block = &mut buf[..(to - from) as usize];
+        read_at(&mut f, from, block)?;
+        let mut found = find_all(block, n);
+        while let Some(i) = found.pop() {
+            let i = from + i as u64;
+            if i >= hi {
+                continue;
+            }
+            // A line's start is known past a newline, or at the file's start.
+            let start = line_start(&mut f, i, floor)?;
+            let end = line_end(&mut f, i, len)?;
+            let mut line = vec![0u8; (end - start) as usize];
+            read_at(&mut f, start, &mut line)?;
+            let line = String::from_utf8_lossy(&line);
+            if accept(line.strip_suffix('\r').unwrap_or(&line)) {
+                return Some((start, end, len));
+            }
+            // The whole line is judged: earlier occurrences in it are too.
+            if start == 0 {
+                return None;
+            }
+            hi = start;
+        }
+        hi = hi.min(from);
+    }
+    None
+}
+
+/// Reads `buf.len()` bytes of `f` from `at`.
+fn read_at(f: &mut std::fs::File, at: u64, buf: &mut [u8]) -> Option<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(at)).ok()?;
+    f.read_exact(buf).ok()
+}
+
+/// The start of the line holding byte `i`: just past the newest newline
+/// before it at or past `floor`, or 0 at the file's start. `None` when the
+/// line starts before `floor` (it cannot be read whole).
+fn line_start(f: &mut std::fs::File, i: u64, floor: u64) -> Option<u64> {
+    let mut b = vec![0u8; 64 << 10];
+    let mut end = i;
+    while end > floor {
+        let from = end.saturating_sub(b.len() as u64).max(floor);
+        let part = &mut b[..(end - from) as usize];
+        read_at(f, from, part)?;
+        if let Some(j) = part.iter().rposition(|&c| c == b'\n') {
+            return Some(from + j as u64 + 1);
+        }
+        end = from;
+    }
+    (floor == 0).then_some(0)
+}
+
+/// The end of the line holding byte `i`: its newline, or the file's end.
+fn line_end(f: &mut std::fs::File, i: u64, len: u64) -> Option<u64> {
+    let mut b = vec![0u8; 64 << 10];
+    let mut from = i;
+    while from < len {
+        let to = (from + b.len() as u64).min(len);
+        let part = &mut b[..(to - from) as usize];
+        read_at(f, from, part)?;
+        if let Some(j) = crate::scan::memchr(b'\n', part) {
+            return Some(from + j as u64);
+        }
+        from = to;
+    }
+    Some(len)
+}
+
+/// Every position of `needle` in `hay` (overlapping ones included), found by
+/// a vector scan for the needle's rarest byte in JSON text (a quote, the
+/// commonest byte of a transcript, is never the probe).
+fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = find_from(hay, needle, from) {
+        out.push(i);
+        from = i + 1;
+    }
+    out
+}
+
+/// The first position at or past `from` of a non-empty `needle` in `hay`,
+/// probed by [`crate::scan::memchr`] on the needle's rarest letter.
+fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    // Letters from rarest to commonest in English text; anything else last.
+    const RARE: &[u8] = b"zqxjkvbpygfwmucldrhsnioate";
+    let rank = |b: u8| RARE.iter().position(|&r| r == b.to_ascii_lowercase()).unwrap_or(RARE.len());
+    let p = (0..needle.len()).min_by_key(|&i| rank(needle[i]))?;
+    let mut at = from + p;
+    while at < hay.len() {
+        let i = at + crate::scan::memchr(needle[p], &hay[at..])?;
+        let s = i - p;
+        if hay.get(s..s + needle.len()) == Some(needle) {
+            return Some(s);
+        }
+        at = i + 1;
+    }
+    None
 }
 
 /// Whether a transcript line is a compaction boundary of the main chain.
@@ -310,15 +510,16 @@ fn parent_transcript(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Seconds since the epoch of a UTC time as the store and transcripts write
-/// it (`YYYY-MM-DDTHH:MM:SS`, any fraction or zone suffix ignored).
-fn epoch_secs(t: &str) -> Option<i64> {
+/// it (`YYYY-MM-DDTHH:MM[:SS]`, any fraction or zone suffix ignored).
+pub(crate) fn epoch_secs(t: &str) -> Option<i64> {
     let b = t.as_bytes();
-    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+    if b.len() < 16 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' {
         return None;
     }
     let n = |a: usize, z: usize| t.get(a..z)?.parse::<i64>().ok();
     let (y, m, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
-    let (hh, mm, ss) = (n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    let ss = if b.get(16) == Some(&b':') { n(17, 19)? } else { 0 };
+    let (hh, mm) = (n(11, 13)?, n(14, 16)?);
     // Days from civil (H. Hinnant).
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -356,60 +557,105 @@ pub fn usage_ctx(v: &Value) -> Option<u64> {
     Some(n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens") + n("output_tokens"))
 }
 
-/// Scans transcript records (`segment`, whose first line is line
-/// `first_line` of the file) for the tail state.
-pub fn scan(segment: &str, first_line: usize, session: &str) -> Tail {
-    let mut t = Tail::default();
-    let mut steps: Vec<Step> = Vec::new();
-    let mut ids: HashMap<String, usize> = HashMap::new();
-    let mut last_msg = String::new();
-    let mut prev_ctx = 0u64;
-    for (i, line) in segment.lines().enumerate() {
-        let n = first_line + i;
+/// Scans transcript records (`segment`, which starts at byte `offset` of
+/// the file) for the tail state.
+pub fn scan(segment: &[u8], offset: u64, session: &str) -> Tail {
+    let mut s = Scanner::default();
+    let mut next = 0usize;
+    while next < segment.len() {
+        let start = next;
+        let end = crate::scan::memchr(b'\n', &segment[start..]).map_or(segment.len(), |j| start + j);
+        next = end + 1;
+        s.record(&segment[start..end], offset + start as u64);
+    }
+    s.finish(session, |o, n| {
+        let at = usize::try_from(o.checked_sub(offset)?).ok()?;
+        segment.get(at..at + n).map(<[u8]>::to_vec)
+    })
+}
+
+/// The tail state built one record at a time ([`scan`], [`scan_file`]).
+/// Only a user or assistant record of the main chain is parsed, and only
+/// the results of the last [`TOOLS`] calls are read back and hashed.
+#[derive(Default)]
+struct Scanner {
+    t: Tail,
+    steps: Vec<Step>,
+    /// Per step, its result's record: byte offset and length.
+    results: Vec<Option<(u64, usize)>>,
+    ids: HashMap<String, usize>,
+    last_msg: String,
+    prev_ctx: u64,
+}
+
+impl Scanner {
+    /// One transcript line (without its newline) starting at byte `n`.
+    fn record(&mut self, raw: &[u8], n: u64) {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let t = &mut self.t;
+        // A record whose first key is its type names itself at once: one
+        // that is not a user or assistant record (Claude Code writes its
+        // bulky api-request records so, most of a long segment's bytes) is
+        // passed over without a search through it.
+        if let Some(kind) = raw.strip_prefix(b"{\"type\":\"") {
+            if !(kind.starts_with(b"user\"") || kind.starts_with(b"assistant\"")) {
+                return;
+            }
+        }
+        let line = String::from_utf8_lossy(raw);
         if line.contains("\"isSidechain\":true") {
-            continue;
+            return;
         }
-        let user = line.contains("\"type\":\"user\"");
-        let assistant = line.contains("\"type\":\"assistant\"");
-        if !(user || assistant) {
-            continue;
+        // A prefilter only: the text can sit nested in any record (a tool
+        // result quoting a transcript), so the parsed type decides.
+        if !(line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")) {
+            return;
         }
-        let Ok(v) = crate::json::parse(line) else { continue };
-        if t.start.is_empty() {
-            t.start = v.get("timestamp").and_then(Value::as_str).unwrap_or("").to_string();
+        let Ok(v) = crate::json::parse(&line) else { return };
+        let assistant = match v.get("type").and_then(Value::as_str) {
+            Some("user") => false,
+            Some("assistant") => true,
+            _ => return,
+        };
+        if let Some(ts) = v.get("timestamp").and_then(Value::as_str).filter(|x| !x.is_empty()) {
+            if t.start.is_empty() {
+                t.start = ts.to_string();
+            }
+            t.end = ts.to_string();
         }
         if v.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
-            continue;
+            return;
         }
-        let blocks = v.pointer("/message/content").and_then(Value::as_array).cloned().unwrap_or_default();
+        let blocks: &[Value] = v.pointer("/message/content").and_then(Value::as_array).map_or(&[], Vec::as_slice);
         if assistant {
             let id = v.pointer("/message/id").and_then(Value::as_str).unwrap_or("").to_string();
             if let Some(c) = usage_ctx(&v) {
-                if id != last_msg && c > 0 {
-                    if prev_ctx > 0 && c > prev_ctx {
-                        t.max_growth = t.max_growth.max(c - prev_ctx);
+                if id != self.last_msg && c > 0 {
+                    if self.prev_ctx > 0 && c > self.prev_ctx {
+                        t.max_growth = t.max_growth.max(c - self.prev_ctx);
                     }
-                    prev_ctx = c;
+                    self.prev_ctx = c;
                     t.last_ctx = c;
                     t.max_ctx = t.max_ctx.max(c);
                 }
-                last_msg = id;
+                self.last_msg = id;
             }
-            for b in &blocks {
+            for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("tool_use") => {
                         let tool = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                        let input = b.get("input").cloned().unwrap_or(Value::Null);
+                        let input = b.get("input").unwrap_or(&Value::Null);
                         if matches!(tool.as_str(), "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
-                            let f = target(&tool, &input);
+                            let f = target(&tool, input);
                             if !f.is_empty() {
                                 t.files.retain(|x| x != &f);
                                 t.files.insert(0, f);
                             }
                         }
                         let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                        ids.insert(id.clone(), steps.len());
-                        steps.push(Step { id, target: target(&tool, &input), tool, result: None });
+                        self.ids.insert(id.clone(), self.steps.len());
+                        self.steps.push(Step { id, target: target(&tool, input), tool, result: None });
+                        self.results.push(None);
                         t.mid_task = true;
                     }
                     Some("text") => {
@@ -423,25 +669,39 @@ pub fn scan(segment: &str, first_line: usize, session: &str) -> Tail {
                 }
             }
         } else {
-            let mut results = false;
-            for b in &blocks {
+            let mut any = false;
+            for b in blocks {
                 if b.get("type").and_then(Value::as_str) == Some("tool_result") {
-                    results = true;
-                    if let Some(&k) = b.get("tool_use_id").and_then(Value::as_str).and_then(|id| ids.get(id)) {
-                        steps[k].result = Some(turn_ref(session, n, &turn_text(&v)));
+                    any = true;
+                    if let Some(&k) = b.get("tool_use_id").and_then(Value::as_str).and_then(|id| self.ids.get(id)) {
+                        self.results[k] = Some((n, raw.len()));
                     }
                 }
             }
             // A person's prompt ends any tool chain.
-            if !results && v.get("isMeta").and_then(Value::as_bool) != Some(true) {
+            if !any && v.get("isMeta").and_then(Value::as_bool) != Some(true) {
                 t.mid_task = false;
             }
         }
     }
-    t.files.truncate(FILES);
-    let k = steps.len().saturating_sub(TOOLS);
-    t.steps = steps.split_off(k);
-    t
+
+    /// The tail: the last [`TOOLS`] calls, each result's record read back by
+    /// `line(offset, length)` and hashed for its ref.
+    fn finish(mut self, session: &str, line: impl Fn(u64, usize) -> Option<Vec<u8>>) -> Tail {
+        let mut t = self.t;
+        t.files.truncate(FILES);
+        let k = self.steps.len().saturating_sub(TOOLS);
+        t.steps = self.steps.split_off(k);
+        for (step, r) in t.steps.iter_mut().zip(&self.results[k..]) {
+            if let Some((n, len)) = *r {
+                if let Some(raw) = line(n, len) {
+                    let v = crate::json::parse(&String::from_utf8_lossy(&raw)).unwrap_or(Value::Null);
+                    step.result = Some(turn_ref(session, n, &turn_text(&v)));
+                }
+            }
+        }
+        t
+    }
 }
 
 /// The window `compact.defer` measures against: the configured one, else
@@ -530,6 +790,9 @@ pub fn state(store: &MemoryStore, session: &str, since: &str, until: &str, lanes
     if lanes == Lanes::Session {
         return Ok(s);
     }
+    // Open by the store's one test (`memory::OPEN_QUESTION_SQL`).
+    let open_keys = store.open_questions()?;
+    let open: std::collections::HashSet<&str> = open_keys.iter().map(|(_, k, _)| k.as_str()).collect();
     for l in store.lanes()? {
         if l.lane.starts_with("session:") || l.last.as_str() < since.as_str() {
             continue;
@@ -543,8 +806,7 @@ pub fn state(store: &MemoryStore, session: &str, since: &str, until: &str, lanes
         if s.lanes.len() < PER_LINE {
             s.lanes.push((l.lane.clone(), step));
         }
-        let answered = store.answered(&l.lane)?;
-        for h in heads.iter().filter(|h| h.sub == "question" && !answered.contains(&h.key)) {
+        for h in heads.iter().filter(|h| open.contains(h.key.as_str())) {
             if s.open.len() < PER_LINE {
                 s.open.push(href(h));
             }
@@ -575,12 +837,9 @@ pub fn body(s: &State, t: &Tail, budget: usize) -> String {
     lines.push(("open", s.open.clone(), ", "));
     lines.push(("owed", s.owed.clone(), ", "));
     lines.push(("rulings", s.rulings.clone(), ", "));
-    let steps: Vec<String> = t.steps.iter().map(|x| match &x.result {
-        Some(r) => format!("{} {} -> {r}", x.tool, x.target),
-        None => format!("{} {}", x.tool, x.target),
-    }).collect();
+    // The tool calls are listed by the chain card's groups
+    // ([`crate::chain::card`]), which the hook appends outside this budget.
     lines.push(("files", t.files.clone(), ", "));
-    lines.push(("tools", steps, "; "));
     if t.mid_task {
         if let Some(p) = t.steps.last().filter(|x| x.result.is_none()) {
             lines.push(("pending", vec![format!("{} {}", p.tool, p.target)], ""));
@@ -638,16 +897,16 @@ pub struct Curve {
 /// oldest first, with the boundary's time.
 pub fn segments(path: &Path, session: &str) -> Vec<(String, Tail)> {
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
-    let text = String::from_utf8_lossy(&bytes);
     let mut out = Vec::new();
-    let (mut seg_start, mut seg_line, mut pos) = (0usize, 1usize, 0usize);
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        if is_boundary(line) {
-            let time = crate::json::parse(line.trim_end()).ok().and_then(|v| v.get("timestamp").and_then(Value::as_str).map(str::to_string)).unwrap_or_default();
-            let t = scan(&text[seg_start..pos], seg_line, session);
-            out.push((time, t));
-            seg_start = pos + line.len();
-            seg_line = i + 2;
+    let (mut seg_start, mut pos) = (0usize, 0usize);
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        if find_from(line, b"\"compact_boundary\"", 0).is_some() {
+            let text = String::from_utf8_lossy(line);
+            if is_boundary(&text) {
+                let time = crate::json::parse(text.trim_end()).ok().and_then(|v| v.get("timestamp").and_then(Value::as_str).map(str::to_string)).unwrap_or_default();
+                out.push((time, scan(&bytes[seg_start..pos], seg_start as u64, session)));
+                seg_start = pos + line.len();
+            }
         }
         pos += line.len();
     }
@@ -781,12 +1040,14 @@ mod tests {
             rec("user", "", r#"[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]"#, 0),
             rec("assistant", "m4", r#"[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"export API_TOKEN=abcdef0123456789xyz"}}]"#, 21000),
         ];
-        let t = scan(&lines[2..].join("\n"), 3, "abcdef0123");
+        // Byte offsets in the file below (one newline per record).
+        let at = |k: usize| lines[..k].iter().map(|l| l.len() as u64 + 1).sum::<u64>();
+        let t = scan(lines[2..].join("\n").as_bytes(), at(2), "abcdef0123");
         assert_eq!(t.files, ["src/main.rs"]);
         assert_eq!(t.steps.len(), 3);
         assert_eq!(t.steps[0].target, "src/main.rs");
-        assert_eq!(t.steps[0].result.as_deref(), Some(turn_ref("abcdef0123", 6, "fn main() {}").as_str()));
-        assert!(t.steps[0].result.as_deref().unwrap().starts_with("turn:abcdef01:6@"));
+        assert_eq!(t.steps[0].result.as_deref(), Some(turn_ref("abcdef0123", at(5), "fn main() {}").as_str()));
+        assert!(t.steps[0].result.as_deref().unwrap().starts_with(&format!("turn:abcdef01:b{}@", at(5))));
         assert_eq!(t.steps[2].target, "[redacted]");
         assert!(t.mid_task);
         assert_eq!(t.intent, "I will read main.rs next.");
@@ -802,6 +1063,184 @@ mod tests {
         assert_eq!(f.steps, t.steps);
         assert_eq!(f.max_ctx, 21000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tail's time span: its first and newest records, which bound the
+    /// card (a replayed cut must not see records newer than itself).
+    #[test]
+    fn the_tail_spans_its_first_to_its_newest_record() {
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-11-01T10:00:00.000Z","message":{"role":"user","content":"go"}}"#,
+            r#"{"type":"system","timestamp":"2026-11-01T10:30:00.000Z","subtype":"turn_duration"}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-01T11:15:00.000Z","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"ok"}]}}"#,
+        ];
+        let t = scan(lines.join("\n").as_bytes(), 0, "s");
+        assert_eq!((t.start.as_str(), t.end.as_str()), ("2026-11-01T10:00:00.000Z", "2026-11-01T11:15:00.000Z"));
+    }
+
+    /// The streamed read of a file gives what [`scan`] gives over the same
+    /// bytes, with a record longer than the read buffer and a last line
+    /// without its newline.
+    #[test]
+    fn the_streamed_scan_matches_the_scan_of_the_whole_segment() {
+        let big = "y".repeat(9 << 20);
+        let lines = [
+            rec("assistant", "m1", r#"[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.rs"}}]"#, 1000),
+            rec("user", "", &format!(r#"[{{"type":"tool_result","tool_use_id":"t1","content":"{big}"}}]"#), 0),
+            rec("assistant", "m2", r#"[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"b.rs"}}]"#, 2000),
+            rec("user", "", r#"[{"type":"tool_result","tool_use_id":"t2","content":"b"}]"#, 0),
+        ];
+        let text = lines.join("\r\n");
+        let dir = std::env::temp_dir().join(format!("atlas-ckpt-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        std::fs::write(&p, &text).unwrap();
+        let streamed = scan_file(&p, 0, text.len() as u64, "s").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(streamed, scan(text.as_bytes(), 0, "s"));
+        assert_eq!(streamed.steps[0].result.as_deref(), Some(turn_ref("s", 0, &big).replace(":b0@", &format!(":b{}@", lines[0].len() + 2)).as_str()));
+        assert_eq!(streamed.steps[1].result.as_deref(), Some(turn_ref("s", (text.len() - lines[3].len()) as u64, "b").as_str()));
+    }
+
+    /// A record whose first key names another type is passed over whole,
+    /// though it holds a user record's words: it neither ends the running
+    /// tool chain nor moves the segment's end.
+    #[test]
+    fn a_record_typed_by_its_first_key_is_passed_over() {
+        let lines = [
+            rec("assistant", "m1", r#"[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]"#, 1000),
+            r#"{"type":"api-request","timestamp":"2026-11-02T00:00:00Z","body":{"type":"user","message":{"content":"go"}}}"#.to_string(),
+        ];
+        let t = scan(lines.join("\n").as_bytes(), 0, "s");
+        assert!(t.mid_task, "{t:?}");
+        assert_eq!(t.end, "2026-11-01T00:00:00Z");
+    }
+
+    /// A record is classed by its parsed type, not by the type text it
+    /// nests: a non-user record (type not its first key) holding a user
+    /// record's words neither ends the tool chain nor moves the span, and a
+    /// user tool_result holding an assistant record's words still links
+    /// its result.
+    #[test]
+    fn a_record_is_classed_by_its_parsed_type_not_its_nested_text() {
+        let lines = [
+            rec("assistant", "m1", r#"[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]"#, 1000),
+            r#"{"timestamp":"2026-11-02T00:00:00Z","type":"api-request","body":{"type":"user","message":{"content":"go"}}}"#.to_string(),
+        ];
+        let t = scan(lines.join("\n").as_bytes(), 0, "s");
+        assert!(t.mid_task, "{t:?}");
+        assert_eq!((t.start.as_str(), t.end.as_str()), ("2026-11-01T00:00:00Z", "2026-11-01T00:00:00Z"));
+        let lines = [
+            rec("assistant", "m1", r#"[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.jsonl"}}]"#, 1000),
+            r#"{"type":"user","timestamp":"2026-11-01T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"read"}]},"toolUseResult":{"type":"assistant","message":{"id":"m0"}}}"#.to_string(),
+        ];
+        let t = scan(lines.join("\n").as_bytes(), 0, "s");
+        let at = lines[0].len() as u64 + 1;
+        assert_eq!(t.steps[0].result.as_deref(), Some(turn_ref("s", at, "read").as_str()), "{t:?}");
+        assert_eq!(t.last_ctx, 1000, "the user record's nested assistant text is no request");
+    }
+
+    /// A quoted needle escaped inside a JSON string (`\"compact_boundary\"`)
+    /// is not the needle on raw bytes: no line is offered to `accept`.
+    #[test]
+    fn an_escaped_needle_is_not_a_boundary() {
+        let dir = std::env::temp_dir().join(format!("atlas-ckpt-esc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        let escaped = r#"{"type":"user","message":{"content":"grep \"compact_boundary\" here"}}"#;
+        std::fs::write(&p, format!("{escaped}\n{escaped}\n")).unwrap();
+        let none = last_line_span(&p, u64::MAX, "\"compact_boundary\"", |_| true);
+        let boundary = r#"{"type":"system","subtype":"compact_boundary"}"#;
+        std::fs::write(&p, format!("{boundary}\n{escaped}\n")).unwrap();
+        let found = last_line_span(&p, u64::MAX, "\"compact_boundary\"", |_| true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(none, None);
+        assert_eq!(found.map(|s| s.0), Some(0), "the unescaped boundary before it is the one found");
+    }
+
+    /// The backward read: the newest accepted line is found across chunk
+    /// edges (the history is over 3 MiB, past the first two chunks), with
+    /// its byte offset; the segment's line numbers count the history, a
+    /// decoy line holding the word is passed over, and a cap that ends
+    /// before the boundary finds nothing.
+    #[test]
+    fn the_newest_boundary_is_read_back_from_the_end() {
+        let dir = std::env::temp_dir().join(format!("atlas-ckpt-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        let filler = format!(r#"{{"type":"user","message":{{"role":"user","content":"{}"}}}}"#, "x".repeat(1000));
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-11-01T10:00:00.000Z"}"#;
+        let decoy = r#"{"type":"assistant","message":{"id":"m9","role":"assistant","content":[{"type":"tool_use","id":"t9","name":"Grep","input":{"pattern":"\"compact_boundary\""}}]}}"#;
+        let mut lines: Vec<String> = (0..3500).map(|_| filler.clone()).collect();
+        lines.push(boundary.to_string());
+        lines.push(r#"{"type":"user","message":{"role":"user","content":"after"}}"#.to_string());
+        lines.push(decoy.to_string());
+        lines.push(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t9","content":"no match"}]}}"#.to_string());
+        let text = lines.join("\n") + "\n";
+        std::fs::write(&p, &text).unwrap();
+        let (at, rest) = last_line_where(&p, u64::MAX, "\"compact_boundary\"", is_boundary).unwrap();
+        assert_eq!(at as usize, text.find(boundary).unwrap());
+        assert!(rest.starts_with(boundary.as_bytes()));
+        let t = tail(&p, "s");
+        assert_eq!(t.steps.len(), 1, "the segment after the boundary only: {:?}", t.steps);
+        let seg = &text[text.find(boundary).unwrap() + boundary.len() + 1..];
+        assert_eq!(t, scan(seg.as_bytes(), (text.len() - seg.len()) as u64, "s"), "the segment starts past the boundary's line");
+        let result_at = text.rfind("{\"type\":\"user\"").unwrap();
+        assert!(t.steps[0].result.as_deref().is_some_and(|r| r.starts_with(&format!("turn:s:b{result_at}@"))), "{:?}", t.steps);
+        assert!(last_line_where(&p, 300, "\"compact_boundary\"", is_boundary).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The raw-byte search: a needle that straddles the first chunk's edge
+    /// (1 MiB from the end) is found; a line longer than a chunk is judged
+    /// once its start is read; a declined line hides an older accepted one
+    /// on the same pass; and every answer is the line-by-line one.
+    #[test]
+    fn the_raw_byte_search_finds_the_needle_across_chunk_edges() {
+        let dir = std::env::temp_dir().join(format!("atlas-ckpt-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        let needle = "\"compact_boundary\"";
+        let want = |l: &str| l.contains("keep");
+        // The line-by-line reference: the newest line holding the needle that `want` takes.
+        let reference = |text: &str| {
+            let mut at = 0;
+            let mut best = None;
+            for l in text.split_inclusive('\n') {
+                let line = l.strip_suffix('\n').unwrap_or(l);
+                if line.contains(needle) && want(line) {
+                    best = Some(at as u64);
+                }
+                at += l.len();
+            }
+            best
+        };
+        let mib = 1usize << 20;
+        let cases: Vec<String> = vec![
+            // The needle straddles the 1 MiB edge: the file is mib + 21
+            // bytes, the needle starts at byte 16, the edge is at byte 21.
+            format!("{}\nkeep {needle}{}\n", "a".repeat(10), "b".repeat(mib - 14)),
+            // One accepted line longer than two chunks, the newest.
+            format!("x\nkeep {needle} {}\ny\n", "c".repeat(3 * mib)),
+            // A declined line holding the needle twice, after an accepted one.
+            format!("keep {needle}\n{}\ndrop {needle} {needle}\nz\n", "d".repeat(2 * mib)),
+            // Only declined lines.
+            format!("drop {needle}\n{}\ndrop {needle}\n", "e".repeat(mib)),
+            // No trailing newline, the needle on the last line.
+            format!("q\nkeep {needle}"),
+        ];
+        for (i, text) in cases.iter().enumerate() {
+            std::fs::write(&p, text).unwrap();
+            let got = last_line_where(&p, u64::MAX, needle, want);
+            assert_eq!(got.as_ref().map(|g| g.0), reference(text), "case {i}");
+            if let Some((at, rest)) = got {
+                assert_eq!(rest, text.as_bytes()[at as usize..], "case {i}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(find_all(b"aaa\"x\"\"x\"", b"\"x\""), [3, 6]);
+        assert_eq!(find_all(b"abab", b"bab"), [1]);
+        assert!(find_all(b"ab", b"abc").is_empty());
     }
 
     /// Review finding 8: the newest `"compact_boundary"` literal started the
@@ -827,7 +1266,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let ids: Vec<&str> = f.steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["t1", "t2", "t3"], "{f:?}");
-        assert_eq!(f.steps[0].result.as_deref(), Some(turn_ref("abcdef0123", 3, "a").as_str()));
+        assert_eq!(f.steps[0].result.as_deref(), Some(turn_ref("abcdef0123", lines[..2].iter().map(|l| l.len() as u64 + 1).sum(), "a").as_str()));
     }
 
     #[test]

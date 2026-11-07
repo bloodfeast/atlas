@@ -77,9 +77,11 @@ pub(crate) mod process {
         }
 
         pub(crate) fn terminate(pid: u32) {
-            // SAFETY: kill takes plain integers; the pid is our own child,
-            // which has not been reaped (the waiter holds its Child), so the
-            // number cannot have been reused.
+            // SAFETY: kill takes plain integers and only reads them. The pid
+            // is our own child, but this is a race, not a guarantee: if the
+            // child exits at the deadline, the waiter may reap it just before
+            // this call, and in that window of microseconds the number could
+            // name a new process. The caller accepts that window.
             unsafe {
                 kill(pid as c_int, SIGKILL);
             }
@@ -153,8 +155,10 @@ pub(crate) mod process {
 
         pub(crate) fn terminate(pid: u32) {
             // SAFETY: OpenProcess returns null or a handle we own; the handle
-            // is used once and closed. The pid is our own child, still
-            // unreaped (its Child is held by the waiter), so it is not reused.
+            // is used once and closed. The pid is our own child, but if it
+            // exits at the deadline the waiter may close its handle just
+            // before this call, and in that window of microseconds the number
+            // could name a new process. The caller accepts that window.
             unsafe {
                 let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
                 if !h.is_null() {
@@ -244,6 +248,17 @@ pub(crate) mod process {
         foreign_cargo_in(&processes(), std::process::id())
     }
 
+    /// Lowers a child process's scheduling priority (nice 10 on Unix; a
+    /// no-op on Windows, where the child is created below normal).
+    pub(crate) fn lower_priority(pid: u32) {
+        sys::lower_priority(pid)
+    }
+
+    /// Ends a child process at once.
+    pub(crate) fn terminate(pid: u32) {
+        sys::terminate(pid)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -265,17 +280,6 @@ pub(crate) mod process {
                 assert!(processes().iter().any(|p| p.0 == me));
             }
         }
-    }
-
-    /// Lowers a child process's scheduling priority (nice 10 on Unix; a
-    /// no-op on Windows, where the child is created below normal).
-    pub(crate) fn lower_priority(pid: u32) {
-        sys::lower_priority(pid)
-    }
-
-    /// Ends a child process at once.
-    pub(crate) fn terminate(pid: u32) {
-        sys::terminate(pid)
     }
 }
 

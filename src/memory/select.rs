@@ -308,7 +308,7 @@ fn find_word(hay: &str, word: &str) -> Option<usize> {
 /// record's first line serves as well (no clause holds a prompt term, or the
 /// best one is the start of the first line): [`clauses`], less that case.
 pub fn excerpt(h: &Head, query: &str, max: usize) -> Option<Excerpt> {
-    clauses(h, query, max).filter(|(_, head)| !*head).map(|(x, _)| x)
+    clauses(h, query, max, 0).filter(|(_, head)| !*head).map(|(x, _)| x)
 }
 
 /// The clauses of a record that match `query` best, and whether they are
@@ -318,8 +318,10 @@ pub fn excerpt(h: &Head, query: &str, max: usize) -> Option<Excerpt> {
 /// The best clause is the one holding the most distinct prompt terms, ties
 /// to the earlier; a dated lead (see [`lead`]) is kept before it; a second
 /// clause is added when it also holds a term and fits. At most `max` chars
-/// of record text in all.
-pub fn clauses(h: &Head, query: &str, max: usize) -> Option<(Excerpt, bool)> {
+/// of record text in all. A clause that starts before byte `from` of the
+/// text is not a candidate (the lane dump passes the end of a title the
+/// body opens with, which is already shown).
+pub fn clauses(h: &Head, query: &str, max: usize, from: usize) -> Option<(Excerpt, bool)> {
     let ts = terms(query);
     if ts.is_empty() {
         return None;
@@ -330,7 +332,7 @@ pub fn clauses(h: &Head, query: &str, max: usize) -> Option<(Excerpt, bool)> {
     }
     let (part, text) = if h.body.trim().is_empty() { (Part::Title, h.title.as_str()) } else { (Part::Body, h.body.as_str()) };
     let segs = segments(text);
-    let scored: Vec<(usize, (usize, usize))> = segs.iter().map(|&sp| (matched(&text[sp.0..sp.1], &ts), sp)).collect();
+    let scored: Vec<(usize, (usize, usize))> = segs.iter().map(|&sp| (if sp.0 < from { 0 } else { matched(&text[sp.0..sp.1], &ts) }, sp)).collect();
     let best = scored.iter().enumerate().max_by(|a, b| a.1 .0.cmp(&b.1 .0).then(b.0.cmp(&a.0)))?;
     let (best_i, &(best_n, best_sp)) = best;
     if best_n == 0 {
@@ -341,7 +343,7 @@ pub fn clauses(h: &Head, query: &str, max: usize) -> Option<(Excerpt, bool)> {
     if best_i > 0 {
         if let Some(l) = lead(text) {
             let n = text[l.0..l.1].chars().count();
-            if n + 24 < left && l.1 <= best_sp.0 {
+            if n + 24 < left && l.0 >= from && l.1 <= best_sp.0 {
                 spans.push(l);
                 left -= n + 1;
             }

@@ -11,7 +11,7 @@ One Rust binary, one dependency (SQLite, bundled), no network at query time.
   into the call as JSON text. Plugin hooks also fire inside subagents, with `agent_id` set (measured).
   `atlas --hook` is the same logic as a command hook, reading the event on stdin. SessionStart is that
   command hook, because Claude Code runs no `mcp_tool` hook at SessionStart (measured on 2.1.316). Its
-  only output is one-time: the settings offer and, once per folder atlas does not index, a line asking the
+  only output is the settings offer, once, and these until answered: for a folder atlas does not index, a line asking the
   model to ask the user whether to create a vault for the project, default yes, which also adds the project
   as a source (`atlas settings add-project --vault`).
 - **The CLI** (`atlas run`, `atlas slice`, `atlas settings`, `atlas grammar`, `atlas --setup`, and the

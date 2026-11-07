@@ -49,8 +49,8 @@ impl Image {
                 for y in oy * k..((oy + 1) * k).min(self.height) {
                     for x in ox * k..((ox + 1) * k).min(self.width) {
                         let p = (y * self.width + x) * 4;
-                        for c in 0..4 {
-                            sum[c] += u32::from(self.rgba[p + c]);
+                        for (c, s) in sum.iter_mut().enumerate() {
+                            *s += u32::from(self.rgba[p + c]);
                         }
                         n += 1;
                     }
@@ -118,7 +118,7 @@ pub fn decode_png(b: &[u8]) -> Result<Image, String> {
                     return Err(format!("PNG bit depth {depth} is not supported"));
                 }
             }
-            b"PLTE" => palette = data.chunks_exact(3).map(|c| [c[0], c[1], c[2], 255]).collect(),
+            b"PLTE" => palette = data.as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2], 255]).collect(),
             b"tRNS" if ctype == 3 => {
                 for (i, a) in data.iter().enumerate() {
                     if let Some(p) = palette.get_mut(i) {
@@ -792,7 +792,7 @@ pub fn crc32(d: &[u8]) -> u32 {
 /// Encodes a picture as an 8-bit PNG: RGB, or RGBA when any pixel is not
 /// opaque.
 pub fn encode_png(img: &Image) -> Vec<u8> {
-    let alpha = img.rgba.chunks_exact(4).any(|p| p[3] != 255);
+    let alpha = img.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255);
     let bpp = if alpha { 4 } else { 3 };
     let stride = img.width * bpp;
     let mut raw = Vec::with_capacity((stride + 1) * img.height);
@@ -801,7 +801,7 @@ pub fn encode_png(img: &Image) -> Vec<u8> {
     let mut trial = vec![0u8; stride];
     for y in 0..img.height {
         cur.clear();
-        for p in img.rgba[y * img.width * 4..(y + 1) * img.width * 4].chunks_exact(4) {
+        for p in img.rgba[y * img.width * 4..(y + 1) * img.width * 4].as_chunks::<4>().0 {
             cur.extend_from_slice(&p[..bpp]);
         }
         let mut best: (u64, u8, Vec<u8>) = (u64::MAX, 0, Vec::new());

@@ -24,10 +24,12 @@ fn kp(seed: [u8; 32]) -> ed25519_compact::KeyPair {
     ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new(seed))
 }
 
+type Files = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
 /// A loopback server whose routes can be filled after it knows its port.
 /// A route body starting with `TRUNC:` is announced at twice its length
 /// and cut off.
-fn server() -> (String, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
+fn server() -> (String, Files) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
     let routes: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();

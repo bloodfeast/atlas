@@ -32,18 +32,8 @@ fn native(s: &str, windows: bool) -> PathBuf {
     PathBuf::from(if windows { s.replace('/', "\\") } else { s.to_string() })
 }
 
-#[cfg(test)]
-mod native_tests {
-    #[test]
-    fn a_forward_slash_folder_reads_with_the_native_separator() {
-        assert_eq!(super::native("Z:/home/atlas", true).to_string_lossy(), "Z:\\home\\atlas");
-        #[cfg(windows)]
-        assert_eq!(super::native("Z:/home/atlas", true).join("atlas.json").to_string_lossy(), "Z:\\home\\atlas\\atlas.json");
-        assert_eq!(super::native("/home/u", false).to_string_lossy(), "/home/u");
-    }
-}
-
-fn home() -> Option<PathBuf> {
+/// The user's home folder: `USERPROFILE` on Windows, `HOME` elsewhere.
+pub fn home() -> Option<PathBuf> {
     if cfg!(windows) {
         env_path("USERPROFILE")
     } else {
@@ -84,4 +74,15 @@ pub fn data_dir() -> Option<PathBuf> {
 /// current folder.
 pub fn default_db() -> PathBuf {
     data_dir().unwrap_or_default().join("state").join("atlas.sqlite")
+}
+
+#[cfg(test)]
+mod native_tests {
+    #[test]
+    fn a_forward_slash_folder_reads_with_the_native_separator() {
+        assert_eq!(super::native("Z:/home/atlas", true).to_string_lossy(), "Z:\\home\\atlas");
+        #[cfg(windows)]
+        assert_eq!(super::native("Z:/home/atlas", true).join("atlas.json").to_string_lossy(), "Z:\\home\\atlas\\atlas.json");
+        assert_eq!(super::native("/home/u", false).to_string_lossy(), "/home/u");
+    }
 }

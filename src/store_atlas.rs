@@ -883,7 +883,7 @@ pub(super) fn index_doc(
 ) -> Result<()> {
     let fm = markdown::parse_frontmatter_nested(text);
     let stem = stem_of(rel);
-    let title = ["title", "name"].iter().find_map(|k| fm.get(*k).and_then(Value::as_str)).unwrap_or(stem).to_string();
+    let title = ["title", "name"].iter().find_map(|k| fm.get(k).and_then(Value::as_str)).unwrap_or(stem).to_string();
     let description = fm.get("description").and_then(Value::as_str).map(str::to_string);
     let doc_type = fm
         .get("metadata")
@@ -893,7 +893,7 @@ pub(super) fn index_doc(
         .map(str::to_string);
     let doc_date = ["date", "created", "opened", "updated", "modified"]
         .iter()
-        .find_map(|k| fm.get(*k).and_then(leading_date))
+        .find_map(|k| fm.get(k).and_then(leading_date))
         .or_else(|| fm.get("metadata").and_then(|m| m.get("modified")).and_then(leading_date));
     let id: i64 = tx.prepare_cached(
         "INSERT INTO docs(source, kind, path, mtime_ns, size, sha256, title, description, doc_type, date, indexed)

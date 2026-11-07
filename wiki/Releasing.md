@@ -23,6 +23,15 @@ line (`@HIGHLIGHTS@`, `@UPGRADE@`, `@DETAILS@`, `@BINARIES@`, `@MISSING@`, `@MOD
 section) is replaced by its block, and an empty block takes its line with it; `@VERSION@`, `@DATE@` and `@REPO@`
 are replaced inline. `ATLAS_RELEASE_DATE` sets the date (default today, UTC).
 
+## Clippy
+
+Warnings fail a release: `cargo +1.99.0 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings`
+and the same with default targets (`cargo +1.99.0 clippy --workspace --locked -- -D warnings`). The manual `cargo xtask
+release` runs both before the tests (`--skip-tests` skips them too), and the public repository's CI runs them in its `clippy` job. The toolchain is
+pinned so that a new Rust release's lints cannot fail an unrelated release; `rust-toolchain.toml` stays `stable`. To
+bump it, change `CLIPPY_TOOLCHAIN` in `xtask/src/release.rs` and every `1.99.0` in `.github/workflows/ci.yml`, and
+clear what the new lints find.
+
 ## The release
 
 A release goes through three hands: the development repository opens a pull request, the public repository
@@ -38,7 +47,7 @@ release signing key never leaves the owner's machine.
    is masked in the log and none is ever printed. It then pushes branch `release/vX.Y.Z` to the public
    repository, the exported tree on top of its `main` with `bin/` left as it is, and opens a pull request into
    `main` whose body is the release notes. No tests run and nothing is built there: the public repository's CI
-   tests the pull request.
+   tests the pull request, and its `clippy` job is the clippy check for this path.
 2. **Review and merge** (public repository). The pull request comes from the release GitHub App, so the owner
    can give it the code-owner approval the `main` ruleset requires. The CI checks run on it; squash merge it.
 3. **The build** (public repository, workflow `release`). A push to `main` that changes `Cargo.toml` to a version

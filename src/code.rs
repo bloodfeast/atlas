@@ -1876,6 +1876,7 @@ pub struct WriteStats {
 /// # Errors
 ///
 /// [`Error::Db`] from SQLite; nothing is changed then.
+#[allow(clippy::too_many_arguments)] // one row of the index: a struct would only name the same fields
 pub fn write_root(
     conn: &mut Connection,
     root: &str,
@@ -2306,7 +2307,7 @@ fn root_of(conn: &Connection, path: &str) -> Result<Option<(String, String, Stri
     let mut best: Option<(String, String, String)> = None;
     for (root, dir, indexed) in roots {
         let d = dir.trim_end_matches('/').to_string();
-        if p.len() > d.len() + 1 && p.is_char_boundary(d.len()) && same_path(&p[..d.len()], &d) && p.as_bytes()[d.len()] == b'/' && best.as_ref().map_or(true, |b| d.len() > b.2.len()) {
+        if p.len() > d.len() + 1 && p.is_char_boundary(d.len()) && same_path(&p[..d.len()], &d) && p.as_bytes()[d.len()] == b'/' && best.as_ref().is_none_or(|b| d.len() > b.2.len()) {
             best = Some((root, indexed, d));
         }
     }
@@ -2580,13 +2581,50 @@ pub fn render(a: &SymbolAnswer, lim: Limits) -> String {
     out
 }
 
+impl std::fmt::Display for RowStats {
+    /// `name N` pairs for the nonzero counts, as `--code-index` prints them.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let all = [
+            ("scip defs", self.scip_defs),
+            ("scan defs", self.scan_defs),
+            ("scip refs", self.scip_refs),
+            ("external refs", self.external_refs),
+            ("cross-root refs", self.xroot_refs),
+            ("impls", self.impls),
+            ("wgsl defs", self.wgsl_defs),
+            ("wgsl refs", self.wgsl_refs),
+            ("proto defs", self.proto_defs),
+            ("proto refs", self.proto_refs),
+            ("mentions", self.mentions),
+            ("other-language defs", self.lang_defs),
+            ("rpc stubs", self.rpc_stubs),
+            ("rpc calls", self.rpc_calls),
+            ("rpc servers", self.rpc_servers),
+        ];
+        let shown: Vec<String> = all.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{n} {k}")).collect();
+        if shown.is_empty() {
+            f.write_str("none")
+        } else {
+            f.write_str(&shown.join(", "))
+        }
+    }
+}
+
+impl std::fmt::Display for WriteStats {
+    /// `N files, N defs, N refs, N impls, N lines`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} files, {} defs, {} refs, {} impls, {} lines", self.files, self.defs, self.refs, self.impls, self.lines)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn item_lines() {
-        let cases: &[(&str, Option<(&str, &str, usize)>)] = &[
+        type Case = (&'static str, Option<(&'static str, &'static str, usize)>);
+        let cases: &[Case] = &[
             ("pub fn open(p: &Path) {", Some(("fn", "open", 7))),
             ("    pub(crate) const unsafe fn raw() {}", Some(("fn", "raw", 31))),
             ("pub(in crate::a) struct S;", Some(("struct", "S", 24))),
@@ -2612,7 +2650,8 @@ mod tests {
     #[test]
     fn impl_lines() {
         let s = |t: &str| Some(t.to_string());
-        let cases: &[(&str, Option<(String, Option<String>, usize)>)] = &[
+        type Case = (&'static str, Option<(String, Option<String>, usize)>);
+        let cases: &[Case] = &[
             ("impl Store {", Some(("Store".into(), None, 0))),
             ("    impl std::fmt::Debug for Router {", Some(("Router".into(), s("Debug"), 4))),
             ("impl<T: Clone, const N: usize> From<[T; N]> for Ring<T> {", Some(("Ring".into(), s("From"), 0))),
@@ -2819,41 +2858,5 @@ mod tests {
         assert!(!relevant("target/debug/build/x.rs"));
         assert!(!relevant(".git/HEAD"));
         assert!(!relevant("README.md"));
-    }
-}
-
-impl std::fmt::Display for RowStats {
-    /// `name N` pairs for the nonzero counts, as `--code-index` prints them.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let all = [
-            ("scip defs", self.scip_defs),
-            ("scan defs", self.scan_defs),
-            ("scip refs", self.scip_refs),
-            ("external refs", self.external_refs),
-            ("cross-root refs", self.xroot_refs),
-            ("impls", self.impls),
-            ("wgsl defs", self.wgsl_defs),
-            ("wgsl refs", self.wgsl_refs),
-            ("proto defs", self.proto_defs),
-            ("proto refs", self.proto_refs),
-            ("mentions", self.mentions),
-            ("other-language defs", self.lang_defs),
-            ("rpc stubs", self.rpc_stubs),
-            ("rpc calls", self.rpc_calls),
-            ("rpc servers", self.rpc_servers),
-        ];
-        let shown: Vec<String> = all.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{n} {k}")).collect();
-        if shown.is_empty() {
-            f.write_str("none")
-        } else {
-            f.write_str(&shown.join(", "))
-        }
-    }
-}
-
-impl std::fmt::Display for WriteStats {
-    /// `N files, N defs, N refs, N impls, N lines`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} files, {} defs, {} refs, {} impls, {} lines", self.files, self.defs, self.refs, self.impls, self.lines)
     }
 }

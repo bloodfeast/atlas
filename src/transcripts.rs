@@ -24,6 +24,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::compact::TurnAt;
 use crate::error::Result;
 use crate::json::Value;
 
@@ -190,15 +191,80 @@ pub fn search(conn: &Connection, project: &str, query: &str, limit: usize) -> Re
 }
 
 /// Resolves a turn ref against a transcript file directly (the session's
-/// own, at SessionStart after a compaction): `Some(true)` when line `line`
-/// hashes to `hash`, `Some(false)` when it does not, `None` when the file
-/// has no such line.
-pub fn check_line(path: &Path, line: usize, hash: &str) -> Option<bool> {
-    let text = std::fs::read(path).ok()?;
-    let l = text.split(|b| *b == b'\n').nth(line.checked_sub(1)?)?;
-    let v = crate::json::parse(&String::from_utf8_lossy(l)).ok()?;
+/// own, at SessionStart after a compaction): `Some(true)` when the record
+/// at `at` hashes to `hash`, `Some(false)` when it does not, `None` when the
+/// file has no such record.
+pub fn check(path: &Path, at: TurnAt, hash: &str) -> Option<bool> {
+    let l = record(path, at)?;
+    let v = crate::json::parse(&String::from_utf8_lossy(&l)).ok()?;
     let h = crate::sha256::hex(crate::checkpoint::turn_text(&v).as_bytes());
     Some(h.starts_with(hash))
+}
+
+/// The record at `at` in a transcript, without its newline. By line the
+/// file is read up to it; by byte offset only the record itself is read,
+/// and an offset that does not start a record (not 0, and not just past a
+/// newline) names none.
+pub fn record(path: &Path, at: TurnAt) -> Option<Vec<u8>> {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+    match at {
+        TurnAt::Line(line) => {
+            let text = std::fs::read(path).ok()?;
+            text.split(|b| *b == b'\n').nth(line.checked_sub(1)?).map(<[u8]>::to_vec)
+        }
+        TurnAt::Byte(offset) => {
+            let mut f = std::fs::File::open(path).ok()?;
+            if offset > 0 {
+                let mut before = [0u8];
+                f.seek(SeekFrom::Start(offset - 1)).ok()?;
+                f.read_exact(&mut before).ok()?;
+                if before[0] != b'\n' {
+                    return None;
+                }
+            }
+            let mut r = std::io::BufReader::new(f);
+            let mut l = Vec::new();
+            if r.read_until(b'\n', &mut l).ok()? == 0 {
+                return None;
+            }
+            if l.last() == Some(&b'\n') {
+                l.pop();
+            }
+            Some(l)
+        }
+    }
+}
+
+/// The 1-based line of the record starting at byte `offset` of a
+/// transcript: how a byte ref finds its indexed turn. `None` when the
+/// offset does not start a record. Reads the whole history before it, so
+/// it is for `recall`, never a hook's path.
+pub fn line_at(path: &Path, offset: u64) -> Option<usize> {
+    use std::io::Read;
+    record(path, TurnAt::Byte(offset))?;
+    let mut r = std::fs::File::open(path).ok()?.take(offset);
+    let mut buf = vec![0; 1 << 20];
+    let mut n = 1;
+    loop {
+        let k = r.read(&mut buf).ok()?;
+        if k == 0 {
+            return Some(n);
+        }
+        n += crate::scan::count(b'\n', &buf[..k]);
+    }
+}
+
+/// The indexed transcript of `project` whose session id starts with
+/// `session8`, if one is indexed.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn path_of(conn: &Connection, project: &str, s8: &str) -> Result<Option<std::path::PathBuf>> {
+    conn.execute_batch(TABLES)?;
+    let mut st = conn.prepare_cached("SELECT path FROM turns_seen")?;
+    let paths = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(paths.into_iter().map(std::path::PathBuf::from).find(|p| project_of_transcript(p) == project && session8(p) == s8))
 }
 
 #[cfg(test)]
@@ -233,7 +299,20 @@ mod tests {
         assert_eq!(t3.text, "[redacted]", "the result of reading a secret file is kept out whole");
         let t4 = get(&conn, "H--proj-a", "12345678", 4).unwrap().unwrap();
         assert_eq!(t4.text, "error E0308 at frame 4127\n[redacted]");
-        assert_eq!(check_line(&pa, 4, &t4.hash), Some(true));
+        assert_eq!(check(&pa, TurnAt::Line(4), &t4.hash), Some(true));
+        // By byte offset: the same record, found without the lines before it.
+        let off = recs[..3].iter().map(|r| r.len() as u64 + 1).sum::<u64>();
+        assert_eq!(check(&pa, TurnAt::Byte(off), &t4.hash), Some(true));
+        assert_eq!(check(&pa, TurnAt::Byte(off), "0123456789ab"), Some(false));
+        assert_eq!(check(&pa, TurnAt::Byte(off + 1), &t4.hash), None, "an offset inside a record names none");
+        let eof = std::fs::metadata(&pa).unwrap().len();
+        assert_eq!(record(&pa, TurnAt::Byte(eof)), None, "an offset at the end names no record");
+        assert_eq!(record(&pa, TurnAt::Byte(eof + 10)), None, "an offset past the end names none");
+        assert_eq!(check(&pa, TurnAt::Byte(eof), &t4.hash), None);
+        assert_eq!(line_at(&pa, off), Some(4));
+        assert_eq!(line_at(&pa, 0), Some(1));
+        assert_eq!(path_of(&conn, "H--proj-a", "12345678").unwrap(), Some(pa.clone()));
+        assert_eq!(path_of(&conn, "H--proj-b", "12345678").unwrap(), None);
         assert!(!format!("{:?}", search(&conn, "H--proj-a", "hidden plan", 5).unwrap()).contains("hidden"));
         // Search sees the asking project only.
         assert_eq!(search(&conn, "H--proj-a", "4127", 5).unwrap().len(), 1);

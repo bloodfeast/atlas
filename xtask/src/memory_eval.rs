@@ -190,6 +190,78 @@ pub fn holds(hay: &str, fact: &[String]) -> bool {
     fact.iter().any(|f| hay.contains(&norm(f)))
 }
 
+/// Embeds every record of `settings.store` that has no vector for the
+/// configured model, in the foreground, so a [`atlas::hooks::Hooks`] opened
+/// afterwards finds nothing pending and starts no background embedder
+/// (`Hooks::load_model` spawns one only when `pending` is non-empty, and
+/// `refresh_vectors` only when `RecVecs::missing` is above 0; both read the
+/// same recallable active heads).
+///
+/// # Returns
+///
+/// `None` when there is no model file (the hooks' gate is then lexical and
+/// they spawn nothing), else how many records were embedded.
+///
+/// # Errors
+///
+/// The model or the store failing to load, or a write failing.
+pub fn embed_all_pending(settings: &atlas::memory::settings::Settings) -> Result<Option<usize>, String> {
+    if !settings.model.is_file() {
+        return Ok(None);
+    }
+    let model = atlas::embed::Model::load(&settings.model).map_err(|e| e.to_string())?;
+    let mem = atlas::memory::MemoryStore::open(&settings.store).map_err(|e| e.to_string())?;
+    let mut n = 0;
+    loop {
+        let k = atlas::memory::vectors::embed_pending(&mem, &model, 128, settings.embed_threads).map_err(|e| e.to_string())?;
+        if k == 0 {
+            return Ok(Some(n));
+        }
+        n += k;
+    }
+}
+
+/// [`embed_all_pending`] through a vector cache shared across stores:
+/// before embedding, every vector the cache holds for a current version
+/// (by the model and the version's content hash) is copied into the store;
+/// after it, the store's vectors go back into the cache. A vector is a
+/// function of the model and the text the hash covers, so a hit is what
+/// embedding would write; only identical records skip the encoder.
+///
+/// # Errors
+///
+/// The store, the cache or the encoder failing, as text.
+pub fn embed_all_pending_cached(settings: &atlas::memory::settings::Settings, cache: &Path) -> Result<Option<usize>, String> {
+    if !settings.model.is_file() {
+        return Ok(None);
+    }
+    let model = atlas::embed::Model::load(&settings.model).map_err(|e| e.to_string())?;
+    let mem = atlas::memory::MemoryStore::open(&settings.store).map_err(|e| e.to_string())?;
+    let err = |e: rusqlite::Error| format!("vector cache {}: {e}", cache.display());
+    atlas::memory::vectors::ensure_schema(&mem).map_err(|e| e.to_string())?;
+    mem.conn().execute("ATTACH DATABASE ?1 AS vc", [cache.to_string_lossy()]).map_err(err)?;
+    mem.conn().execute_batch(&atlas::memory::vectors::SCHEMA.replace("EXISTS rec_vec", "EXISTS vc.rec_vec")).map_err(err)?;
+    // The hits: the versions `embed_pending` would read.
+    mem.conn()
+        .execute(
+            "INSERT OR IGNORE INTO main.rec_vec(model, sha, vec) SELECT model, sha, vec FROM vc.rec_vec WHERE model = ?1 AND sha IN
+             (SELECT v.sha FROM records r JOIN versions v ON v.vid = r.head WHERE r.status = 'active' AND r.kind NOT IN ('block', 'journal'))",
+            [&model.id],
+        )
+        .map_err(err)?;
+    let mut n = 0;
+    loop {
+        let k = atlas::memory::vectors::embed_pending(&mem, &model, 128, settings.embed_threads).map_err(|e| e.to_string())?;
+        if k == 0 {
+            break;
+        }
+        n += k;
+    }
+    mem.conn().execute("INSERT OR IGNORE INTO vc.rec_vec(model, sha, vec) SELECT model, sha, vec FROM main.rec_vec WHERE model = ?1", [&model.id]).map_err(err)?;
+    mem.conn().execute_batch("DETACH DATABASE vc").map_err(err)?;
+    Ok(Some(n))
+}
+
 /// Record keys an answer lists, in order: `== KEY ...` (a record) and
 /// `- KEY: title` or `- KEY score: title` (a pointer).
 pub fn keys_in(text: &str) -> Vec<String> {
@@ -774,19 +846,11 @@ pub fn run(o: &Opts) -> Result<bool, String> {
     // running for more than a minute has them all. Embedded here first, the
     // replay sees that store, and no question's score depends on how far a
     // background embedder got before it was asked.
-    if !o.floors.is_empty() && settings.model.is_file() {
+    if !o.floors.is_empty() {
         let t0 = std::time::Instant::now();
-        let model = atlas::embed::Model::load(&settings.model).map_err(|e| e.to_string())?;
-        let mem = atlas::memory::MemoryStore::open(&settings.store).map_err(|e| e.to_string())?;
-        let mut n = 0;
-        loop {
-            let k = atlas::memory::vectors::embed_pending(&mem, &model, 128, settings.embed_threads).map_err(|e| e.to_string())?;
-            if k == 0 {
-                break;
-            }
-            n += k;
+        if let Some(n) = embed_all_pending(&settings)? {
+            println!("hook replay: embedded {n} pending record vectors first in {:.1} s", t0.elapsed().as_secs_f64());
         }
-        println!("hook replay: embedded {n} pending record vectors first in {:.1} s", t0.elapsed().as_secs_f64());
     }
     // Each floor twice: context selection off (the pointers as before it),
     // then on (the default); the selection line says what trim and

@@ -248,6 +248,13 @@ pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
             Mode::One(|s| nextest_block(s).map(v)),
         ),
         site(
+            "digest nextest indented block",
+            r"^\s+(stdout|stderr) ─+\s*$",
+            &[" ", "  ", "\t", "stdout", "stderr", "\u{2500}", "\u{2500}\u{2500}\u{2500}", "-", "x", "\n", "\u{a0}"],
+            &["  stdout ───", "  stderr ───  ", "    stderr ─"],
+            Mode::One(|s| nextest_indented_block(s).map(v)),
+        ),
+        site(
             "digest panic (new)",
             r"panicked at ([^\s]+:\d+):\d+:$",
             LOG,
@@ -270,7 +277,7 @@ pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
         ),
         site(
             "digest build skip",
-            r"^(error: could not compile|error: aborting|warning: build failed|warning: `[^`]+` \(.*\) generated|warning: unused manifest key|error: test failed|error: \d+ target)",
+            r"^(error: could not compile|error: aborting|warning: build failed|warning: `[^`]+` \(.*\) generated|warning: unused manifest key|error: test failed|error: test run failed|error: \d+ target)",
             &[
                 "error: ",
                 "warning: ",
@@ -282,12 +289,13 @@ pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
                 "build failed",
                 "unused manifest key",
                 "test failed",
+                "test run failed",
                 "12",
                 " target",
                 "x",
                 "\n",
             ],
-            &["warning: `atlas` (lib) generated 2 warnings", "error: could not compile `x`", "error: 2 targets failed"],
+            &["warning: `atlas` (lib) generated 2 warnings", "error: could not compile `x`", "error: 2 targets failed", "error: test run failed"],
             Mode::Bool(build_skip),
         ),
         site(
@@ -370,9 +378,9 @@ pub(crate) fn lex_sites() -> Vec<lex::props::Site> {
         ),
         site(
             "digest verdict line",
-            r"^[^:]{1,80}: (PASS|FAIL)\b",
-            &["oracle", ": ", "PASS", "FAIL", ":", " ", "x", "PASSED"],
-            &["shadow oracle: PASS", "a b: FAIL (3)"],
+            r"^[^:]{1,80}: (PASS|FAILED|FAIL)\b",
+            &["oracle", ": ", "PASS", "FAIL", "FAILED", "ED", ":", " ", "x", "PASSED"],
+            &["shadow oracle: PASS", "a b: FAIL (3)", "backend oracle: FAILED (`x`: 3 px)"],
             Mode::Bool(verdict_line),
         ),
         site(
@@ -541,6 +549,16 @@ pub(crate) fn nextest_block(s: &str) -> Option<Spans<4>> {
     (lex::lit(s, b1, " ---")? == s.len()).then_some([Some((0, s.len())), Some((w0, w1)), Some((a0, a1)), Some((b0, b1))])
 }
 
+/// `^\s+(stdout|stderr) ─+\s*$`: the header of an output block in
+/// nextest's current format (0.9.80 on), under the `FAIL [..]` line of the
+/// test it belongs to, the block's lines indented four spaces.
+pub(crate) fn nextest_indented_block(s: &str) -> Option<Spans<2>> {
+    let w0 = lex::spaces1(s, 0)?;
+    let (w1, _) = lex::one_of(s, w0, &["stdout", "stderr"])?;
+    let r = lex::run1(s, lex::lit(s, w1, " ")?, |c| c == '\u{2500}')?;
+    (lex::spaces(s, r) == s.len()).then_some([Some((0, s.len())), Some((w0, w1))])
+}
+
 /// `panicked at ([^\s]+:\d+):\d+:$`: a panic line (Rust 1.73 on).
 pub(crate) fn panic_new(s: &str) -> Option<Spans<2>> {
     // Every earlier `panicked at ` has this one's spaces after it.
@@ -599,7 +617,7 @@ pub(crate) fn build_skip(s: &str) -> bool {
     let targets = lex::lit(s, 0, "error: ").and_then(|q| lex::run1(s, q, lex::digit)).is_some_and(|q| lex::lit(s, q, " target").is_some());
     generated
         || targets
-        || ["error: could not compile", "error: aborting", "warning: build failed", "warning: unused manifest key", "error: test failed"]
+        || ["error: could not compile", "error: aborting", "warning: build failed", "warning: unused manifest key", "error: test failed", "error: test run failed"]
             .iter()
             .any(|p| s.starts_with(p))
 }
@@ -724,7 +742,7 @@ pub(crate) fn summary_fail(s: &str) -> bool {
 pub(crate) fn verdict_line(s: &str) -> bool {
     let (e, n) = lex::run_max(s, 0, 81, |c| c != ':');
     (1..=80).contains(&n)
-        && lex::lit(s, e, ": ").and_then(|q| lex::one_of(s, q, &["PASS", "FAIL"])).is_some_and(|(f, _)| lex::boundary(s, f))
+        && lex::lit(s, e, ": ").is_some_and(|q| ["PASS", "FAILED", "FAIL"].iter().any(|w| lex::lit(s, q, w).is_some_and(|f| lex::boundary(s, f))))
 }
 
 /// `(?i)\b(error|fail(ed|ure)?|panic(ked)?)\b`: a word that says
@@ -966,6 +984,9 @@ fn totals(text: &str) -> Totals {
 fn test_items(text: &str) -> Vec<Item> {
     let lines: Vec<&str> = text.lines().collect();
     let mut v = Vec::new();
+    // The test of the last nextest status line: the owner of the
+    // indented blocks under it.
+    let mut last_status: Option<String> = None;
     let mut i = 0;
     while i < lines.len() {
         let l = lines[i];
@@ -979,6 +1000,7 @@ fn test_items(text: &str) -> Vec<Item> {
             v.push(Item { name: g(c[1]).to_string(), first: i + 1, last: i + 1, status: st.into(), depth: 0 });
         } else if let Some(c) = nextest_status(l) {
             let st = if g(c[1]) == "PASS" { "ok" } else { "failed" };
+            last_status = Some(g(c[3]).to_string());
             v.push(Item { name: g(c[3]).to_string(), first: i + 1, last: i + 1, status: st.into(), depth: 0 });
         } else if let Some(name) = libtest_block(l).map(|c| g(c[1])).or_else(|| nextest_block(l).map(|c| g(c[3]))) {
             let name = name.to_string();
@@ -999,13 +1021,102 @@ fn test_items(text: &str) -> Vec<Item> {
             while last > i + 1 && lines[last - 1].trim().is_empty() {
                 last -= 1;
             }
-            v.push(Item { name: format!("{name}"), first: i + 1, last, status: "failed-output".into(), depth: 0 });
+            v.push(Item { name: name.to_string(), first: i + 1, last, status: "failed-output".into(), depth: 0 });
+            i = j;
+            continue;
+        } else if let Some(name) = nextest_indented_block(l).and(last_status.clone()) {
+            // nextest's current format: `  stdout ───` and `  stderr ───`
+            // under the test's `FAIL [..]` line, the output indented four
+            // spaces. The test's blocks are one item, so its panic is found
+            // in whichever block holds it.
+            let mut j = i + 1;
+            while j < lines.len() && (lines[j].trim().is_empty() || lines[j].starts_with("    ") || nextest_indented_block(lines[j]).is_some()) {
+                j += 1;
+            }
+            let mut last = j;
+            while last > i + 1 && lines[last - 1].trim().is_empty() {
+                last -= 1;
+            }
+            v.push(Item { name, first: i + 1, last, status: "failed-output".into(), depth: 0 });
             i = j;
             continue;
         }
         i += 1;
     }
+    unblocked_failures(&lines, &mut v);
     v
+}
+
+/// libtest's closing list of failed tests: after a `failures:` line (and
+/// blank lines), the names indented four spaces.
+fn failure_list<'a>(lines: &[&'a str]) -> Vec<(usize, &'a str)> {
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < lines.len() {
+        if lines[k].trim_end() != "failures:" {
+            k += 1;
+            continue;
+        }
+        let mut j = k + 1;
+        while j < lines.len() && lines[j].trim().is_empty() {
+            j += 1;
+        }
+        while j < lines.len() {
+            let n = lines[j].trim_end();
+            match n.strip_prefix("    ") {
+                Some(name) if !name.is_empty() && !name.contains(lex::space) => out.push((j, name)),
+                _ => break,
+            }
+            j += 1;
+        }
+        k = j.max(k + 1);
+    }
+    out
+}
+
+/// The test a panic line names, `thread 'NAME' ... panicked at`.
+fn panic_thread(l: &str) -> Option<&str> {
+    let rest = l.trim_start().strip_prefix("thread '")?;
+    let (name, after) = rest.split_once('\'')?;
+    (after.contains("panicked at ") && (panic_new(l).is_some() || panic_old(l).is_some())).then_some(name)
+}
+
+/// Failures with no output block, as a run under `--nocapture` (or the
+/// test binary run directly) prints them: the test's status line is not
+/// `... FAILED` (its own output follows the `...`), only the closing
+/// failures list names it, and its panic is inline. Adds a `failed` item
+/// for each listed name not yet failed, and for each failed test with no
+/// block, a `failed-output` item from its `thread 'NAME' panicked at` line
+/// to the next test, status or panic line.
+fn unblocked_failures(lines: &[&str], v: &mut Vec<Item>) {
+    for (j, name) in failure_list(lines) {
+        if !v.iter().any(|it| it.status == "failed" && it.name == name) {
+            v.push(Item { name: name.to_string(), first: j + 1, last: j + 1, status: "failed".into(), depth: 0 });
+        }
+    }
+    let unblocked: Vec<String> = v
+        .iter()
+        .filter(|it| it.status == "failed" && !v.iter().any(|b| b.status == "failed-output" && b.name == it.name))
+        .map(|it| it.name.clone())
+        .collect();
+    for name in unblocked {
+        let Some(k) = lines.iter().position(|l| panic_thread(l) == Some(name.as_str())) else { continue };
+        let mut j = k + 1;
+        while j < lines.len() {
+            let m = lines[j];
+            let t = m.trim();
+            if t == "FAILED" || t == "failures:" || m.starts_with("test ") || panic_thread(m).is_some() || libtest_block(m).is_some() {
+                break;
+            }
+            j += 1;
+        }
+        while j > k + 1 && lines[j - 1].trim().is_empty() {
+            j -= 1;
+        }
+        v.push(Item { name, first: k + 1, last: j, status: "failed-output".into(), depth: 0 });
+    }
+    // Items in line order, as the loop above makes them.
+    v.sort_by_key(|it| it.first);
 }
 
 /// The panic location and message of a failure block.
@@ -1826,6 +1937,15 @@ fn grep_path(l: &str) -> Option<&str> {
     // its start; Windows drive letters keep their colon.
     let skip = if l.len() > 2 && l.as_bytes()[1] == b':' && l.as_bytes()[0].is_ascii_alphabetic() { 2 } else { 0 };
     let rest = &l[skip..];
+    // Digits then `:` are one file's line number (`12:text`). Digits then `-` are
+    // a line number (`13-context`) or a date (`2026-11-06 12:00:00`), unless what
+    // reaches the line number looks like a file (`0001-init.sql:5:x`).
+    let lead = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if lead > 0 && rest[lead..].starts_with(':') {
+        return None;
+    }
+    let digits_first = lead > 0 && rest[lead..].starts_with('-');
+    let file = |p: &str| !digits_first || (!p.contains(char::is_whitespace) && p.contains(['.', '/', '\\']));
     // `path:12:` (a hit), else `path-12-` (a context line).
     for sep in [':', '-'] {
         let mut from = 0;
@@ -1833,7 +1953,7 @@ fn grep_path(l: &str) -> Option<&str> {
             let c = from + k;
             let after = &rest[c + 1..];
             let digits = after.bytes().take_while(u8::is_ascii_digit).count();
-            if c > 0 && digits > 0 && after[digits..].starts_with(sep) {
+            if c > 0 && digits > 0 && after[digits..].starts_with(sep) && file(&rest[..c]) {
                 return Some(&l[..skip + c]);
             }
             if sep == ':' {
@@ -1868,20 +1988,32 @@ fn grep(id: &str, text: &str, max: usize) -> String {
             }
         }
     }
-    let hits: usize = counts.iter().map(|c| c.1).sum();
-    let mut out = format!("{hits} hits in {} files\n", counts.len());
-    let mut by = counts.clone();
-    by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let top: Vec<String> = by.iter().take(10).map(|(p, n)| format!("{p} {n}")).collect();
-    out.push_str(&top.join(", "));
-    if by.len() > 10 {
-        out.push_str(&format!(", and {} more files", by.len() - 10));
-    }
-    out.push('\n');
+    // One file's output names no file (`12:text`, or `text` alone): those lines
+    // are still matches, so they are never read as none.
+    let bare = |l: &&str| !l.is_empty() && *l != "--" && grep_path(l).is_none();
+    let others = text.lines().filter(bare).count();
+    let named = !counts.is_empty();
+    let hits: usize = if named { counts.iter().map(|c| c.1).sum() } else { others };
+    let mut out = if named {
+        let mut by = counts.clone();
+        by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let top: Vec<String> = by.iter().take(10).map(|(p, n)| format!("{p} {n}")).collect();
+        let mut s = format!("{hits} hits in {} files\n{}", counts.len(), top.join(", "));
+        if by.len() > 10 {
+            s.push_str(&format!(", and {} more files", by.len() - 10));
+        }
+        if others > 0 {
+            s.push_str(&format!("; and {others} lines naming no file"));
+        }
+        s.push('\n');
+        s
+    } else {
+        format!("{hits} lines, in output that names no file\n")
+    };
     let budget = max.saturating_sub(out.len() + 80);
     let mut used = 0;
     let mut shown = 0;
-    for l in text.lines().filter(|l| grep_path(l).is_some()) {
+    for l in text.lines().filter(|l| if named { grep_path(l).is_some() } else { bare(l) }) {
         let q = format!("{}\n", clip(l, QUOTE));
         if used + q.len() > budget {
             break;
@@ -1891,10 +2023,10 @@ fn grep(id: &str, text: &str, max: usize) -> String {
         out.push_str(&q);
     }
     if shown < hits {
-        out.push_str(&format!("({shown} of {hits} hits shown)\n"));
+        out.push_str(&format!("({shown} of {hits} {} shown)\n", if named { "hits" } else { "lines" }));
     }
     let _ = items;
-    out.push_str(&hint(id, "--item PATH | --grep RE | --lines A-B"));
+    out.push_str(&hint(id, if named { "--item PATH | --grep RE | --lines A-B" } else { "--grep RE | --lines A-B" }));
     out
 }
 
@@ -2266,6 +2398,39 @@ fn source(id: &str, lang: Lang, text: &str, max: usize) -> String {
 /// Verdict lines a summary keeps whole, up to this many characters.
 const VERDICT: usize = 480;
 
+/// Log pointers a summary keeps, at most this many.
+const LOG_POINTERS: usize = 3;
+
+/// The lines of a check log that name its detail log, `(log PATH)` with a
+/// path of no spaces, each once and whole up to [`VERDICT`] characters, at
+/// most [`LOG_POINTERS`]. A path wrapped onto the next line (a terminal
+/// break after `(log `) is joined to its line with one space.
+fn log_pointers(lines: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (n, l) in lines.iter().enumerate() {
+        let Some(p) = l.find("(log ") else { continue };
+        let rest = l[p + 5..].trim();
+        let line = if rest.is_empty() {
+            match lines.get(n + 1).map(|x| x.trim()) {
+                Some(x) if !x.is_empty() => format!("{} {x}", l.trim()),
+                _ => continue,
+            }
+        } else {
+            l.trim().to_string()
+        };
+        let q = line.find("(log ").expect("found above") + 5;
+        let ok = line[q..].split_once(')').is_some_and(|(path, _)| !path.is_empty() && !path.contains(lex::space));
+        let line = clip(&line, VERDICT);
+        if ok && !out.contains(&line) {
+            out.push(line);
+            if out.len() == LOG_POINTERS {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// The digest of a long check log, with no budget: only what decides it.
 ///
 /// 1. Every totals table: from a [`table_head`] line to the first line
@@ -2278,8 +2443,13 @@ const VERDICT: usize = 480;
 ///    [`MAX_FAILURES`] and then a count.
 /// 3. Panics: each `panicked at` line and the message line after it, at
 ///    most [`MAX_FAILURES`] and then a count.
-/// 4. Verdicts: lines of the form `NAME: PASS` or `NAME: FAIL` (a check's
-///    own verdict, such as an oracle's), whole up to [`VERDICT`] characters.
+/// 4. Verdicts: lines of the form `NAME: PASS`, `NAME: FAIL` or `NAME:
+///    FAILED` (a check's own verdict, such as an oracle's), whole up to
+///    [`VERDICT`] characters.
+///
+/// After the tables, the setup lines that name the run's detail log,
+/// `(log PATH)` (see [`log_pointers`]), where the failed tests' own output
+/// is.
 pub fn summary(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = String::new();
@@ -2304,6 +2474,10 @@ pub fn summary(text: &str) -> String {
     }
     if tables == 0 {
         out.push_str("no totals table\n");
+    }
+    for p in log_pointers(&lines) {
+        out.push_str(&p);
+        out.push('\n');
     }
     let mut failures: Vec<String> = Vec::new();
     let mut in_list = false;
@@ -2553,6 +2727,21 @@ panics: none
         assert_eq!(v, vec![("T", 1, 7), ("a", 4, 5), ("b", 6, 7), ("U", 8, 8)]);
     }
 
+    /// A file's name can start with digits; a line number or a date is no file.
+    #[test]
+    fn grep_paths_may_start_with_digits() {
+        assert_eq!(grep_path("0001-init.sql:5:x"), Some("0001-init.sql"));
+        assert_eq!(grep_path("0001-init.sql-6-x"), Some("0001-init.sql"));
+        assert_eq!(grep_path("1-a/b:5:x"), Some("1-a/b"));
+        assert_eq!(grep_path("C:/w/0001-init.sql:5:x"), Some("C:/w/0001-init.sql"));
+        for bare in ["12:text", "13-context", "12:5:x", "13-a b.c:5:x", "2026-11-06 12:00:00", "2026-11-06T12:00:00Z", "2026-11-06T12:00:00.5 x", "13-4-5-text"] {
+            assert_eq!(grep_path(bare), None, "{bare}");
+        }
+        let t: String = (0..400).map(|i| format!("0001-init.sql:{i}:x\n")).collect();
+        let d = grep("h:1", &t, 600);
+        assert!(d.contains("0001-init.sql") && !d.contains("names no file"), "{d}");
+    }
+
     #[test]
     fn grep_paths_keep_drive_letters() {
         assert_eq!(grep_path("C:/w/a.rs:12:x"), Some("C:/w/a.rs"));
@@ -2564,6 +2753,97 @@ panics: none
     fn digests_are_reproducible() {
         let t = "a\nb\nerror: x\n";
         assert_eq!(digest("h:1", "make", Shape::Generic, t, None, 600), digest("h:1", "make", Shape::Generic, t, None, 600));
+    }
+
+    /// P1: under `--nocapture` a test's output follows its `...`, so no
+    /// status line says FAILED, there is no `---- NAME stdout ----` block,
+    /// and the panic is inline.
+    #[test]
+    fn a_nocapture_failure_is_paired_with_its_panic() {
+        let t = "running 3 tests\n\
+                 test a::wick ... film wick: 1 pixels\n\
+                 \n\
+                 thread 'a::wick' (301) panicked at src\\film.rs:12:5:\n\
+                 the wick draws threads: 1 pixels\n\
+                 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+                 FAILED\n\
+                 test a::fine ... ok\n\
+                 knoll: 456 m3\n\
+                 \n\
+                 thread 'knoll' (302) panicked at tests\\t.rs:559:5:\n\
+                 a line of four needs 1625 s\n\
+                 test knoll ... FAILED\n\
+                 \n\
+                 failures:\n\
+                 \n\
+                 failures:\n\
+                 \x20   a::wick\n\
+                 \x20   knoll\n\
+                 \n\
+                 test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let d = cargo_test("h:1", t, Some(101), 600);
+        assert!(d.contains("FAILED a::wick src/film.rs:12 the wick draws threads: 1 pixels\n"), "{d}");
+        assert!(d.contains("FAILED knoll tests/t.rs:559 a line of four needs 1625 s\n"), "{d}");
+        let blocks: Vec<(String, usize, usize)> =
+            test_items(t).into_iter().filter(|i| i.status == "failed-output").map(|i| (i.name, i.first, i.last)).collect();
+        assert_eq!(blocks, vec![("a::wick".to_string(), 4, 6), ("knoll".to_string(), 11, 12)]);
+        // A captured run is read as before: the block, not the inline panic.
+        let captured = "test x ... FAILED\n\nfailures:\n\n---- x stdout ----\n\nthread 'x' panicked at src/a.rs:3:5:\nboom\n\nfailures:\n    x\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let items = test_items(captured);
+        assert_eq!(items.iter().filter(|i| i.status == "failed").count(), 1);
+        assert_eq!(items.iter().filter(|i| i.status == "failed-output").map(|i| i.first).collect::<Vec<_>>(), vec![5]);
+    }
+
+    /// P3: nextest's current output blocks, and its closing `error: test
+    /// run failed`, which is no build error.
+    #[test]
+    fn nextest_indented_blocks_belong_to_the_test_above_them() {
+        let t = "    Starting 1 test across 2 binaries\n\
+                 \x20       FAIL [   0.010s] (1/1) ledger::ledger chunks_sum\n\
+                 \x20 stdout \u{2500}\u{2500}\u{2500}\n\
+                 \n\
+                 \x20   running 1 test\n\
+                 \x20   test chunks_sum ... FAILED\n\
+                 \n\
+                 \x20 stderr \u{2500}\u{2500}\u{2500}\n\
+                 \x20   ledger: FX_DATA_DIR is not set\n\
+                 \n\
+                 \x20   thread 'chunks_sum' (11) panicked at src\\lib.rs:31:9:\n\
+                 \x20   index out of bounds: the len is 1 but the index is 1\n\
+                 \n\
+                 \x20 Cancelling due to test failure: \n\
+                 \u{2500}\u{2500}\u{2500}\u{2500}\n\
+                 \x20    Summary [   0.011s] 1 test run: 0 passed, 1 failed, 4 skipped\n\
+                 \x20       FAIL [   0.010s] (1/1) ledger::ledger chunks_sum\n\
+                 error: test run failed\n";
+        let items = test_items(t);
+        let b: Vec<(&str, usize, usize)> = items.iter().filter(|i| i.status == "failed-output").map(|i| (i.name.as_str(), i.first, i.last)).collect();
+        assert_eq!(b, vec![("chunks_sum", 3, 12)]);
+        assert!(build_items(t).is_empty(), "{:?}", build_items(t));
+        let d = cargo_test("h:1", t, Some(100), 600);
+        assert!(d.contains("FAILED chunks_sum src/lib.rs:31 index out of bounds: the len is 1 but the index is 1\n"), "{d}");
+        assert!(!d.contains("build:"), "{d}");
+        assert_eq!(nextest_indented_block("  stdout \u{2500}").map(|c| c[1]), Some(Some((2, 8))));
+        assert!(nextest_indented_block("stdout \u{2500}\u{2500}").is_none() && nextest_indented_block("  stdout ---").is_none());
+    }
+
+    /// P2 and P5: a check log's summary keeps the line that names the
+    /// detail log, wrapped or not, and a `NAME: FAILED` verdict.
+    #[test]
+    fn a_check_summary_keeps_the_log_pointer_and_a_failed_verdict() {
+        let t = "xtask: tests by cargo nextest (log Z:/t/a\\xtask-check.log)\n\
+                 crate passed failed\n\
+                 total 1 1\n\
+                 backend oracle: FAILED (`siege-night`: a pair has 5477 px over 8/255)\n\
+                 shadow oracle: PASS\n\
+                 not a pointer (log of the day)\n";
+        let s = summary(t);
+        assert!(s.contains("xtask: tests by cargo nextest (log Z:/t/a\\xtask-check.log)\n"), "{s}");
+        assert!(s.contains("backend oracle: FAILED (`siege-night`: a pair has 5477 px over 8/255)\n"), "{s}");
+        assert!(!s.contains("of the day"), "{s}");
+        let wrapped = ["xtask: tests by cargo nextest (log ", "Z:\\t\\b\\xtask-check.log)", "more"];
+        assert_eq!(log_pointers(&wrapped), vec!["xtask: tests by cargo nextest (log Z:\\t\\b\\xtask-check.log)".to_string()]);
+        assert!(verdict_line("a: FAILED") && verdict_line("a: FAIL") && !verdict_line("a: FAILURE") && !verdict_line("a: FAILEDX"));
     }
     /// Real `go test` outputs of a small module (fixtures/go-test): three
     /// packages, one with failing tests and subtests, a skip, a panic and a

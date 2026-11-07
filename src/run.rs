@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use crate::digest::{self, Shape};
 use crate::handles::{HandleCfg, Handles, Meta};
 
-const USAGE: &str = "usage: atlas run [--digest test|build|grep|listing|source|summary|generic] [--timeout S] [--label TEXT] -- CMD [ARGS...]";
+/// The usage line of `atlas run`.
+pub const USAGE: &str = "usage: atlas run [--digest test|build|grep|listing|source|summary|generic] [--timeout S] [--label TEXT] -- CMD [ARGS...]";
 
 pub(crate) fn forced(name: &str) -> Result<Shape, String> {
     Ok(match name {
@@ -147,7 +148,9 @@ pub fn cli(args: Vec<String>, db: &std::path::Path, lean: Option<&crate::json::V
     }
     let cfg = HandleCfg::from_lean(lean);
     let text = String::from_utf8_lossy(&buf).into_owned();
-    if buf.len() < cfg.threshold_bytes {
+    // A command naming a deny-listed file still runs and prints; only the
+    // handle is left out.
+    if buf.len() < cfg.threshold_bytes || cmd.iter().any(|w| crate::hook_rewrite::command_denied(w, &cwd)) {
         print!("{text}");
         return Ok(ExitCode::from(code.clamp(0, 255) as u8));
     }

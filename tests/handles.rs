@@ -165,6 +165,52 @@ fn routing_swaps_large_results_and_keeps_the_shape() {
     assert_eq!(off.post_tool_use(&bash_event("cargo test", &text)).unwrap(), None);
 }
 
+/// Real session finding: a Grep over the threshold on one file prints `N:text`
+/// with no path, and the digest said `0 hits in 0 files`, which the model believed.
+#[test]
+fn a_grep_of_one_file_is_never_digested_as_no_hits() {
+    let t = Temp::new("grep-one");
+    let mut r = Router::with_db(&t.path().join("index.sqlite"), None);
+    let numbered: String = (1..=800).map(|i| format!("{i}:alpha line {i} of a long file\n")).collect();
+    let plain: String = (1..=800).map(|i| format!("alpha line {i} of a long file\n")).collect();
+    let digits: String = (1..=800).map(|i| format!("{i}:5:alpha line {i} of a long file\n")).collect();
+    let dated: String = (1..=800).map(|i| format!("{i}:2026-11-06 alpha line {i} of a long file\n")).collect();
+    let stamped: String = (1..=800).map(|i| format!("2026-11-06 12:00:00 alpha line {i} of a long file\n")).collect();
+    let tool = |content: &str| HookEvent {
+        event: "PostToolUse".into(),
+        tool_name: "Grep".into(),
+        session_id: "s1".into(),
+        tool_input: json!({"pattern": "alpha", "path": "one.txt"}),
+        tool_response: json!({"mode": "content", "content": content}),
+        ..HookEvent::default()
+    };
+    for (name, ev) in [
+        ("Grep tool", tool(&numbered)),
+        ("Grep tool, no line numbers", tool(&plain)),
+        ("Grep tool, digits after the line number", tool(&digits)),
+        ("Grep tool, a date after the line number", tool(&dated)),
+        ("Grep tool, a date first", tool(&stamped)),
+        ("grep -n", bash_event("grep -n alpha one.txt", &numbered)),
+        ("grep", bash_event("grep alpha one.txt", &plain)),
+        ("rg -N", bash_event("rg -N alpha one.txt", &plain)),
+    ] {
+        let out = r.post_tool_use(&ev).unwrap().unwrap();
+        let o = if name.starts_with("Grep") { out["content"].as_str().unwrap().to_string() } else { out["stdout"].as_str().unwrap().to_string() };
+        assert!(!o.contains("0 hits"), "{name}: {o}");
+        assert!(o.contains("800 lines") && !o.contains(" files"), "{name}: the count is there: {o}");
+        // Bash output naming no file takes the log shape: its count and tail are honest.
+        if name.starts_with("Grep") {
+            assert!(o.contains("alpha line 1 "), "{name}: the first match is quoted: {o}");
+        }
+    }
+    // Output that does name its files reads as before, and says so of any line that does not.
+    let many: String = (1..=800).map(|i| format!("a{}.rs:{i}:alpha line\n", i % 2)).collect();
+    let o = r.post_tool_use(&tool(&many)).unwrap().unwrap();
+    assert!(o["content"].as_str().unwrap().contains("800 hits in 2 files"), "{o:?}");
+    let d = digest::digest("h:1", "grep", Shape::Grep, "a.rs:1:x\nb.rs:2:y\nloose line\n", Some(0), 600);
+    assert!(d.contains("2 hits in 2 files") && d.contains("and 1 lines naming no file"), "{d}");
+}
+
 #[test]
 fn routing_reads_a_persisted_bash_output_whole() {
     let t = Temp::new("persist");

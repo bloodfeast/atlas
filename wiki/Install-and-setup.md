@@ -4,6 +4,10 @@ atlas is a Claude Code plugin. The plugin carries prebuilt binaries for Windows 
 aarch64, and macOS (Apple Silicon and Intel), as the release notes list them; a platform a release lacks
 builds from source (below).
 
+Claude Code version: no minimum is established. The measurements these pages cite were taken on Claude Code
+2.1.316 and 2.1.318; the hooks other than SessionStart are `mcp_tool` hooks, and the always-loaded tool schemas need 2.1.285 or later.
+An older Claude Code is untested.
+
 1. Add the marketplace and install the plugin, in Claude Code:
 
    ```
@@ -39,7 +43,7 @@ builds from source (below).
    model file, and prints where everything is. Run it again after an interrupted download to resume. It
    needs `curl`, which ships with Windows 10 and later, macOS and practically every Linux distribution.
 
-   The first session in a folder atlas does not index asks once (through Claude, in one line): *create a
+   A new session in a folder atlas does not index asks, through Claude, in one line: *create a
    vault for this project at `<path>`? yes / other folder / no*, yes being the default. `atlas --setup` asks
    the same in the terminal for the folder it runs in (`[Y]es / [o]ther folder / [n]o`; Enter is yes). Yes
    runs `atlas settings add-project --vault`, which adds the folder's Markdown as a source (`**/*.md`,
@@ -50,15 +54,19 @@ builds from source (below).
    repository. It starts with one `README.md` note; open the folder in Obsidian with *Open folder as vault*.
    Other folder runs `atlas settings add-project --vault-at FOLDER` instead: an existing folder (an Obsidian
    vault you already have) is registered as it is, nothing written into it, and a folder inside the project
-   is left out of the project's source so no note is indexed twice. No changes nothing. Each folder is asked
-   once, whatever the answer, and the question is recorded as asked when it is put, so a session with no
-   user to answer it (Claude is told to do nothing then) does not ask again; `atlas settings add-project
+   is left out of the project's source so no note is indexed twice. No runs `atlas settings add-project --no DIR`, which records the
+   answer and changes nothing else. A folder is asked until it is answered: nothing is recorded when the question is
+   put, because Claude does not always relay it, and a session with no user runs nothing. So someone who never answers
+   hears it at each new session (a start or `/clear`, not a resume or a compaction) in that folder, and the
+   orchestrated mode question at each new session in any folder. `atlas settings add-project
    [--vault | --vault-at FOLDER] DIR` adds one any time (`.` for the current folder), and `--vault` on an
    indexed project adds its vault alone. `--dry-run` shows the change, the file and the project it would go
    into, and writes nothing; so does `add-project` with no folder named (pass `.` or `--yes` to write). A
    folder a project already covers (a project root, its project file's folder, a repository) counts as
    indexed, so it is not asked about. Without a terminal, `atlas --setup` only prints the command and records
-   nothing, and says so: nothing went wrong, there was no terminal to ask in.
+   nothing, and says so: nothing went wrong, there was no terminal to ask in. In auto mode, Claude Code's
+   classifier may block `atlas --setup` and `atlas settings` commands that Claude runs (the reason reads "No
+   reason provided") until you tell Claude you allow them.
 
    In a configuration with `projects`, add-project writes into the project the folder belongs to (its
    `projects[]` entry: `sources`, `code.roots`, `vaults`), never the top level, whose lists every project
@@ -75,11 +83,46 @@ builds from source (below).
    or one that was there before, is kept. Notes are never deleted.
    Backups of atlas's configuration go to `atlas-backups` beside the configuration file; backups of Claude
    Code's `settings.json` go to `atlas-backups` in Claude Code's folder. Undo finds each in its own place.
+   A change holds `atlas.json.lock` beside the configuration file, or `settings.json.lock` in Claude Code's
+   folder, so two sessions cannot lose each other's write; both are empty and stay there.
    Undo first shows what it would revert (when the change was made, which command made it, and for each file
    what goes back, with line counts) and asks; without a terminal it reverts only with `--yes`, so a command
    that changed nothing (and made no backup) never leads undo to revert an older change unseen.
    A folder that holds several git repositories is offered as a multi-repository project instead; see
    [[Projects and multi-repo]].
+
+   Setup also asks whether you want to work in **orchestrated mode**, for sessions that delegate their work
+   to subagents: atlas caps how many agents of each kind run at once and tells each agent to hand off near its
+   context limit (see the `orchestrate` skill and [[Memory store and hooks]]). Nothing is on until you say
+   yes. On yes it asks each option, with the value in effect in brackets (Enter keeps it):
+
+   | Question | Stored as | Default |
+   |---|---|---|
+   | Builders at once | `orchestrate.kinds.builder.max` | 2 |
+   | Reviewers at once | `orchestrate.kinds.reviewer.max` | 2 |
+   | Research and design agents at once | `orchestrate.kinds.research.max` | 1 |
+   | Context limits: enforced, advisory or off | `orchestrate.mode` | enforced |
+   | Handoff point, in context tokens | `cap.warn_tokens`, only when you type a number | 285,000 on a 1M window, scaled to the window |
+   | Hard limit, in context tokens | `cap.block_tokens`, only when you type a number | 450,000 on a 1M window, scaled to the window |
+   | After a handoff, start the fresh agent: auto, or ask you first | `orchestrate.fresh` | auto |
+
+   The handoff point and the hard limit are skipped when context limits are off. The answers are one
+   configuration change, backed up, which `atlas settings undo` reverts. The first Claude Code session asks
+   the same once, through Claude, unless the configuration already sets `orchestrate.enabled`. To answer
+   again at any time:
+
+   ```sh
+   atlas settings orchestrate                       # asks in a terminal; without one, lists the options
+   atlas settings orchestrate --yes --builders 3 --mode advisory   # answers without a terminal
+   atlas settings orchestrate --no                  # declines (and turns the caps off if they are on)
+   ```
+
+   Setup never asks about [[Memory and rule files]], which is experimental and off by default. Turning it
+   on is a deliberate `atlas settings set memory-rules true`.
+
+   `--yes` takes `--builders N`, `--reviewers N`, `--research N`, `--mode enforced|advisory|off`,
+   `--handoff TOKENS`, `--limit TOKENS` and `--fresh auto|ask`; an option left out keeps the value in effect,
+   and a handoff point above the hard limit is refused. A no writes nothing to the configuration.
 
 4. Updates are on. At each session start atlas asks whether a newer release exists (at most once an hour),
    checks the release manifest's ed25519 signature against the public key built into atlas, downloads the
@@ -93,7 +136,7 @@ builds from source (below).
    ```
 
    (`atlas settings on update` turns them back on), or pin a version in `atlas.json` with
-   `"update": {"pin": "0.2.0"}`. A binary you build from source never updates itself.
+   `"update": {"pin": "0.3.0"}`. A binary you build from source never updates itself.
 
 5. Point atlas at your notes: edit `atlas.json` (see [[Configuration reference]]) to add vaults (folders atlas may add
    to) and read-only sources (folders it only indexes), then run `/mcp` and reconnect atlas, or restart
@@ -113,7 +156,8 @@ and copy `target/release/atlas` (`atlas.exe` on Windows) into the plugin's `bin`
 
 1. In Claude Code: `/plugin uninstall atlas@atlas`, then `/plugin marketplace remove atlas`.
 2. atlas's own folders are kept on purpose (the memory store is yours). To remove them too, delete the
-   configuration folder and the data folder from the table above. Nothing else is written outside them.
+   configuration folder and the data folder from the table above. In Claude Code's folder atlas leaves only
+   what the settings commands wrote there: `atlas-backups` and `settings.json.lock`.
 
 ## Build and run
 
@@ -158,3 +202,15 @@ configuration through `ATLAS_CONFIG`, `atlas.json` at the plugin root (gitignore
 folder. In a release, `bin/` holds `atlas.exe` (Windows resolves `bin/atlas` to it) and, for macOS and Linux, a
 small `sh` launcher named `atlas` that starts `atlas-<arch>-<os>` beside it. `cargo xtask release` builds them
 (see [[Releasing]]).
+
+`atlas doctor` says what it can check: whether the atlas hooks in Claude Code's `settings.json` match the plugin's
+`hooks/hooks.json`, or that there is no such file, no atlas hook in it, or that it could not be read (exit 1). A plugin
+install keeps its hooks in the plugin, so it gets its own line and those hooks are not checked. It also names a project
+root at or above your home folder, without changing it. It writes nothing.
+
+If the server fails to start once (a missing binary, an invalid `atlas.json`), Claude Code does not try it again for
+15 minutes, even after you fix the cause, unless the fix changes the server's command: the next sessions show it as
+failed, and its hooks report it as not connected.
+This is Claude Code's behaviour, measured at 14.9 minutes still failing and 15.2 connected, and atlas cannot change it.
+A session works without atlas in that time: routing, recall and agent caps are off. `atlas doctor` names the wait
+when it can see Claude Code's record of it (`mcp-needs-auth-cache.json`).

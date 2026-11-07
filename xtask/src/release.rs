@@ -103,6 +103,9 @@ pub const USAGE: &str = "usage: cargo xtask release --build-only
 pub(crate) const TARGETS: [&str; 5] =
     ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"];
 
+/// The toolchain the clippy gate runs on, here and in `.github/workflows/ci.yml`.
+const CLIPPY_TOOLCHAIN: &str = "1.99.0";
+
 /// The build script run inside WSL: the Linux binary, from the same archive.
 const WSL_BUILD: &str = r#"set -eu
 stage="$1"
@@ -798,6 +801,23 @@ pub fn run(args: Vec<String>) -> R {
     crate::tar::extract(&archive, &stage.join("src"))?;
 
     if !o.build_only && !o.skip_tests {
+        // Clippy before the tests: it fails sooner. On a pinned toolchain, so a new
+        // Rust release's lints cannot fail an unrelated release.
+        for args in [&["--all-targets", "--features", "atlas/dev"][..], &[]] {
+            say(&format!("clippy (cargo +{CLIPPY_TOOLCHAIN} clippy --workspace --locked {} -- -D warnings)", args.join(" ")));
+            let ok = status(
+                Command::new("cargo")
+                    .current_dir(&root)
+                    .env("CARGO_TARGET_DIR", stage.join("target"))
+                    .arg(format!("+{CLIPPY_TOOLCHAIN}"))
+                    .args(["clippy", "--workspace", "--locked"])
+                    .args(args)
+                    .args(["--", "-D", "warnings"]),
+            )?;
+            if !ok {
+                return Err(format!("clippy failed, on a warning above or a missing toolchain: `rustup toolchain install {CLIPPY_TOOLCHAIN} --profile minimal -c clippy`"));
+            }
+        }
         // With the dev feature, so the measuring modes' tests run too; the
         // binaries are built without it below.
         say("tests (cargo test --release --locked --features dev, denylist set)");
@@ -1016,15 +1036,16 @@ pub fn run(args: Vec<String>) -> R {
     let mut c = pubc(&["tag", "-a", "--cleanup=verbatim", &tag, "-F", &msg]);
     ident(&mut c, false);
     output(&mut c)?;
-    let mut addrs: Vec<String> = output(&mut pubc(&["log", "--format=%ae%n%ce"]))?.lines().map(str::to_string).collect();
+    let log = output(&mut pubc(&["log", "--format=%H %ae %ce"]))?;
+    let mut addrs: Vec<&str> = log.lines().flat_map(|l| l.split(' ').skip(1)).collect();
     addrs.sort();
     addrs.dedup();
     let addresses = addrs.join(" ");
     // GitHub's own addresses come with releases merged through a pull
     // request (see release_ci.rs); any other is refused.
-    let other: Vec<&String> = addrs.iter().filter(|a| !crate::release_ci::address_allowed(a, &public_email)).collect();
+    let other = crate::release_ci::other_addresses(&log, &public_email);
     if !other.is_empty() {
-        return Err(format!("the public history carries another address: {}", other.iter().map(|a| format!("{a} ")).collect::<String>()));
+        return Err(format!("the public history carries another address: {}", other.join(" ")));
     }
     let tagger = output(&mut pubc(&["for-each-ref", "--format=%(taggeremail)", &format!("refs/tags/{tag}")]))?;
     if tagger.trim() != format!("<{public_email}>") {

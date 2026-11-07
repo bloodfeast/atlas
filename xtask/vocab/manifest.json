@@ -1,0 +1,294 @@
+{
+ "seed": 20261106,
+ "caps": {
+  "prose": 1500000,
+  "code": 1000000
+ },
+ "generated_lines": 100000,
+ "splits": [
+  "classes",
+  "lead"
+ ],
+ "mixes": [
+  [
+   40,
+   40,
+   10,
+   10
+  ],
+  [
+   30,
+   30,
+   20,
+   20
+  ],
+  [
+   30,
+   50,
+   10,
+   10
+  ]
+ ],
+ "sizes": [
+  300,
+  500,
+  744,
+  1000,
+  2000
+ ],
+ "sources": {
+  "rust-lang/book": {
+   "commit": "2771df165f092a4fbb9f46b5b2e7450f19010adb",
+   "url": "https://codeload.github.com/rust-lang/book/tar.gz/2771df165f092a4fbb9f46b5b2e7450f19010adb",
+   "spdx": "MIT OR Apache-2.0",
+   "select": {
+    "prose": [
+     "src/.*\\.md"
+    ]
+   },
+   "text_sha256": {
+    "prose": "858404cd73680b96a0b27197b64595ca35885fdf032807dd47fa276d984fcadc"
+   }
+  },
+  "rust-lang/reference": {
+   "commit": "a2ae66d7037cbedac68746b9510b24cc34b96d69",
+   "url": "https://codeload.github.com/rust-lang/reference/tar.gz/a2ae66d7037cbedac68746b9510b24cc34b96d69",
+   "spdx": "MIT OR Apache-2.0",
+   "select": {
+    "prose": [
+     "src/.*\\.md"
+    ]
+   },
+   "text_sha256": {
+    "prose": "ce23d921ae51d161d8d89c37f6342f7df098b98ca4f9eb9e914d80868af1e7bb"
+   }
+  },
+  "rust-lang/nomicon": {
+   "commit": "b0bb569883a3e65ab19d4f1adf1b8dbc1629d0a6",
+   "url": "https://codeload.github.com/rust-lang/nomicon/tar.gz/b0bb569883a3e65ab19d4f1adf1b8dbc1629d0a6",
+   "spdx": "MIT OR Apache-2.0",
+   "select": {
+    "prose": [
+     "src/.*\\.md"
+    ]
+   },
+   "text_sha256": {
+    "prose": "032c584a73ec01378a06bcf9a6f16aab70f19a59cc4c9f74d972d3f00301556c"
+   }
+  },
+  "rust-lang/cargo": {
+   "commit": "111443f3dc4d82a65e2306a93028f122406401c1",
+   "url": "https://codeload.github.com/rust-lang/cargo/tar.gz/111443f3dc4d82a65e2306a93028f122406401c1",
+   "spdx": "MIT OR Apache-2.0",
+   "select": {
+    "prose": [
+     "src/doc/src/.*\\.md"
+    ]
+   },
+   "text_sha256": {
+    "prose": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   }
+  },
+  "django/django": {
+   "commit": "8e3dec67c42f1557fe0ecb11b620ed707b01f498",
+   "url": "https://codeload.github.com/django/django/tar.gz/8e3dec67c42f1557fe0ecb11b620ed707b01f498",
+   "spdx": "BSD-3-Clause",
+   "select": {
+    "prose": [
+     "docs/.*\\.txt"
+    ],
+    "code": [
+     "django/.*\\.py"
+    ]
+   },
+   "text_sha256": {
+    "prose": "9ed5d75d3c999ca49b4da0200c9ab54d211223cd15bb2d73a9986d221081727c",
+    "code": "d10f82f9f910956b604dbc74b284966c01ccdf8169690d26e1cbaa207daa1691"
+   }
+  },
+  "pallets/flask": {
+   "commit": "49943b5a94413a530761350f04e896f76e8d620e",
+   "url": "https://codeload.github.com/pallets/flask/tar.gz/49943b5a94413a530761350f04e896f76e8d620e",
+   "spdx": "BSD-3-Clause",
+   "select": {
+    "prose": [
+     "docs/.*\\.rst"
+    ],
+    "code": [
+     "src/flask/.*\\.py"
+    ]
+   },
+   "text_sha256": {
+    "prose": "172315910716fd54d29db8fac83961c1710fa0a57d5ef51e8671cea90cd3cdb9",
+    "code": "7e6e3523b98ddea96beb69f92c27b73a2f36d0ac95b6fad57006c4ad809f6190"
+   }
+  },
+  "BurntSushi/ripgrep": {
+   "commit": "91f5d22ef48bde459d90a8c7dbeab416e97d0f2b",
+   "url": "https://codeload.github.com/BurntSushi/ripgrep/tar.gz/91f5d22ef48bde459d90a8c7dbeab416e97d0f2b",
+   "spdx": "Unlicense OR MIT",
+   "select": {
+    "code": [
+     "crates/.*\\.rs"
+    ]
+   },
+   "text_sha256": {
+    "code": "2f4e6e8a53c3139e00fb98800eef9759d920897859915d336d1f3db94722f737"
+   }
+  },
+  "tokio-rs/tokio": {
+   "commit": "695a07dd5e5baae82eb8b6931afa61029cd9b854",
+   "url": "https://codeload.github.com/tokio-rs/tokio/tar.gz/695a07dd5e5baae82eb8b6931afa61029cd9b854",
+   "spdx": "MIT",
+   "select": {
+    "code": [
+     "tokio/src/.*\\.rs"
+    ]
+   },
+   "text_sha256": {
+    "code": "100c5ec35255cc8deca176a99a25cac44a576336b83d98819f461bc3f121c77d"
+   }
+  },
+  "serde-rs/serde": {
+   "commit": "0db9b3b504bcb0a7fa9cf001429869519afd3e9a",
+   "url": "https://codeload.github.com/serde-rs/serde/tar.gz/0db9b3b504bcb0a7fa9cf001429869519afd3e9a",
+   "spdx": "MIT OR Apache-2.0",
+   "select": {
+    "code": [
+     "serde[a-z_]*/src/.*\\.rs"
+    ]
+   },
+   "text_sha256": {
+    "code": "e70fe23828a92afe4205561c84d9c42f685c58851ca5e35a2d3ba3d8cc384bbb"
+   }
+  },
+  "gfx-rs/wgpu": {
+   "commit": "8d49278285ef1297faca335dcb0d423438b21ab9",
+   "url": "https://codeload.github.com/gfx-rs/wgpu/tar.gz/8d49278285ef1297faca335dcb0d423438b21ab9",
+   "spdx": "MIT OR Apache-2.0",
+   "select": {
+    "code": [
+     "(wgpu|wgpu-core|wgpu-hal|naga)/src/.*\\.rs"
+    ]
+   },
+   "text_sha256": {
+    "code": "ec44373dd50829cd9cfe7a69e8f5ff911e197c3273c1effe2153866fe9cdbf01"
+   }
+  },
+  "psf/requests": {
+   "commit": "3c7baaa05ab4aa49cc819ce3a819d260de19c157",
+   "url": "https://codeload.github.com/psf/requests/tar.gz/3c7baaa05ab4aa49cc819ce3a819d260de19c157",
+   "spdx": "Apache-2.0",
+   "select": {
+    "code": [
+     "src/requests/.*\\.py"
+    ]
+   },
+   "text_sha256": {
+    "code": "4e64b95c7ae471b9905ee990a170186131e2bbfa919f64d1604825285018cc9d"
+   }
+  },
+  "vuejs/core": {
+   "commit": "8b479a89445868d474f17e2d837765e7c9ece5e4",
+   "url": "https://codeload.github.com/vuejs/core/tar.gz/8b479a89445868d474f17e2d837765e7c9ece5e4",
+   "spdx": "MIT",
+   "select": {
+    "code": [
+     "packages/[a-z-]+/src/.*\\.ts"
+    ]
+   },
+   "text_sha256": {
+    "code": "cb393c72983e8bd12717c204df059db448fc016c23032aea53935e042d9a6dda"
+   }
+  },
+  "expressjs/express": {
+   "commit": "43fca52d28a422c8be48fd489cbd4f2d6152bab6",
+   "url": "https://codeload.github.com/expressjs/express/tar.gz/43fca52d28a422c8be48fd489cbd4f2d6152bab6",
+   "spdx": "MIT",
+   "select": {
+    "code": [
+     "lib/.*\\.js"
+    ]
+   },
+   "text_sha256": {
+    "code": "21827186afce50bd14500e9671e420685b87022402aa330cfb5180d05eda6106"
+   }
+  },
+  "ocornut/imgui": {
+   "commit": "dbb30112c619990c593ab46f1855ac08d8ff1e52",
+   "url": "https://codeload.github.com/ocornut/imgui/tar.gz/dbb30112c619990c593ab46f1855ac08d8ff1e52",
+   "spdx": "MIT",
+   "select": {
+    "code": [
+     "imgui[a-z_]*\\.(cpp|h)"
+    ]
+   },
+   "text_sha256": {
+    "code": "36d303f2ac4bff391d8f1c187c31d00eab77e25f3ae03467181e6719e6d0ca2f"
+   }
+  },
+  "libuv/libuv": {
+   "commit": "9e40720a0cdfd99970eacc43b39fa1404c6df38d",
+   "url": "https://codeload.github.com/libuv/libuv/tar.gz/9e40720a0cdfd99970eacc43b39fa1404c6df38d",
+   "spdx": "MIT",
+   "select": {
+    "code": [
+     "src/.*\\.(c|h)"
+    ]
+   },
+   "text_sha256": {
+    "code": "63354d2b89b9173b14037daa586ac99f76814ff43cb4f861c14886338a28aa5d"
+   }
+  },
+  "gin-gonic/gin": {
+   "commit": "0f09c3a9b4626d9fe9979cf4d0521d6ae32ab646",
+   "url": "https://codeload.github.com/gin-gonic/gin/tar.gz/0f09c3a9b4626d9fe9979cf4d0521d6ae32ab646",
+   "spdx": "MIT",
+   "select": {
+    "code": [
+     "[a-z_]+\\.go"
+    ]
+   },
+   "text_sha256": {
+    "code": "da1971adf42b790dc657165c8426e7019b1c0e54073283541394c4b417cbabed"
+   }
+  }
+ },
+ "frozen": {
+  "split": "lead",
+  "mix": [
+   40,
+   40,
+   10,
+   10
+  ],
+  "size": 500,
+  "factors": {
+   "prose": 0.7136,
+   "code": 0.8207,
+   "ids": 0.7386,
+   "paths": 0.8333,
+   "card": 0.7277
+  },
+  "flat_tokens_per_byte": {
+   "prose": 0.3453,
+   "code": 0.3736,
+   "ids": 0.6583,
+   "paths": 0.5265,
+   "card": 0.4971
+  },
+  "factors_set1_paths": {
+   "ours": 0.9128,
+   "flat": 0.5897
+  },
+  "paths_fit": "median over 36 counted texts: sets 1, 2, 3 and fit4",
+  "rule": "abs-line-col",
+  "factors_before_rule": {
+   "prose": 0.7141,
+   "code": 0.8207,
+   "ids": 0.7417,
+   "paths": 0.8329,
+   "card": 0.7298
+  }
+ }
+}

@@ -396,7 +396,10 @@ fn the_offer_state_and_routing_switch_are_user_level_and_migrate_once() {
         h.handle(&HookEvent { event: "SessionStart".into(), cwd: acme.to_string_lossy().into_owned(), ..HookEvent::default() }).context
     };
     assert!(session_start(&sa).contains("holds 2 git repos"));
-    assert!(!session_start(&sb).contains("git repos"), "asked once for every project");
+    assert!(session_start(&sb).contains("git repos"), "unanswered, so it returns in any project");
+    let (ok, out) = settings_cmd(&p, &["add-project", "--no", &acme.to_string_lossy()]);
+    assert!(ok, "{out}");
+    assert!(!session_start(&sa).contains("git repos") && !session_start(&sb).contains("git repos"), "answered once for every project");
     let state: Value = json::parse(&std::fs::read_to_string(user.join(cs::OFFER_STATE)).unwrap()).unwrap();
     assert!(state["projects"].as_array().unwrap().len() == 2 && state["unmapped"] == json!(["beta:reports"]), "{state}");
 }
@@ -599,7 +602,7 @@ fn a_root_of_repos_is_discovered_offered_written_routed_and_indexed() {
     let vault_shown = atlas::paths::canonical(r).join("vaults").join("acme-notes").to_string_lossy().replace('\\', "/");
     assert!(line.contains(&format!("and a vault for its notes at {vault_shown}")), "{line}");
     assert!(line.contains("--vault-at") && line.contains("--no-vault"), "{line}");
-    assert!(!session_start(&p).contains("git repos"), "asked once per folder");
+    assert!(session_start(&p).contains("git repos"), "unanswered, so it returns");
 
     // Yes: the project file, then undo removes it, then yes again.
     let acme_arg = acme.to_string_lossy().into_owned();
@@ -984,7 +987,7 @@ fn a_project_reached_through_a_link_resolves_routes_and_is_offered_once() {
     assert_eq!(beta.active.as_ref().map(|a| a.spec.name.as_str()), Some("beta"), "and so is a cwd through the link, existing or not");
     assert!(project::resolve(&c, &via, None).unwrap().active.is_none(), "acme is no project yet");
 
-    // The offer: asked once for the folder, whichever way it is reached.
+    // The offer: answered once for the folder, whichever way it is reached.
     let p = paths(r, &cfg);
     let session_start = |cwd: &Path| {
         let mut h = Hooks::open(settings_for(&project::resolve(&c, cwd, None).unwrap().config)).unwrap();
@@ -994,6 +997,9 @@ fn a_project_reached_through_a_link_resolves_routes_and_is_offered_once() {
     };
     let line = session_start(&via);
     assert!(line.contains("holds 2 git repos (auth, billing)"), "{line}");
+    assert!(session_start(&acme).contains("git repos"), "unanswered, so the real path is asked too");
+    let (ok, out) = settings_cmd(&p, &["add-project", "--no", &via.to_string_lossy()]);
+    assert!(ok, "{out}");
     assert!(!session_start(&acme).contains("git repos"), "the same folder by its real path is not asked again");
     assert!(!session_start(&via).contains("git repos"), "nor through the link again");
 
@@ -1563,4 +1569,269 @@ fn the_moved_setup_is_named_after_its_folder_or_by_the_user() {
         let (ok, out) = settings_cmd(&p, &["undo", "--yes"]);
         assert!(ok && std::fs::read_to_string(&cfg).unwrap() == original, "{out}");
     }
+}
+
+/// The README's "One repository" then "A folder of repositories", as a user
+/// runs them on a fresh machine: no root ends up at or above home, an unrelated
+/// folder is asked about, the first project keeps its folder, and one undo
+/// reverts the second step. `default_project` stays, so that folder still reads
+/// the first project: the fix restores the question, not isolation.
+#[test]
+fn the_readme_path_leaves_unrelated_folders_asked_about() {
+    let t = Temp::new("proj-wide");
+    let x = t.path();
+    let (p1, multi, unrelated) = (x.join("code").join("p1"), x.join("code").join("multi"), x.join("Desktop").join("unrelated"));
+    write(&p1.join("README.md"), "# p1\n");
+    repo(&multi.join("a"), "https://example.invalid/a.git");
+    repo(&multi.join("b"), "https://example.invalid/b.git");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    let cfg = wide_cfg(x);
+    let (ok, out) = wide_atlas(x, &p1, &["settings", "add-project", "--yes", "."], None);
+    assert!(ok, "{out}");
+    let before = std::fs::read(&cfg).unwrap();
+    let (ok, out) = wide_atlas(x, &multi, &["settings", "add-project", "--new", "."], None);
+    assert!(ok, "{out}");
+
+    let c = Config::load(&cfg).unwrap();
+    assert_eq!(c.user.projects.len(), 2);
+    let home = project::path_key(x);
+    for p in &c.user.projects {
+        for r in project::project_roots(p, &c.user.checkouts) {
+            assert!(!project::key_within(&home, &project::path_key(&r)), "{} has the root {}", p.name, r.display());
+        }
+    }
+    let first = c.user.default_project.clone().unwrap();
+    let a = project::active(&c, &p1, None).unwrap().unwrap();
+    assert_eq!((a.spec.name.as_str(), a.why), (first.as_str(), project::Why::Root), "the first project keeps its folder");
+
+    let event = format!("{{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":{:?}}}", unrelated.to_string_lossy());
+    let (ok, line) = wide_atlas(x, &unrelated, &["--hook"], Some(&event));
+    assert!(ok && line.contains("is not indexed") && line.contains("add-project --vault"), "{line}");
+    let (_, again) = wide_atlas(x, &unrelated, &["--hook"], Some(&event));
+    assert!(again.contains("is not indexed"), "unanswered, so asked again: {again}");
+    for source in ["resume", "compact"] {
+        let same = format!("{{\"hook_event_name\":\"SessionStart\",\"source\":\"{source}\",\"cwd\":{:?}}}", unrelated.to_string_lossy());
+        let (_, line) = wide_atlas(x, &unrelated, &["--hook"], Some(&same));
+        assert!(!line.contains("is not indexed") && !line.contains("orchestrated mode is offered"), "{source} is the same session: {line}");
+    }
+    let (ok, out) = wide_atlas(x, &unrelated, &["settings", "add-project", "--no", "."], None);
+    assert!(ok, "{out}");
+    let (_, again) = wide_atlas(x, &unrelated, &["--hook"], Some(&event));
+    assert!(!again.contains("is not indexed"), "answered: {again}");
+    let d = project::active(&c, &unrelated, None).unwrap().unwrap();
+    assert_eq!(d.why, project::Why::Default, "default_project stays");
+    // A folder indexed as a source, below it, and the starter vault are not "not indexed".
+    let p3 = x.join("code").join("p3");
+    write(&p3.join("docs").join("R.md"), "# p3\n");
+    let (ok, out) = wide_atlas(x, &p3, &["settings", "add-project", "--yes", "."], None);
+    assert!(ok, "{out}");
+    let c3 = Config::load(&cfg).unwrap();
+    let vault = c3.user.projects.iter().flat_map(|p| p.body.vaults.iter()).next().unwrap().path.clone();
+    for dir in [p3.join("docs"), vault] {
+        let event = format!("{{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":{:?}}}", dir.to_string_lossy());
+        let (ok, line) = wide_atlas(x, &dir, &["--hook"], Some(&event));
+        assert!(ok && !line.contains("is not indexed"), "{}: {line}", dir.display());
+    }
+    let (ok, out) = wide_atlas(x, &p3, &["settings", "undo", "--yes"], None);
+    assert!(ok, "{out}");
+
+    let (ok, out) = wide_atlas(x, &multi, &["settings", "undo", "--yes"], None);
+    assert!(ok, "{out}");
+    assert_eq!(std::fs::read(&cfg).unwrap(), before, "one undo restores the bytes");
+}
+
+/// `add-project --new` in the home folder, or above it, would write a project
+/// file there, and its folder would be a root found from every folder below.
+#[test]
+fn add_project_new_refuses_home_and_above_and_it_is_not_offered() {
+    let t = Temp::new("proj-wide-new");
+    let x = t.path().join("Users").join("me");
+    let p1 = x.join("code").join("p1");
+    write(&p1.join("README.md"), "# p1\n");
+    repo(&x.join("dotfiles"), "https://example.invalid/dotfiles.git");
+    let cfg = wide_cfg(&x);
+    assert!(wide_atlas(&x, &p1, &["settings", "add-project", "--yes", "."], None).0);
+    let before = std::fs::read(&cfg).unwrap();
+    for dir in [x.clone(), t.path().join("Users")] {
+        let (ok, out) = wide_atlas(&x, &p1, &["settings", "add-project", "--new", &dir.to_string_lossy()], None);
+        assert!(!ok && out.contains("home folder") && out.contains("Nothing written"), "{out}");
+        assert!(!dir.join(project::PROJECT_FILE).exists());
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    }
+    // A scoped configuration offers repositories in any folder that is no
+    // root; home is not one of them.
+    let multi = x.join("code").join("multi");
+    repo(&multi.join("a"), "https://example.invalid/a.git");
+    assert!(wide_atlas(&x, &multi, &["settings", "add-project", "--new", "."], None).0);
+    let event = format!("{{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":{:?}}}", x.to_string_lossy());
+    let (_, line) = wide_atlas(&x, &x, &["--hook"], Some(&event));
+    assert!(!line.contains("add-project --new") && !line.contains("is not indexed"), "{line}");
+}
+
+/// The configuration file of a fresh user whose home is `x`.
+fn wide_cfg(x: &Path) -> PathBuf {
+    let dir = if cfg!(windows) {
+        x.join("AppData").join("Roaming").join("atlas")
+    } else if cfg!(target_os = "macos") {
+        x.join("Library").join("Application Support").join("atlas")
+    } else {
+        x.join(".config").join("atlas")
+    };
+    dir.join("atlas.json")
+}
+
+/// Runs the binary as a fresh user whose home is `x`.
+fn wide_atlas(x: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut c = Command::new(bin());
+    c.args(args)
+        .current_dir(cwd)
+        .env("HOME", x)
+        .env("USERPROFILE", x)
+        .env("APPDATA", x.join("AppData").join("Roaming"))
+        .env("LOCALAPPDATA", x.join("AppData").join("Local"))
+        .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env("CLAUDE_CONFIG_DIR", x.join(".claude"))
+        .env_remove("ATLAS_HOME")
+        .env_remove("ATLAS_CONFIG")
+        .env_remove(project::PROJECT_VAR)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut kid = c.spawn().unwrap();
+    if let Some(text) = stdin {
+        kid.stdin.as_mut().unwrap().write_all(text.as_bytes()).unwrap();
+    }
+    drop(kid.stdin.take());
+    let o = kid.wait_with_output().unwrap();
+    (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+}
+
+/// Real session finding: the question was marked asked when the line was made,
+/// so one a model never relayed was never asked again. It now returns until it
+/// is answered, on new sessions only, and yes or no ends it.
+#[test]
+fn the_first_session_question_returns_until_it_is_answered() {
+    let t = common::Temp::new("question");
+    let r = t.path();
+    let home = r.join("home");
+    let dirs = [home.join("code").join("yes"), home.join("code").join("no"), home.join("code").join("other")];
+    for d in &dirs {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("R.md"), "# x\n").unwrap();
+    }
+    let v = r.join("v");
+    std::fs::create_dir_all(&v).unwrap();
+    std::fs::write(v.join("N.md"), "# n\n").unwrap();
+    let cfg = r.join("atlas.json");
+    std::fs::write(&cfg, format!("{{\"vaults\": [{{\"name\": \"v\", \"path\": \"{}\"}}]}}\n", v.to_string_lossy().replace('\\', "/"))).unwrap();
+    let p = paths(r, &cfg);
+    let roots = || cs::configured_roots(&Config::load(&cfg).unwrap());
+    for d in &dirs {
+        let a = cs::project_line(&p, d, &roots()).unwrap();
+        assert!(a.contains("--no") && a.contains("asks again next session"), "{a}");
+        assert_eq!(cs::project_line(&p, d, &roots()).as_ref(), Some(&a), "a line made and not answered returns");
+    }
+    // No: recorded, nothing else changes.
+    let before = std::fs::read_to_string(&cfg).unwrap();
+    let (ok, out) = settings_cmd(&p, &["add-project", "--no", &dirs[1].to_string_lossy()]);
+    assert!(ok && out.contains("will not ask"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+    assert!(cs::project_line(&p, &dirs[1], &roots()).is_none());
+    // Yes: indexed, so not offered.
+    let (ok, out) = settings_cmd(&p, &["add-project", &dirs[0].to_string_lossy()]);
+    assert!(ok, "{out}");
+    assert!(cs::project_line(&p, &dirs[0], &roots()).is_none());
+    // Neither touches another folder's question.
+    assert!(cs::project_line(&p, &dirs[2], &roots()).is_some());
+    // --no is an answer, not a mode.
+    let (ok, _) = settings_cmd(&p, &["add-project", "--no", "--new", &dirs[2].to_string_lossy()]);
+    assert!(!ok);
+    let (ok, _) = settings_cmd(&p, &["add-project", "--no"]);
+    assert!(!ok);
+}
+
+/// A question whose answer could not be recorded would return every session, and
+/// its `--no` would fail: with a state that cannot be written, atlas does not ask.
+#[test]
+fn a_question_that_could_not_be_recorded_is_not_asked() {
+    let t = common::Temp::new("question-unwritable");
+    let r = t.path();
+    let home = r.join("home");
+    let plain = home.join("code").join("plain");
+    let acme = home.join("code").join("acme");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::create_dir_all(acme.join("a").join(".git")).unwrap();
+    let cfg = r.join("atlas.json");
+    std::fs::write(&cfg, "{\"vaults\": []}\n").unwrap();
+    let a_file = r.join("a-file");
+    std::fs::write(&a_file, "x").unwrap();
+    let p = paths(r, &cfg);
+    let roots = cs::configured_roots(&Config::load(&cfg).unwrap());
+    let ctx = cs::OfferCtx::unscoped(&roots);
+    assert!(cs::project_line(&p, &plain, &roots).is_some() && cs::repos_line(&p, &acme, &ctx).is_some() && cs::orchestrate_line(&p).is_some(), "a state that can be written asks");
+    assert!(!p.state.as_ref().unwrap().exists(), "and asking writes nothing");
+    let before = std::fs::read_dir(r).unwrap().count();
+    for state in [Some(r.to_path_buf()), Some(a_file.join("offer.json")), None] {
+        let s = Paths { state: state.clone(), ..p.clone() };
+        assert!(cs::project_line(&s, &plain, &roots).is_none(), "{state:?}");
+        assert!(cs::repos_line(&s, &acme, &ctx).is_none(), "{state:?}");
+        assert!(cs::orchestrate_line(&s).is_none(), "{state:?}");
+    }
+    assert_eq!(std::fs::read_dir(r).unwrap().count(), before, "the look leaves nothing behind");
+    // Windows refuses to replace a read-only file, so that state is stuck too.
+    #[cfg(windows)]
+    {
+        let held = r.join("held.json");
+        std::fs::write(&held, "{}\n").unwrap();
+        let mut perm = std::fs::metadata(&held).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&held, perm.clone()).unwrap();
+        let s = Paths { state: Some(held.clone()), ..p.clone() };
+        assert!(cs::project_line(&s, &plain, &roots).is_none());
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        std::fs::set_permissions(&held, perm).unwrap();
+        assert!(cs::project_line(&s, &plain, &roots).is_some());
+    }
+}
+
+/// With projects and none for a plain folder, the question's yes must name one or
+/// it is refused; `--to` with nothing to add and `orchestrate --no` are answers too,
+/// and one that cannot be recorded says so.
+#[test]
+fn every_answer_to_the_question_ends_it_or_says_why_not() {
+    let t = common::Temp::new("answers");
+    let r = t.path();
+    let plain = r.join("plain");
+    let acme = r.join("acme");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::create_dir_all(acme.join("a").join(".git")).unwrap();
+    let cfg = r.join("atlas.json");
+    std::fs::write(&cfg, r#"{"projects_dir": "state", "projects": [{"name": "solo", "roots": ["solo"], "repos": [{"name": "a", "path": "elsewhere/a"}]}, {"name": "two", "roots": ["two"]}], "watch": false}"#).unwrap();
+    let p = paths(r, &cfg);
+    let roots = || cs::configured_roots(&Config::load(&cfg).unwrap());
+    let line = cs::project_line(&p, &plain, &roots()).unwrap();
+    assert!(line.contains("atlas --project NAME settings add-project --vault \"") && line.contains("the user picks: solo, two."), "{line}");
+    let dir = plain.to_string_lossy().into_owned();
+    let (ok, _) = settings_cmd(&p, &["add-project", "--vault", &dir]);
+    assert!(!ok, "no project named, so refused");
+    assert!(cs::project_line(&p, &plain, &roots()).is_some());
+    let named = Paths { project: Some("solo".into()), ..p.clone() };
+    let (ok, out) = settings_cmd(&named, &["add-project", "--vault", &dir]);
+    assert!(ok, "{out}");
+    assert!(cs::project_line(&p, &plain, &roots()).is_none(), "the named yes ends it");
+    // Every repo there is in the project by name: nothing to add, and still an answer.
+    let (ok, out) = settings_cmd(&p, &["add-project", "--to", "solo", &acme.to_string_lossy()]);
+    assert!(ok && out.contains("nothing to change"), "{out}");
+    let state = std::fs::read_to_string(p.state.as_ref().unwrap()).unwrap();
+    assert!(state.contains("acme"), "{state}");
+    // An answer that cannot be recorded is no success.
+    let stuck = Paths { state: Some(r.to_path_buf()), ..p.clone() };
+    let (ok, out) = settings_cmd(&stuck, &["orchestrate", "--no"]);
+    assert!(!ok && out.contains("could not record"), "{out}");
 }

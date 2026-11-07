@@ -31,6 +31,7 @@ pub mod check;
 pub mod export;
 pub mod import;
 pub mod recall;
+pub mod rules;
 pub mod select;
 pub mod settings;
 pub mod sync;
@@ -97,6 +98,34 @@ pub const SCHEMA_VERSION: i64 = 2;
 
 /// The most words one search sends to FTS5 (the rarest ones).
 pub const SEARCH_TERMS: usize = 12;
+/// The words a filtered search keeps, all a query has up to this many (see
+/// [`recall::terms`]). The words are picked by how rare they are in the whole
+/// store, which says nothing of a scope or kind, so a filter cannot spare any: the
+/// words dropped could be the only ones its records hold.
+pub const FILTERED_TERMS: usize = 48;
+/// The rows a search with `limit` 0 answers: no limit but this window.
+pub const UNLIMITED_ROWS: usize = 8;
+
+/// How many of a query's words a search keeps. Unfiltered, a long prompt is
+/// searched by its rarest words only: they carry the signal, and every common word
+/// adds a long posting list to scan. Filtered, see [`FILTERED_TERMS`]; such a call
+/// already walks every match.
+fn terms_kept(kind: Option<&str>, scope: Option<&str>) -> usize {
+    if kind.is_some() || scope.is_some() {
+        FILTERED_TERMS
+    } else {
+        SEARCH_TERMS
+    }
+}
+
+/// How many unlinked rules and memories a query with `memory.rules` on keeps
+/// whatever else matches better (see [`MemoryStore::search_sure`]). Beyond the
+/// usual rows, so nothing that came before is lost for them.
+pub const SURE_RULINGS: usize = 2;
+
+/// How many unlinked rules and memories [`MemoryStore::search_sure`] reads for
+/// those: a query of common words matches hundreds. Linked ones are all read.
+const SURE_SCAN: usize = 64;
 
 /// Placement ords are spaced so a record can be put between two others.
 pub const ORD_STEP: i64 = 1 << 16;
@@ -105,7 +134,7 @@ pub const ORD_STEP: i64 = 1 << 16;
 pub const KINDS: &[&str] = &["memory", "rule", "section", "block", "handoff", "journal", "decision"];
 
 /// Journal entry kinds (`records.sub` for kind `journal`).
-pub const ENTRIES: &[&str] = &["brief", "decision", "measurement", "commit", "question", "answered", "next", "note", "cap", "checkpoint"];
+pub const ENTRIES: &[&str] = &["brief", "decision", "measurement", "commit", "question", "answered", "next", "note", "cap", "checkpoint", "queued", "review", "idea"];
 
 /// Where an imported text came from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -166,7 +195,8 @@ pub struct Head {
     pub title: String,
     /// Metadata text.
     pub meta: String,
-    /// The text.
+    /// The text. Empty on a body-free row ([`MemoryStore::active_entries_no_body`],
+    /// [`MemoryStore::head_no_body`]), as are `sha`, `chain` and `anchor`.
     pub body: String,
     /// SHA-256 of this version's text.
     pub sha: String,
@@ -231,15 +261,54 @@ pub fn now() -> String {
     crate::discussion::utc_now_ms()
 }
 
+/// The longest title a record gets. A text's first line past it is cut at a
+/// clause by [`short_title`], and the whole line stays in the body.
+pub const TITLE_CHARS: usize = 120;
+
+/// A title from a text's first line: whole when it fits in [`TITLE_CHARS`]
+/// characters, else cut at the last sentence or clause end that fits
+/// (`. `, `; `, `: `, `, `, ` (`) and leaves no parenthesis open, else at
+/// the last space.
+pub fn short_title(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= TITLE_CHARS {
+        return line.to_string();
+    }
+    let end = line.char_indices().nth(TITLE_CHARS).map_or(line.len(), |(i, _)| i);
+    let window = &line[..end];
+    let balanced = |t: &str| t.matches('(').count() <= t.matches(')').count();
+    for marks in [&[". ", "? ", "! "][..], &["; ", ": "][..], &[", ", " ("][..]] {
+        let mut at: Vec<usize> = marks.iter().flat_map(|m| window.match_indices(m).map(|(i, _)| i)).filter(|i| *i >= 20).collect();
+        at.sort_unstable();
+        if let Some(i) = at.into_iter().rev().find(|i| balanced(&window[..*i])) {
+            return window[..i].trim_end_matches([',', ';', ':', ' ']).trim().to_string();
+        }
+    }
+    window.rfind(' ').map_or(window, |i| &window[..i]).trim().to_string()
+}
+
+/// The title and body of a text whose first line `head` is its title and
+/// `rest` the remainder: a `head` too long for a title is cut by
+/// [`short_title`] and kept whole at the top of the body, so nothing is
+/// lost and a short line is never repeated.
+pub fn title_and_body(head: &str, rest: &str) -> (String, String) {
+    let head = head.trim();
+    let title = short_title(head);
+    let body = if title != head { format!("{head}\n{rest}") } else { rest.to_string() };
+    (title, body)
+}
+
+type Vocab = (Vec<u8>, std::collections::HashMap<String, i64>);
+
 /// The memory store.
 pub struct MemoryStore {
     conn: Connection,
     path: PathBuf,
     jsonl: PathBuf,
-    /// Document frequency per FTS term, with the `data_version` and
-    /// `total_changes` it was read at (any commit, from any connection,
-    /// changes one of them).
-    vocab: std::cell::RefCell<Option<((i64, u64), std::collections::HashMap<String, i64>)>>,
+    /// Document frequency per FTS term, with the index's structure record it
+    /// was read at (any write to the index, from any connection, changes it;
+    /// a commit that leaves the index alone does not).
+    vocab: std::cell::RefCell<Option<Vocab>>,
 }
 
 /// The shortest `expected_sha` prefix a revision accepts.
@@ -434,11 +503,27 @@ pub fn jsonl_path(store: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-const HEAD_SQL: &str = "SELECT r.rid, r.key, r.kind, r.sub, r.scope, r.status, v.seq, v.time, v.title, v.meta, v.body, v.sha, v.chain,
-    (SELECT n.key FROM supersedes s JOIN records n ON n.rid = s.new_rid WHERE s.old_rid = r.rid ORDER BY s.time DESC LIMIT 1),
-    (SELECT s.time FROM supersedes s WHERE s.old_rid = r.rid ORDER BY s.time DESC LIMIT 1),
-    v.src_path, v.src_line, v.src
-    FROM records r JOIN versions v ON v.vid = r.head";
+/// The head query, with the columns stored after `versions.meta` given:
+/// read (body, sha, chain; the anchor), or left empty.
+macro_rules! head_sql {
+    ($body_sha_chain:literal, $anchor:literal) => {
+        concat!(
+            "SELECT r.rid, r.key, r.kind, r.sub, r.scope, r.status, v.seq, v.time, v.title, v.meta, ",
+            $body_sha_chain,
+            ",
+    (SELECT n.key FROM supersedes s JOIN records n ON n.rid = s.new_rid WHERE s.old_rid = r.rid AND r.status = 'superseded' ORDER BY s.time DESC, s.rowid DESC LIMIT 1),
+    (SELECT s.time FROM supersedes s WHERE s.old_rid = r.rid AND r.status = 'superseded' ORDER BY s.time DESC, s.rowid DESC LIMIT 1), ",
+            $anchor,
+            " FROM records r JOIN versions v ON v.vid = r.head"
+        )
+    };
+}
+const HEAD_SQL: &str = head_sql!("v.body, v.sha, v.chain", "v.src_path, v.src_line, v.src");
+/// [`HEAD_SQL`] for a caller that reads only meta and titles (the work
+/// queue, where a refused launch's body is its whole brief, 20 KB and
+/// more). Body, sha, chain and anchor are left empty: every column stored
+/// after the body is, since reading one walks the body's overflow pages.
+const HEAD_SQL_NO_BODY: &str = head_sql!("'', '', ''", "NULL, NULL, NULL");
 
 fn head_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Head> {
     Ok(Head {
@@ -528,7 +613,27 @@ pub struct LaneStatus {
     pub open_questions: i64,
     /// Handoff records.
     pub handoffs: i64,
+    /// Time of the newest work record, empty when there is none: a record
+    /// [`WORK_SQL`] passes, where a note counts only while no `queued` entry
+    /// waits in the lane (a note in a planned lane is a brief addition).
+    pub last_work: String,
 }
+
+/// The open-question test, in SQL over `records r`: an active question no
+/// `answers` ref closes. `lanes()`, `open_questions()` and the checkpoint
+/// card (`checkpoint::state`) all count by it.
+pub const OPEN_QUESTION_SQL: &str = "(r.kind = 'journal' AND r.sub = 'question' AND r.status = 'active'
+    AND r.key NOT IN (SELECT f.target FROM refs f WHERE f.kind = 'answers'))";
+
+/// The work-record test, in SQL over `records r` and its head `versions v`:
+/// an active journal entry or handoff that is not a `queued` entry and that
+/// atlas did not write itself (the queue's notes, client `atlas-queue`; the
+/// hook's cap and compaction notes, client `atlas-hook`).
+pub const WORK_SQL: &str =
+    "(r.status = 'active' AND v.client NOT IN ('atlas-queue', 'atlas-hook') AND NOT (r.kind = 'journal' AND r.sub = 'queued'))";
+
+/// How long a store connection waits on another writer.
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl MemoryStore {
     /// Opens (creating if needed) a store file.
@@ -545,7 +650,7 @@ impl MemoryStore {
             std::fs::create_dir_all(d)?;
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // The schema is made once; a store at the current version opens
         // with two pragma reads (start to first answer is an aim of 5 ms).
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -652,7 +757,7 @@ impl MemoryStore {
                 }
             }
         }
-        Ok(Writer { tx, log: String::new(), jsonl: self.jsonl.clone(), pid: std::process::id() as i64 })
+        Ok(Writer { tx, log: String::new(), jsonl: self.jsonl.clone(), pid: std::process::id() as i64, no_index: false })
     }
 
     /// Where the `.jsonl` copy's committed lines end, in bytes (`None` for a
@@ -722,9 +827,81 @@ impl MemoryStore {
     ///
     /// [`Error::Db`].
     pub fn heads(&self, kind: Option<&str>, scope: Option<&str>) -> Result<Vec<Head>> {
-        let sql = format!("{HEAD_SQL} WHERE (?1 IS NULL OR r.kind = ?1) AND (?2 IS NULL OR r.scope = ?2) ORDER BY r.rid");
+        heads_on(&self.conn, kind, scope)
+    }
+
+    /// The active journal entries of one kind (`records.sub`), oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn active_entries(&self, sub: &str) -> Result<Vec<Head>> {
+        self.entries(HEAD_SQL, sub)
+    }
+
+    /// [`MemoryStore::active_entries`] with `body`, `sha`, `chain` and the
+    /// anchor left empty (meta and titles only).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn active_entries_no_body(&self, sub: &str) -> Result<Vec<Head>> {
+        self.entries(HEAD_SQL_NO_BODY, sub)
+    }
+
+    fn entries(&self, head_sql: &str, sub: &str) -> Result<Vec<Head>> {
+        let sql = format!("{head_sql} WHERE r.kind = 'journal' AND r.sub = ?1 AND r.status = 'active' ORDER BY r.rid");
         let mut st = self.conn.prepare_cached(&sql)?;
-        let rows = st.query_map(params![kind, scope], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([sub], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// [`MemoryStore::head`], meta and title only (as
+    /// [`MemoryStore::active_entries_no_body`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn head_no_body(&self, key: &str) -> Result<Option<Head>> {
+        Ok(self.conn.prepare_cached(&format!("{HEAD_SQL_NO_BODY} WHERE r.key = ?1"))?.query_row([key], head_row).optional()?)
+    }
+
+    /// Why a record was last retired, if it was.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn retired_reason(&self, rid: i64) -> Result<Option<String>> {
+        let sql = "SELECT reason FROM retirements WHERE rid = ?1 ORDER BY time DESC, rowid DESC LIMIT 1";
+        Ok(self.conn.prepare_cached(sql)?.query_row([rid], |r| r.get(0)).optional()?)
+    }
+
+    /// The meta of every journal note whose meta starts with `prefix`
+    /// (the work queue's `done:` and `met:` marks), oldest first: one query,
+    /// with no bodies.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn note_metas(&self, prefix: &str) -> Result<Vec<String>> {
+        let sql = "SELECT v.meta FROM records r JOIN versions v ON v.vid = r.head WHERE r.kind = 'journal' AND r.sub = 'note' AND substr(v.meta, 1, length(?1)) = ?1 ORDER BY r.rid";
+        let mut st = self.conn.prepare_cached(sql)?;
+        let rows = st.query_map([prefix], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// The key and meta of every active review: journal entries of kind
+    /// `review`, and notes with a `review:` meta line (the form before the
+    /// kind existed). Oldest first, one query, no bodies.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn review_metas(&self) -> Result<Vec<(String, String)>> {
+        let sql = "SELECT r.key, v.meta FROM records r JOIN versions v ON v.vid = r.head WHERE r.kind = 'journal' AND r.status = 'active'
+            AND (r.sub = 'review' OR (r.sub = 'note' AND (substr(v.meta, 1, 7) = 'review:' OR instr(v.meta, char(10) || 'review:') > 0))) ORDER BY r.rid";
+        let mut st = self.conn.prepare_cached(sql)?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<(String, String)>>>()?;
         Ok(rows)
     }
 
@@ -781,41 +958,85 @@ impl MemoryStore {
     ///
     /// # Arguments
     ///
-    /// * `terms` - query words (already split and cleaned; ORed).
+    /// * `terms` - query words (already split and cleaned; ORed). The 12 rarest,
+    ///   or with a filter up to [`FILTERED_TERMS`].
     /// * `kind`, `scope` - optional filters.
-    /// * `limit` - the most rows.
+    /// * `limit` - the most rows; 0 means [`UNLIMITED_ROWS`].
     ///
     /// # Errors
     ///
     /// [`Error::Db`].
     pub fn search(&self, terms: &[String], kind: Option<&str>, scope: Option<&str>, limit: usize) -> Result<Vec<(Head, f64, usize)>> {
-        if terms.is_empty() {
+        self.search_with(terms, kind, scope, limit, rules::Mode::Today)
+    }
+
+    /// [`MemoryStore::search`] under a `memory.rules` mode. [`rules::Mode::Live`]
+    /// also returns superseded records that have a live successor, so a caller can
+    /// answer a hit on one with it (see [`rules::live_view`]); one with none would
+    /// show nothing and only use up the limit. [`rules::Mode::Off`] leaves out
+    /// rules and memories. Both are decided here, before the limit, or what they
+    /// drop could cut a list short and read as no match.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn search_with(&self, terms: &[String], kind: Option<&str>, scope: Option<&str>, limit: usize, mode: rules::Mode) -> Result<Vec<(Head, f64, usize)>> {
+        if terms.is_empty() || !self.any_record(kind, scope)? {
             return Ok(Vec::new());
         }
-        // A long prompt is searched by its rarest words only: they carry the
-        // signal, and every common word adds a long posting list to scan.
-        let picked = self.rarest(terms, SEARCH_TERMS)?;
+        let picked = self.rarest(terms, terms_kept(kind, scope))?;
         if picked.is_empty() {
             return Ok(Vec::new());
         }
         let q = picked.iter().map(|t| format!("\"{}\"", t.replace('"', ""))).collect::<Vec<_>>().join(" OR ");
         // Rank in FTS5 alone, then fetch the few heads: joining inside the
         // ranked query measured 3.4x slower.
-        let sql = "SELECT rowid, -bm25(records_fts, 2.0, 1.0) FROM records_fts WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts, 2.0, 1.0) LIMIT ?2";
-        let ranked: Vec<(i64, f64)> = self.conn.prepare_cached(sql)?.query_map(params![q, (limit * 2 + 8) as i64], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let ranking = "SELECT rowid, -bm25(records_fts, 2.0, 1.0) FROM records_fts WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts, 2.0, 1.0)";
         let mut st = self.conn.prepare_cached(
             "SELECT r.rid, r.key, r.kind, r.sub, r.scope, r.status, v.seq, v.time, v.title, v.meta, v.body, v.sha, v.chain, NULL, NULL, v.src_path, v.src_line, v.src
              FROM records r JOIN versions v ON v.vid = r.head WHERE r.rid = ?1",
         )?;
-        let mut rows: Vec<(Head, f64)> = Vec::with_capacity(limit);
-        for (rid, score) in ranked {
-            let Some(h) = st.query_row([rid], head_row).optional()? else { continue };
-            if h.status != "active" || h.kind == "block" || kind.is_some_and(|k| k != h.kind) || scope.is_some_and(|s| s != h.scope) {
-                continue;
+        let passes = |h: &Head| -> Result<bool> {
+            if h.kind == "block" || kind.is_some_and(|k| k != h.kind) || scope.is_some_and(|s| s != h.scope) || (mode == rules::Mode::Off && rules::managed_kind(&h.kind)) {
+                return Ok(false);
             }
-            rows.push((h, score));
-            if rows.len() == limit {
-                break;
+            Ok(h.status == "active" || (mode == rules::Mode::Live && h.status == "superseded" && rules::live_of(self, &h.key)?.is_some()))
+        };
+        let want = if limit == 0 { UNLIMITED_ROWS } else { limit };
+        // One page is enough unless most of it is dropped. LIMIT gives the ranking
+        // a top-N sort, far cheaper than sorting every match.
+        let page = want * 2 + 8;
+        let first: Vec<(i64, f64)> = self.conn.prepare_cached(&format!("{ranking} LIMIT ?2"))?.query_map(params![q, page as i64], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut rows: Vec<(Head, f64)> = Vec::with_capacity(want);
+        for &(rid, score) in &first {
+            let Some(h) = st.query_row([rid], head_row).optional()? else { continue };
+            if passes(&h)? {
+                rows.push((h, score));
+                if rows.len() == want {
+                    break;
+                }
+            }
+        }
+        // Ranked rows the filters drop must not use up the answer, or a list cut
+        // here would look complete. Rank once, every match, and read a body only
+        // for a row that passes: `records` alone says which do. No cap on the
+        // matches walked, since any cap could drop a match ranked past it. One
+        // ranking also means a write between two pages cannot skip a record.
+        if rows.len() < want && first.len() == page {
+            rows.clear();
+            let pass = self.passing_rids(kind, scope, mode)?;
+            let ranked: Vec<(i64, f64)> = self.conn.prepare_cached(ranking)?.query_map([&q], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (rid, score) in ranked {
+                if !pass.contains(&rid) {
+                    continue;
+                }
+                let Some(h) = st.query_row([rid], head_row).optional()? else { continue };
+                if passes(&h)? {
+                    rows.push((h, score));
+                    if rows.len() == want {
+                        break;
+                    }
+                }
             }
         }
         let mut out = Vec::with_capacity(rows.len());
@@ -828,6 +1049,124 @@ impl MemoryStore {
         Ok(out)
     }
 
+    /// Whether any record has this kind and scope; true with no filter. Records
+    /// are never deleted, so a filter nothing holds answers here, unranked.
+    fn any_record(&self, kind: Option<&str>, scope: Option<&str>) -> Result<bool> {
+        let (sql, args): (&str, Vec<&str>) = match (kind, scope) {
+            (None, None) => return Ok(true),
+            (Some(k), Some(s)) => ("SELECT EXISTS(SELECT 1 FROM records WHERE scope = ?1 AND kind = ?2)", vec![s, k]),
+            (None, Some(s)) => ("SELECT EXISTS(SELECT 1 FROM records WHERE scope = ?1)", vec![s]),
+            (Some(k), None) => ("SELECT EXISTS(SELECT 1 FROM records WHERE kind = ?1)", vec![k]),
+        };
+        Ok(self.conn.prepare_cached(sql)?.query_row(rusqlite::params_from_iter(args), |r| r.get(0))?)
+    }
+
+    /// The records [`MemoryStore::search_with`] may answer with, by `records` alone:
+    /// a superseded one's successor is still to check.
+    fn passing_rids(&self, kind: Option<&str>, scope: Option<&str>, mode: rules::Mode) -> Result<std::collections::HashSet<i64>> {
+        let mut sql = String::from(match mode {
+            rules::Mode::Live => "SELECT rid FROM records WHERE status IN ('active', 'superseded') AND kind <> 'block'",
+            rules::Mode::Today => "SELECT rid FROM records WHERE status = 'active' AND kind <> 'block'",
+            rules::Mode::Off => "SELECT rid FROM records WHERE status = 'active' AND kind NOT IN ('block', 'rule', 'memory')",
+        });
+        let mut args: Vec<&str> = Vec::new();
+        if let Some(s) = scope {
+            args.push(s);
+            sql.push_str(" AND scope = ?1");
+        }
+        if let Some(k) = kind {
+            args.push(k);
+            sql.push_str(&format!(" AND kind = ?{}", args.len()));
+        }
+        let rids = self.conn.prepare_cached(&sql)?.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rids)
+    }
+
+    /// The rules and memories a query with `memory.rules` on may not lose to a
+    /// better match elsewhere (see [`rules::live_hits`]), each ranked only among
+    /// its own kind so nothing else can push it past a cut-off: every replaced
+    /// or linked one, then the [`SURE_RULINGS`] best others, all holding at
+    /// least `need` of the query's words.
+    ///
+    /// # Arguments
+    ///
+    /// * `terms` - the query's words.
+    /// * `kind`, `scope` - optional filters, as in [`MemoryStore::search`].
+    /// * `need` - the fewest of `terms` a record holds to count as about them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn search_sure(&self, terms: &[String], kind: Option<&str>, scope: Option<&str>, need: usize) -> Result<Vec<(Head, f64, usize)>> {
+        let picked = self.rarest(terms, terms_kept(kind, scope))?;
+        if picked.is_empty() || kind.is_some_and(|k| !rules::managed_kind(k)) {
+            return Ok(Vec::new());
+        }
+        // Which rows count, known before the ranking so the ranking stays the
+        // plain query: a filter inside it measured about 180x slower.
+        let managed = "SELECT rid, status FROM records WHERE kind IN ('rule', 'memory') AND status IN ('active', 'superseded')";
+        let mut marked: std::collections::HashSet<i64> = self.conn.prepare_cached("SELECT rid FROM refs WHERE kind IN ('amends', 'amended_by')")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut rulings: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for row in self.conn.prepare_cached(managed)?.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (rid, status) = row?;
+            rulings.insert(rid);
+            if status == "superseded" {
+                marked.insert(rid);
+            }
+        }
+        let q = picked.iter().map(|t| format!("\"{}\"", t.replace('"', ""))).collect::<Vec<_>>().join(" OR ");
+        let sql = "SELECT rowid, -bm25(records_fts, 2.0, 1.0) FROM records_fts WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts, 2.0, 1.0)";
+        let ranked: Vec<(i64, f64)> = self.conn.prepare_cached(sql)?.query_map([q], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut out: Vec<(Head, f64, usize)> = Vec::new();
+        let (mut others, mut read) = (0, 0);
+        for (rid, score) in ranked {
+            if !rulings.contains(&rid) {
+                continue;
+            }
+            let linked = marked.contains(&rid);
+            if !linked {
+                if others == SURE_RULINGS || read == SURE_SCAN {
+                    continue;
+                }
+                read += 1;
+            }
+            let Some(h) = self.heads_by_rid(&[rid])?.pop() else { continue };
+            if kind.is_some_and(|k| k != h.kind) || scope.is_some_and(|s| s != h.scope) {
+                continue;
+            }
+            let hay = format!("{}\n{}", h.title, h.body).to_lowercase();
+            let matched = terms.iter().filter(|t| contains_word(&hay, t)).count();
+            if matched >= need {
+                others += usize::from(!linked);
+                out.push((h, score, matched));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The keys of records linked to `key` by a ref of `kind` whose target is
+    /// `key` (see [`rules::AMENDS`]), oldest link first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn linked_to(&self, kind: &str, key: &str) -> Result<Vec<String>> {
+        let sql = "SELECT r.key FROM refs f JOIN records r ON r.rid = f.rid WHERE f.kind = ?1 AND f.target = ?2 ORDER BY r.rid";
+        let rows = self.conn.prepare_cached(sql)?.query_map(params![kind, key], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The keys of records that carry a ref of `kind`, whatever its target.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn keys_with_ref(&self, kind: &str) -> Result<std::collections::HashSet<String>> {
+        let sql = "SELECT DISTINCT r.key FROM refs f JOIN records r ON r.rid = f.rid WHERE f.kind = ?1";
+        let rows = self.conn.prepare_cached(sql)?.query_map([kind], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Up to `n` of `terms` that occur in the most records' fewest: words in
     /// no record are dropped, the rest ordered by document frequency.
     ///
@@ -835,7 +1174,7 @@ impl MemoryStore {
     ///
     /// [`Error::Db`].
     pub fn rarest(&self, terms: &[String], n: usize) -> Result<Vec<String>> {
-        let stamp = self.stamp()?;
+        let stamp: Vec<u8> = self.conn.query_row("SELECT block FROM records_fts_data WHERE id = 10", [], |r| r.get(0)).optional()?.unwrap_or_default();
         let mut cache = self.vocab.borrow_mut();
         if cache.as_ref().is_none_or(|(s, _)| *s != stamp) {
             // fts5vocab has no index on `term`: one pass into a map beats a
@@ -845,7 +1184,24 @@ impl MemoryStore {
             *cache = Some((stamp, map));
         }
         let map = &cache.as_ref().map(|(_, m)| m).ok_or_else(|| Error::Db("vocabulary".into()))?;
-        let mut df: Vec<(i64, &String)> = terms.iter().filter_map(|t| map.get(t).map(|d| (*d, t))).collect();
+        let mut df: Vec<(i64, &String)> = Vec::with_capacity(terms.len());
+        for t in terms {
+            match map.get(t) {
+                Some(d) => df.push((*d, t)),
+                // The tokenizer folds diacritics, so the vocabulary holds `muller` for
+                // Müller and a plain lookup misses. Its own MATCH folds the same way, so
+                // ask it. A word nothing holds is still dropped: passing them all through
+                // would let unknown words of a non-ASCII prompt take every place.
+                None if !t.is_ascii() => {
+                    let phrase = format!("\"{}\"", t.replace('"', ""));
+                    let d: i64 = self.conn.prepare_cached("SELECT count(*) FROM records_fts WHERE records_fts MATCH ?1")?.query_row([phrase], |r| r.get(0))?;
+                    if d > 0 {
+                        df.push((d, t));
+                    }
+                }
+                None => {}
+            }
+        }
         df.sort();
         Ok(df.into_iter().take(n).map(|(_, t)| t.clone()).collect())
     }
@@ -873,34 +1229,26 @@ impl MemoryStore {
         Ok(rows)
     }
 
-    /// Keys of questions in a lane that an `answered` entry refs.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Db`].
-    pub fn answered(&self, lane: &str) -> Result<Vec<String>> {
-        let sql = "SELECT f.target FROM refs f JOIN records r ON r.rid = f.rid WHERE f.kind = 'answers' AND r.scope = ?1";
-        let mut st = self.conn.prepare_cached(sql)?;
-        let rows = st.query_map([lane], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
-        Ok(rows)
-    }
-
     /// Every lane with a journal or a handoff, newest activity first.
     ///
     /// # Errors
     ///
     /// [`Error::Db`].
     pub fn lanes(&self) -> Result<Vec<LaneStatus>> {
-        let sql = "SELECT r.scope, COUNT(*), MAX(v.time),
+        let sql = format!(
+            "SELECT r.scope, COUNT(*), MAX(v.time),
                 COALESCE((SELECT v2.title FROM records r2 JOIN versions v2 ON v2.vid = r2.head
                           WHERE r2.scope = r.scope AND r2.kind = 'journal' AND r2.sub = 'commit' ORDER BY r2.rid DESC LIMIT 1), ''),
-                SUM(r.kind = 'journal' AND r.sub = 'question'
-                    AND r.key NOT IN (SELECT f.target FROM refs f WHERE f.kind = 'answers')),
-                SUM(r.kind = 'handoff')
+                SUM({OPEN_QUESTION_SQL}),
+                SUM(r.kind = 'handoff'),
+                COALESCE(MAX(CASE WHEN {WORK_SQL} AND r.sub <> 'note' THEN v.time END), ''),
+                COALESCE(MAX(CASE WHEN {WORK_SQL} AND r.sub = 'note' THEN v.time END), ''),
+                SUM(r.kind = 'journal' AND r.sub = 'queued' AND r.status = 'active')
             FROM records r JOIN versions v ON v.vid = r.head
-            WHERE r.kind IN ('journal', 'handoff') AND r.scope <> ''
-            GROUP BY r.scope ORDER BY MAX(v.time) DESC";
-        let mut st = self.conn.prepare_cached(sql)?;
+            WHERE r.kind IN ('journal', 'handoff') AND r.scope NOT IN ('', 'session:ideas')
+            GROUP BY r.scope ORDER BY MAX(v.time) DESC"
+        );
+        let mut st = self.conn.prepare_cached(&sql)?;
         let rows = st
             .query_map([], |r| {
                 Ok(LaneStatus {
@@ -910,9 +1258,40 @@ impl MemoryStore {
                     last_commit: r.get(3)?,
                     open_questions: r.get(4)?,
                     handoffs: r.get(5)?,
+                    last_work: {
+                        let (work, notes, waiting): (String, String, i64) = (r.get(6)?, r.get(7)?, r.get(8)?);
+                        if waiting > 0 { work } else { work.max(notes) }
+                    },
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every active handoff as (lane, key, title, time), newest first, with
+    /// no bodies (the resume card's handoff keys).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn handoff_keys(&self) -> Result<Vec<(String, String, String, String)>> {
+        let sql = "SELECT r.scope, r.key, v.title, v.time FROM records r JOIN versions v ON v.vid = r.head
+            WHERE r.kind = 'handoff' AND r.status = 'active' ORDER BY v.time DESC, r.rid DESC";
+        let mut st = self.conn.prepare_cached(sql)?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The open questions ([`OPEN_QUESTION_SQL`]), as (lane, key, title),
+    /// newest first, with no bodies.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn open_questions(&self) -> Result<Vec<(String, String, String)>> {
+        let sql = format!("SELECT r.scope, r.key, v.title FROM records r JOIN versions v ON v.vid = r.head WHERE {OPEN_QUESTION_SQL} ORDER BY r.rid DESC");
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1010,15 +1389,34 @@ pub fn contains_word(hay: &str, word: &str) -> bool {
     false
 }
 
+/// [`MemoryStore::heads`] on a connection, or inside a write batch.
+fn heads_on(conn: &Connection, kind: Option<&str>, scope: Option<&str>) -> Result<Vec<Head>> {
+    let sql = format!("{HEAD_SQL} WHERE (?1 IS NULL OR r.kind = ?1) AND (?2 IS NULL OR r.scope = ?2) ORDER BY r.rid");
+    let mut st = conn.prepare_cached(&sql)?;
+    let rows = st.query_map(params![kind, scope], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// One write batch. Dropped without [`Writer::commit`], nothing is written.
 pub struct Writer<'a> {
     tx: rusqlite::Transaction<'a>,
     log: String,
     jsonl: PathBuf,
     pid: i64,
+    no_index: bool,
 }
 
 impl Writer<'_> {
+    /// [`MemoryStore::heads`] as this batch sees them: under its write lock, so
+    /// no other session can change them before it commits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn heads(&self, kind: Option<&str>, scope: Option<&str>) -> Result<Vec<Head>> {
+        heads_on(&self.tx, kind, scope)
+    }
+
     fn insert_version(&mut self, rid: i64, seq: i64, prev_chain: &str, d: &Draft) -> Result<(i64, String)> {
         let sha = version_sha(&d.title, &d.meta, &d.body);
         let chain = chain_next(prev_chain, &sha);
@@ -1049,8 +1447,10 @@ impl Writer<'_> {
                 has_p.then_some(&p.sha)
             ])?;
         let vid = self.tx.last_insert_rowid();
-        self.tx.prepare_cached("DELETE FROM records_fts WHERE rowid = ?1")?.execute([rid])?;
-        self.tx.prepare_cached("INSERT INTO records_fts(rowid, title, body) VALUES(?1, ?2, ?3)")?.execute(params![rid, d.title, d.body])?;
+        if !self.no_index {
+            self.tx.prepare_cached("DELETE FROM records_fts WHERE rowid = ?1")?.execute([rid])?;
+            self.tx.prepare_cached("INSERT INTO records_fts(rowid, title, body) VALUES(?1, ?2, ?3)")?.execute(params![rid, d.title, d.body])?;
+        }
         Ok((vid, sha))
     }
 
@@ -1096,6 +1496,13 @@ impl Writer<'_> {
         Ok(Written { key: key.to_string(), seq: 1, sha, changed: true })
     }
 
+    /// This writer's versions stay out of the search index, so `recall query`
+    /// and the hook's candidates never see them, and a commit of only these
+    /// leaves the index, and so the vocabulary cache, as it was.
+    pub fn unindexed(&mut self) {
+        self.no_index = true;
+    }
+
     /// Appends a version to an existing record.
     ///
     /// # Arguments
@@ -1136,6 +1543,35 @@ impl Writer<'_> {
         Ok(Written { key: key.to_string(), seq: seq + 1, sha: new_sha, changed: true })
     }
 
+    /// Rewrites a journal entry's title and body as a new version under the
+    /// same key. Its kind, entry, lane, status, refs and meta lines stay
+    /// byte for byte (the draft's meta is ignored), except a queued launch's
+    /// `brief_sha:`, which follows the new body; the history keeps every
+    /// earlier version. The entry must be in `lane` with entry `entry`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an unknown key, [`Error::InvalidArgument`]
+    /// for a record that is no journal entry or is in another lane or
+    /// entry, and as [`Writer::revise`] (the head must be `expected_sha`).
+    pub fn amend_journal(&mut self, key: &str, expected_sha: &str, lane: &str, entry: &str, draft: &Draft) -> Result<Written> {
+        let h = rusqlite::OptionalExtension::optional(self.head(key))?.ok_or_else(|| Error::NotFound(format!("record {key:?}")))?;
+        if h.kind != "journal" {
+            return Err(Error::InvalidArgument(format!("{key} is a {} record; amend rewrites journal entries only", h.kind)));
+        }
+        if h.scope != lane || h.sub != entry {
+            return Err(Error::InvalidArgument(format!("{key} is lane {} entry {}, not lane {lane} entry {entry}", h.scope, h.sub)));
+        }
+        // A queued launch's `brief_sha` follows its brief, so the queue
+        // still knows the amended launch when it comes again.
+        let meta = match crate::queue::amended_meta(&h.meta, &draft.title, &draft.body) {
+            Some(m) => m,
+            None => h.meta,
+        };
+        let d = Draft { meta, ..draft.clone() };
+        self.revise(key, Some(expected_sha), &d)
+    }
+
     /// Creates a record that supersedes others; each old record is marked
     /// `superseded` and keeps every version.
     ///
@@ -1143,6 +1579,7 @@ impl Writer<'_> {
     ///
     /// [`Error::NotFound`] for an unknown old key, [`Error::InvalidArgument`]
     /// for one already superseded, and as [`Writer::create`].
+    #[allow(clippy::too_many_arguments)] // the shape of `create` plus the old keys; a pub signature stays
     pub fn supersede(&mut self, old: &[String], key: &str, kind: &str, sub: &str, scope: &str, draft: &Draft, place: Option<(&str, Place)>) -> Result<Written> {
         let mut olds = Vec::new();
         for o in old {
@@ -1168,6 +1605,82 @@ impl Writer<'_> {
         self.log.push_str(&line);
         self.log.push('\n');
         Ok(w)
+    }
+
+    /// Marks an existing record superseded by another existing one, creating
+    /// nothing: both records are already in the store (a sitting's answer, or
+    /// `--supersedes` on an item that came in through a sync). Its log line is
+    /// the one [`Writer::supersede`] writes plus the reason (no version holds
+    /// it here), so replay reads both the same.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an unknown key, [`Error::InvalidArgument`] for
+    /// a record marked over itself, an old record that is not active, or a
+    /// successor already replaced by the old record; [`Error::Db`].
+    pub fn mark_superseded(&mut self, old: &str, new: &str, reason: &str) -> Result<()> {
+        if old == new {
+            return Err(Error::InvalidArgument(format!("record {old:?} cannot supersede itself")));
+        }
+        let (old_rid, _, _) = self.rid_of(old)?.ok_or_else(|| Error::NotFound(format!("record {old:?}")))?;
+        let (new_rid, _, _) = self.rid_of(new)?.ok_or_else(|| Error::NotFound(format!("record {new:?}")))?;
+        let status: String = self.tx.prepare_cached("SELECT status FROM records WHERE rid = ?1")?.query_row([old_rid], |r| r.get(0))?;
+        if status != "active" {
+            return Err(Error::InvalidArgument(format!("record {old:?} is already {status}")));
+        }
+        // A successor that already leads back to the old record would leave
+        // both superseded with no live ruling, gone from query recall.
+        let mut at = new_rid;
+        let sql = "SELECT s.new_rid FROM supersedes s JOIN records r ON r.rid = s.old_rid WHERE s.old_rid = ?1 AND r.status = 'superseded' ORDER BY s.time DESC, s.rowid DESC LIMIT 1";
+        while let Some(next) = self.tx.prepare_cached(sql)?.query_row([at], |r| r.get::<_, i64>(0)).optional()? {
+            if next == old_rid {
+                return Err(Error::InvalidArgument(format!("record {new:?} is already replaced by {old:?}")));
+            }
+            at = next;
+        }
+        let time = now();
+        // An answer changed and back again: the pair's row takes the new time.
+        let sql = "INSERT INTO supersedes(new_rid, old_rid, time, reason) VALUES(?1, ?2, ?3, ?4) ON CONFLICT(new_rid, old_rid) DO UPDATE SET time = excluded.time, reason = excluded.reason";
+        self.tx.prepare_cached(sql)?.execute(params![new_rid, old_rid, time, reason])?;
+        self.tx.prepare_cached("UPDATE records SET status = 'superseded' WHERE rid = ?1")?.execute([old_rid])?;
+        let line = json::object(128, |w| {
+            w.field("op", "supersede").field("key", new).field("old", &vec![old.to_string()]).field("time", &time).field("reason", reason);
+        });
+        self.log.push_str(&line);
+        self.log.push('\n');
+        Ok(())
+    }
+
+    /// Links a later record to the one it amends: both stay active and both
+    /// keep every word (the partial case, which a status cannot express).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for a record linked to itself, and as
+    /// [`Writer::add_refs`]. A link already there is left alone.
+    pub fn link_amends(&mut self, old: &str, new: &str) -> Result<()> {
+        if old == new {
+            return Err(Error::InvalidArgument(format!("record {old:?} cannot amend itself")));
+        }
+        for (from, kind, to) in [(new, rules::AMENDS, old), (old, rules::AMENDED_BY, new)] {
+            let (rid, _, _) = self.rid_of(from)?.ok_or_else(|| Error::NotFound(format!("record {from:?}")))?;
+            let there = self.tx.prepare_cached("SELECT 1 FROM refs WHERE rid = ?1 AND kind = ?2 AND target = ?3")?.query_row(params![rid, kind, to], |_| Ok(())).optional()?.is_some();
+            if !there {
+                self.add_refs(from, &[(kind.to_string(), to.to_string())])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Undoes [`Writer::mark_superseded`] when an answer changes: the record
+    /// is active again, and the log keeps both steps.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an unknown key, [`Error::InvalidArgument`]
+    /// for one that is not superseded; [`Error::Db`].
+    pub fn unmark_superseded(&mut self, key: &str, reason: &str) -> Result<()> {
+        self.set_status(key, "superseded", "active", reason)
     }
 
     /// Retires a record whose source item is gone: it keeps every version,

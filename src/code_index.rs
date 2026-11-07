@@ -772,7 +772,8 @@ fn read_prebuilt(
     };
     let times: HashMap<&str, i64> = walk.source.iter().map(|f| (f.path.as_str(), f.mtime)).collect();
     let paths: Vec<String> = ix.doc_path.iter().map(|p| code::rebase(dir, p)).collect();
-    let (docs, others): (Vec<(usize, String)>, Vec<(usize, String)>) = paths.into_iter().enumerate().partition(|(i, _)| family(*i));
+    type Numbered = Vec<(usize, String)>;
+    let (docs, others): (Numbered, Numbered) = paths.into_iter().enumerate().partition(|(i, _)| family(*i));
     let docs: Vec<String> = docs.into_iter().map(|(_, p)| p).collect();
     if docs.is_empty() {
         return format!("scan only: {name} holds no {owner} files");

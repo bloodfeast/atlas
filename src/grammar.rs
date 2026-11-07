@@ -353,6 +353,9 @@ fn resolve_grammar_misses(store: &mut Store, query: &str, note: &str) -> Result<
 ///
 /// # Errors
 ///
+/// The usage of `atlas grammar`.
+pub const USAGE: &str = "usage: atlas grammar list | accept N | reject N";
+
 /// A message for the user when the subcommand cannot run.
 pub fn cli(args: Vec<String>, store: &mut Store, config: Option<&Path>, db: &Path) -> std::result::Result<ExitCode, String> {
     let e = |x: crate::Error| x.to_string();
@@ -375,6 +378,9 @@ pub fn cli(args: Vec<String>, store: &mut Store, config: Option<&Path>, db: &Pat
         "accept" => {
             let s = pick()?.clone();
             let config = config.ok_or("accept writes to the configuration file, and none is in use (--vault flags only)")?;
+            let p = crate::claude_settings::Paths::detect(Some(config), db).ok_or("no home folder is known for the backup (set HOME or USERPROFILE)")?;
+            // The whole `ids` list is written back, so it is read under the lock.
+            let held = p.lock_config()?;
             let text = std::fs::read_to_string(config).map_err(|x| format!("{}: {x}", config.display()))?;
             let cur = crate::json::parse(&text).map_err(|x| format!("{}: {}", config.display(), x.msg))?;
             let mut ids: Vec<Value> = cur.get("ids").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -391,14 +397,14 @@ pub fn cli(args: Vec<String>, store: &mut Store, config: Option<&Path>, db: &Pat
                 })
                 .collect();
             Rules::new(&specs, false).map_err(e)?;
-            let p = crate::claude_settings::Paths::detect(Some(config), db).ok_or("no home folder is known for the backup (set HOME or USERPROFILE)")?;
             let stdin = std::io::stdin();
             let mut input = stdin.lock();
             let mut out = std::io::stdout();
             let mut io = crate::claude_settings::Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false };
             let label = format!("accepted: kind {:?} regex {:?}", s.kind, s.regex);
             let manual = format!("append {{\"name\": {}, \"regex\": {}}} to \"ids\"", Value::String(s.kind.clone()), Value::String(s.regex.clone()));
-            let ok = crate::claude_settings::edit_config(&p, &mut io, &["ids"], Some(&Value::Array(ids)), &label, &manual)?;
+            let ok = crate::claude_settings::edit_config(&held, &mut io, &["ids"], Some(&Value::Array(ids)), &label, &manual)?;
+            drop(held);
             if ok {
                 resolve_grammar_misses(store, &s.regex, "accepted into the configuration's ids").map_err(e)?;
                 println!("restart Claude Code (or reconnect atlas with /mcp) to index with it");
@@ -416,7 +422,7 @@ pub fn cli(args: Vec<String>, store: &mut Store, config: Option<&Path>, db: &Pat
             println!("rejected {:?}: it is not suggested again ({})", s.regex, rejected_path.display());
             Ok(ExitCode::SUCCESS)
         }
-        w => Err(format!("unknown grammar command {w:?}\nusage: atlas grammar list | accept N | reject N")),
+        w => Err(format!("unknown grammar command {w:?}\n{USAGE}")),
     }
 }
 

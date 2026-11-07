@@ -87,8 +87,10 @@ impl Args {
     }
 }
 
+type Tables = (Vec<(u32, String)>, Vec<(u32, u32, u32)>);
+
 /// The normalisation map and the character class ranges, from 0x80 up.
-fn unicode_tables(db: &Db, lowercase: bool) -> (Vec<(u32, String)>, Vec<(u32, u32, u32)>) {
+fn unicode_tables(db: &Db, lowercase: bool) -> Tables {
     let mut mapping = Vec::new();
     let mut flags = Vec::with_capacity(0x110000 - 0x80);
     for cp in 0x80u32..0x110000 {
@@ -312,7 +314,7 @@ pub fn run(a: &Args) -> Result<String, String> {
         let t = w.get(&name).ok_or_else(|| format!("model.safetensors has no {name}"))?;
         if matrix && a.int8 {
             let [rows, cols] = t.shape[..] else { return Err(format!("{name} is not a matrix")) };
-            let vals: Vec<f32> = t.bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes"))).collect();
+            let vals: Vec<f32> = t.bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
             let mut q = Vec::with_capacity(rows * cols);
             for r in 0..rows {
                 let row = &vals[r * cols..(r + 1) * cols];

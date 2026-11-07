@@ -197,8 +197,8 @@ impl Bert {
         for (t, &id) in ids.iter().enumerate() {
             let row = &mut s.x[t * h..(t + 1) * h];
             self.word.row(id as usize, row);
-            for j in 0..h {
-                row[j] += self.pos[t * h + j] + self.typ[j];
+            for (j, x) in row.iter_mut().enumerate() {
+                *x += self.pos[t * h + j] + self.typ[j];
             }
         }
         layer_norm(&mut s.x, h, &self.emb_norm, self.eps);

@@ -1,0 +1,500 @@
+  
+    
+in
+re
+ t
+te
+   
+on
+st
+ a
+he
+        
+se
+le
+or
+de
+at
+an
+ c
+\x0a\x0a
+me
+ the
+ing
+ i
+al
+ f
+--
+er
+ar
+ion
+//
+       
+ w
+==
+it
+ `
+ou
+lo
+ b
+go
+ct
+nt
+ p
+ s
+mp
+ in
+es
+li
+ro
+ re
+ o
+ate
+ to
+ =
+en
+ri
+ {
+ex
+ u
+ m
+as
+jan
+jango
+           
+ n
+is
+ an
+ed
+ter
+----
+django
+ th
+ac
+``
+test
+ut
+il
+ is
+ag
+ic
+pe
+ode
+ad
+ue
+po
+ //
+ se
+et
+()
+ d
+ab
+un
+ }
+ of
+el
+/c
+ur
+====
+ame
+ v
+ T
+sr
+loc
+ce
+tests
+ "
+ve
+ (
+ra
+ h
+ st
+ and
+ul
+ de
+ation
+ for
+ I
+ser
+lf
+ be
+/django
+ol
+ru
+repo
+);
+ss
+fi
+ot
+ly
+ch
+ui
+om
+ith
+pp
+pt
+rs
+src
+and
+ con
+               
+ if
+iz
+ S
+ction
+ ex
+/tests
+fe
+ that
+able
+ ///
+od
+ok
+ment
+ore
+ as
+th
+tt
+ype
+argo
+id
+ *
+sting
+oc
+..
+--------
+ure
+ult
+ver
+con
+/repo
+/w
+out
+ on
+ [
+ig
+ow
+ |
+mple
+urn
+bu
+der
+.rs
+/src
+ y
+ -
+ le
+um
+ C
+ew
+ile
+ES
+ use
+ror
+ :
+ e
+ &
+ with
+ it
+turn
+pu
+                
+ g
+.m
+ome
+",
+xt
+cl
+mpl
+ you
+ase
+ort
+pre
+ke
+alue
+~~
+ize
+========
+ D
+ return
+ain
+rom
+ime
+ay
+name
+/li
+ A
+one
+her
+op
+.t
+int
+eld
+.p
+ack
+ al
+ self
+ this
+ #
+ we
+orm
+ass
+unction
+ R
+tri
+omp
+self
+ or
+fa
+/loc
+ can
+_t
+sp
+ pro
+ me
+ F
+ust
+ork
+ted
+ let
+if
+ not
+tem
+ect
+end
+     
+ath
+ li
+que
+ N
+::
+ap
+lock
+ill
+ption
+\xe2\x80
+ring
+ind
+ _
+sh
+ine
+/u
+all
+ata
+nd
+ruct
+age
+ are
+ant
+ssion
+ E
+/listing
+gpu
+vi
+mplate
+ook
+tern
+/m
+_in
+nc
+ec
+ub
+low
+ l
+ The
+Gui
+mGui
+ type
+io
+andle
+text
+ 1
+ by
+gs
+up
+                   
+ from
+00
+??
+ld
+ un
+ whe
+ang
+/cargo
+are
+get
+ample
+ask
+ O
+ 0
+ject
+ ->
+_c
+rate
+ff
+32
+ fi
+\xe2\x80\x99
+\x09\x09
+trib
+ will
+ te
+use
+")
+atch
+ fn
+.py
+form
+ated
+ code
+ign
+ P
+am
+lag
+ wh
+/con
+ U
+ r
+yp
+ function
+doc
+_s
+St
+\x5cc
+dd
+his
+quest
+ /
+no
+/b
+ value
+ess
+art
+.c
+ari
+ ch
+20
+In
+ht
+ale
+ext
+ ImGui
+rust
+tes
+_M
+ def
+app
+pression
+25
+ W
+lic
+error
+ ar
+rror
+qu
+`,
+ <
+_p
+]:
+ '
+ace
+di
+atic
+fault
+AG
+ould
+sert
+64
+_m
+ESS
+ name
+fere
+tr
+`.
+ lo
+ls
+/ch
+12
+pr
+pec
+),
+ypes
+.md
+sing
+_re
+put
+ial
+cc
+ =>
+ers
+ition
+/L
+ive
+ ..
+ca
+lags
+ave
+----------------
+to
+16
+ttp
+_f
+Con
+ail
+-b
+/work
+-c
+ sh
+10
+ en
+Re
+~~~~
+ app
+AGES
+/contrib
+mport
+min
+add
+ po
+/user
+uite
+ener
+ary
+set
+_MESS
+ B
+();
+))
+_MESSAGES
+ .
+Error
+thod
+ded
+ord
+ file
+ry
+ations
+ip
+rou
+home
+'s
+read
+tent
+/listings
+.s
+rait
+rect
+ This
+ M
+clu
+/local
+///
+ do
+im
+ature
+The
+\x5ccode
+ml
+\x5crepo
+/locale
+##

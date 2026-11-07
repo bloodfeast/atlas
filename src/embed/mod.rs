@@ -60,7 +60,7 @@ impl<'a> Cursor<'a> {
     }
     fn f32s(&mut self, n: usize) -> Result<Vec<f32>> {
         let bytes = n.checked_mul(4).ok_or_else(|| Error::InvalidArgument("model file sizes overflow".into()))?;
-        Ok(self.take(bytes)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Ok(self.take(bytes)?.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
     }
     fn text16(&mut self) -> Result<String> {
         let n = u16::from_le_bytes(self.take(2)?.try_into().unwrap_or([0; 2])) as usize;

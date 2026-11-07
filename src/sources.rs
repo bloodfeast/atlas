@@ -97,6 +97,48 @@ pub fn path_denied(p: &Path) -> bool {
     named(p) || std::fs::canonicalize(p).is_ok_and(|c| named(&c))
 }
 
+/// What breaks a command into the fragments [`command_names_denied`] judges.
+const COMMAND_BREAKS: &str = "|;&()<>$=,:@{}[]";
+
+/// Whether a command, in any shell, names a file on the deny-list. Total and
+/// over-matching by design: it never parses the command, so a chain, `sh -c`,
+/// `cmd /C`, an unclosed quote or a redirection cannot hide a name it can see,
+/// and `grep credentials src` counts too, which costs one digest and no
+/// secret. A command can still hide a path (`F=.e; cat ${F}nv`, a link reached
+/// after `cd`): this catches named files only.
+///
+/// The string is read three ways: quotes as separators (`sh -c "cat '.env'"`),
+/// quotes deleted (`.e"n"v`), and backslashes and backticks deleted too
+/// (`.e\nv`, ``.e`nv``). In each, a fragment's last component is taken at both
+/// `/` and `\` on every OS, since `Path::file_name` does not split `\` on Unix.
+pub fn command_names_denied(cmd: &str) -> bool {
+    let names = |text: &str, quotes: bool| {
+        text.split(|c: char| c.is_whitespace() || COMMAND_BREAKS.contains(c) || (quotes && matches!(c, '\'' | '"'))).any(|f| {
+            let name = f.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("");
+            !name.is_empty() && is_denied(name)
+        })
+    };
+    if names(cmd, true) {
+        return true;
+    }
+    let unquoted = cmd.replace(['\'', '"'], "");
+    names(&unquoted, false) || names(&unquoted.replace(['\\', '`'], ""), false)
+}
+
+/// Whether a Grep `glob` can only name deny-listed files by its own text: `*.pem`,
+/// `.env*`, `*.{pem,key}`. Named files only, as [`command_names_denied`] is.
+pub fn glob_names_denied(glob: &str) -> bool {
+    let bare = glob.replace(['*', '?'], "");
+    command_names_denied(&bare)
+        || glob.split('{').skip(1).filter_map(|r| r.split_once('}')).any(|(parts, _)| parts.split(',').any(|p| is_denied(&format!("x.{}", p.trim_start_matches('.')))))
+}
+
+/// The words of a command that could be paths, for a check of where links lead:
+/// unlike [`command_names_denied`] a drive's colon stays, and `@file` loses its `@`.
+pub fn command_path_words(cmd: &str) -> impl Iterator<Item = &str> {
+    cmd.split(|c: char| c.is_whitespace() || "|;&()<>=,'\"".contains(c)).map(|w| w.trim_start_matches('@')).filter(|w| !w.is_empty())
+}
+
 /// The refusal for a [`path_denied`] file.
 pub fn denied_message(p: &Path) -> String {
     format!("{}: atlas never reads .env, key or credential files (the deny-list)", p.display())
@@ -301,6 +343,49 @@ impl Source {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_glob_naming_denied_files_is_seen() {
+        for g in ["*.pem", ".env*", "**/.env*", "*.{pem,key}", "*.{rs,pem}", "{a,b}.{pem,key}", "id_rsa*", "conf/.env.big"] {
+            assert!(glob_names_denied(g), "{g}");
+        }
+        for g in ["", "*.rs", "*.{rs,md}", "src/**", ".envrc"] {
+            assert!(!glob_names_denied(g), "{g}");
+        }
+    }
+
+    #[test]
+    fn a_command_naming_a_denied_file_is_seen_however_it_is_written() {
+        for c in [
+            "cat .env.big",
+            "cat \".env.big\"",
+            "cat './x y/.env.big'",
+            "cat<.env",
+            "$(cat .env)",
+            "sh -c 'cat .env.big'",
+            "bash -lc \"cat '.env'\"",
+            "cmd /C type .env.big",
+            "powershell -Command gc .\\.env",
+            "gc .\\.env",
+            "--env-file=.env",
+            "curl -d @.env",
+            "F=.env; cat $F",
+            "cat .env\"",
+            "cat ../a/server.pem",
+            "cat .env | base64",
+            "cd d && cat .env",
+            "cat .e\"n\"v",
+            "cat .e\\nv",
+            "gc .e`nv",
+            "type C:\\a\\id_rsa",
+            "cat a/b\\.npmrc",
+        ] {
+            assert!(command_names_denied(c), "{c}");
+        }
+        for c in ["cat README.md", "cat .envrc", "grep -rn secrets src", "cat src/key.rs", "cargo test --features dev", "", "   ", "\"", "cat"] {
+            assert!(!command_names_denied(c), "{c}");
+        }
+    }
 
     #[test]
     fn deny_list() {

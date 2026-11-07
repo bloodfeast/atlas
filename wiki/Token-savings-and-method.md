@@ -52,12 +52,13 @@ target the 36% shell-read bucket. A 1-hour subagent cache targets the 25% re-wri
   the Read note. Files the index does not cover, or that changed since it was built, are left as they are;
   a file the model edits with Edit or Write is re-indexed as soon as the edit lands, so its next read is
   annotated again.
-- **Claude Code settings, offered once.** `atlas settings` offers the settings that cut cost (the 1-hour
-  subagent prompt cache, an early compaction point with handoff records), each with what it does and what
-  it costs. Nothing is written without a yes, and every change is backed up and reversible.
+- **Claude Code settings, offered until answered.** `atlas settings` offers the settings that cut cost (the
+  1-hour subagent prompt cache, fewer goal check-ins while background work runs), each with what it does and
+  what it costs. Nothing is written without a yes, every change is backed up and reversible, and `atlas settings
+  offer --no` declines them.
 
 First measurements, on scratch copies of this repository with Opus sessions doing review, test and edit
-tasks:
+tasks. One early run: its sessions are not published, so these figures cannot be checked or rerun.
 
 - Seven results were routed. Raw output over the threshold that was not routed: none.
 - 236 KB of output entered context as 8.2 KB of digests. One 87 KB source file became a 3.7 KB outline,

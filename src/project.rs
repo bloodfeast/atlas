@@ -774,7 +774,18 @@ fn other_memory_dirs(c: &Config, active: Option<&str>) -> Vec<PathBuf> {
 /// [`active`].
 pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> {
     if !c.user.scoped {
-        return Ok(Resolved { config: c.clone(), active: None, graph: Graph::default() });
+        let mut e = c.clone();
+        let mode = crate::memory::rules::Mode::of(c.memory.as_ref().and_then(|m| m.rules));
+        if mode != crate::memory::rules::Mode::Today {
+            let mut memory = e.memory.take().unwrap_or_default();
+            apply_rules(mode, &mut e, &mut memory, &[cwd.to_path_buf()], claude_dir().as_deref());
+            if mode == crate::memory::rules::Mode::Off {
+                memory.tree = None;
+            }
+            e.memory = Some(memory);
+            e.check_names()?;
+        }
+        return Ok(Resolved { config: e, active: None, graph: Graph::default() });
     }
     let active = active(c, cwd, named)?;
     let mut e = c.clone();
@@ -882,9 +893,15 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
         memory.user_scope_from = other_memory_dirs(c, active.as_ref().map(|a| a.spec.name.as_str()));
         memory.user_memory = Some(dir.clone());
     }
+    // A yes or no at the top level holds in every project a project's own
+    // `memory` block does not answer for.
+    memory.rules = memory.rules.or(c.memory.as_ref().and_then(|m| m.rules));
+    let found_in: Vec<PathBuf> = std::iter::once(cwd.to_path_buf()).chain(active.iter().flat_map(|a| project_roots(&a.spec, &c.user.checkouts))).collect();
+    let mode = crate::memory::rules::Mode::of(memory.rules);
+    apply_rules(mode, &mut e, &mut memory, &found_in, claude_dir().as_deref());
     exclude_covered(&mut e, &repo_sources);
     memory.user_state = user_state_dir(c);
-    memory.tree = project_tree(c, &memory, active.as_ref().map(|a| &a.spec));
+    memory.tree = if mode == crate::memory::rules::Mode::Off { None } else { project_tree(c, &memory, active.as_ref().map(|a| &a.spec)) };
     if e.vaults.is_empty() {
         // The server needs one writable vault (discussions, next_id): a
         // project without one gets its own `notes` beside its database.
@@ -982,6 +999,55 @@ fn project_tree(c: &Config, memory: &MemorySpec, p: Option<&ProjectSpec>) -> Opt
     t.shared = c.user.memory.iter().map(|d| (d.clone(), false)).collect();
     t.shared.extend(other_memory_dirs(c, p.map(|p| p.name.as_str())).into_iter().map(|d| (d, true)));
     Some(t)
+}
+
+/// Claude Code's folder: `$CLAUDE_CONFIG_DIR`, else `<home>/.claude`.
+fn claude_dir() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    env("CLAUDE_CONFIG_DIR").or_else(|| env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| h.join(".claude")))
+}
+
+/// What `memory.rules` does to a configuration; unset does nothing.
+///
+/// A no drops every memory folder and rule file from sync, with its source:
+/// the store keeps what it holds. A yes adds what the user did not name: Claude
+/// Code's memory folder for the first of `folders` that has one, and the first
+/// root `CLAUDE.md` among them. Sync only reads a rule file. A memory folder's
+/// `MEMORY.md` is rewritten only when `memory.tree` is configured for it.
+fn apply_rules(mode: crate::memory::rules::Mode, e: &mut Config, memory: &mut MemorySpec, folders: &[PathBuf], claude: Option<&Path>) {
+    use crate::memory::rules::{Mode, CLAUDE_MD};
+    match mode {
+        Mode::Today => {}
+        Mode::Off => {
+            let dropped: Vec<String> = memory.exports.iter().filter(|x| matches!(x.shape.as_str(), "memory" | "items")).map(|x| x.name.clone()).collect();
+            memory.exports.retain(|x| !dropped.contains(&x.name));
+            e.sources.retain(|s| !dropped.contains(&s.name));
+            memory.user_memory = None;
+            memory.user_scope_from.clear();
+        }
+        Mode::Live => {
+            let taken = |e: &Config, n: &str| e.sources.iter().any(|s| s.name == n) || e.vaults.iter().any(|v| v.name == n);
+            let has_folder = memory.exports.iter().any(|x| x.shape == "memory" && x.name != USER_EXPORT);
+            let found = claude.and_then(|d| folders.iter().map(|f| d.join("projects").join(crate::transcripts::project_of_cwd(f)).join("memory")).find(|m| m.is_dir()));
+            if let (false, false, Some(dir)) = (has_folder, taken(e, "memory"), found) {
+                e.sources.push(memory_source("memory", &dir));
+                memory.exports.push(ExportCfg { name: "memory".into(), shape: "memory".into(), path: "memory".into(), index: Some("MEMORY.md".into()), ..ExportCfg::default() });
+            }
+            let file = folders.iter().map(|f| f.join("CLAUDE.md")).find(|f| f.is_file());
+            if let (false, Some(file)) = (taken(e, CLAUDE_MD), file) {
+                e.sources.push(SourceSpec {
+                    name: CLAUDE_MD.into(),
+                    root: file.parent().map(Path::to_path_buf).unwrap_or_default(),
+                    include: vec!["CLAUDE.md".into()],
+                    exclude: Vec::new(),
+                    chunk: crate::chunk::ChunkRule { top_level_items: true, ..Default::default() },
+                    id_keys: None,
+                    names_kind: None,
+                });
+                memory.exports.push(ExportCfg { name: CLAUDE_MD.into(), shape: "items".into(), path: "CLAUDE.md".into(), ..ExportCfg::default() });
+            }
+        }
+    }
 }
 
 fn memory_source(name: &str, dir: &Path) -> SourceSpec {
@@ -1221,6 +1287,33 @@ fn common_root(paths: &[PathBuf]) -> Option<PathBuf> {
     (named >= 1).then(|| common.iter().collect())
 }
 
+/// Whether a folder is too wide to be a project root: a drive or file-system
+/// root, the home folder, or a folder holding it (`C:/Users` has one named
+/// component, so counting components is not enough). As a root it would claim
+/// every folder below, and none of them would be asked about. Compared by
+/// [`path_key`], so case, separators and links do not matter.
+pub fn too_wide(dir: &Path, home: Option<&Path>) -> bool {
+    let key = path_key(dir);
+    let named = Path::new(&key).components().filter(|c| matches!(c, std::path::Component::Normal(_))).count();
+    named == 0 || home.is_some_and(|h| key_within(&path_key(h), &key))
+}
+
+/// The roots a moved setup gets for the folders it reads: the deepest folder
+/// holding them, or when that is [`too_wide`] each folder as its own root
+/// (leaving out any that is too wide itself).
+fn narrow_roots(dirs: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(r) = common_root(dirs).filter(|r| !too_wide(r, home)) {
+        return vec![r];
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if !too_wide(d, home) && !out.iter().any(|o| path_key(o) == path_key(d)) {
+            out.push(d.clone());
+        }
+    }
+    out
+}
+
 /// The configuration value after moving a pre-project configuration into
 /// one project named `name`, or `None` when there is nothing to move (no
 /// pre-project keys, or `projects` already present): a migration is
@@ -1228,10 +1321,13 @@ fn common_root(paths: &[PathBuf]) -> Option<PathBuf> {
 ///
 /// The project keeps the database and memory store it had (an absent `db`
 /// is written as `default_db`, the path it resolved to), so no data moves.
-/// Its root is the deepest folder holding its vaults, sources and code roots
-/// (the Claude Code configuration folder left out), and it becomes
-/// `default_project`, so every session that resolved to it before still
-/// does.
+/// Its root is the deepest folder holding its vaults, sources and code roots,
+/// leaving out Claude Code's folder and, while anything else is left, atlas's
+/// own (the starter vault lives there, and says nothing about where the work
+/// is). A root that would be [`too_wide`] becomes one root per folder. It
+/// becomes `default_project`, so every session that resolved to it before
+/// still does; that includes a folder in no project, which reads this project
+/// and is still asked about once.
 ///
 /// # Arguments
 ///
@@ -1240,7 +1336,8 @@ fn common_root(paths: &[PathBuf]) -> Option<PathBuf> {
 /// * `name` - the project's name.
 /// * `default_db` - the database an absent `db` resolved to.
 /// * `claude_dir` - Claude Code's folder, left out of the root.
-pub fn migrate_value(v: &Value, base: &Path, name: &str, default_db: &Path, claude_dir: Option<&Path>) -> Option<Value> {
+/// * `home` - the user's home folder, which no root may be or hold.
+pub fn migrate_value(v: &Value, base: &Path, name: &str, default_db: &Path, claude_dir: Option<&Path>, home: Option<&Path>) -> Option<Value> {
     let m = v.as_object()?;
     if m.contains_key("projects") || !MIGRATED_KEYS.iter().any(|k| m.contains_key(k)) {
         return None;
@@ -1262,8 +1359,14 @@ pub fn migrate_value(v: &Value, base: &Path, name: &str, default_db: &Path, clau
     let claude = claude_dir.map(path_key);
     let mut dirs: Vec<PathBuf> = crate::claude_settings::configured_roots(&c);
     dirs.retain(|d| claude.as_ref().is_none_or(|ck| !key_within(&path_key(d), ck)));
-    if let Some(r) = common_root(&dirs) {
-        proj.insert("roots".into(), Value::Array(vec![Value::String(r.to_string_lossy().replace('\\', "/"))]));
+    let own = path_key(base);
+    let outside: Vec<PathBuf> = dirs.iter().filter(|d| !key_within(&path_key(d), &own)).cloned().collect();
+    if !outside.is_empty() {
+        dirs = outside;
+    }
+    let roots = narrow_roots(&dirs, home);
+    if !roots.is_empty() {
+        proj.insert("roots".into(), Value::Array(roots.iter().map(|r| Value::String(r.to_string_lossy().replace('\\', "/"))).collect()));
     }
     // The project's keys in a fixed order: name, roots, then the rest.
     let mut ordered = crate::json::Map::new();
@@ -1282,12 +1385,33 @@ pub fn migrate_value(v: &Value, base: &Path, name: &str, default_db: &Path, clau
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_yes_finds_the_memory_folder_by_claude_codes_own_key() {
+        let t = std::env::temp_dir().join(format!("atlas-rules-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (claude, work) = (t.join("claude"), t.join("work"));
+        let mem = claude.join("projects").join(crate::transcripts::project_of_cwd(&work)).join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let run = |mode| {
+            let (mut e, mut m) = (Config::default(), MemorySpec::default());
+            apply_rules(mode, &mut e, &mut m, &[t.join("elsewhere"), work.clone()], Some(&claude));
+            (e, m)
+        };
+        let (e, m) = run(crate::memory::rules::Mode::Live);
+        assert_eq!(e.sources.iter().find(|s| s.name == "memory").map(|s| s.root.clone()), Some(mem.clone()));
+        assert!(m.exports.iter().any(|x| x.name == "memory" && x.shape == "memory"));
+        assert!(!m.exports.iter().any(|x| x.name == crate::memory::rules::CLAUDE_MD), "no CLAUDE.md here");
+        let (e, m) = run(crate::memory::rules::Mode::Today);
+        assert!(e.sources.is_empty() && m.exports.is_empty());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
     use super::*;
 
     #[test]
     fn a_migrated_default_db_is_written_with_forward_slashes() {
         let v = crate::json::parse(r#"{"vaults": [{"name": "notes", "path": "notes"}]}"#).unwrap();
-        let out = migrate_value(&v, Path::new("/cfg"), "p", Path::new(r"C:\home\state\atlas.sqlite"), None).unwrap();
+        let out = migrate_value(&v, Path::new("/cfg"), "p", Path::new(r"C:\home\state\atlas.sqlite"), None, None).unwrap();
         assert_eq!(out["projects"][0]["db"], crate::json!("C:/home/state/atlas.sqlite"), "{out}");
     }
 
@@ -1381,7 +1505,7 @@ mod tests {
     fn migration_moves_the_keys_once() {
         let v = crate::json::parse(r#"{"db": "s/a.sqlite", "vaults": [{"name": "notes", "path": "w/notes"}], "sources": [{"name": "d", "root": "w/docs", "include": ["*.md"]}], "update": {"enabled": true}}"#).unwrap();
         let base = Path::new("base");
-        let m = migrate_value(&v, base, "alpha", Path::new("unused.sqlite"), None).unwrap();
+        let m = migrate_value(&v, base, "alpha", Path::new("unused.sqlite"), None, None).unwrap();
         assert!(m.get("vaults").is_none() && m.get("db").is_none());
         assert_eq!(m.get("default_project").and_then(Value::as_str), Some("alpha"));
         assert!(m.get("update").is_some());
@@ -1389,8 +1513,68 @@ mod tests {
         assert_eq!(p.get("db").and_then(Value::as_str), Some("s/a.sqlite"));
         let root = p.get("roots").unwrap().as_array().unwrap()[0].as_str().unwrap().to_string();
         assert_eq!(Path::new(&root), base.join("w"));
-        assert!(migrate_value(&m, base, "alpha", Path::new("x"), None).is_none(), "idempotent");
+        assert!(migrate_value(&m, base, "alpha", Path::new("x"), None, None).is_none(), "idempotent");
         let c = Config::parse(&crate::json::to_string_pretty(&m), base).unwrap();
         assert_eq!(c.user.projects[0].body.vaults[0].path, base.join("w/notes"));
+    }
+
+    /// The roots a migration writes, with the home folder as given.
+    fn roots_of(t: &Path, home: &Path, base: &str, sources: &[&str], vaults: &[&str]) -> Vec<PathBuf> {
+        let s = |x: &&str| t.join(x).to_string_lossy().replace('\\', "/");
+        let src: Vec<String> = sources.iter().enumerate().map(|(i, x)| format!("{{\"name\": \"s{i}\", \"root\": {:?}, \"include\": [\"*.md\"]}}", s(x))).collect();
+        let vs: Vec<String> = vaults.iter().enumerate().map(|(i, x)| format!("{{\"name\": \"v{i}\", \"path\": {:?}}}", s(x))).collect();
+        let v = crate::json::parse(&format!("{{\"vaults\": [{}], \"sources\": [{}]}}", vs.join(","), src.join(","))).unwrap();
+        let m = migrate_value(&v, &t.join(base), "alpha", Path::new("unused.sqlite"), None, Some(home)).unwrap();
+        let p = &m.get("projects").unwrap().as_array().unwrap()[0];
+        p.get("roots").and_then(Value::as_array).map(|a| a.iter().map(|r| PathBuf::from(r.as_str().unwrap())).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_migration_never_writes_a_root_at_or_above_home() {
+        let t = std::env::temp_dir().join(format!("atlas-wide-{}", std::process::id()));
+        let home = t.join("Users").join("me");
+        let same = |got: Vec<PathBuf>, want: &[PathBuf]| {
+            let k = |v: &[PathBuf]| v.iter().map(|p| path_key(p)).collect::<Vec<_>>();
+            assert_eq!(k(&got), k(want));
+        };
+        // The audit's case: the starter vault under the configuration folder.
+        same(roots_of(&t, &home, "Users/me/AppData/atlas", &["Users/me/code/p1"], &["Users/me/AppData/atlas/notes"]), &[home.join("code").join("p1")]);
+        // Common folder fine: still one root.
+        same(roots_of(&t, &home, "cfg", &["Users/me/code/p1", "Users/me/code/p2"], &[]), &[home.join("code")]);
+        // Common folder is home: one root each.
+        same(roots_of(&t, &home, "cfg", &["Users/me/code/p1", "Users/me/docs"], &[]), &[home.join("code").join("p1"), home.join("docs")]);
+        // Common folder above home, the `C:/Users` shape.
+        same(roots_of(&t, &home, "cfg", &["Users/me/code", "Users/other/code"], &[]), &[home.join("code"), t.join("Users").join("other").join("code")]);
+        // A source that is home itself is no root, and the same folder twice is one.
+        same(roots_of(&t, &home, "cfg", &["Users/me", "Users/me/code", "Users/me/code"], &[]), &[home.join("code")]);
+        // Only the starter vault: it stays the root, as before.
+        same(roots_of(&t, &home, "Users/me/AppData/atlas", &[], &["Users/me/AppData/atlas/notes"]), &[home.join("AppData").join("atlas").join("notes")]);
+    }
+
+    #[test]
+    fn too_wide_is_home_and_above_and_drive_roots() {
+        let t = std::env::temp_dir().join(format!("atlas-wide2-{}", std::process::id()));
+        let home = t.join("Users").join("me");
+        std::fs::create_dir_all(home.join("code")).unwrap();
+        assert!(too_wide(&home, Some(&home)));
+        assert!(too_wide(&t.join("Users"), Some(&home)), "a folder holding home, with few components");
+        assert!(too_wide(&PathBuf::from(format!("{}/", home.display())), Some(&home)), "a trailing separator");
+        if cfg!(windows) {
+            assert!(too_wide(Path::new(&home.to_string_lossy().to_uppercase()), Some(&home)), "another case");
+        }
+        assert!(!too_wide(&home.join("code"), Some(&home)));
+        assert!(!too_wide(&t.join("Users").join("other"), Some(&home)));
+        let drive = home.ancestors().last().unwrap();
+        assert!(too_wide(drive, None), "{}", drive.display());
+        assert!(too_wide(drive, Some(&home)));
+        assert!(!too_wide(&home, None), "with no home known, only drive roots");
+        #[cfg(unix)]
+        {
+            let link = t.join("link");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&home, &link).unwrap();
+            assert!(too_wide(&link, Some(&home)), "a link to home");
+        }
+        let _ = std::fs::remove_dir_all(&t);
     }
 }

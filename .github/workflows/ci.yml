@@ -39,3 +39,29 @@ jobs:
         env:
           CARGO_TERM_COLOR: always
           CARGO_BUILD_JOBS: 4
+  clippy:
+    # Same rule as the tests. On a pinned toolchain, so a new Rust release's
+    # lints cannot fail an unrelated release: bump it in xtask/src/release.rs too.
+    if: github.repository == 'bloodfeast/atlas'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned clippy
+        run: rustup toolchain install 1.99.0 --profile minimal -c clippy
+      - name: Clippy, all targets with dev
+        run: cargo +1.99.0 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings
+        env:
+          CARGO_TERM_COLOR: always
+          CARGO_BUILD_JOBS: 4
+      - name: Clippy, default targets
+        run: cargo +1.99.0 clippy --workspace --locked -- -D warnings
+        env:
+          CARGO_TERM_COLOR: always
+          CARGO_BUILD_JOBS: 4

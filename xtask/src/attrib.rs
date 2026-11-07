@@ -279,7 +279,7 @@ pub fn report(paths: &[String]) -> Result<String, String> {
         let s = match py::sum(w.values()) {
             // `sum(...) or 1`
             Num::Int(0) => Num::Int(1),
-            Num::Float(x) if x == 0.0 => Num::Int(1),
+            Num::Float(0.0) => Num::Int(1),
             s => s,
         };
         total += s.f();

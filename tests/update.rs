@@ -106,8 +106,10 @@ fn release(version: &str, bin: &[u8]) -> (String, Seen) {
     (base, seen)
 }
 
+type Files = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
 /// Routes filled after the port is known (see [`release`]).
-static LATE: Mutex<Vec<(String, Arc<Mutex<HashMap<String, Vec<u8>>>>)>> = Mutex::new(Vec::new());
+static LATE: Mutex<Vec<(String, Files)>> = Mutex::new(Vec::new());
 
 fn serve_late() -> (String, Seen) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();

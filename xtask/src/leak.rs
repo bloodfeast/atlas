@@ -324,7 +324,7 @@ fn utf8(bytes: &[u8], base: usize) -> Vec<(usize, char)> {
 }
 
 fn utf16(bytes: &[u8], base: usize, big_endian: bool) -> Vec<(usize, char)> {
-    let units = bytes.chunks_exact(2).map(|p| if big_endian { u16::from_be_bytes([p[0], p[1]]) } else { u16::from_le_bytes([p[0], p[1]]) });
+    let units = bytes.as_chunks::<2>().0.iter().map(|p| if big_endian { u16::from_be_bytes(*p) } else { u16::from_le_bytes(*p) });
     let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut at = base;
     for r in char::decode_utf16(units) {

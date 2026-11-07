@@ -5,7 +5,7 @@ rate and post-compaction misses reported by `--token-report` and measured on rep
 
 v0.2.0 ships these features experimental and off by default (`compact.enabled`, default false), until they are
 tested live: off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes
-the transcript), and SessionStart injects no card or ref report and offers no Compact instructions.
+the transcript), and SessionStart injects no card or ref report.
 
 Goal: higher compaction ratios and more accurate references. A compacted session should carry keys and
 deltas, not restated content, and every key it carries should either resolve to the exact text it meant or
@@ -14,9 +14,31 @@ be reported as stale.
 ## 1. What the hooks can and cannot do (measured and documented)
 
 - **PreCompact** gets `trigger` (`manual` or `auto`), `custom_instructions` (what the user typed after
-  `/compact`, else null) and `transcript_path`. It can block compaction (exit 2 or `decision: block`). It
-  cannot add instructions to the summarizer: `additionalContext` is not acted on for this event, and stdout
-  goes to the debug log. Claude Code writes the summary itself.
+  `/compact`, else null) and `transcript_path`. It can block compaction (exit 2 or `decision: block`).
+  `additionalContext` is not acted on for this event. Claude Code writes the summary itself, but what a PreCompact
+  hook returns as plain text steers it: a command hook's stdout on exit 0 and an `mcp_tool` hook's tool result
+  both land in the summarizer's instructions (the web docs do not say so). That the text comes after any `/compact`
+  argument is read from the binary, not observed: no run had both.
+  - Evidence: one manual run of each on claude.exe 2.1.318, journal:COMPACT-INPUT:0004 (command hook, body 4,249
+    chars), journal:COMPACT-INPUT:0005 (`mcp_tool` stub, body 3,780) and journal:ATLAS-V03:0266 (the real atlas
+    `hook` tool, body 3,885). There is no plain control on 2.1.318; the 11,357 baseline is from an earlier version,
+    so the summaries' free format is the evidence that does not rest on it.
+  - Untested: the automatic trigger (the binary appears to run the same path, not observed).
+  - What atlas does: with `compact.enabled` on, once the checkpoint is written, the hook replies with
+    `COMPACT_INSTRUCTIONS` (`src/claude_settings.rs`; 1,344 bytes, 336 tokens at 4 bytes per token), the plain text
+    and nothing around it, by both `atlas --hook` and the `hook` tool. Off, it replies with nothing, as before. A
+    deferred compaction replies `decision: block` as before and gets no text.
+  - On failure the reply is empty and Claude Code compacts with its own instructions, as it would without atlas:
+    a checkpoint that failed to write, or one with no chain card (a transcript atlas could not read), since the text
+    tells the summarizer to leave out what the card lists.
+  - What the reply adds to the hook: on the live `mcp_tool` form, nothing waited for. On the command form, one
+    token-log row, waited for at exit (main's PreCompact sends no row); that row is unmeasured.
+  - The echo: on a manual `/compact` the text also lands in the conversation, on the display line Claude Code writes
+    as `local-command-stdout`, about 340 tokens on each later request until the next compaction. The line is on the
+    resumed chain (journal:ATLAS-V03:0266's transcript), and a live request body holds that line without text. No run
+    measured a turn after it, since all three jobs skipped the scripted turn. The automatic trigger's path is unread.
+  - Every byte of the reply is now instructions: nothing else may reach stdout on this path. Diagnostics go to
+    stderr.
 - **PostCompact** gets `compact_summary` and has no decision control.
 - **SessionStart** with `source: compact` runs after the summary is in place. Its `additionalContext` is
   injected at the start of the compacted conversation. Hook strings are capped at 10,000 characters (past
@@ -45,7 +67,7 @@ at the next quiet point" option possible (`compact.defer`, off by default):
 Whether a deferred compaction is re-offered at every later request is not documented, so the first live
 run checks it before the option ships. Either way, the checkpoint carries the in-task working state a
 mid-task compaction would cut, as visible records: the current step (the newest `next` entry or brief),
-the last tool calls' targets and their result refs, and the files touched since the last checkpoint.
+the chain card's keys for every part of the segment (section 8), and the files touched since the last checkpoint.
 
 **No reasoning content.** The checkpoint and the transcript source read only what is visible: user
 prompts, assistant text, tool calls and tool results, decisions, files touched and lane state. Thinking
@@ -55,10 +77,12 @@ compaction is accepted.
 The summary itself is the one thing atlas cannot write. So the steering levers are:
 
 1. what the session can point at instead of restating (records exist, with refs that resolve verbatim);
-2. what SessionStart(compact) injects next to the summary (the checkpoint card, a few hundred tokens);
-3. a "Compact instructions" block in the project's `CLAUDE.md`, which the summarizer reads, offered once
-   through `atlas settings` like the other context settings (asked, never written without a yes);
-4. `/compact <instructions>` typed by the user (out of atlas's hands).
+2. what SessionStart(compact) injects next to the summary (the checkpoint card and its chain card, 1,165 tokens at the one point measured);
+3. the Compact instructions the PreCompact hook returns with `compact.enabled` on (section 1);
+4. the same text as a block in the project's `CLAUDE.md`, a manual choice through `atlas settings compact-md` only
+   (asked, never written without a yes). Neither SessionStart nor `atlas settings offer` raises it: in `CLAUDE.md`
+   alone it showed no reliable effect, and a project with the block gets the text twice and should drop it;
+5. `/compact <instructions>` typed by the user (out of atlas's hands).
 
 ## 2. The four parts
 
@@ -93,7 +117,11 @@ A ref names exact text:
   resolvable).
 - `src:path:a-b@hash`: lines `a` to `b` of a vault or source file. `hash` is the first 12 hex digits of
   SHA-256 over those lines joined with `\n` (CRLF read as LF).
-- `turn:<session8>:<n>@hash` (part c): one transcript turn.
+- `turn:<session8>:<n>@hash` (part c): one transcript turn, by its line `n`; a checkpoint writes
+  `turn:<session8>:b<offset>@hash`, the same turn by its record's byte offset (section 8).
+- Chain keys (section 8): `turn:<session>:b<first>-b<last>@hash` (a group of records),
+  `turn:<session>:b<offset>#<k>@hash` (part `k` of a long record) and `compact:<session>:b<offset>@hash` (an
+  older sub-segment's card and digest).
 
 Resolution: the hash matches the head (current), matches an older version (changed: the old text is still
 returned verbatim, with the head's ref), or matches nothing (dangling). `recall {key: "k@hash"}` returns that
@@ -177,14 +205,24 @@ Latency cannot equal no hooks at all, so its bar is stated on its own: the hooks
 Questions are extracted mechanically, never written by a model. For each compaction point, a fact is a
 token run that appears in the compacted segment (a tool result or assistant text before the boundary) and
 is used again in the 40 tool calls after it: a number, an error line, a command, a path, a record key.
+A fact comes from what a call names (its string and number values, read raw), never from the file text it
+writes or must match: an edit's `old_string` and `new_string`, a write's `content`, a notebook cell's source.
+That text is code the next step types or copies from a fresh read; scoring it would reward a summary for
+restating code, which the Compact instructions forbid for the ratio's sake. (Ruled out on 2026-11-04: on the
+81a956e5 150k cut, 179 of the 183 facts under the old rule were JavaScript and CSS identifiers inside edits
+and writes. Over the 72 recorded compactions in H--dev the rule drops 192 of 2,483 facts and moves plain
+fidelity from 49.9% to 52.3%; the numbers in sections 6 and 8 were measured under the old rule.)
 Scoring is the eval's substring test over what each arm makes available. The questions are derived per run
 from the transcripts and never written inside the repository.
+The rule reads a call's own fields only, so a file written through a shell (a Bash heredoc, `python -c`)
+still has its body scored as the command's string. Both arms are scored on the same list, so this is
+symmetric, but it is the one place restated code still counts.
 
 ### Live sample (not run without the maintainer's OK)
 
 The atlas arm's summaries need real compactions. The plan is 12 compaction points from 4 recorded sessions,
 mixing auto and manual and spanning 140,000 to 800,000 `preTokens`. Each is truncated at its boundary into a
-scratch project, resumed headless with `--fork-session`, and compacted twice: once with atlas off and once
+scratch project, resumed headless, and compacted twice: once with atlas off and once
 with atlas on (checkpoint, compact instructions, card). The plain arm is re-run rather than reused, so model
 drift since the recording favours neither arm. 24 compactions at about 350,000 input and 4,000 output tokens
 each come to roughly 8.5M input and 0.1M output tokens, mostly cache-cold. Resume tokens add one scripted
@@ -248,18 +286,38 @@ remove, which is why pre/post sits far below pre/summary.
 1. Refs, validation, metrics: `recall k@hash`, the ref report at SessionStart(compact), `compact_log`,
    `compact:miss`, `--compact-report`, the `--token-report` line, this note.
 2. Checkpoint records: the structured PreCompact record and the SessionStart(compact) card; the compact
-   instructions settings offer; the eval's compaction pass.
+   instructions settings offer (removed since; `atlas settings compact-md` remains); the eval's compaction pass.
 3. Transcript source: opt-in indexing with redaction, `turn:` refs.
 
 ## 8. Part 2 as built, measured offline
 
 The checkpoint body is the format of section 2(a), with the in-task lines after the store's: `files` (touched
-since the last compaction, newest first, at most 12), `tools` (the last 6 calls, each `Tool target ->
-turn:<session8>:<line>@hash`, the line of the transcript record holding the result and the SHA-256 of its
-visible text), `pending` (a call with no result yet) and `intent` (the last line of visible assistant text).
-Targets and intent are one line each, cut to 100 and 200 characters, and pass `src/redact.rs` first. The card
-budget is `compact.card_tokens` (default 400); items are dropped from a line's end, then whole lines from the
-end, so the store's refs survive a tight budget first.
+since the last compaction, newest first, at most 12), `pending` (a call with no result yet) and `intent` (the
+last line of visible assistant text). Targets and intent are one line each, cut to 100 and 200 characters, and
+pass `src/redact.rs` first. The body's budget is `compact.card_tokens` (default 400); items are dropped from a
+line's end, then whole lines from the end, so the store's refs survive a tight budget first.
+
+The tool calls are not listed one by one. The PreCompact hook appends the chain card (`src/chain.rs`), outside
+that budget: every part of the current sub-segment by a group key, then the links to the older sub-segments. A
+card prints the short form, a 4-character session prefix and 6 hash digits; the long
+form (8 and 12) resolves too. `recall` resolves a chain key from this project's transcript itself, with
+`memory.transcripts` or `compact.enabled` on, and answers an error otherwise. Nothing is stored or indexed for
+it, so a key lives as long as its transcript file. A key's hash covers the record's unredacted visible text (a
+link's: its line's bytes), so a denylist change does not dangle it. Part numbers are cut from redacted text, so
+under a different setting a part key can name another slice or none. Keep the hook and the resolver on one
+`ATLAS_LEAK_DENYLIST` setting.
+
+The ref check after a compaction counts a chain key with 8 or more hash digits as unchecked, never dangling; it
+does not see the short form a card prints, which is not a plain ref (at least 8 digits), nor a part key. `atlas
+--compact-report` prints the checkpoint body only: it has no chain card, so its card size and coverage lines do
+not describe the live card.
+
+The ref is by byte offset, not line, so PreCompact reads only the segment since the newest boundary:
+finding a line number meant counting every newline of the history before it, 60 ms of a 200 MB transcript
+(profiled 2026-11-05). The boundary is found by a raw-byte search back from the end
+that decodes only lines holding the needle, and the segment is then streamed once through one buffer. On
+the saved compact-live jobs PreCompact went from 190 ms to 90 ms at 400k and from 330 ms to 130 ms on the
+largest segment (57 MB). A `turn:<session8>:<line>` ref still parses and resolves.
 
 `compact.defer` reads the window as `compact.window`, else 1,000,000 once the session has held more than
 200,000 tokens, else 200,000; with a 200,000 window it never defers near Claude Code's own threshold.
@@ -296,7 +354,8 @@ offer` offers no compaction point until the live sweep shows a threshold where a
 
 Card budget: at 150, 200, 300 and 400 tokens the misses named stay 25 of 32, and the facts in summary or card
 are 1,293, 1,300, 1,309 and 1,311 of 3,058; a smaller card loses facts, so the budget stays 400. The Compact
-instructions aim the summary at about 1,800 words spent on identifiers: one line per file with no code
+instructions set a hard limit of 3,000 characters (about 1,250 tokens), which the summarizer has not kept to in
+live smokes, spent on identifiers: one line per file with no code
 snippets, user messages as requirements and corrections, no restated tool output, refs instead of record
 text, and nothing the card lists. A plain summary's bulk is code snippets and the full list of user messages,
 which is what this removes.
@@ -310,10 +369,40 @@ hold (numbers in `cargo xtask memory-eval`).
 atlas compaction of the same transcript cut. The points are the recorded compactions (`rec`: `preTokens`
 140,000 to 810,000, the 4 sessions with the most, 3 each, cut just before the boundary) and, for each
 threshold T, as many cuts where a segment's context crosses T (or `--per-threshold N`), from the same sessions
-first. Each cut is copied into a scratch project, resumed with `--fork-session` and compacted: the plain arm
-with no hooks, no MCP servers and no `CLAUDE.md` (`--setting-sources project`, `--strict-mcp-config`), the atlas
-arm with atlas's hooks and server from a scratch copy of the eval snapshot configuration and the Compact
-instructions as the project's `CLAUDE.md`. One scripted turn follows in plan mode with edits and shells refused.
+first. Each cut is copied into a scratch project under a session id of the job's own, resumed in place and
+compacted. Both arms run atlas's hooks and server from a scratch copy of the eval snapshot configuration
+(`--setting-sources project`, `--strict-mcp-config`), so the baseline carries the same tool list and session lines:
+the plain arm with that configuration's compaction features off, no `CLAUDE.md` and a bare `/compact`, the atlas
+arm with them on and the Compact instructions both as the `/compact` argument and as the project's `CLAUDE.md`. The
+`CLAUDE.md` block is part of the shipped feature (the steering a user installs); in a resumed session it reaches
+only the turn after the boundary, so it is a turn-side difference between the arms, counted in the atlas arm's
+tokens. An atlas binary whose hook returns the instructions adds them a further time (after the argument, as read
+from the binary, not observed) and adds the echo (section 1) to each scripted turn: the runs recorded here predate
+that. By Brandon's ruling the scored run uses a bare `/compact` in the atlas arm, the echo counts against atlas in
+bar 3, and its results are not directly comparable with older runs; `compact_prompt` still passes the argument until
+that follow-up lands. Each job runs on its own copy of the configuration, index and memory store, so no job's hooks feed another
+job's session lines or recall. The memory store copy is pruned to the cut's time (the newest record time in
+the kept lines; versions after it go, heads, status and search follow), so no record written after the cut is
+there; an undated source item carries its import time and is dropped too, which can only cost the arm that
+recalls it. The index is not pruned: its sources are the 2026-11-02 snapshot (as of 15:19:37Z), and every point
+the ruling's plan picks (3 sessions, 9 cuts, 2026-10-04 to 2026-11-02T03:45Z) is older than it. The only
+session with compactions after the snapshot is the orchestrator's own live one, so refusing older cuts would
+leave no plan. The harness therefore refuses them unless `--index-newer-ok`, and the score says how many jobs
+ran one. What leaks is symmetric and stays out of the compaction: both arms can search the later index in the
+scripted turn, while the summary, the card (bounded by the transcript's newest record) and the ref check never
+read it. A `/compact` that leaves no boundary past the cut is retried, never measured. A
+cut that leaves a `/goal` active has it cleared first in both arms, since a restored goal's Stop check re-prompts
+the turn. One scripted turn follows in plan mode with edits and shells refused; resume is the tool-result bytes from
+the boundary to the first edit attempt or `ExitPlanMode`.
+
+Fixes from the 2026-11-03 audit of the first run (voided), besides the symmetric baseline, the goal clear and
+the resume measure above: a resumed session attaches `CLAUDE.md` only
+after the boundary, so the steering reaches the summarizer only as the `/compact` argument; a `--fork-session`
+fork's transcript is written after PreCompact runs, so its checkpoint read nothing (7 of 11), and the copy is now
+resumed in place instead, with each job's card source (`own`, `parent`, `unread`) recorded and reported; and
+`compact_tokens` was always 0, so each claude result's `usage` and `modelUsage` are counted (the larger), a turn
+that hits `--max-turns` keeps its usage, a `/compact` result without usage is counted at the boundary's
+`preTokens` and marked so, and `--spend` prints a work folder's totals (input, output, cost).
 
 The run happens once and its result decides. `run.json` in the work folder records the plan and the run id;
 launching again resumes it after an infrastructure failure only (a finished compaction or job is never
@@ -321,7 +410,9 @@ redone). A smoke run (`--only`) is marked as such, needs its own work folder and
 refuses unfinished jobs and results from another run, then judges each compaction point on its own: atlas
 against plain at that point on ratio, fidelity, misses, dangling refs, resume tokens and input tokens (at least
 as good on all pairs but one and on the mean), and on latency (hooks at most 1% of the compaction's own time,
-p95 under 250 ms). The offered point is chosen among the thresholds where atlas wins its pair.
+p95 under 250 ms). Hook latency is each hook process's wall time, spawn to exit, logged by the harness's
+`xtask hook-time` wrapper around every hook (PreCompact plus the SessionStart after the compaction); a missing
+timing fails the bar. The offered point is chosen among the thresholds where atlas wins its pair.
 
 Sizes (dry run, 2026-11-03): 12 `rec` pairs and 12 pairs at each threshold (10 at 400,000, the crossings the
 recordings hold) are 92 jobs, about 47.1M input tokens; with `--per-threshold 6`, 60 jobs and 31.8M; with
@@ -333,7 +424,8 @@ Built as section 2(c) describes, with these choices. `memory.transcripts` (defau
 PreCompact hook queues the session's transcript, and it is indexed once the hook's answer is out (in the
 server, after the reply; in a command hook, after the JSON is printed), from where the last pass stopped. A turn
 is one record's visible text; its ref hashes that text unredacted, so the checkpoint's `turn:` result refs are
-the same refs. `recall {key: "turn:<session8>:<line>@hash"}` returns the stored turn; `recall {query, kind:
+the same refs. `recall {key: "turn:<session8>:<line>@hash"}` returns the stored turn (a checkpoint's
+`b<offset>` ref is mapped to its line through the indexed transcript); `recall {query, kind:
 "turn"}` searches turns. After a compaction the ref check resolves `turn:` refs against the transcripts beside
 the session's own, so a mistyped one counts as dangling.
 

@@ -182,13 +182,10 @@ pub(crate) fn judge(setup: &Setup, file: &Path, modes: &[String], runs: usize) -
                 let (a, b) = (h.get("line_start").and_then(Value::as_i64).unwrap_or(0), h.get("line_end").and_then(Value::as_i64).unwrap_or(0));
                 j.want.iter().any(|(s, p, l)| s == src && p == path && l.is_none_or(|l| a <= l && l <= b))
             });
-            match rank {
-                Some(r) => {
-                    h1 += usize::from(r == 0);
-                    h5 += usize::from(r < 5);
-                    rr += 1.0 / (r + 1) as f64;
-                }
-                None => {}
+            if let Some(r) = rank {
+                h1 += usize::from(r == 0);
+                h5 += usize::from(r < 5);
+                rr += 1.0 / (r + 1) as f64;
             }
             if rank.is_none_or(|r| r >= 5) {
                 misses.push(j.query.clone());

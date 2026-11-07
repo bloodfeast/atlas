@@ -25,6 +25,7 @@ The README is the front page; this wiki is the whole manual.
 - [[Identifiers and freshness]]: documents, sections, the identifier registry, freshness and misses.
 - [[Memory store and hooks]]: the append-only store, exports, sync from files, recall and the hooks.
 - [[Memory tree]]: the memory index as a tree under Claude Code's 200-line cut.
+- [[Memory and rule files]]: experimental, off by default: what atlas does with your rules and memories once you turn it on, replaced rulings, headlines, known limits, and how to turn it off.
 - [[Discussions]]: reviewer threads with immutable posts and a decision queue.
 - [[Generated indices]]: indices written between markers, from frontmatter.
 - [[Cross-vault links]]: `obsidian://` links between vaults and how links resolve.

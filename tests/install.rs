@@ -22,7 +22,9 @@ fn fresh(c: &mut Command, root: &Path) {
         .env("CLAUDE_CONFIG_DIR", root.join("claude"))
         .env("HOME", root)
         .env("USERPROFILE", root)
-        .env_remove("ATLAS_CONFIG");
+        .env_remove("ATLAS_CONFIG")
+        .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT");
     for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
         c.env(k, "http://127.0.0.1:9");
     }
@@ -48,7 +50,7 @@ fn fill(input: &Value, vals: &Value) -> Value {
 }
 
 #[test]
-fn a_fresh_home_serves_every_hook_and_offers_the_settings_once() {
+fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
     let t = Temp::new("install");
     let root = t.path();
     std::fs::create_dir_all(root.join("claude")).unwrap();
@@ -90,7 +92,7 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings_once() {
     }
     let events: Vec<&str> = hook_ids.iter().map(|(_, e)| e.as_str()).chain(commands.iter().map(String::as_str)).collect();
     assert_eq!(commands, ["SessionStart"]);
-    for e in ["SessionStart", "UserPromptSubmit", "SubagentStart", "PreToolUse", "PostToolUse", "PreCompact"] {
+    for e in ["SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "PreToolUse", "PostToolUse", "PreCompact"] {
         assert!(events.contains(&e), "hooks.json wires {e}");
     }
     lines.push(json!({"jsonrpc": "2.0", "id": 90, "method": "tools/call", "params": {"name": "remember", "arguments": {"kind": "rule", "title": "Cache eviction", "body": "The cache evicts entries by age, oldest first, when it is full.", "reason": "install test"}}}));
@@ -109,7 +111,13 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings_once() {
     assert!(ho.status.success() && herr.contains("first run"), "{herr}");
     let ctx = json::parse(&String::from_utf8_lossy(&ho.stdout)).unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string();
     assert!(ctx.starts_with("atlas: 2 Claude Code settings are offered"), "{ctx}");
-    assert!(ctx.len() <= 240, "{ctx}");
+    // The settings line stays within 60 tokens; the orchestrated-mode
+    // question follows it once, within its own budget (about 200 tokens).
+    let (settings, orchestrate) = ctx.split_once(" atlas: orchestrated mode is offered").unwrap_or((ctx.as_str(), ""));
+    assert!(settings.len() <= 240, "{ctx}");
+    assert!(!orchestrate.is_empty() && orchestrate.len() <= 800, "{} bytes: {ctx}", orchestrate.len());
+    // Experimental and off by default: a session never hears of memory rules.
+    assert!(!ctx.contains("memory folder") && !ctx.contains("memory-rules"), "{ctx}");
 
     let mut c = Command::new(bin());
     fresh(&mut c, root);
@@ -142,7 +150,7 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings_once() {
     }
     // A recall query answers the best record whole.
     assert!(text(&by(91)).contains("evicts entries by age"), "{}", by(91));
-    assert_eq!(text(&by(92)), "", "the offer is made once, whichever transport asks");
+    assert_eq!(text(&by(92)), "", "the first-session questions are the command hook's: a tool call does not say a user is there, so it asks nothing");
     // What the first run wrote: the template, its vault, the state.
     let home = root.join("atlas");
     assert_eq!(std::fs::read_to_string(home.join("atlas.json")).unwrap(), atlas::config::TEMPLATE);
