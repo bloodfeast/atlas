@@ -7,8 +7,12 @@
 //! atlas settings off ID               a Claude Code setting: atlas's value is removed and
 //!                                     Claude Code's default applies; an atlas switch: off
 //! atlas settings undo                 restores the newest backup (and consumes it)
-//! atlas settings offer [--yes ID...]  asks about each Claude Code setting; --yes applies
-//!                                     the named ones without asking
+//! atlas settings offer [--yes ID... | --no]
+//!                                     asks about each Claude Code setting; --yes applies
+//!                                     the named ones without asking, --no declines them
+//! atlas settings orchestrate [--yes OPTIONS | --no]
+//!                                     asks whether to work in orchestrated mode, then
+//!                                     its options (see `orchestrated.rs`)
 //! ```
 //!
 //! The manifest ships as data ([`MANIFEST`], `config/claude_settings.json`).
@@ -218,6 +222,25 @@ fn flag_write(p: &Paths, io: &mut Io, s: &Item, on: bool) -> Result<bool, String
 
 // ------------------------------------------------------------------ paths
 
+/// [`Paths`] with the lock on the configuration files a command changes: only
+/// this reaches the functions that write them, so a writer cannot run outside
+/// the lock. A command asks its questions first, takes this once, and makes
+/// every read its write rests on after that. See [`crate::fsio::FileLock`].
+#[derive(Debug)]
+pub struct Locked<'a> {
+    paths: &'a Paths,
+    // Dropped in this order; atlas.json is always taken first.
+    _settings: Option<crate::fsio::FileLock>,
+    _atlas: Option<crate::fsio::FileLock>,
+}
+
+impl std::ops::Deref for Locked<'_> {
+    type Target = Paths;
+    fn deref(&self) -> &Paths {
+        self.paths
+    }
+}
+
 /// The files the commands read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -239,6 +262,36 @@ pub struct Paths {
 }
 
 impl Paths {
+    /// Holds no lock: a dry run writes nothing, and must not make a lock file.
+    fn unlocked(&self) -> Locked<'_> {
+        Locked { paths: self, _settings: None, _atlas: None }
+    }
+
+    /// Locks atlas's configuration file (nothing is held without one).
+    ///
+    /// # Errors
+    ///
+    /// A message naming the lock file when it stays held past the deadline.
+    pub fn lock_config(&self) -> Result<Locked<'_>, String> {
+        let atlas = self.atlas_config.as_deref().map(crate::fsio::FileLock::acquire).transpose()?;
+        Ok(Locked { paths: self, _settings: None, _atlas: atlas })
+    }
+
+    /// Locks Claude Code's `settings.json`. Only atlas against atlas: Claude
+    /// Code writes the file itself and takes no lock.
+    fn lock_settings(&self) -> Result<Locked<'_>, String> {
+        Ok(Locked { paths: self, _settings: Some(crate::fsio::FileLock::acquire(&self.settings())?), _atlas: None })
+    }
+
+    /// Locks both files, atlas's first (the fixed order; only undo holds two).
+    /// With no backups in Claude Code's folder there is nothing of its to
+    /// restore, and that folder gets no lock file.
+    fn lock_both(&self) -> Result<Locked<'_>, String> {
+        let atlas = self.atlas_config.as_deref().map(crate::fsio::FileLock::acquire).transpose()?;
+        let settings = self.backups().is_dir().then(|| crate::fsio::FileLock::acquire(&self.settings())).transpose()?;
+        Ok(Locked { paths: self, _settings: settings, _atlas: atlas })
+    }
+
     /// `$CLAUDE_CONFIG_DIR`, else `<home>/.claude`; `None` when no home is
     /// known. The offer state goes beside `db`.
     pub fn detect(atlas_config: Option<&Path>, db: &Path) -> Option<Paths> {
@@ -557,6 +610,9 @@ macro_rules! say {
     ($io:expr, $($t:tt)*) => {{ let _ = writeln!($io.out, $($t)*); }};
 }
 
+mod orchestrated;
+pub use orchestrated::orchestrate_line;
+
 fn show(v: Option<&Value>) -> String {
     match v {
         None => "not set".into(),
@@ -676,7 +732,12 @@ fn backup_key(name: &str) -> Option<(String, u32)> {
 fn backup(p: &Paths, stem: &str, path: &Path, core: Option<&str>) -> Result<(PathBuf, String), String> {
     let dir = p.backups_for(stem)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let ext = if path.exists() { "json" } else { "absent" };
+    let at = |e: &dyn std::fmt::Display, f: &Path| format!("{}: {e}", f.display());
+    let (ext, body) = match std::fs::read(path) {
+        Ok(b) => ("json", b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ("absent", path.display().to_string().into_bytes()),
+        Err(e) => return Err(at(&e, path)),
+    };
     if let Some(c) = core {
         // One change that writes a file twice (a migration, then the
         // registration) keeps the first backup: undo restores the file as
@@ -685,31 +746,45 @@ fn backup(p: &Paths, stem: &str, path: &Path, core: Option<&str>) -> Result<(Pat
         if let Some(f) = first {
             return Ok((f, c.to_string()));
         }
+        let dst = dir.join(format!("{stem}.{c}.{ext}"));
+        crate::fsio::create_exclusive(&dst, &body).map_err(|e| at(&e, &dst))?;
+        return Ok((dst, c.to_string()));
     }
-    let (dst, core) = match core {
-        Some(c) => (dir.join(format!("{stem}.{c}.{ext}")), c.to_string()),
-        None => {
-            let s = stamp();
-            // A stamp and number are unique across both kinds and both
-            // folders, so undo orders every backup by them alone.
-            let folders: Vec<PathBuf> = STEMS.iter().filter_map(|k| p.backups_for(k).ok()).collect();
-            let mut n = 0;
-            loop {
-                let core = if n == 0 { s.clone() } else { format!("{s}-{n}") };
-                let taken = folders.iter().any(|f| STEMS.iter().any(|k| ["json", "absent"].iter().any(|x| f.join(format!("{k}.{core}.{x}")).exists())));
-                if !taken {
-                    break (dir.join(format!("{stem}.{core}.{ext}")), core);
-                }
-                n += 1;
-            }
-        }
+    let s = stamp();
+    // A stamp and number are unique across both kinds and both folders, so
+    // undo orders every backup by them alone. The name is claimed atomically
+    // with its contents: the two files have separate locks, so another
+    // process may be backing up in this very second. The check after the
+    // claim catches a claim of the same number in the other folder: of two
+    // such claims at least one sees the other, and moves on.
+    let folders: Vec<PathBuf> = STEMS.iter().filter_map(|k| p.backups_for(k).ok()).collect();
+    let holder = |core: &str, me: Option<&Path>| {
+        folders.iter().any(|f| {
+            STEMS.iter().any(|k| {
+                ["json", "absent"].iter().any(|x| {
+                    let other = f.join(format!("{k}.{core}.{x}"));
+                    me != Some(other.as_path()) && other.exists()
+                })
+            })
+        })
     };
-    if ext == "json" {
-        std::fs::copy(path, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-    } else {
-        std::fs::write(&dst, path.display().to_string()).map_err(|e| format!("{}: {e}", dst.display()))?;
+    let mut n = 0;
+    loop {
+        let core = if n == 0 { s.clone() } else { format!("{s}-{n}") };
+        n += 1;
+        if holder(&core, None) {
+            continue;
+        }
+        let dst = dir.join(format!("{stem}.{core}.{ext}"));
+        match crate::fsio::create_exclusive(&dst, &body) {
+            Ok(()) if holder(&core, Some(&dst)) => {
+                let _ = std::fs::remove_file(&dst);
+            }
+            Ok(()) => return Ok((dst, core)),
+            Err(crate::error::Error::AlreadyExists(_)) => {}
+            Err(e) => return Err(at(&e, &dst)),
+        }
     }
-    Ok((dst, core))
 }
 
 /// The kinds of backup: Claude Code's settings, atlas's configuration, a
@@ -739,7 +814,7 @@ fn newest_backups(p: &Paths) -> Vec<PathBuf> {
 
 /// Restores one backup (and consumes it): a copy is written back, an
 /// `.absent` record removes the file atlas created.
-fn restore(p: &Paths, io: &mut Io, b: &Path) -> Result<(), String> {
+fn restore(p: &Locked, io: &mut Io, b: &Path) -> Result<(), String> {
     let name = b.file_name().unwrap_or_default().to_string_lossy().to_string();
     if name.starts_with("vault.") {
         let record = std::fs::read_to_string(b).map_err(|e| format!("{}: {e}", b.display()))?;
@@ -777,13 +852,13 @@ fn restore(p: &Paths, io: &mut Io, b: &Path) -> Result<(), String> {
 // ----------------------------------------------------------------- writing
 
 /// Writes one file: backup, then an atomic replace.
-fn commit(p: &Paths, io: &mut Io, stem: &str, path: &Path, text: &str, label: &str) -> Result<(), String> {
+fn commit(p: &Locked, io: &mut Io, stem: &str, path: &Path, text: &str, label: &str) -> Result<(), String> {
     commit_in(p, io, stem, path, text, label, None).map(|_| ())
 }
 
 /// [`commit`], the backup joining the change stamped `core` when given.
 /// Returns the stamp.
-fn commit_in(p: &Paths, io: &mut Io, stem: &str, path: &Path, text: &str, label: &str, core: Option<&str>) -> Result<String, String> {
+fn commit_in(p: &Locked, io: &mut Io, stem: &str, path: &Path, text: &str, label: &str, core: Option<&str>) -> Result<String, String> {
     let (saved, core) = backup(p, stem, path, core)?;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -890,7 +965,7 @@ fn manual(s: &Item, v: Option<&Value>) -> String {
 }
 
 /// Applies changes to Claude Code's settings.json in one write.
-fn write_claude(p: &Paths, io: &mut Io, changes: &[(&Item, Option<Value>)], label: &str) -> Result<bool, String> {
+fn write_claude(p: &Locked, io: &mut Io, changes: &[(&Item, Option<Value>)], label: &str) -> Result<bool, String> {
     let doc = load(&p.settings())?;
     let mut v = doc.value.clone();
     for (s, val) in changes {
@@ -937,7 +1012,7 @@ fn write_claude(p: &Paths, io: &mut Io, changes: &[(&Item, Option<Value>)], labe
 }
 
 /// Sets (or removes) one atlas switch in atlas's configuration.
-fn write_atlas(p: &Paths, io: &mut Io, s: &Item, val: Option<&Value>, label: &str) -> Result<bool, String> {
+fn write_atlas(p: &Locked, io: &mut Io, s: &Item, val: Option<&Value>, label: &str) -> Result<bool, String> {
     let keys: Vec<&str> = s.key.split('.').collect();
     edit_config(p, io, &keys, val, label, &manual(s, val))
 }
@@ -951,13 +1026,13 @@ fn write_atlas(p: &Paths, io: &mut Io, s: &Item, val: Option<&Value>, label: &st
 /// # Errors
 ///
 /// A message when the file cannot be read, backed up or written.
-pub fn edit_config(p: &Paths, io: &mut Io, keys: &[&str], val: Option<&Value>, label: &str, manual_edit: &str) -> Result<bool, String> {
+pub fn edit_config(p: &Locked, io: &mut Io, keys: &[&str], val: Option<&Value>, label: &str, manual_edit: &str) -> Result<bool, String> {
     edit_config_in(p, io, keys, val, label, manual_edit, None)
 }
 
 /// [`edit_config`], the backup joining the change stamped `core` when
 /// given (one undo restores both).
-fn edit_config_in(p: &Paths, io: &mut Io, keys: &[&str], val: Option<&Value>, label: &str, manual_edit: &str, core: Option<&str>) -> Result<bool, String> {
+fn edit_config_in(p: &Locked, io: &mut Io, keys: &[&str], val: Option<&Value>, label: &str, manual_edit: &str, core: Option<&str>) -> Result<bool, String> {
     Ok(!matches!(edit_config_many(p, io, &[(keys, val.cloned())], label, manual_edit, core)?, Written::Refused))
 }
 
@@ -993,7 +1068,7 @@ fn config_after(p: &Paths, edits: &[(&[&str], Option<Value>)]) -> Result<Option<
 /// Several [`edit_config`] changes in one write: each is spliced into the
 /// text in turn, so one backup (and one `atlas settings undo`) covers them
 /// all.
-fn edit_config_many(p: &Paths, io: &mut Io, edits: &[(&[&str], Option<Value>)], label: &str, manual_edit: &str, core: Option<&str>) -> Result<Written, String> {
+fn edit_config_many(p: &Locked, io: &mut Io, edits: &[(&[&str], Option<Value>)], label: &str, manual_edit: &str, core: Option<&str>) -> Result<Written, String> {
     let Some((path, text, new)) = config_after(p, edits)? else {
         let path = p.atlas_config.clone().unwrap_or_default();
         say!(io, "atlas will not rewrite {}: the change could not be made without touching other text.", path.display());
@@ -1075,6 +1150,16 @@ fn atlas_value(p: &Paths) -> Value {
     v
 }
 
+/// The lock a change to `s` needs: the file it lives in. A flag switch lives
+/// in neither (its own flag file is written whole), so it needs none.
+fn lock_for<'a>(p: &'a Paths, s: &Item) -> Result<Locked<'a>, String> {
+    match s.kind {
+        _ if s.flag => Ok(p.unlocked()),
+        Kind::Atlas => p.lock_config(),
+        Kind::Setting | Kind::Env => p.lock_settings(),
+    }
+}
+
 fn find<'a>(items: &'a [Item], id: Option<&String>) -> Result<&'a Item, String> {
     let ids: Vec<&str> = items.iter().map(|s| s.id.as_str()).collect();
     match id {
@@ -1083,7 +1168,8 @@ fn find<'a>(items: &'a [Item], id: Option<&String>) -> Result<&'a Item, String> 
     }
 }
 
-const HELP: &str = "usage: atlas settings list | set ID VALUE | off ID | undo [--yes] | offer [--yes ID...] | compact-md [DIR] [--yes] | add-project [--vault | --vault-at FOLDER | --new [--name NAME] [--vault-at FOLDER | --no-vault] | --to PROJECT] [--dry-run] (DIR | --yes) | migrate-projects NAME";
+/// The usage of `atlas settings`.
+pub const HELP: &str = "usage: atlas settings list | set ID VALUE | off ID | undo [--yes] | offer [--yes ID... | --no] | orchestrate [--yes OPTIONS | --no] | compact-md [DIR] [--yes] | add-project --no DIR | add-project [--vault | --vault-at FOLDER | --new [--name NAME] [--vault-at FOLDER | --no-vault] | --to PROJECT] [--dry-run] (DIR | --yes) | migrate-projects NAME";
 
 /// Runs one `atlas settings` command against `p`, talking through `io`.
 ///
@@ -1092,9 +1178,12 @@ const HELP: &str = "usage: atlas settings list | set ID VALUE | off ID | undo [-
 /// A message for the user (an unknown id, a bad value, an unreadable file).
 pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> {
     let items = manifest()?;
-    let claude = load(&p.settings())?.value;
-    let atlas = atlas_value(p);
     let word = args.first().map(String::as_str).unwrap_or("list");
+    // A no reads nothing from settings.json: a settings.json that does not parse must not stop
+    // one being recorded, or the question it answers would return for good.
+    let answers_no = matches!(word, "offer" | "orchestrate" | "add-project") && args.iter().any(|a| a == "--no");
+    let claude = if answers_no { Value::Null } else { load(&p.settings())?.value };
+    let atlas = atlas_value(p);
     match word {
         "list" => {
             say!(io, "Claude Code settings: {}", p.settings().display());
@@ -1111,9 +1200,21 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             let s = find(&items, args.get(1))?;
             let raw = args.get(2).ok_or("set needs ID VALUE")?;
             let v = check(s, raw)?;
-            if let Some((_, w)) = s.warn.iter().find(|(k, _)| k == raw) {
+            // `false` is not off for this one: only its own word reaches it.
+            if s.id == "memory-rules" && v == Value::Bool(false) && !raw.eq_ignore_ascii_case("false") {
+                return Err(format!("{}: {raw:?} is not taken here. To go back to the default: atlas settings off {}. The value false also stops what the configuration names by hand: atlas settings set {} false", s.id, s.id, s.id));
+            }
+            // By the value, so every spelling `check` accepts is warned about.
+            let word = match &v {
+                Value::String(t) => t.clone(),
+                other => other.to_string(),
+            };
+            if let Some((_, w)) = s.warn.iter().find(|(k, _)| *k == word) {
                 say!(io, "warning: {w}");
             }
+            // Read again under the lock: `claude` and `atlas` above came before it.
+            let held = lock_for(p, s)?;
+            let (claude, atlas) = (load(&p.settings())?.value, atlas_value(p));
             let have = current(s, &claude, &atlas);
             // A flag switch has no stored "on": its default is the value.
             if have == Some(&v) || (s.flag && effective(s, have) == Some(&v)) {
@@ -1125,11 +1226,13 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
                 return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
             }
             let label = format!("[{}] set to {}", s.id, show(Some(&v)));
-            let ok = if s.kind == Kind::Atlas { write_atlas(p, io, s, Some(&v), &label)? } else { write_claude(p, io, &[(s, Some(v))], &label)? };
+            let ok = if s.kind == Kind::Atlas { write_atlas(&held, io, s, Some(&v), &label)? } else { write_claude(&held, io, &[(s, Some(v))], &label)? };
             Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         "off" => {
             let s = find(&items, args.get(1))?;
+            let held = lock_for(p, s)?;
+            let (claude, atlas) = (load(&p.settings())?.value, atlas_value(p));
             let have = current(s, &claude, &atlas);
             // An on-by-default switch is turned off; anything else is removed.
             let target = s.default_on().then_some(Value::Bool(false));
@@ -1143,10 +1246,14 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             }
             let note = if s.default_note.is_empty() { String::new() } else { format!(" ({})", s.default_note) };
             let label = if target.is_some() { format!("[{}] turned off", s.id) } else { format!("[{}] removed{note}", s.id) };
-            let ok = if s.kind == Kind::Atlas { write_atlas(p, io, s, target.as_ref(), &label)? } else { write_claude(p, io, &[(s, None)], &label)? };
+            let ok = if s.kind == Kind::Atlas { write_atlas(&held, io, s, target.as_ref(), &label)? } else { write_claude(&held, io, &[(s, None)], &label)? };
             Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         "undo" => {
+            let yes = args.iter().skip(1).any(|a| a == "--yes");
+            // With --yes nothing is asked, so the lock comes first. A question
+            // is never asked under it: the list is read again after the answer.
+            let mut held = if yes { Some(p.lock_both()?) } else { None };
             // The newest change: one file, or every file one command wrote.
             let all = newest_backups(p);
             if all.is_empty() {
@@ -1156,7 +1263,6 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             // unrelated to what the user just ran (a command that changed
             // nothing makes none).
             let _ = write!(io.out, "{}", undo_summary(p, &all));
-            let yes = args.iter().skip(1).any(|a| a == "--yes");
             if !yes {
                 if !io.interactive {
                     say!(io, "Nothing reverted: there is no terminal here to confirm in. Run `atlas settings undo --yes` to revert it.");
@@ -1171,13 +1277,32 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
                     return Ok(ExitCode::SUCCESS);
                 }
             }
+            let held = match held.take() {
+                Some(h) => h,
+                None => p.lock_both()?,
+            };
+            if newest_backups(p) != all {
+                say!(io, "Nothing reverted: another atlas change came after the one shown. Run `atlas settings undo` again to see the newest.");
+                return Ok(ExitCode::FAILURE);
+            }
             for b in &all {
                 let _ = std::fs::remove_file(label_file(b));
-                restore(p, io, b)?;
+                restore(&held, io, b)?;
             }
             Ok(ExitCode::SUCCESS)
         }
+        "offer" if args.iter().any(|a| a == "--no") => {
+            if args.len() != 2 {
+                return Err(format!("offer: --no takes nothing else\n{HELP}"));
+            }
+            if !mark_answered(p, &items) {
+                return Err("offer: could not record the answer".into());
+            }
+            say!(io, "No setting was changed, and atlas will not ask about these again; `atlas settings offer` asks any time.");
+            Ok(ExitCode::SUCCESS)
+        }
         "offer" => offer(p, io, &items, &claude, &atlas, args.iter().position(|a| a == "--yes").map(|i| &args[i + 1..])),
+        "orchestrate" => orchestrated::command(p, io, &items, &atlas, &args[1..]),
         "add-project" => {
             let mut new = false;
             let mut to: Option<String> = None;
@@ -1187,9 +1312,11 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             let mut no_vault = false;
             let mut dry_run = false;
             let mut yes = false;
+            let mut no = false;
             let mut it = args.iter().skip(1);
             while let Some(a) = it.next() {
                 match a.as_str() {
+                    "--no" => no = true,
                     "--vault" => vault = Some(VaultAt::Default),
                     "--vault-at" => vault = Some(VaultAt::Folder(PathBuf::from(it.next().ok_or("--vault-at needs a folder")?))),
                     "--no-vault" => no_vault = true,
@@ -1201,6 +1328,19 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
                     d if !d.starts_with("--") && dir.is_none() => dir = Some(PathBuf::from(d)),
                     other => return Err(format!("add-project: unknown argument {other:?}\n{HELP}")),
                 }
+            }
+            // The answer no to the session's question: recorded, nothing else.
+            if no {
+                if new || to.is_some() || name.is_some() || vault.is_some() || no_vault || dry_run || yes {
+                    return Err("add-project: --no takes a folder and nothing else".into());
+                }
+                let dir = dir.ok_or("add-project: --no needs a folder")?;
+                let key = project_key(&dir);
+                if !mark_project(p, &key) {
+                    return Err(format!("add-project: could not record the answer for {key}"));
+                }
+                say!(io, "atlas will not ask about {key} again; `atlas settings add-project \"{key}\"` adds it any time.");
+                return Ok(ExitCode::SUCCESS);
             }
             // With no folder named and no --yes, the command only shows what
             // it would do: a bare `add-project` is a question, not a change.
@@ -1260,11 +1400,18 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
 
 fn offer(p: &Paths, io: &mut Io, items: &[Item], claude: &Value, atlas: &Value, yes: Option<&[String]>) -> Result<ExitCode, String> {
     if let Some(ids) = yes {
+        if ids.is_empty() {
+            return Err(format!("offer --yes names the settings to turn on; `offer --no` declines them all\n{HELP}"));
+        }
         for id in ids {
-            find(items, Some(id))?;
+            if find(items, Some(id))?.kind == Kind::Atlas {
+                say!(io, "[{id}] is an atlas switch, not changed here: `atlas settings set {id} VALUE`");
+            }
         }
     }
     let mut todo: Vec<(&Item, Option<Value>)> = Vec::new();
+    // Settings this Claude Code cannot take: nobody was asked, or a yes could not land.
+    let mut too_new: Vec<&str> = Vec::new();
     for s in items.iter().filter(|s| s.kind != Kind::Atlas) {
         let have = current(s, claude, atlas);
         if applied(s, have) {
@@ -1274,6 +1421,7 @@ fn offer(p: &Paths, io: &mut Io, items: &[Item], claude: &Value, atlas: &Value, 
         if let (Some(need), Some(have)) = (s.min_version, io.version) {
             if have < need {
                 say!(io, "[{}] skipped: needs Claude Code {}.{}.{} or newer", s.id, need.0, need.1, need.2);
+                too_new.push(&s.id);
                 continue;
             }
         }
@@ -1306,28 +1454,52 @@ fn offer(p: &Paths, io: &mut Io, items: &[Item], claude: &Value, atlas: &Value, 
             say!(io, "\n[{}] {} ({state}; on by default)\n  What: {}\n  Cost: {}\n  Turn off: atlas settings off {}", s.id, s.title, s.what, s.cost, s.id);
         }
     }
-    // Recorded as offered only when someone could answer: without a terminal
-    // (and without --yes) nothing was asked, so the next terminal run asks.
-    if io.interactive || yes.is_some() {
-        mark_offered(p, items.iter().map(|s| s.id.as_str()));
-    }
-    // The project's Compact instructions, asked here too (in the current folder).
-    if yes.is_none() && io.interactive && compaction_on(p) {
-        if let Ok(dir) = std::env::current_dir() {
-            compact_md(p, io, &dir, false)?;
+    // Whether to work in orchestrated mode, and its options (a terminal
+    // asks; without one the options are listed).
+    if yes.is_none() {
+        if io.interactive {
+            orchestrated::prompt(p, io, items, atlas)?;
+        } else {
+            orchestrated::describe(io, atlas);
         }
     }
+    // Recorded as offered only when someone could answer: without a terminal
+    // (and without --yes) nothing was asked, so the next terminal run asks.
+    if yes.is_none() && io.interactive {
+        // A terminal asked the orchestrated question too. Experimental and never
+        // asked, so memory rules are not recorded as offered. A setting skipped as
+        // too new was not asked; a yes waits for its write, below.
+        let waits = |s: &Item| too_new.contains(&s.id.as_str()) || todo.iter().any(|(t, _)| t.id == s.id);
+        mark_offered(p, items.iter().filter(|s| s.id != "memory-rules" && !waits(s)).map(|s| s.id.as_str()));
+    }
     if yes.is_none() && !io.interactive {
-        say!(io, "\nNothing went wrong. No setting was changed because there is no terminal here to answer in (input is not a terminal), and atlas only changes a setting you say yes to. To choose, run `atlas settings offer` in a terminal, or apply chosen ones with `atlas settings offer --yes ID...`.");
+        say!(io, "\nNothing went wrong. No setting was changed because there is no terminal here to answer in (input is not a terminal), and atlas only changes a setting you say yes to. To choose, run `atlas settings offer` in a terminal, apply chosen ones with `atlas settings offer --yes ID...`, or decline them with `atlas settings offer --no`.");
         return Ok(ExitCode::SUCCESS);
+    }
+    // A named setting that could not land leaves the yes unanswered: the setting
+    // stays off, and the question must still be there after an upgrade. An atlas
+    // switch, named by hand, answers nothing either.
+    let missed = yes.is_some_and(|ids| ids.iter().any(|id| too_new.contains(&id.as_str())));
+    let answers = yes.is_some_and(|ids| !missed && !ids.iter().any(|id| items.iter().any(|s| s.id == *id && s.kind == Kind::Atlas)));
+    if missed {
+        say!(io, "The question stays, at each new session until the upgrade; `atlas settings offer --no` stops it for good.");
     }
     if todo.is_empty() {
+        if answers {
+            mark_answered(p, items);
+        }
         say!(io, "nothing to change");
-        return Ok(ExitCode::SUCCESS);
+        return Ok(if missed { ExitCode::FAILURE } else { ExitCode::SUCCESS });
     }
     let label = format!("applied: {}", todo.iter().map(|(s, _)| s.id.as_str()).collect::<Vec<_>>().join(", "));
-    let ok = write_claude(p, io, &todo, &label)?;
-    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+    let ok = write_claude(&p.lock_settings()?, io, &todo, &label)?;
+    // A yes that did not land is no answer: the question stays.
+    if ok && answers {
+        mark_answered(p, items);
+    } else if ok && yes.is_none() {
+        mark_offered(p, todo.iter().map(|(s, _)| s.id.as_str()));
+    }
+    Ok(if ok && !missed { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 // ------------------------------------------------------- the first-run offer
@@ -1358,11 +1530,20 @@ fn mark_offered<'a>(p: &Paths, ids: impl Iterator<Item = &'a str>) -> bool {
     crate::fsio::replace_atomic(s, (crate::json::to_string_pretty(&v) + "\n").as_bytes()).is_ok()
 }
 
-/// The one-time SessionStart line: the Claude Code settings not yet offered
-/// and not applied, and atlas's on-by-default switches not yet explained.
-/// The ids are marked offered, so it is never repeated; `None` when there is
-/// nothing to say (or the state cannot be recorded, so a line is never
-/// repeated every session).
+/// Records the settings as answered, by a yes to some or a no to all. Not the
+/// orchestrated question, which this answer did not touch and which has its own
+/// `--yes` and `--no`; not memory rules, experimental and never asked. Returns
+/// false when the state cannot be written.
+fn mark_answered(p: &Paths, items: &[Item]) -> bool {
+    mark_offered(p, items.iter().filter(|s| s.id != "memory-rules" && s.id != orchestrated::ID).map(|s| s.id.as_str()))
+}
+
+/// The SessionStart line: the Claude Code settings not yet answered and not
+/// applied, and atlas's on-by-default switches not yet explained. The settings
+/// are a question, so it returns until `atlas settings offer` answers it (`--yes`
+/// or `--no`); the switches are a notice nobody can answer, so they are marked
+/// when shown. `None` when there is nothing to say, or when the state cannot be
+/// recorded: an answer would be lost and the line would never stop.
 pub fn session_start_line(p: &Paths) -> Option<String> {
     let items = manifest().ok()?;
     let seen = offered(p);
@@ -1373,7 +1554,7 @@ pub fn session_start_line(p: &Paths) -> Option<String> {
     if offer.is_empty() && defaults.is_empty() {
         return None;
     }
-    if !mark_offered(p, offer.iter().chain(defaults.iter()).map(|s| s.id.as_str())) {
+    if !can_record(p) || (!defaults.is_empty() && !mark_offered(p, defaults.iter().map(|s| s.id.as_str()))) {
         return None;
     }
     let mut line = String::from("atlas:");
@@ -1381,7 +1562,7 @@ pub fn session_start_line(p: &Paths) -> Option<String> {
         let names: Vec<&str> = offer.iter().map(|s| s.short.as_str()).collect();
         let n = offer.len();
         line.push_str(&format!(
-            " {n} Claude Code setting{} {} offered ({}); ask the user, then run `atlas settings offer --yes ID` or `atlas settings list`.",
+            " {n} Claude Code setting{} {} offered ({}); ask the user, then run `atlas settings offer --yes ID` or `offer --no`; asked again next session.",
             if n == 1 { "" } else { "s" },
             if n == 1 { "is" } else { "are" },
             names.join(", ")
@@ -1401,44 +1582,28 @@ pub const COMPACT_BEGIN: &str = "<!-- atlas:compact-instructions";
 /// Its last line.
 pub const COMPACT_END: &str = "<!-- /atlas:compact-instructions -->";
 
-/// The Compact instructions block: Claude Code's summarizer reads the
-/// project's `CLAUDE.md`, so this is how a compaction summary is steered to
-/// keys and deltas (`docs/design/compaction.md`, section 1).
-pub const COMPACT_BLOCK: &str = "<!-- atlas:compact-instructions (added by `atlas settings compact-md`; `atlas settings undo` removes it) -->
+/// The instructions for Claude Code's compaction summary: keys and deltas.
+/// The PreCompact hook returns this text as it stands, so it holds no markers
+/// and no heading; [`compact_block`] is the same text for a `CLAUDE.md`.
+pub const COMPACT_INSTRUCTIONS: &str = "When compacting, write keys and deltas, not restated content. The summary's hard limit is 3,000 characters (about 1,250 tokens), under half of a usual summary; a longer one has failed, so count characters, not words: prose for rulings, decisions, state and next steps; keys for detail.
+- After compaction atlas injects a card that names every part of this segment by a key one recall returns (turn:...-...@hash groups, older segments by compact:...@hash links), plus lanes, open questions, owed steps, rulings and files touched. Do not repeat what it lists, and never restate tool output: its exact text is one recall away.
+- Where a card key or a record key already holds something (a discussion, a plan, a file's content, an earlier step's detail), write that key in place of the content, never both.
+- Rulings and decisions: one line each, in the user's own few words, with the record key that holds it (key@hash) when there is one.
+- State: what is done, what is in flight, what failed, each with its key (a journal key, a src:path:a-b@hash ref, a file:line, a commit or PR number).
+- Files: one line per file, its path, line range and what changed. No code, except the few lines the next step will edit.
+- Keep exact only what the next step needs inline: an error line, a number, a command.
+- End with the current step and the next action.";
+
+/// The block `atlas settings compact-md` adds to a project's `CLAUDE.md`. In
+/// `CLAUDE.md` alone its effect is unproven (`docs/design/compaction.md`,
+/// section 1).
+pub fn compact_block() -> String {
+    format!("{COMPACT_BEGIN} (added by `atlas settings compact-md`; `atlas settings undo` removes it) -->
 ## Compact instructions
 
-When compacting, write keys and deltas, not restated content. Aim for at most about 1,800 words, spent on identifiers rather than prose:
-- After compaction atlas injects a checkpoint card (lanes, open questions, owed steps, rulings, files touched, the last tool calls with result refs, the pending call). Do not repeat what it lists.
-- Files and code: one line per file, its path, line range and what changed. No code snippets, except the few lines the next step will edit.
-- User messages: keep requirements, corrections and decisions in a few quoted words each; do not list every message.
-- Tool output: never restate it; keep only exact error lines, numbers, commands, paths, ids and record keys the next step needs.
-- Cite atlas records and lines by the key@hash or src:path:a-b@hash refs shown, and say only what changed since.
-- End with the current step and the next action.
-<!-- /atlas:compact-instructions -->
-";
-
-/// The folders already asked about the block (the state's `compact_md`).
-fn offered_compact_md(p: &Paths) -> Vec<String> {
-    let Some(s) = &p.state else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(s) else { return Vec::new() };
-    crate::json::parse(&text).ok().and_then(|v| v.get("compact_md").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())).unwrap_or_default()
-}
-
-/// Records a folder as asked about the block, keeping the state's other keys.
-fn mark_compact_md(p: &Paths, dir: &str) -> bool {
-    let Some(s) = &p.state else { return false };
-    let mut v = std::fs::read_to_string(s).ok().and_then(|t| crate::json::parse(&t).ok()).filter(Value::is_object).unwrap_or(Value::Object(Map::new()));
-    let mut all = offered_compact_md(p);
-    if !all.iter().any(|x| x == dir) {
-        all.push(dir.to_string());
-    }
-    if let Some(o) = v.as_object_mut() {
-        o.insert("compact_md".into(), Value::Array(all.into_iter().map(Value::String).collect()));
-    }
-    if let Some(d) = s.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    crate::fsio::replace_atomic(s, (crate::json::to_string_pretty(&v) + "\n").as_bytes()).is_ok()
+{COMPACT_INSTRUCTIONS}
+{COMPACT_END}
+")
 }
 
 /// Whether a `CLAUDE.md` text already holds the block.
@@ -1462,19 +1627,17 @@ pub fn compact_md(p: &Paths, io: &mut Io, dir: &Path, yes: bool) -> Result<bool,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let key = project_key(dir);
-    mark_compact_md(p, &key);
     if old.as_deref().is_some_and(has_compact_block) {
         say!(io, "[compact-md] already in {}", path.display());
         return Ok(true);
     }
     let base = old.clone().unwrap_or_default();
     let sep = if base.is_empty() || base.ends_with("\n\n") { "" } else if base.ends_with('\n') { "\n" } else { "\n\n" };
-    let new = format!("{base}{sep}{COMPACT_BLOCK}");
+    let new = format!("{base}{sep}{}", compact_block());
     if !yes {
         say!(
             io,
-            "\n[compact-md] Compact instructions for {}\n  What: steers Claude Code's compaction summary to cite atlas refs and write deltas, beside the checkpoint card atlas injects after a compaction.\n  Cost: about 270 tokens of CLAUDE.md in every session of this project.\n  Measured: `atlas --compact-report` (ratio, refs, misses); see docs/design/compaction.md.\n{}",
+            "\n[compact-md] Compact instructions for {}\n  What: instructions for Claude Code's compaction summary (cite atlas keys, write deltas), beside the checkpoint card atlas injects after a compaction.\n  Cost: about 380 tokens of CLAUDE.md in every session and agent of this project.\n  Measured: the same kind of text passed as the /compact argument moved summary size; in CLAUDE.md alone it showed no reliable effect; a PreCompact hook returning it steered the summary in two one-sample manual tests, and with compact.enabled atlas's hook returns it, so a project with this block gets the text twice and should drop it. The benefit of this block on a bare or automatic /compact is unproven; see docs/design/compaction.md.\n{}",
             path.display(),
             diff(&path.display().to_string(), old.as_deref().unwrap_or(""), &new)
         );
@@ -1536,25 +1699,18 @@ fn undo_compact_md(b: &Path) -> String {
     }
 }
 
-/// The one-time SessionStart line offering the block for the session's
-/// folder: once per folder, and never when its `CLAUDE.md` already has it.
-pub fn compact_md_line(p: &Paths, cwd: &Path) -> Option<String> {
-    // A project folder only: a repository root or a folder with a CLAUDE.md,
-    // never the home folder.
-    if cwd.as_os_str().is_empty() || !(cwd.join(".git").exists() || cwd.join("CLAUDE.md").is_file()) || !offerable(cwd, &[]) {
-        return None;
-    }
-    let key = project_key(cwd);
-    if offered_compact_md(p).iter().any(|x| x == &key) {
-        return None;
-    }
-    if std::fs::read_to_string(cwd.join("CLAUDE.md")).is_ok_and(|t| has_compact_block(&t)) || !mark_compact_md(p, &key) {
-        return None;
-    }
-    Some("atlas: Compact instructions for this project's CLAUDE.md are offered (compaction summaries cite refs and write deltas); ask the user, then run `atlas settings compact-md --yes` here, or `atlas settings compact-md` to see the change.".into())
-}
-
 // ------------------------------------------------------ the project offer
+
+/// Whether an answer could be recorded in the state file. A question whose answer
+/// cannot be would come back every session and its `--no` would fail, so it is
+/// not asked; the command still says so when run by hand.
+fn can_record(p: &Paths) -> bool {
+    let Some(s) = &p.state else { return false };
+    if let Some(d) = s.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    crate::fsio::can_replace(s)
+}
 
 /// The projects already offered (the state file's `projects`).
 fn offered_projects(p: &Paths) -> Vec<String> {
@@ -1611,7 +1767,7 @@ pub fn configured_roots(c: &crate::config::Config) -> Vec<PathBuf> {
 /// drive root or a folder atlas already indexes (or one inside it).
 fn offerable(dir: &Path, roots: &[PathBuf]) -> bool {
     let key = project_key(dir);
-    if !dir.is_dir() || key.matches('/').count() < 2 {
+    if !dir.is_dir() || key.matches('/').count() < 2 || crate::project::too_wide(dir, crate::dirs::home().as_deref()) {
         return false;
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| project_key(Path::new(&h)));
@@ -1628,32 +1784,54 @@ fn same_folder(a: &str, b: &str) -> bool {
     crate::project::path_key(Path::new(a)) == crate::project::path_key(Path::new(b))
 }
 
-/// The one-time SessionStart line offering the session's folder as a
-/// source, at most once per folder; `None` when it is not offerable, was
-/// offered before, or atlas has no configuration file to add it to.
+/// Whether a session has no user to answer a question, from what Claude Code
+/// sets for its hooks. `CLAUDE_CODE_SESSION_ATTENDED` is its own word on it, and
+/// `CLAUDE_CODE_ENTRYPOINT` covers a version without that: measured on 2.1.319,
+/// `1` and `cli` interactive, `0` and `sdk-cli` under `-p`, in a console or on
+/// pipes, started from another session or not (`sdk-ts` with `0` from the SDK).
+/// The hook's stdin says nothing usable and a terminal test sees the hook's own
+/// pipes. With neither variable, as with a hook run by hand, a user is assumed.
+pub fn unattended_session(env: impl Fn(&str) -> Option<String>) -> bool {
+    match env("CLAUDE_CODE_SESSION_ATTENDED").as_deref() {
+        Some("1") => false,
+        Some("0") => true,
+        _ => matches!(env("CLAUDE_CODE_ENTRYPOINT").as_deref(), Some("sdk-cli" | "sdk-ts" | "sdk-py")),
+    }
+}
+
+/// The SessionStart line offering the session's folder as a source, until it
+/// is answered; `None` when it is not offerable, was answered before, atlas has
+/// no configuration file to add it to, or the answer could not be recorded.
 ///
 /// The question folds in the project's vault: yes adds the source and
 /// creates the vault at the default folder ([`default_vault`]), another
-/// folder puts the vault there, and no changes nothing. The folder is
-/// recorded as asked when the line is made, so no needs no command.
+/// folder puts the vault there, and no records itself with `add-project --no`.
+/// Nothing is recorded when the line is made: a line is often never relayed
+/// (a task-shaped first prompt, a session with no user), and a question marked
+/// asked then was never asked at all.
 pub fn project_line(p: &Paths, cwd: &Path, roots: &[PathBuf]) -> Option<String> {
     let cfg = p.atlas_config.as_ref()?;
     if cwd.as_os_str().is_empty() || !offerable(cwd, roots) {
         return None;
     }
     let key = project_key(cwd);
-    if offered_projects(p).iter().any(|x| same_folder(x, &key)) {
+    if offered_projects(p).iter().any(|x| same_folder(x, &key)) || !can_record(p) {
         return None;
     }
     let c = crate::config::Config::load(cfg).ok()?;
     let vault = default_vault(p, &c, &key)?;
-    if !mark_project(p, &key) {
-        return None;
-    }
     let name = key.rsplit('/').next().unwrap_or(&key);
     let at = project_key(&vault.path);
+    // With projects and none for this folder, a yes must name one or it is refused.
+    let named = p.project.as_deref().filter(|n| !n.is_empty());
+    let (run, which) = if c.user.scoped && matches!(crate::project::active(&c, cwd, named), Ok(None)) {
+        let names: Vec<&str> = c.user.projects.iter().map(|x| x.name.as_str()).collect();
+        ("atlas --project NAME settings", format!(" NAME is the project the user picks: {}.", names.join(", ")))
+    } else {
+        ("atlas settings", String::new())
+    };
     Some(format!(
-        "atlas: this project ({name}) is not indexed. Ask the user once, in one line: \"create a vault for this project at {at}? yes / other folder / no\" (yes is the default; yes and other folder also add the project as a source). On yes run `atlas settings add-project --vault \"{key}\"`, on other folder `atlas settings add-project --vault-at \"FOLDER\" \"{key}\"`, on no nothing (atlas will not ask again); `atlas settings undo` reverses a yes. With no user to ask, do nothing."
+        "atlas: this project ({name}) is not indexed. In your first reply, whatever the task, ask the user in one line: \"create a vault for this project at {at}? yes / other folder / no\" (yes is the default; yes and other folder also add the project as a source). On yes run `{run} add-project --vault \"{key}\"`, on other folder `{run} add-project --vault-at \"FOLDER\" \"{key}\"`, on no `atlas settings add-project --no \"{key}\"`;{which} `atlas settings undo` reverses a yes. With no answer, or no user to ask, run nothing: atlas asks again next session."
     ))
 }
 
@@ -1955,6 +2133,7 @@ pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&Vaul
     }
     // Where the entries go: the project's own lists (top-level ones are in
     // every project), or the top level of a configuration without projects.
+    // This may ask, so it comes before the lock.
     let target = match target_project(p, io, &c, Path::new(&key))? {
         Target::Top => None,
         Target::Project(n) => Some(n),
@@ -1963,6 +2142,21 @@ pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&Vaul
             return Ok(true);
         }
     };
+    // A walk of the folder: not under the lock, and it depends on nothing there.
+    let code = has_code(Path::new(&key));
+    // From here on every decision rests on the file as read under the lock.
+    let held = if io.dry_run { p.unlocked() } else { p.lock_config()? };
+    let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
+    // `add-project --new` may have moved the setup into projects during the wait:
+    // a top-level entry would then join every project.
+    if target.is_none() && c.user.scoped {
+        return Err(format!("{}: moved into projects while this waited; nothing written. Run it again.", cfg.display()));
+    }
+    let indexed = !offerable(Path::new(&key), &configured_roots(&c));
+    if indexed && vault.is_none() {
+        say!(io, "{key} is already indexed (or is inside a folder that is); nothing to change");
+        return Ok(true);
+    }
     let plan = match vault {
         Some(at) => plan_vault(p, io, &c, &key, &key, indexed, at)?,
         None => None,
@@ -1993,7 +2187,7 @@ pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&Vaul
         adds.push((&["sources"], crate::json!({"name": name.clone(), "root": key.clone(), "include": ["**/*.md"], "exclude": Value::Array(exclude)})));
         did.push(format!("source {name}"));
         manual.push(format!("add {{\"name\": \"{name}\", \"root\": \"{key}\", \"include\": [\"**/*.md\"]}} to {}", to("\"sources\"")));
-        if has_code(Path::new(&key)) {
+        if code {
             adds.push((&["code", "roots"], crate::json!({"name": format!("{name}-code"), "root": key.clone()})));
             did.push(format!("code root {name}-code"));
             manual.push(format!("add {{\"name\": \"{name}-code\", \"root\": \"{key}\"}} to {}", to("\"code\".\"roots\"")));
@@ -2062,10 +2256,12 @@ pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&Vaul
             return Err(would(e.to_string()));
         }
     };
-    let written = edit_config_many(p, io, &edits, &label, &manual, None)?;
+    let written = edit_config_many(&held, io, &edits, &label, &manual, None)?;
     if !vault_written(p, io, &written, plan.as_ref(), created.as_deref())? {
         return Ok(false);
     }
+    // The index is slow and reads the configuration as written: not under the lock.
+    drop(held);
     mark_project(p, &key);
     if indexed {
         return Ok(true);
@@ -2332,10 +2528,10 @@ pub fn folder_of_repos(dir: &Path) -> bool {
     !crate::project::is_repo(dir) && !crate::project::child_repos(dir).is_empty()
 }
 
-/// The one-time SessionStart line for a folder that is no project's root:
-/// the git repositories in it (one level down), and the three answers.
-/// Asked once per folder; `None` when the folder is a known root, holds a
-/// project file, has no repositories, or was asked about before.
+/// The SessionStart line for a folder that is no project's root: the git
+/// repositories in it (one level down), and the three answers. Asked until
+/// answered, as [`project_line`] is; `None` when the folder is a known root,
+/// holds a project file, has no repositories, or was answered before.
 pub fn repos_line(p: &Paths, cwd: &Path, ctx: &OfferCtx) -> Option<String> {
     let c = crate::config::Config::load(p.atlas_config.as_ref()?).ok()?;
     if cwd.as_os_str().is_empty() || !cwd.is_dir() || cwd.join(crate::project::PROJECT_FILE).is_file() {
@@ -2344,12 +2540,16 @@ pub fn repos_line(p: &Paths, cwd: &Path, ctx: &OfferCtx) -> Option<String> {
     if !ctx.scoped && !offerable(cwd, &ctx.known) {
         return None;
     }
+    // `add-project --new` refuses these, so they are never offered.
+    if crate::project::too_wide(cwd, crate::dirs::home().as_deref()) {
+        return None;
+    }
     let key = project_key(cwd);
     if ctx.known.iter().any(|k| same_folder(&project_key(k), &key)) {
         return None;
     }
     let repos: Vec<_> = offered_repos(cwd).into_iter().filter(|(_, d, _)| !ctx.known.iter().any(|k| same_folder(&project_key(k), &project_key(d)))).collect();
-    if repos.is_empty() || offered_projects(p).iter().any(|x| same_folder(x, &key)) || !mark_project(p, &key) {
+    if repos.is_empty() || offered_projects(p).iter().any(|x| same_folder(x, &key)) || !can_record(p) {
         return None;
     }
     let names: Vec<&str> = repos.iter().map(|r| r.0.as_str()).collect();
@@ -2366,11 +2566,11 @@ pub fn repos_line(p: &Paths, cwd: &Path, ctx: &OfferCtx) -> Option<String> {
         // a project of its own first (named after its configuration folder, or
         // by the user in a terminal), so "add to an existing project" is no answer.
         return Some(format!(
-            "atlas: this folder ({folder}) holds {n} git repo{plural} ({shown}) and atlas has no projects yet. Ask the user once, in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} (atlas first moves its current setup into a project of its own) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on skip nothing; `atlas settings undo` reverses new, the move included."
+            "atlas: this folder ({folder}) holds {n} git repo{plural} ({shown}) and atlas has no projects yet. In your first reply, whatever the task, ask the user in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} (atlas first moves its current setup into a project of its own) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses new, the move included. With no answer, or no user to ask, run nothing: atlas asks again next session."
         ));
     }
     Some(format!(
-        "atlas: this folder ({folder}) is no atlas project and holds {n} git repo{plural} ({shown}). Ask the user once, in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} / add to an existing project ({existing}) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on add `atlas settings add-project --to NAME \"{key}\"`, on skip nothing; `atlas settings undo` reverses either."
+        "atlas: this folder ({folder}) is no atlas project and holds {n} git repo{plural} ({shown}). In your first reply, whatever the task, ask the user in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} / add to an existing project ({existing}) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on add `atlas settings add-project --to NAME \"{key}\"`, on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses either. With no answer, or no user to ask, run nothing: atlas asks again next session."
     ))
 }
 
@@ -2415,7 +2615,7 @@ fn plan_project_vault(p: &Paths, io: &mut Io, c: &crate::config::Config, key: &s
 /// folder made first). The backups share `core` when given. `Ok(false)`
 /// when the configuration could not be changed byte-exactly (a vault folder
 /// atlas just made is removed again).
-fn register_project(p: &Paths, io: &mut Io, key: &str, name: &str, plan: Option<VaultPlan>, core: Option<&str>) -> Result<bool, String> {
+fn register_project(p: &Locked, io: &mut Io, key: &str, name: &str, plan: Option<VaultPlan>, core: Option<&str>) -> Result<bool, String> {
     let cfg = p.atlas_config.clone().ok_or("atlas has no configuration file (--vault flags only)")?;
     let file = format!("{key}/{}", crate::project::PROJECT_FILE);
     let mut entry = Map::new();
@@ -2481,26 +2681,37 @@ fn dry_config(p: &Paths, io: &mut Io, edits: &[(&[&str], Option<Value>)], label:
 ///
 /// # Errors
 ///
-/// A message when the configuration is not project-scoped, the folder holds
-/// a project file already or no repositories, the vault folder cannot be
+/// A message when the folder is too wide to be a project root
+/// ([`crate::project::too_wide`]), holds no repositories, the vault folder cannot be
 /// one (see [`plan_vault`]), or a file cannot be written.
 pub fn add_project_new(p: &Paths, io: &mut Io, dir: &Path, name: Option<&str>, vault: Option<&VaultAt>) -> Result<bool, String> {
     let cfg = p.atlas_config.clone().ok_or("atlas has no configuration file (--vault flags only)")?;
+    let key = project_key(dir);
+    if crate::project::too_wide(Path::new(&key), crate::dirs::home().as_deref()) {
+        return Err(format!(
+            "{key} is your home folder, a folder holding it, or a drive root: as a project root it would claim every folder below it, and none would be asked about. Nothing written. Move your repositories into a folder of their own and run this there, or add each with `atlas settings add-project \"REPO\"`"
+        ));
+    }
+    let base = cfg.parent().map(Path::to_path_buf).unwrap_or_default();
+    let new_name = name.map(str::to_string).unwrap_or_else(|| project_name(&key, &[]));
+    // The one question comes before the lock.
+    let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
+    let asked = (!c.user.scoped).then(|| existing_setup_name(io, &base, &new_name));
+    // One lock for the whole command: the revert below restores the text read
+    // under it, so a revert cannot lose what another process wrote.
+    let held = if io.dry_run { p.unlocked() } else { p.lock_config()? };
     let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
     if c.user.scoped {
-        return add_project_new_scoped(p, io, &c, dir, name, vault, None);
+        return add_project_new_scoped(&held, io, &c, dir, name, vault, None);
     }
     // A configuration without projects (every fresh install) is moved into
     // one first, as `migrate-projects` would, under the same backup stamp:
     // one `atlas settings undo` reverses the move and the new project.
-    let key = project_key(dir);
     let doc = load(&cfg)?;
     let old = doc.text.clone().unwrap_or_default();
-    let base = cfg.parent().map(Path::to_path_buf).unwrap_or_default();
     let db = p.db.clone().unwrap_or_else(crate::dirs::default_db);
-    let new_name = name.map(str::to_string).unwrap_or_else(|| project_name(&key, &[]));
-    let existing = existing_setup_name(io, &base, &new_name);
-    let moved = match crate::project::migrate_value(&doc.value, &base, &existing, &db, Some(&p.claude_dir)) {
+    let existing = asked.unwrap_or_else(|| project_name(&project_key(&base), std::slice::from_ref(&new_name)));
+    let moved = match crate::project::migrate_value(&doc.value, &base, &existing, &db, Some(&p.claude_dir), crate::dirs::home().as_deref()) {
         Some(v) => v,
         // Nothing to move (no vaults, sources or code yet): an empty list.
         None => {
@@ -2518,8 +2729,8 @@ pub fn add_project_new(p: &Paths, io: &mut Io, dir: &Path, name: Option<&str>, v
         say!(io, "dry run: would write {} ({}), then the new project; nothing written", cfg.display(), if c2.user.projects.is_empty() { "the projects list" } else { "the move" });
         return Ok(true);
     }
-    let core = commit_in(p, io, "atlas", &cfg, &text, &format!("moved the configuration into project {existing}"), None)?;
-    let res = add_project_new_scoped(p, io, &c2, dir, name, vault, Some(&core));
+    let core = commit_in(&held, io, "atlas", &cfg, &text, &format!("moved the configuration into project {existing}"), None)?;
+    let res = add_project_new_scoped(&held, io, &c2, dir, name, vault, Some(&core));
     if !matches!(res, Ok(true)) {
         // Nothing half done: the configuration goes back as it was.
         let _ = crate::fsio::replace_atomic(&cfg, old.as_bytes());
@@ -2567,7 +2778,7 @@ fn existing_setup_name(io: &mut Io, base: &Path, new_name: &str) -> String {
 
 /// [`add_project_new`] on a project-scoped configuration `c`; `core` is the
 /// backup stamp of a move into projects made just before (one undo).
-fn add_project_new_scoped(p: &Paths, io: &mut Io, c: &crate::config::Config, dir: &Path, name: Option<&str>, vault: Option<&VaultAt>, core0: Option<&str>) -> Result<bool, String> {
+fn add_project_new_scoped(p: &Locked, io: &mut Io, c: &crate::config::Config, dir: &Path, name: Option<&str>, vault: Option<&VaultAt>, core0: Option<&str>) -> Result<bool, String> {
     let key = project_key(dir);
     let dir = Path::new(&key);
     let file = dir.join(crate::project::PROJECT_FILE);
@@ -2634,6 +2845,7 @@ fn add_project_new_scoped(p: &Paths, io: &mut Io, c: &crate::config::Config, dir
 /// cannot be changed.
 pub fn add_to_project(p: &Paths, io: &mut Io, dir: &Path, project: &str) -> Result<bool, String> {
     let cfg = p.atlas_config.clone().ok_or("atlas has no configuration file (--vault flags only)")?;
+    let held = if io.dry_run { p.unlocked() } else { p.lock_config()? };
     let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
     if !c.user.scoped {
         return Err("this configuration has no projects yet: run `atlas settings migrate-projects NAME` first".into());
@@ -2674,13 +2886,17 @@ pub fn add_to_project(p: &Paths, io: &mut Io, dir: &Path, project: &str) -> Resu
     }
     if added == 0 {
         say!(io, "every repo in {key} is in project {project} already; nothing to change");
+        // Still an answer: the folder's question ends here.
+        if !io.dry_run {
+            mark_project(p, &key);
+        }
         return Ok(true);
     }
     let manual = format!("add the repos of {key} to \"repos\" of project {project:?}");
     if io.dry_run {
         return dry_config(p, io, &[(&["projects"], Some(Value::Array(projects)))], &format!("project {project}: added {added} repos"), &format!("project {project}"), &manual);
     }
-    let ok = edit_config(p, io, &["projects"], Some(&Value::Array(projects)), &format!("project {project}: added {added} repos"), &manual)?;
+    let ok = edit_config(&held, io, &["projects"], Some(&Value::Array(projects)), &format!("project {project}: added {added} repos"), &manual)?;
     if ok {
         mark_project(p, &key);
     }
@@ -2699,10 +2915,11 @@ pub fn add_to_project(p: &Paths, io: &mut Io, dir: &Path, project: &str) -> Resu
 /// load, or the file cannot be written.
 pub fn migrate_projects(p: &Paths, io: &mut Io, name: &str) -> Result<bool, String> {
     let cfg = p.atlas_config.clone().ok_or("atlas has no configuration file (--vault flags only)")?;
+    let held = p.lock_config()?;
     let doc = load(&cfg)?;
     let base = cfg.parent().map(Path::to_path_buf).unwrap_or_default();
     let db = p.db.clone().unwrap_or_else(crate::dirs::default_db);
-    let Some(new) = crate::project::migrate_value(&doc.value, &base, name, &db, Some(&p.claude_dir)) else {
+    let Some(new) = crate::project::migrate_value(&doc.value, &base, name, &db, Some(&p.claude_dir), crate::dirs::home().as_deref()) else {
         say!(io, "{} has projects already (or nothing to move); nothing to change", cfg.display());
         return Ok(true);
     };
@@ -2710,7 +2927,7 @@ pub fn migrate_projects(p: &Paths, io: &mut Io, name: &str) -> Result<bool, Stri
     crate::config::Config::parse(&text, &base).map_err(|e| format!("the migrated configuration would not load: {e}"))?;
     let old = doc.text.clone().unwrap_or_default();
     let _ = write!(io.out, "{}", diff(&cfg.display().to_string(), &old, &text));
-    commit(p, io, "atlas", &cfg, &text, &format!("moved the configuration into project {name}"))?;
+    commit(&held, io, "atlas", &cfg, &text, &format!("moved the configuration into project {name}"))?;
     say!(io, "atlas reads its configuration at start: restart Claude Code (or reconnect atlas with /mcp).");
     Ok(true)
 }
@@ -2783,8 +3000,309 @@ pub fn offer_interactive(config: Option<&Path>, db: &Path, user_state: Option<&P
     run(&["offer".to_string()], &p, &mut Io { out: &mut out, input: &mut input, interactive, version, dry_run: false }).map(|_| ())
 }
 
+// ------------------------------------------------------------ hook drift
+
+/// The plugin's hook declarations, the reference every live atlas hook's
+/// input is checked against.
+pub const PLUGIN_HOOKS: &str = include_str!("../hooks/hooks.json");
+
+/// An atlas hook as declared: an `mcp_tool` hook on atlas's `hook` tool (a
+/// server named `atlas` or `plugin:...:atlas`) with its input fields, or a
+/// command hook running `atlas --hook` (`None`: it gets the whole event).
+fn atlas_hook(h: &Value) -> Option<Option<std::collections::BTreeSet<String>>> {
+    let s = |k: &str| h.get(k).and_then(Value::as_str).unwrap_or("");
+    let server = s("server");
+    match s("type") {
+        "mcp_tool" if s("tool") == "hook" && (server == "atlas" || server.ends_with(":atlas")) => {
+            Some(Some(h.get("input").and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default()))
+        }
+        "command" if s("command").contains("atlas") && s("command").contains("--hook") => Some(None),
+        _ => None,
+    }
+}
+
+/// Every atlas hook of a settings value, by event, in file order.
+fn atlas_hooks(settings: &Value) -> Vec<(String, Option<std::collections::BTreeSet<String>>)> {
+    let mut out = Vec::new();
+    let Some(events) = settings.get("hooks").and_then(Value::as_object) else { return out };
+    for (event, groups) in events {
+        for g in groups.as_array().into_iter().flatten() {
+            for h in g.get("hooks").and_then(Value::as_array).into_iter().flatten() {
+                if let Some(f) = atlas_hook(h) {
+                    out.push((event.clone(), f));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// How the atlas hooks in a Claude Code settings value differ from
+/// `hooks/hooks.json`, one line per finding: an event the plugin hooks with
+/// no live atlas hook, an `mcp_tool` hook whose input fields differ (the
+/// missing and extra fields), and an atlas hook on an event the plugin does
+/// not hook. A command hook is compared by its event only. Empty when they
+/// match or the settings hold no atlas hook (the plugin's own hooks are then
+/// the ones in use).
+pub fn hook_drift(settings: &Value) -> Vec<String> {
+    let live = atlas_hooks(settings);
+    if live.is_empty() {
+        return Vec::new();
+    }
+    let reference = crate::json::parse(PLUGIN_HOOKS).map(|v| atlas_hooks(&v)).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut events: Vec<&str> = Vec::new();
+    for (event, want) in &reference {
+        if events.contains(&event.as_str()) {
+            continue;
+        }
+        events.push(event);
+        let here: Vec<&Option<std::collections::BTreeSet<String>>> = live.iter().filter(|(e, _)| e == event).map(|(_, f)| f).collect();
+        if here.is_empty() {
+            out.push(format!("{event}: no atlas hook"));
+            continue;
+        }
+        let Some(want) = want else { continue };
+        for fields in here.into_iter().flatten() {
+            let missing: Vec<&str> = want.difference(fields).map(String::as_str).collect();
+            let extra: Vec<&str> = fields.difference(want).map(String::as_str).collect();
+            if missing.is_empty() && extra.is_empty() {
+                continue;
+            }
+            let mut line = format!("{event}:");
+            if !missing.is_empty() {
+                line.push_str(&format!(" missing {}", missing.join(", ")));
+            }
+            if !extra.is_empty() {
+                line.push_str(&format!("{} extra {}", if missing.is_empty() { "" } else { ";" }, extra.join(", ")));
+            }
+            out.push(line);
+        }
+    }
+    for (event, _) in &live {
+        if !events.contains(&event.as_str()) {
+            events.push(event);
+            out.push(format!("{event}: an atlas hook on an event hooks/hooks.json does not hook"));
+        }
+    }
+    out
+}
+
+/// The drift of the live user settings' atlas hooks, read from `path`
+/// (a missing or unreadable file has none).
+pub fn hook_drift_at(path: &Path) -> Vec<String> {
+    load(path).map(|d| hook_drift(&d.value)).unwrap_or_default()
+}
+
+/// Whether a settings value has atlas hooks, but none of its PostToolUse atlas
+/// groups would see `AskUserQuestion`.
+fn ask_answers_missed(settings: &Value) -> bool {
+    if atlas_hooks(settings).is_empty() {
+        return false;
+    }
+    let groups = settings.pointer("/hooks/PostToolUse").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    !groups.iter().any(|g| {
+        let atlas = g.get("hooks").and_then(Value::as_array).is_some_and(|hs| hs.iter().any(|h| atlas_hook(h).is_some()));
+        let m = g.get("matcher").and_then(Value::as_str).unwrap_or("*");
+        atlas && (m == "*" || m.split('|').any(|x| x == "AskUserQuestion"))
+    })
+}
+
+/// The warning for a session's first prompt when the live atlas hooks
+/// drifted from `hooks/hooks.json`; `None` when they match. Only idea questions
+/// use the Stop hook, so a settings install that lacks it hears nothing unless
+/// `asks_on` (`atlas doctor` still lists it). With `ideas_on`, an
+/// `AskUserQuestion` the PostToolUse matcher leaves out is said, or typed answers
+/// and labels never come back.
+pub fn hook_drift_line(p: &Paths, ideas_on: bool, asks_on: bool) -> Option<String> {
+    let mut d = hook_drift_at(&p.settings());
+    if !asks_on {
+        d.retain(|l| !l.starts_with("Stop:"));
+    }
+    if ideas_on && load(&p.settings()).is_ok_and(|s| ask_answers_missed(&s.value)) {
+        d.push("PostToolUse: the matcher leaves out AskUserQuestion".to_string());
+    }
+    (!d.is_empty()).then(|| {
+        format!(
+            "atlas: the atlas hooks in {} differ from the plugin's hooks/hooks.json ({}); a hook missing a field gives atlas less to go on (a PreToolUse without tool_use_id once made the agent cap count agents twice). Tell the user; `atlas doctor` lists it.",
+            p.settings().display(),
+            d.join("; ")
+        )
+    })
+}
+
+/// Whether Claude Code has atlas installed as a plugin, read from
+/// `plugins/installed_plugins.json` in its folder: `{"plugins": {"atlas@MARKET":
+/// [{"version": ...}]}}`, a shape seen in a real install and not a documented
+/// one, so anything else is an error. No file is `Ok(None)`; `Ok(Some(v))`
+/// holds the installed version, when it says.
+fn plugin_install(claude_dir: &Path) -> Result<Option<String>, String> {
+    let path = claude_dir.join("plugins").join("installed_plugins.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let v = crate::json::parse(&text).map_err(|e| format!("{}: not JSON ({} at byte {})", path.display(), e.msg, e.at))?;
+    let plugins = v.get("plugins").and_then(Value::as_object).ok_or_else(|| format!("{}: no `plugins` object", path.display()))?;
+    for (key, installs) in plugins {
+        if key.split('@').next() != Some("atlas") {
+            continue;
+        }
+        let list = installs.as_array().ok_or_else(|| format!("{}: {key} is not a list", path.display()))?;
+        if let Some(first) = list.first() {
+            return Ok(Some(first.get("version").and_then(Value::as_str).unwrap_or("unknown").to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// How long Claude Code holds a server off after a failed start, as measured:
+/// it was still failing at 14.9 minutes and connected at 15.2.
+const HELD_OFF_MS: i64 = 15 * 60 * 1000;
+
+/// The doctor's lines for an atlas server Claude Code is holding off: after one
+/// failed start it records the server in `mcp-needs-auth-cache.json` and does not
+/// start it for 15 minutes, even with the cause fixed, and atlas cannot change that.
+/// Read only, and not a documented file, so anything unexpected in it says nothing.
+fn held_off_lines(claude_dir: &Path, now_ms: i64) -> Vec<String> {
+    let path = claude_dir.join("mcp-needs-auth-cache.json");
+    let Some(v) = std::fs::read_to_string(&path).ok().and_then(|t| crate::json::parse(&t).ok()) else { return Vec::new() };
+    let Some(entries) = v.as_object() else { return Vec::new() };
+    let mut out = Vec::new();
+    for (server, e) in entries {
+        if server.rsplit(':').next() != Some("atlas") {
+            continue;
+        }
+        let Some(at) = e.get("timestamp").and_then(Value::as_i64) else { continue };
+        let left = at + HELD_OFF_MS - now_ms;
+        if left > 0 {
+            let minutes = (left + 59_999) / 60_000;
+            out.push(format!(
+                "server: Claude Code recorded a failed start of {server} and will not start it for about {minutes} more minutes, even once the cause is fixed, unless the fix changed its command. A new session after that connects, and nothing atlas does brings it sooner."
+            ));
+        }
+    }
+    out
+}
+
+/// The doctor's lines about project roots wide enough to claim every folder
+/// under them, so that no folder there is asked about: what a setup from
+/// before this check may hold. Named, never rewritten, and no failure, since
+/// such a root can be meant. `config` is only read: the doctor writes nothing,
+/// and a first run's template holds no roots.
+fn wide_root_lines(config: Option<&Path>) -> Vec<String> {
+    let home = crate::dirs::home();
+    let mut out = Vec::new();
+    if let Some(cp) = config.filter(|c| c.is_file()) {
+        match crate::config::Config::load(cp) {
+            Ok(c) => {
+                for p in &c.user.projects {
+                    for r in p.roots.iter().filter(|r| crate::project::too_wide(r, home.as_deref())) {
+                        out.push(format!(
+                            "roots: project {} in {} has the root {}, which holds your home folder or is a drive root, so no folder under it is asked about. To narrow it, list the project's own folders under `roots`.",
+                            p.name,
+                            cp.display(),
+                            r.display()
+                        ));
+                    }
+                }
+            }
+            Err(e) => out.push(format!("roots: not checked, {} did not load: {e}", cp.display())),
+        }
+    }
+    if let Some(f) = home.as_deref().and_then(crate::project::find_project_file) {
+        out.push(format!("roots: the project file {} sits at or above your home folder, so every folder under it reads that project. To narrow it, move the file into the project's own folder.", f.display()));
+    }
+    out
+}
+
+/// `atlas doctor`: says what it could check of the live Claude Code settings'
+/// atlas hooks against `hooks/hooks.json`, one honest line for each case: no
+/// settings file, a malformed one, no atlas hooks in it, a plugin install
+/// (whose hooks live in the plugin), or real hooks that match or differ. Also
+/// names a project root that is too wide in `config`, and a server Claude Code is
+/// holding off. Exit 1 when the hooks
+/// differ or when the settings or plugin file could not be read. Writes nothing.
+///
+/// # Errors
+///
+/// A message when no Claude Code folder is known.
+pub fn doctor_cli(args: &[String], config: Option<&Path>) -> Result<ExitCode, String> {
+    if let Some(a) = args.first() {
+        if a == "-h" || a == "--help" {
+            println!("usage: atlas doctor   says what it can check of the atlas hooks and project roots; writes nothing");
+            return Ok(ExitCode::SUCCESS);
+        }
+        return Err(format!("atlas doctor takes no arguments, not {a:?}"));
+    }
+    let env = |n: &str| std::env::var_os(n).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let dir = env("CLAUDE_CONFIG_DIR").or_else(|| env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| h.join(".claude"))).ok_or("no Claude Code folder: set CLAUDE_CONFIG_DIR")?;
+    let path = dir.join("settings.json");
+    let mut failed = false;
+    match load(&path) {
+        Err(e) => {
+            println!("hooks: not checked, the settings file could not be read: {e}");
+            failed = true;
+        }
+        Ok(doc) if atlas_hooks(&doc.value).is_empty() => {
+            if doc.text.is_some() {
+                println!("hooks: {} holds no atlas hooks, so there was nothing there to check", path.display());
+            } else {
+                println!("hooks: there is no {}, so there was nothing there to check", path.display());
+            }
+        }
+        Ok(doc) => {
+            let d = hook_drift(&doc.value);
+            if d.is_empty() {
+                println!("hooks: the atlas hooks in {} match hooks/hooks.json", path.display());
+            } else {
+                println!("hooks: the atlas hooks in {} differ from hooks/hooks.json:", path.display());
+                for line in &d {
+                    println!("  {line}");
+                }
+                failed = true;
+            }
+        }
+    }
+    match plugin_install(&dir) {
+        Ok(Some(version)) => println!("plugin: atlas {version} is installed as a plugin; its hooks are in the plugin and were not checked here"),
+        Ok(None) => {}
+        Err(e) => {
+            println!("plugin: cannot tell whether atlas is installed as a plugin: {e}");
+            failed = true;
+        }
+    }
+    for line in wide_root_lines(config) {
+        println!("{line}");
+    }
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    for line in held_off_lines(&dir, now_ms) {
+        println!("{line}");
+    }
+    Ok(if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_stop_hook_is_drift_only_with_ideas_on() {
+        let d = std::env::temp_dir().join(format!("atlas-drift-ideas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut live = crate::json::parse(PLUGIN_HOOKS).unwrap();
+        let hooks = live.as_object_mut().and_then(|m| m.get_mut("hooks")).and_then(Value::as_object_mut).unwrap();
+        hooks.remove("Stop");
+        let p = Paths { claude_dir: d.clone(), atlas_config: None, state: None, db: None, user_state: None, project: None };
+        std::fs::write(p.settings(), live.to_string()).unwrap();
+        assert_eq!(hook_drift_line(&p, false, false), None, "off adds nothing to context");
+        assert_eq!(hook_drift_line(&p, true, false), None, "no questions, so no use for Stop");
+        assert!(hook_drift_line(&p, true, true).is_some_and(|l| l.contains("Stop: no atlas hook")));
+        std::fs::write(p.settings(), PLUGIN_HOOKS.replace("|AskUserQuestion", "")).unwrap();
+        assert!(hook_drift_line(&p, true, false).is_some_and(|l| l.contains("leaves out AskUserQuestion")));
+        assert_eq!(hook_drift_line(&p, false, false), None);
+    }
+
     use super::*;
 
     #[test]
@@ -2804,7 +3322,7 @@ mod tests {
     fn the_manifest_is_well_formed() {
         let m = manifest().unwrap();
         let ids: Vec<&str> = m.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["subagent-cache-1h", "goal-checkin-120", "routing", "update", "update-pin"]);
+        assert_eq!(ids, ["subagent-cache-1h", "goal-checkin-120", "routing", "update", "update-pin", "orchestrate", "memory-rules", "agents-builders", "agents-reviewers", "agents-research", "context-mode", "context-limit", "context-handoff"]);
         for s in &m {
             assert!(!s.title.is_empty() && !s.what.is_empty() && !s.cost.is_empty() && !s.basis.is_empty() && !s.short.is_empty(), "{}", s.id);
             if s.kind != Kind::Atlas {

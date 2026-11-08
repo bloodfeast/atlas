@@ -889,6 +889,8 @@ impl<F: Fn(&str, usize) -> usize, G: Fn(&str, usize) -> usize, H: Fn(&str, usize
     }
 }
 
+type Last = Option<(usize, Option<((usize, usize), usize)>)>;
+
 /// The rest of a Markdown link after its text, with its searches kept
 /// (see [`lex::Next`]) and its last answer: texts from several `[` that
 /// end at the same `]` ask for the same rest.
@@ -900,7 +902,7 @@ struct LinkRest<A, B, Q> {
     /// The first `"` or newline (a title's end).
     quote: lex::Next<Q>,
     /// The last answer: the `]` asked from and what it gave.
-    last: Option<(usize, Option<((usize, usize), usize)>)>,
+    last: Last,
 }
 
 impl<A: Fn(&str, usize) -> usize, B: Fn(&str, usize) -> usize, Q: Fn(&str, usize) -> usize> LinkRest<A, B, Q> {

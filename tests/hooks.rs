@@ -237,7 +237,11 @@ fn usage_line(id: &str, ctx: u64) -> String {
 #[test]
 fn the_cap_warns_then_blocks_all_but_handoff_in_subagents_only() {
     let t = Temp::new("hook-cap");
-    let s = settings(t.path());
+    let mut s = settings(t.path());
+    // The per-kind defaults on a 1M window, whatever the environment says.
+    // They apply in orchestrated mode only; off, the v0.2 cap applies.
+    s.orchestrate = atlas::orchestrate::resolve(None, None, None, |_| None);
+    s.orchestrate.enabled = true;
     let mut h = Hooks::open(s).unwrap();
     let dir = t.path().join("proj");
     let parent = dir.join("sess.jsonl");
@@ -251,13 +255,13 @@ fn the_cap_warns_then_blocks_all_but_handoff_in_subagents_only() {
     assert_eq!(call(&mut h, "", "Bash"), Default::default());
     std::fs::write(&sub, usage_line("m1", 100_000)).unwrap();
     assert_eq!(call(&mut h, "a9", "Bash"), Default::default());
-    std::fs::write(&sub, usage_line("m1", 100_000) + &usage_line("m2", 451_000)).unwrap();
+    std::fs::write(&sub, usage_line("m1", 100_000) + &usage_line("m2", 286_000)).unwrap();
     let w = call(&mut h, "a9", "Bash");
-    assert!(w.deny.is_none() && w.context.contains("451000 tokens"), "{w:?}");
+    assert!(w.deny.is_none() && w.context.contains("286000 tokens"), "{w:?}");
     // Not repeated until another 25k tokens.
-    std::fs::write(&sub, usage_line("m2", 451_000) + &usage_line("m3", 460_000)).unwrap();
+    std::fs::write(&sub, usage_line("m2", 286_000) + &usage_line("m3", 300_000)).unwrap();
     assert!(call(&mut h, "a9", "Bash").context.is_empty());
-    std::fs::write(&sub, usage_line("m3", 460_000) + &usage_line("m4", 501_000) + &usage_line("m4", 501_000)).unwrap();
+    std::fs::write(&sub, usage_line("m3", 300_000) + &usage_line("m4", 451_000) + &usage_line("m4", 451_000)).unwrap();
     let b = call(&mut h, "a9", "Bash");
     assert!(b.deny.as_deref().is_some_and(|r| r.contains("handoff")), "{b:?}");
     assert!(b.to_json("PreToolUse").contains("\"permissionDecision\":\"deny\""));
@@ -269,7 +273,7 @@ fn the_cap_warns_then_blocks_all_but_handoff_in_subagents_only() {
     // Both crossings are journal entries for the agent.
     let lane = h.store().lane("agent:a9").unwrap();
     let subs: Vec<&str> = lane.iter().map(|x| x.title.as_str()).collect();
-    assert_eq!(subs, vec!["context cap warned at 451000 tokens", "context cap blocked at 501000 tokens"]);
+    assert_eq!(subs, vec!["context cap warned at 286000 tokens", "context cap blocked at 451000 tokens"]);
 }
 
 #[test]
@@ -670,11 +674,25 @@ fn a_lookup_made_again_after_a_compaction_is_a_logged_miss() {
 }
 
 /// A synthetic session segment: a prompt, a read with its result, an edit,
-/// then a running tool call (no result yet). Nothing here is a real
-/// transcript.
+/// then a running tool call (no result yet), the last of it at a time
+/// after anything a test seeds (the session is still running). Nothing here
+/// is a real transcript.
 fn working_transcript(path: &Path, ctx: u64) {
+    working_transcript_until(path, ctx, "2099-12-31T23:59:59.000Z");
+}
+
+/// The byte offset of 1-based line `line` of a file: where a checkpoint's
+/// byte ref (`turn:<s8>:b<offset>`) points.
+fn offset_of_line(path: &Path, line: usize) -> u64 {
+    let text = std::fs::read(path).unwrap();
+    text.split_inclusive(|&b| b == b'\n').take(line - 1).map(|l| l.len() as u64).sum()
+}
+
+/// [`working_transcript`] whose newest record is at `end`.
+fn working_transcript_until(path: &Path, ctx: u64, end: &str) {
     let rec = |kind: &str, id: &str, content: atlas::json::Value, c: u64| {
-        json!({"type": kind, "timestamp": "2020-01-01T00:00:00.000Z", "message": {"id": id, "usage": {"input_tokens": c}, "content": content}})
+        let time = if id == "m4" { end } else { "2020-01-01T00:00:00.000Z" };
+        json!({"type": kind, "timestamp": time, "message": {"id": id, "usage": {"input_tokens": c}, "content": content}})
     };
     let lines = [
         rec("user", "", json!([{"type": "text", "text": "fix the exporter"}]), 0),
@@ -687,6 +705,27 @@ fn working_transcript(path: &Path, ctx: u64) {
     ];
     let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     std::fs::write(path, text.join("\n") + "\n").unwrap();
+}
+
+/// Cost review item 2: the card is bounded by the transcript's newest
+/// record, so it never lists a record newer than anything the session has
+/// seen. (In the compact-live harness the newest record is the harness's
+/// own `/goal clear`, so there the per-job store prune does the bounding.)
+#[test]
+fn the_card_never_lists_records_newer_than_the_transcript() {
+    let t = Temp::new("hook-card-asof");
+    let mut s = settings(t.path());
+    s.compact.enabled = true;
+    seed(&s);
+    let tp = t.path().join("s1.jsonl");
+    working_transcript_until(&tp, 300_000, "2020-01-01T00:00:09.000Z");
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    h.handle(&HookEvent { trigger: "manual".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().expect("a checkpoint");
+    assert!(!ck.body.contains("build-7") && !ck.body.contains("rules:r00001"), "records seeded after the cut leak in:\n{}", ck.body);
+    assert!(ck.body.contains("files: src/export.rs"), "the transcript side stays: {}", ck.body);
 }
 
 #[test]
@@ -711,7 +750,7 @@ fn precompact_writes_a_checkpoint_and_the_card_follows_the_compaction() {
         format!("owed: journal:build-7:0002@{}", &next.sha[..12]),
         format!("rules:r00001@{}", &r00001.sha[..12]),
         "files: src/export.rs".to_string(),
-        "tools: Read src/export.rs -> turn:s1:4@".to_string(),
+        "groups (recall a key for its digest and text):\n- turn:s1:b0-b".to_string(),
         "pending: Bash cargo test --no-fail-fast".to_string(),
         "intent: I will read the exporter first.".to_string(),
     ] {
@@ -778,13 +817,22 @@ fn with_the_transcript_source_on_precompact_indexes_turns_and_turn_refs_are_chec
     // The card's result ref is that turn's.
     let store = MemoryStore::open(&s.store).unwrap();
     let ck = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
-    assert!(ck.body.contains(&format!("turn:s1:4@{}", turn.hash)), "{}", ck.body);
+    // The card's group key resolves from the project folder, and its reply
+    // holds the read's result.
+    let key = atlas::chain::written_keys(&ck.body).into_iter().find(|k| k.starts_with("turn:s1:b0-b")).expect("a group key");
+    let reply = atlas::chain::resolve(&dir, &key).unwrap();
+    assert!(reply.contains("fn export() {}"), "{reply}");
+    let b = offset_of_line(&tp, 4);
     drop(store);
-    // A summary citing it resolves; a wrong hash is dangling.
+    // A summary citing it (by byte offset, or by line as the index names it)
+    // resolves; a wrong hash, or an offset inside a record, is dangling.
     let after = dir.join("after.jsonl");
-    compacted_transcript(&after, &format!("read turn:s1:4@{} and turn:s1:4@0123456789ab", turn.hash));
+    let cited = format!("read turn:s1:b{b}@{h}, turn:s1:4@{h}, turn:s1:b{b}@0123456789ab and turn:s1:b{}@{h}", b + 1, h = turn.hash);
+    compacted_transcript(&after, &cited);
     let a = h.handle(&HookEvent { source: "compact".into(), transcript_path: after.to_string_lossy().into_owned(), ..ev("SessionStart") });
-    assert!(a.context.contains("atlas ref dangling: turn:s1:4@0123456789ab"), "{}", a.context);
+    assert!(a.context.contains(&format!("dangling: turn:s1:b{b}@0123456789ab")), "{}", a.context);
+    assert!(a.context.contains(&format!("dangling: turn:s1:b{}@{}", b + 1, turn.hash)), "{}", a.context);
+    assert!(!a.context.contains(&format!("dangling: turn:s1:b{b}@{}", turn.hash)), "{}", a.context);
     assert!(!a.context.contains(&format!("dangling: turn:s1:4@{}", turn.hash)), "{}", a.context);
 }
 
@@ -798,8 +846,10 @@ fn with_compaction_off_the_hooks_write_and_inject_nothing_for_it() {
     working_transcript(&tp, 300_000);
     let mut h = Hooks::open(s.clone()).unwrap();
     h.set_offer_paths(None);
-    let a = h.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
-    assert!(a.block.is_none() && a.to_json("PreCompact").is_empty());
+    for trigger in ["auto", "manual"] {
+        let a = h.handle(&HookEvent { trigger: trigger.into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+        assert!(a.block.is_none() && a.to_json("PreCompact").is_empty(), "{trigger}");
+    }
     let store = MemoryStore::open(&s.store).unwrap();
     assert!(atlas::checkpoint::newest(&store, "s1").unwrap().is_none(), "no checkpoint while off");
     assert!(store.lane("session:s1").unwrap().is_empty(), "nothing written in the session lane");
@@ -899,7 +949,7 @@ fn a_transcript_not_yet_written_is_read_from_its_parent_or_said_unread() {
     let ck = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
     assert!(ck.title.contains("at 300000 context tokens"), "{}", ck.title);
     assert!(ck.meta.contains("tail_from:") && ck.meta.contains("parent0.jsonl"), "{}", ck.meta);
-    for want in ["files: src/export.rs", "tools: Read src/export.rs -> turn:parent0:4@", "pending: Bash cargo test", "intent: I will read the exporter first."] {
+    for want in ["files: src/export.rs", "\n- turn:pare:b0-b", "pending: Bash cargo test", "intent: I will read the exporter first."] {
         assert!(ck.body.contains(want), "missing {want:?} in\n{}", ck.body);
     }
     drop(store);
@@ -1016,6 +1066,8 @@ fn command_hook_rows_reach_the_token_log_before_the_process_exits() {
             .arg("--config")
             .arg(&cfg)
             .arg("--hook")
+            .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .current_dir(t.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1031,6 +1083,76 @@ fn command_hook_rows_reach_the_token_log_before_the_process_exits() {
     let conn = rusqlite::Connection::open(&db).unwrap();
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool LIKE 'hook:%'", [], |r| r.get(0)).unwrap();
     assert_eq!(n, RUNS, "one ledger row per hook answer");
+}
+
+/// What the real binary answers a PreCompact with, on each form Claude Code
+/// can run it by: (command hook's stdout, `hook` tool's reply content).
+fn precompact_replies(dir: &Path, cfg: &Path, tp: &Path, trigger: &str) -> (String, Value) {
+    let event = |name: &str| json!({name: "PreCompact", "session_id": "s-pre", "trigger": trigger, "transcript_path": tp.to_string_lossy().into_owned(), "cwd": dir.to_string_lossy().into_owned()});
+    let spawn = |a: &[&str]| Command::new(bin()).arg("--config").arg(cfg).args(a).current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = spawn(&["--hook"]);
+    child.stdin.take().unwrap().write_all(event("hook_event_name").to_string().as_bytes()).unwrap();
+    let stdout = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    let mut child = spawn(&[]);
+    {
+        let mut i = child.stdin.take().unwrap();
+        writeln!(i, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "t"}}})).unwrap();
+        writeln!(i, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "hook", "arguments": event("event")}})).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let replies: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().map(|l| json::parse(l).unwrap()).collect();
+    let reply = replies.iter().find(|r| r["id"].as_i64() == Some(2)).unwrap();
+    (stdout, reply["result"]["content"].clone())
+}
+
+/// `compact.enabled` on: both forms and both triggers reply with the
+/// instructions and nothing around them, since all of the reply lands in the
+/// summarizer's instructions. Off: both reply with no text.
+#[test]
+fn precompact_replies_with_the_plain_instructions_only_when_compaction_is_on() {
+    let t = Temp::new("hook-pre-forms");
+    write(&t.path().join("vault").join("Index.md"), "# Index\n");
+    let tp = t.path().join("s-pre.jsonl");
+    working_transcript(&tp, 300_000);
+    let cfg = |name: &str, on: bool| {
+        let c = t.path().join(name);
+        write(&c, &format!("{}", json!({"db": format!("state-{on}/atlas.sqlite"), "vaults": [{"name": "notes", "path": "vault"}], "watch": false, "models": {"auto_download": false, "files": []}, "compact": {"enabled": on}})));
+        c
+    };
+    let text = atlas::claude_settings::COMPACT_INSTRUCTIONS;
+    assert!(!text.contains("<!--") && !text.contains("##") && text == text.trim() && !text.starts_with('{'), "{text}");
+    let (on, off) = (cfg("on.json", true), cfg("off.json", false));
+    for trigger in ["manual", "auto"] {
+        let (stdout, content) = precompact_replies(t.path(), &on, &tp, trigger);
+        assert_eq!(stdout, text, "{trigger}");
+        assert_eq!(content, json!([{"type": "text", "text": text}]), "{trigger}");
+        let (stdout, content) = precompact_replies(t.path(), &off, &tp, trigger);
+        assert_eq!(stdout, "", "{trigger}");
+        assert_eq!(content, json!([{"type": "text", "text": ""}]), "{trigger}");
+    }
+}
+
+/// The instructions tell the summarizer to leave out what the card lists, so
+/// with no card behind them the hook returns none: the checkpoint failed, or
+/// it holds no chain card (a transcript atlas could not read).
+#[test]
+fn precompact_returns_no_instructions_without_a_card() {
+    let t = Temp::new("hook-pre-fail");
+    let s = compaction(t.path());
+    seed(&s);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let missing = t.path().join("none").join("x.jsonl").to_string_lossy().into_owned();
+    let a = h.handle(&HookEvent { trigger: "manual".into(), transcript_path: missing, ..ev("PreCompact") });
+    assert!(a.block.is_none() && a.to_json("PreCompact").is_empty());
+    let store = MemoryStore::open(&s.store).unwrap();
+    assert!(atlas::checkpoint::newest(&store, "s1").unwrap().is_some(), "the checkpoint is still written");
+    drop(store);
+
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    rusqlite::Connection::open(&s.store).unwrap().execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE records").unwrap();
+    let a = h.handle(&HookEvent { trigger: "manual".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    assert!(a.block.is_none() && a.to_json("PreCompact").is_empty());
 }
 
 /// The hook tool writes journal entries (context caps, checkpoints), so it
@@ -1081,4 +1203,62 @@ fn a_tailed_failure_is_said_in_the_context_only_when_routing_failed() {
     assert!(h.handle(&post(&format!("{long_ok}a line naming {mark} here\n"))).context.is_empty());
     let untailed = HookEvent { tool_input: json!({"command": "git log -1"}), ..post(&big) };
     assert!(h.handle(&untailed).context.is_empty());
+}
+
+#[test]
+fn a_new_or_cleared_session_gets_the_resume_card() {
+    let t = Temp::new("hook-resume");
+    let s = settings(t.path());
+    let tp = t.path().join("sessions").join("new.jsonl");
+    std::fs::create_dir_all(tp.parent().unwrap()).unwrap();
+    let startup = |h: &mut Hooks, source: &str| h.handle(&HookEvent { source: source.into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("SessionStart") }).context;
+    // An empty store and no previous session: no card.
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.set_offer_paths(None);
+        assert!(!startup(&mut h, "startup").contains("resume card"));
+    }
+    {
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let mut add = |key: &str, kind: &str, scope: &str, sub: &str, title: &str| {
+            let d = Draft { title: title.into(), reason: "seeding".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+            w.create(key, kind, sub, scope, &d, None).unwrap();
+        };
+        add("journal:build-7:0001", "journal", "build-7", "brief", "Build the gadget exporter");
+        add("journal:build-7:0002", "journal", "build-7", "question", "Which format does the exporter write?");
+        add("journal:build-7:0003", "journal", "build-7", "question", "Answered already?");
+        add("journal:build-7:0004", "journal", "build-7", "decision", "Yes");
+        add("handoff:build-7:001", "handoff", "build-7", "", "Exporter half done");
+        add("journal:session:abc:0001", "journal", "session:abc", "checkpoint", "a checkpoint");
+        w.add_refs("journal:build-7:0004", &[("answers".into(), "journal:build-7:0003".into())]).unwrap();
+        drop(w.commit());
+        let launch = atlas::queue::Launch { kind: atlas::orchestrate::Kind::Builder, lane: Some("build-7"), description: "finish the exporter", subagent_type: "", prompt: "Lane: build-7\nFinish the exporter.", session: "s0", class_meta: "" };
+        atlas::queue::add(&mut store, &launch).unwrap();
+    }
+    // The previous session, with an unmet goal.
+    let prev = t.path().join("sessions").join("old.jsonl");
+    std::fs::write(&prev, "{\"type\":\"attachment\",\"attachment\":{\"type\":\"goal_status\",\"met\":false,\"sentinel\":true,\"condition\":\"Ship the exporter\"}}\n").unwrap();
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let card = startup(&mut h, "clear");
+    assert!(card.contains("atlas resume card"), "{card}");
+    assert!(card.contains("build-7 (1 question, handoff:build-7:001)"), "{card}");
+    assert!(card.contains("- open questions for the user: journal:build-7:0002\n"), "{card}");
+    assert!(!card.contains("journal:build-7:0003"), "an answered question is not open: {card}");
+    assert!(!card.contains("session:abc"), "a session lane is not a live lane: {card}");
+    assert!(card.contains("- work queue: 1 waiting"), "{card}");
+    assert!(!card.contains("other handoffs"), "the lanes line names the only handoff: {card}");
+    assert!(card.contains("not met") && card.contains("Ship the exporter"), "{card}");
+    assert!(card.contains("(1) resume the work queue, (2) change it first, or (3) do something more pressing"), "{card}");
+    assert!(card.len() <= atlas::resume::CARD_BYTES, "{} bytes", card.len());
+    // Compaction keeps its own card; a resumed session needs none.
+    assert!(!startup(&mut h, "compact").contains("resume card"));
+    assert!(!startup(&mut h, "resume").contains("resume card"));
+    // The switch.
+    let mut off = s.clone();
+    off.resume_card = false;
+    let mut h = Hooks::open(off).unwrap();
+    h.set_offer_paths(None);
+    assert!(!startup(&mut h, "startup").contains("resume card"));
 }

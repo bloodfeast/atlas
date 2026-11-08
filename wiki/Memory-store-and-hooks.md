@@ -80,7 +80,9 @@ exports are not. `--recall-check` counts every item or memory file the store doe
 
 A snapshot is also taken on the first write after `snapshot_hours` (24). `--memory-check` replays every hash chain,
 replays the `.jsonl` copy to the same heads, compares each export with the files on disk, and splits each rendered
-export back into exactly its records.
+export back into exactly its records. A process killed between a write's commit and its export leaves that export
+behind the store: `--memory-check` reports `disk: ... differs from its export` and exits 1 until the next write to that
+export (or `--memory-export`) rewrites it. No record is lost; the store and its `.jsonl` copy hold the write.
 
 Snapshots are kept until they and the archive together pass `memory.snapshot_cap_mb` (1024 MB by default, a
 setting). Past it the oldest snapshots are folded, oldest first, into `archive.sqlite` in the snapshot folder and
@@ -119,17 +121,70 @@ recall. Use the `mcp_tool` hooks for subagent recall.
   matching clauses (`lane_chars`, 180), with a `+N trimmed above` line. Every piece of an excerpt is an exact
   substring of the record, joined by ` ... `, so a quote of it is the record's own text and `recall {key}` reads
   it whole. A record the lane brief shows is not pointed to again. Clauses are chosen by the prompt's words, not
-  by embedding each clause: measured at about 48 ms a clause with the bge int8 model on the development machine,
-  with cosines that did not separate the answer from an off-topic clause.
+  by embedding each clause: with the bge int8 model, the cosines did not separate the answer from an off-topic
+  clause.
 - **Context cap** (`PreToolUse`, subagents only unless `cap.main_session`): the size is the last assistant
   message's input, cache and output tokens in the subagent's own transcript
-  (`<parent>/subagents/agent-<id>.jsonl`). At `cap.warn_tokens` (450,000) the agent is told to finish, commit, push
-  and write its handoff; at `cap.block_tokens` (500,000) every tool but `handoff` is denied. Both are journal
-  entries.
+  (`<parent>/subagents/agent-<id>.jsonl`). Each agent kind (builder, reviewer, research) has its own limits;
+  by default, on a 1M window and scaled to the window, at 285,000 the agent is told to wrap up and write its
+  handoff at its next clean stopping point, and at 450,000 every tool but `handoff` is denied. Both are journal
+  entries. A SendMessage to an agent past its hard limit is refused, and when an agent that passed its handoff
+  point finishes, the orchestrator is told to start a fresh agent from the handoff. `orchestrate.mode` makes it
+  advisory or off.
+- **Agent caps** (`PreToolUse` on `Agent`, with `orchestrate.enabled`): the session's running agents are read
+  from Claude Code's `subagents/agent-<id>.meta.json` files and counted by kind; a launch past its kind's cap
+  (2 builders, 2 reviewers, 1 research agent by default) or past Claude Code's own limit is denied with a reason
+  to queue it. The hook files the refused launch as a `queued` journal entry in the lane its brief names (else
+  lane `queue`), with the brief as its body, and the reason names the key; a retry is not filed twice. A
+  finished agent's notification lists the oldest waiting launches, and launching one again with the same
+  description and brief retires its entry. `atlas queue [list | show KEY | drop KEY]` lists, prints or removes
+  them. The hook only ever denies; on any error it gives no decision. The `orchestrate` skill teaches the
+  main session to work this way. `atlas --setup` asks whether to turn it on and its options, and the first
+  new session asks the same through Claude until it is answered (`atlas settings orchestrate`; see [[Install and setup]]).
+- **Resume card (`memory.resume_card`, on by default):** SessionStart with `source: startup` or `clear` injects
+  where the work stands as keys, in at most 1,160 bytes (612 tokens on the test's card full of keys, at 1,119 bytes, by a public
+  vocabulary times a fitted factor, not real tokens; `cargo test -p xtask` holds that card there, the bytes bind at runtime). The lines: the six newest live lanes, each with its open question count and newest
+  handoff; the live lanes' open questions; after a `/clear` only, the agents still running from the previous
+  session (a new process has none, so none hold slots); the work queue's count, up to five that can start now
+  and the next waiting; the previous session's goal when its newest `goal_status` says not met; and handoffs
+  the lanes line does not name. A lane is live when it has a work record in the last 7 days: an active journal
+  entry or handoff that atlas did not write itself (queue entries and notes, the hook's cap and compaction
+  notes); a note counts only while no queued entry waits in its lane, since there it adds to a brief. A line past
+  the budget is cut at an item, and the card ends by asking Claude to put one multiple-choice question to the
+  user: resume, change the plan, or something more pressing first. `recall {key}` reads any key whole. An empty
+  store gives no card, and a store error drops only the card. Two limits: the previous session is the newest
+  other transcript in the folder, so a second session open in the same project counts as the previous one; and
+  a headless `claude -p` run starts with `startup` too, so it gets the card (turn it off in that run's config).
 - **Compaction (experimental, off by default):** everything in this item and the next three, except the
   transcript source, runs only with `"compact": {"enabled": true}` in atlas's configuration. Off, PreCompact only
   forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript); SessionStart
-  injects no card or ref report and offers no Compact instructions.
+  injects no card or ref report.
+- **Idea capture (`memory.ideas`, off by default):** a person's standalone statements that propose, decide or
+  constrain something are filed as pending `idea` journal entries with their exact words, redacted, so an idea said
+  in passing is not lost. The detector is a no-model linear score whose weights are data; they come from one author's
+  labelled prompts, label error limits them, and generality to other users is untested. Off, it reads nothing, writes
+  nothing and adds nothing to context; the Stop and `AskUserQuestion` hooks still make a round trip that does no work.
+  A denylist file that cannot be read keeps it off, and with no denylist named only the secret rules redact. UserPromptSubmit spools the capture and answers; the store takes it once the
+  answer is out and the transcript's record says `origin.kind` is `human` outside a headless run, so `/loop`
+  iterations, scheduled tasks, other sessions' messages and `claude -p` prompts are dropped. Only a record written
+  after the hook ran counts, as an older prompt may start with the same words. A prompt whose record
+  never turns up in 10 minutes is kept as `origin: unverified`, in `atlas ideas list --unsure` only. Check-ins, task
+  notifications and the resume card count and name the last 7 days, framed as records rather than requests, once per
+  new capture per session (a line of at most 300 bytes); older ideas stay pending in `atlas ideas list`.
+  The question below is unproven in a live session, so `asks_per_day` defaults to 0: nothing asks and the band is off
+  until it is set. With it set, scores from 0.25 below to 0.5 above the threshold are unsure, and the band only adds
+  to what is captured. At a Stop
+  after a person's prompt, with no background tasks, no scheduled wakeups and no active goal, the hook blocks once and
+  has the assistant ask, by `AskUserQuestion`, whether the text is a standalone statement; the answer returns through
+  PostToolUse and is stored as a label of source `live`, and free text typed there is filed as a capture. At most
+  `asks_per_day` a day, on captures of 600 characters or fewer. A question holds the main thread until it is answered,
+  and costs at least two more model calls at the session's context. A settings-based install needs the Stop hook and
+  `AskUserQuestion` in the PostToolUse matcher; with ideas on, the drift line says when either is missing. CLI:
+  `atlas ideas list [--unsure|--all] [--limit N]`, `show ID`, `file TEXT`, `dismiss ID` (source `dismiss`), `answer ID yes|no`
+  (source `manual`), `convert ID ruling --by NAME`, `convert ID queue`, and `labels` (tab separated, no text: id, label,
+  source, time, asked day, score, weights sha). Asked rows were chosen by band, so they are not a random sample. The
+  same words are one record: a dismissed statement said again stays dismissed. Weights change only by an explicit
+  later step, scored on rows newer than those it trained on.
 - **Compaction** (`PreCompact`, then `SessionStart` with `source: compact`): PreCompact writes a checkpoint
   journal entry in lane `session:<id>` and sets the session's lookups aside. After the compaction the hook reads
   the summary Claude Code wrote (the transcript's `isCompactSummary` record), resolves every content-addressed
@@ -139,6 +194,15 @@ recall. Use the `mcp_tool` hooks for subagent recall.
   lookup with the same target) made before the compaction and again after it is a `compact:miss` row.
   `--token-report` ends with the totals; `atlas --compact-report --transcripts DIR` replays recorded sessions and
   prints the same numbers, never transcript text. Design: `docs/design/compaction.md`.
+- **Instructions for the summary:** once the checkpoint is written, PreCompact replies with the Compact instructions
+  as plain text (1,344 bytes, 336 tokens), by both `atlas --hook` and the `hook` tool; Claude Code adds that text to
+  the summarizer's instructions (after any `/compact` argument, as read from Claude Code's binary, not observed). A
+  failed checkpoint, or one with no chain card
+  (a transcript atlas could not read), replies with nothing, and Claude Code compacts with its own instructions.
+  What is known: one manual run each on Claude Code 2.1.318 steered the summary, a command hook's stdout, an
+  `mcp_tool` stub's return and the real atlas tool, with no plain control on that version. The automatic trigger is
+  untested. On a manual `/compact` the text also lands in the conversation as `local-command-stdout`, about 340 tokens
+  on each later request until the next compaction; the automatic path is unread.
 - **Checkpoint and card:** the PreCompact checkpoint is a `journal` entry of kind `checkpoint` whose body is ref
   lines: `since` (the previous checkpoint), `lanes` (each active lane and its current step), `open` (unanswered
   questions), `owed` (`next` entries no commit followed), `rulings` (rules written since), then the in-task state
@@ -169,8 +233,9 @@ recall. Use the `mcp_tool` hooks for subagent recall.
   confirms Claude Code offers a blocked compaction again.
 - **Compact instructions:** `atlas settings compact-md [DIR] [--yes]` shows the block for `DIR/CLAUDE.md`
   (default the current folder) and its diff, asks, and writes it with a backup; `atlas settings undo` removes only
-  the block (and the file, when atlas created it). SessionStart offers it once per project folder (a repository
-  root or a folder with a `CLAUDE.md`); `atlas settings offer` asks it for the current folder.
+  the block (and the file, when atlas created it). This command is the only way in: neither SessionStart nor
+  `atlas settings offer` raises it. It is the same text the hook returns, so a project with the block gets the text
+  twice and should drop the block (`atlas settings undo`, or delete it by hand).
 - **Token ledger:** every hook answer is a `token_log` row (`hook:<event>`), empty ones included, with the
   counterfactual of reading the injected records without atlas.
 

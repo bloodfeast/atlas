@@ -10,6 +10,228 @@ wiki's Changelog page. A section has these parts, in this order, and leaves out 
 
 `cargo xtask release` refuses to release a version whose section is missing, empty or has no highlights.
 
+## v0.3.0
+
+### Highlights
+
+- **Orchestrator mode.** An `orchestrate` skill teaches the main session to delegate: lanes, lean briefs that
+  name their rulings instead of pasting them, a `Kind:` line, handoffs at a context limit, a fresh agent after
+  every handoff, and verify-then-merge. In orchestrated mode the PreToolUse hook caps how many agents of each
+  kind run at once (2 builders, 2 reviewers, 1 research agent by default, adjustable, clamped to Claude Code's
+  own limit) and denies a launch past its cap with a reason to queue it. It never allows a call.
+- **Orchestrated mode is asked, not defaulted.** `atlas --setup` and the first session ask whether you want to
+  work in orchestrated mode, and on yes ask its options: the caps per kind, how context limits apply
+  (enforced, advisory or off), the handoff point and hard limit, and whether a fresh agent after a handoff
+  starts on its own or asks you first. The answers go into atlas's configuration in one change that
+  `atlas settings undo` reverts. `atlas settings orchestrate` asks again at any time, and `--yes` with flags
+  or `--no` answers without a terminal.
+- **Context limits per agent kind.** Each kind has its own handoff point and hard limit, scaled to the context
+  window, with `enforced`, `advisory` or `off` modes. A SendMessage to an agent past its hard limit is refused,
+  and a finished agent that passed its handoff point is followed by a fresh one.
+
+### Upgrade notes
+
+- In orchestrated mode the default context limits are 285,000 (handoff point) and 450,000 (hard limit) on a 1M
+  window, scaled to the window, per agent kind; a configuration that sets `cap.warn_tokens` or
+  `cap.block_tokens` keeps its values for every kind without its own. With orchestrated mode off (the default)
+  nothing changes from v0.2: the cap is `cap.warn_tokens` and `cap.block_tokens` (450,000 and 500,000),
+  enforced, for every agent, and a SendMessage is never gated.
+- `journal_status` no longer counts a retired question as open, and the checkpoint card counts a question
+  answered from another lane as closed: both now share the resume card's open-question test, and so does
+  `recall lane=X`.
+- One title rule for every record: a title is at most 120 characters, cut at a sentence or clause end. A first
+  line past that (a journal entry, a handoff, a decision, `atlas queue plan --title`) stays whole at the top of
+  the body, so nothing is lost; before, journal and handoff titles were cut at 200 characters mid-word and other
+  titles lost their tail. A memory's or a rule's own `title` (or a memory's `summary`, past 200) is refused
+  rather than cut. `journal` with `amend: KEY` now also amends a `review` entry, and a queued launch's
+  `brief_sha` follows its amended brief.
+- The config lock is atlas against atlas: Claude Code writes `settings.json` itself and takes no lock, so a change
+  it makes in the same moment as an atlas one can still lose. The offer state file has the same read and write
+  with no lock; its worst case is a question asked twice.
+- The shell deny-list check catches named files only, since a shell command can hide a path (`F=.e; cat ${F}nv`, a
+  link reached after `cd`). It over-matches on purpose: `grep credentials src` gets no handle, at the cost of one digest.
+  Handles stored before this release stay until they expire, up to 7 days; nothing purges them.
+- The README's lookup figure, 2.2x (288 tokens per atlas answer against 624 per grep-and-read episode, medians), is
+  the v0.1.0 measurement on the maintainer's transcripts. The measured ratio that `atlas --token-report` prints is
+  a different measure: your own store's answers against a baseline that `cargo xtask calibrate-baseline` takes from
+  your own transcripts. Its lookup rules changed in this release (stricter about what counts as a lookup, with
+  `--project`, `--skip` and `--audit`), so a baseline saved before gives a different ratio until it is taken again.
+  No figure for it is published here.
+
+### Features
+
+- **A resume card for a new or cleared session.** SessionStart with `source: startup` or `clear` injects where
+  the work stands, as keys, in at most 1,160 bytes (612 tokens on the test's card full of keys, at 1,119 bytes, by a
+  public vocabulary times a fitted factor, not real tokens): the live lanes (each with its open questions and newest
+  handoff), their open questions for you, after a `/clear` the agents still running, the work queue's head and
+  the batch that can start now, handoffs from the last seven days, and the previous session's goal when it was
+  not met, never cut: a goal too long for the card is named by where it is in the transcript. Claude then asks
+  you, as one multiple-choice question, whether to resume, change the plan, or do something more pressing
+  first. An empty store gives no card; `memory.resume_card: false` turns it off.
+- **A queue for refused launches.** A launch the agent cap refuses is filed as a `queued` journal entry in its
+  lane, with its brief, and the deny reason names the key. When an agent finishes, the notification lists what
+  waits; launching it again with the same description and brief takes it off the queue. `atlas queue` lists the
+  queue, `atlas queue show KEY` prints one, and `atlas queue drop KEY` removes one.
+- **Work queue lanes.** Every queued item has a lane, a priority (`urgent`, `normal`, `background`, with aging
+  so nothing starves) and the shared resources it uses (`gpu`, `compile`, a worktree, any name you configure),
+  each read from `Lane:`, `Priority:` and `Uses:` lines in the brief or inferred from it; a declaration always
+  wins. Items on the same lane run one at a time unless declared `Uses: read-only`, and a resource serializes
+  across lanes. When an agent finishes, atlas proposes the batch that can start together and says why the rest
+  wait; `atlas queue next` shows it on demand and `atlas queue add` files planned work. A launch that conflicts
+  with running work is queued when both sides declared the conflict, and warned about when atlas inferred it.
+  Planned work waits on other items (`after: KEY`, met when KEY is marked done) and leaves the queue when a
+  launch names it with `Queue: KEY`. An agent files planned work over MCP with the `journal` tool's `queued`
+  entry, checked as `atlas queue plan` checks it.
+- **Required reviews before merge.** With `orchestrate.reviews` naming roles (`["simplicity", "cost"]`), a
+  `gh pr merge` waits until each role has a passing review of the PR's current head, read from `gh pr view`.
+  Reviews are `review` journal entries (`role:`, `pr:`, `head:`, `verdict:`, `report:`); notes with `review:`
+  meta count too. A request for changes blocks its role until a newer head passes. Enforced mode denies the
+  merge, advisory (the default) warns, and no roles leaves the gate off.
+- **Digest-form reports.** The orchestrate skill asks agents to hand back the outcome first, then the numbers,
+  the open questions under one heading and the risks, with longer notes filed in the journal and cited by key.
+  In orchestrated mode a report over 14,000 bytes is sent back once, at the agent's stop: atlas files it whole
+  in the lane journal and asks for the digest form, with its own draft attached.
+- **Experimental, off by default: chain keys on the compaction card.** With `compact.enabled`, the card names
+  every part of the segment by a key one `recall` resolves from the transcript. `memory.transcripts` also lets
+  `recall` resolve them. Not yet scored live. `atlas --compact-report` no longer lists a `tools:` line, so its
+  card size and coverage lines change and do not describe the live card.
+- **Experimental, off by default: memory rules.** Nothing asks about it. `atlas settings set memory-rules true`
+  has atlas find a project's Claude Code memory folder and root `CLAUDE.md`, and a query that hits a replaced
+  ruling answers with the one that holds. `atlas settings off memory-rules` goes back to unset. On a test set, not
+  a promise: the ruling that holds came first more often (hook 19 to 33 of 46, query 23 to 43), but the 1.5x token
+  bar was missed (hook 1.027x, query 0.921x, so a query costs more), `memory-eval` strict pass fell from 98 to 82,
+  tokens per question rose 13%, and the labels are circular, 21 of 46 not reviewed by the maintainer. The known
+  limits are on the wiki's Memory and rule files page.
+- **Experimental, off by default: idea capture.** With `memory.ideas.enabled`, a person's standalone statements
+  that propose, decide or constrain something are filed as pending `idea` journal entries in their exact words,
+  redacted, so an idea said in passing is not lost; `atlas ideas` lists, files, dismisses and converts them. The
+  detector is a linear score with no model; its weights come from one author's labelled prompts and are untested on
+  anyone else. Asking you about an unsure capture is built but unproven in a live session, so
+  `memory.ideas.asks_per_day` defaults to 0 and nothing asks. Off, it reads and writes nothing.
+- **Compact instructions are no longer offered.** Neither SessionStart nor `atlas settings offer` raises the block,
+  which costs about 380 tokens per session and agent and in `CLAUDE.md` alone showed no reliable effect on the
+  summary. `atlas settings compact-md` is the only way in, and its prompt now says what was measured.
+- **Experimental, off by default: the PreCompact hook returns the Compact instructions.** With `compact.enabled`,
+  a compaction's summarizer gets the instructions (336 tokens) without a `CLAUDE.md` block or a `/compact` argument.
+  The route steered the summary in one manual run each by command hook, stub and the real atlas tool on Claude Code
+  2.1.318, with no plain control on that version; the automatic trigger is untested. On a manual `/compact` the text
+  also lands in the conversation as `local-command-stdout`, about 340 tokens on each later request until the next
+  compaction; the automatic path is unread. A project with the block gets the text twice and should drop it.
+
+### Fixes
+
+- **The agent cap no longer counts a started or finished agent twice.** A launch's pending record now ends at
+  the agent's SubagentStart (or once its meta file is seen, running or finished). Before, with a hook input
+  that carried no `tool_use_id`, every agent counted twice for two minutes ("3 of 2 reviewer slots ... 2
+  launched moments ago" with one reviewer running), and an agent that finished inside two minutes kept its slot.
+- **Reviews wait only for a reviewer slot.** A `Kind: reviewer` launch no longer holds or conflicts on a lane,
+  so both reviews of one PR run together beside the lane's builder. `atlas queue` lists waiting reviews as
+  their own queue.
+- **A fractional queue order is read.** `order: 9.5` read as no order, so it listed bare and after every whole
+  number of its priority, and a proposal ignored it. An order is now an exact decimal, compared digit by digit
+  and printed as written (`#9.5`), and `atlas queue plan --order` and the `journal` tool file one.
+- **`atlas doctor`** checks the atlas hooks in Claude Code's `settings.json` against the plugin's
+  `hooks/hooks.json`: each event with no atlas hook, and any missing or extra input field per event. A session's
+  first prompt says so too.
+- **Concurrent config changes no longer lose a write or fail on the backup.** Every `atlas settings` change,
+  `atlas grammar accept` and `atlas settings on|off update` now holds a lock from before its read through its
+  write, and takes a backup name no other process can hold: two sessions adding a project at once both keep
+  their source, and each change has its own undo. A change waits up to 30 s for another one, saying so once, then
+  stops with an error naming the lock file; a process that dies releases its lock. Questions are asked before the
+  lock, and a question's answer is applied to the file as it is afterwards. `atlas settings undo` refuses when a
+  newer change came after the one it showed.
+- **A second project no longer makes your home folder a project root.** Following "One repository" then "A folder
+  of repositories" gave the first project a root of the home folder, because the starter vault under atlas's
+  configuration folder counted towards it, so no folder under home was ever asked about. A moved setup's root now
+  leaves that folder out, and no root is ever the home folder, a folder holding it, or a drive root: each folder
+  gets its own root instead. `add-project --new` refuses those folders and says what to do. With projects, a folder
+  in no project and holding no repositories is now asked about once, as on a fresh install; before, only folders
+  of repositories were. It still reads `default_project`, which is unchanged. A configuration that already holds
+  such a root is not rewritten: `atlas doctor` names it.
+- **`--memory-check` no longer reports corruption because another session is writing.** It reported `copy:`,
+  `disk:` and `round trip:` problems on about 6 in 10 runs beside two writing sessions, and none once they stopped.
+  Chains, copy and round trip now read one snapshot of the store; a file that differs from its export is taken again
+  under the store's write lock, for up to 6 s, since an export is written just after its commit. A real fault is
+  still reported, by the same prefixes and exit code, while writers run. A real disk mismatch makes the check take
+  those 6 s.
+- **A handoff is no longer refused when two sessions hand off on one lane.** The lane's active handoff is read
+  under the write lock. Before, about 1 handoff in 200 under load failed with `already superseded`, and two on an
+  empty lane could both stay active.
+- **`atlas doctor` says what it checked.** With no `settings.json`, or `{broken` in it, it said the hooks match,
+  and a plugin install always got that answer. No file, no atlas hooks in it, a malformed file and a plugin install
+  now each have their own line, and "match" is only said of real hooks that match. A malformed or unreadable file
+  now exits 1. It also names a project root at or above the home folder, or a project file there, without
+  changing it; that is not a failure.
+- **A large secret read through the shell is not kept as a handle.** The Read tool's path was denied; Bash,
+  PowerShell, `atlas run` and Grep were not, so `cat .env.big` over the threshold sat in plain text under
+  `state/handles` for up to 7 days. Output is no longer kept when the command names a deny-listed file, however it
+  is quoted or chained, or a word in it is a link to one. The command still runs and its output still shows.
+- **The README and wiki name what `atlas settings offer` offers.** They still listed an early compaction point, which
+  is no longer offered; it offers the 1-hour subagent cache and goal check-ins.
+- **The security page says what holds for prompt-shaped notes.** It said note text comes back only as a JSON string;
+  by default it comes back as plain text, as written, and nothing marks it as data. The README's memory evaluation
+  row now says it is from v0.2.0.
+- **Figures with no source are gone.** The README's 236 KB and 87 KB rows, the about -20% lane cost in the settings
+  text and the 48 ms a clause in the wiki had nothing behind them a reader could check. The wiki keeps the first run's
+  figures, marked as one unpublished run.
+- **`--help` writes nothing.** `atlas settings --help` wrote the first-run configuration before reading its arguments,
+  and failed on a malformed `settings.json`; `queue`, `ideas`, `rules` and `ruling` opened a store first, and `rules`
+  and `grammar` had no help. Help on any subcommand now touches nothing. `atlas --help` also lists `ideas` and the
+  queue's `done`, `met` and `plan`.
+- **A Grep of one file no longer reads as no matches.** Over the threshold, a search of a single file prints `12:text`
+  with no path, and its digest said `0 hits in 0 files`, which a model took at its word. The digest now counts those
+  lines and quotes them. Bash `grep` without file names reads as a plain log, with its line count. A file whose name
+  starts with digits (`0001-init.sql:5:x`) is named as a file.
+- **A filtered `recall` finds what matches and says when it cut.** `scope` and `kind` were applied after the search's
+  window, so records elsewhere could use it up: five matching records could read as `no records match`, and a list cut
+  short had no `+more`. The search now reads on until the list is full or the matches run out, and `limit: 0` says when
+  its 8 rows cut anything. A filter also keeps all the query's words, up to 48: over 12 known words, the search kept the
+  rarest in the whole store, and a scope's only record could hold just the others and read as `no records match`. Past
+  48 the answer says how many went unsearched.
+- **`memory.rules: false` and `true` no longer answer a false "none".** Under `false`, the hidden rules and memories were
+  dropped after the limit, so eight of them at the top read as `no records match` with a journal entry ranked ninth,
+  and the hook injected nothing the same way. Under `true`, a replaced record whose successor is gone held a row of the
+  limit and showed nothing. Both are now decided before the limit. Unset is unchanged.
+- **A word with diacritics is found.** The search folds them and the check for known words did not, so `recall` for
+  `Müller` answered `no records match` over a record holding it, and the hook passed it over.
+- **The first-session question comes back until it is answered.** It was marked asked when the line was made, and
+  Claude relayed it in about 4 of 9 test sessions, so it was often never asked at all. A new session now asks until
+  you answer, and no is recorded with `atlas settings add-project --no DIR`, `atlas settings orchestrate --no` or
+  `atlas settings offer --no`. The Claude Code settings question is one of these now, at most 60 tokens a session;
+  a yes or a no to it is no answer to the orchestrated question. The "on by default" notice is shown once.
+  Ignoring it means hearing it again at each new session; a resume or a compaction does not repeat it. Folders already
+  marked as asked stay that way. A session with no user (`claude -p`, the SDK) asks nothing, so its stdout stays yours,
+  and spends no question: atlas reads `CLAUDE_CODE_SESSION_ATTENDED`, else `CLAUDE_CODE_ENTRYPOINT`, which Claude Code
+  sets for its hooks but does not document; with neither it asks. A state file that cannot be written means no
+  question at all, rather than one that returns forever with a `--no` that fails. A yes counts once it lands: not
+  when the write failed, at a terminal or with `--yes`, and not when the setting needs a newer Claude Code (the command
+  then exits 1, and the question stays at each new session, at a terminal's answers too, until the upgrade or `--no`). `offer --yes` names what to turn
+  on: bare it is refused, and an atlas switch named there answers nothing.
+- **`atlas doctor` names Claude Code's 15-minute wait.** After one failed start of the server, Claude Code does not
+  start it again for 15 minutes, even with the cause fixed unless the fix changed its command, which reads as the fix not working. atlas cannot change
+  that; the wiki now says so, and the doctor names the wait when it can see it.
+- **Compaction's summary is not filed as an agent's report.** Its summariser fires SubagentStop, so in orchestrated mode
+  a long summary hit the report backstop, was blocked, and was filed whole as a report. It is now left alone.
+- **Test digests name more failures.** A `cargo test --nocapture` failure with no `---- NAME stdout ----` block is
+  named from libtest's closing list with its panic; nextest's current `stdout` and `stderr` blocks are a failure's
+  block, and `error: test run failed` is not a build error; a check log's summary keeps the line naming its detail
+  log; a `NAME: FAILED` verdict is kept like `NAME: FAIL`; and overlapping `--failures` items are shown once.
+- **Compaction hooks no longer read the whole transcript.** The checkpoint and PreCompact hooks read only the part
+  since the newest compaction, so their time no longer grows with the session's history. A checkpoint's turn refs
+  now carry a byte offset (`turn:...:b<offset>@hash`); line refs written before still resolve.
+- **`recall {query}` says what it left out.** Records scoring near zero were dropped with no word, which in a small
+  store can be real matches (4 records held the words; 2 came back), and the limit cut silently too. The answer now ends
+  with `+N more scoring near zero` and `+more (limit=L)`.
+
+### Known limits
+
+- `--memory-export` run beside servers that are writing can make a write answer `export refused: ... present and
+  never exported by atlas` for a while; the write itself is stored, and a later export clears it. Seen only under
+  heavy load with exports and side commands running.
+- Under heavy writes `--memory-snapshot` may print `snapshot skipped ... run it again`. Nothing is lost; run it again
+  when the store is quieter.
+- The first `add-project` diff can mark unchanged template lines as changed. The change itself is what it says.
+
 ## v0.2.1
 
 A patch release with two fixes for the hooks.

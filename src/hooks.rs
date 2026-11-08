@@ -43,6 +43,8 @@ pub struct HookEvent {
     pub prompt: String,
     /// The tool (PreToolUse).
     pub tool_name: String,
+    /// The tool call's id (PreToolUse, PostToolUse).
+    pub tool_use_id: String,
     /// The tool input's `prompt` (the brief, when the tool spawns an agent).
     pub tool_prompt: String,
     /// What started a compaction.
@@ -59,6 +61,24 @@ pub struct HookEvent {
     pub tool_input: Value,
     /// The whole tool result (PostToolUse), `Null` when absent.
     pub tool_response: Value,
+    /// The agent's last message (SubagentStop `last_assistant_message`).
+    pub last_message: String,
+    /// Whether a stop hook already blocked this stop (SubagentStop).
+    pub stop_hook_active: bool,
+    /// Stop's `background_tasks`, `Null` when the input lacks it.
+    pub background_tasks: Value,
+    /// Stop's `session_crons`, `Null` when the input lacks it.
+    pub session_crons: Value,
+}
+
+/// An array field that arrives as an array (a command hook) or as its JSON text
+/// (an `mcp_tool` hook). Anything else is `Null`.
+fn array_field(v: &Value, k: &str) -> Value {
+    match v.get(k) {
+        Some(a @ Value::Array(_)) => a.clone(),
+        Some(Value::String(t)) if t.starts_with('[') => crate::json::parse(t).ok().filter(|p| p.as_array().is_some()).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
 }
 
 /// An object field that arrives either as an object (a command hook's
@@ -95,6 +115,7 @@ impl HookEvent {
             transcript_path: s("transcript_path"),
             prompt: s("prompt"),
             tool_name: s("tool_name"),
+            tool_use_id: s("tool_use_id"),
             tool_prompt,
             trigger: s("trigger"),
             source: s("source"),
@@ -102,6 +123,14 @@ impl HookEvent {
             cwd: s("cwd"),
             tool_input: object_field(v, "tool_input"),
             tool_response: object_field(v, "tool_response"),
+            last_message: s("last_assistant_message"),
+            background_tasks: array_field(v, "background_tasks"),
+            session_crons: array_field(v, "session_crons"),
+            stop_hook_active: match v.get("stop_hook_active") {
+                Some(Value::Bool(b)) => *b,
+                Some(Value::String(t)) => t == "true",
+                _ => false,
+            },
         }
     }
 }
@@ -120,16 +149,23 @@ pub struct HookAnswer {
     pub updated_output: Option<Value>,
     /// Block the event, with this reason (PreCompact: `decision: block`).
     pub block: Option<String>,
+    /// Instructions for the compaction summary (PreCompact). Claude Code adds
+    /// a PreCompact hook's plain reply to the summarizer's instructions.
+    pub instructions: &'static str,
 }
 
 impl HookAnswer {
-    /// The hook JSON Claude Code acts on, or an empty string for "nothing"
-    /// (plain text is not injected, so empty is a no-op).
+    /// The reply Claude Code acts on: the hook JSON, a PreCompact's plain
+    /// instructions, or an empty string for "nothing" (outside PreCompact plain
+    /// text is not injected, so empty is a no-op).
     pub fn to_json(&self, event: &str) -> String {
         if let Some(r) = &self.block {
             return crate::json::object(r.len() + 48, |w| {
                 w.field("decision", "block").field("reason", r);
             });
+        }
+        if !self.instructions.is_empty() {
+            return self.instructions.to_string();
         }
         if self.deny.is_none() && self.context.is_empty() && self.updated_input.is_none() && self.updated_output.is_none() {
             return String::new();
@@ -245,6 +281,11 @@ struct AgentRun {
     wrote: Vec<String>,
 }
 
+/// A tool that hands a subagent's report back to its caller.
+fn is_handback_tool(name: &str) -> bool {
+    name == "SubagentHandback" || name.ends_with("__SubagentHandback")
+}
+
 /// The atlas tools that write to a lane journal.
 fn is_journal_tool(name: &str) -> bool {
     is_handoff_tool(name) || name == "journal" || name.ends_with("__journal")
@@ -266,8 +307,13 @@ pub fn is_interim(notification: &str) -> bool {
 /// brief mentions. A lane named after "lane" may be new (no entries yet)
 /// when it reads as an id: two or more characters, no lowercase letters.
 pub fn brief_lane(brief: &str, known: &[String]) -> Option<String> {
+    brief_lane_lower(brief, &brief.to_ascii_lowercase(), known)
+}
+
+/// [`brief_lane`] given the brief's ASCII-lowercased copy (`lower`), for a
+/// caller that already made one.
+pub fn brief_lane_lower(brief: &str, lower: &str, known: &[String]) -> Option<String> {
     const SEP: [char; 7] = [' ', '\t', ':', '`', '=', '*', '"'];
-    let lower = brief.to_ascii_lowercase();
     let b = lower.as_bytes();
     let mut strong: Vec<String> = Vec::new();
     let mut named: Vec<String> = Vec::new();
@@ -477,6 +523,8 @@ pub struct Hooks {
     pending_recall: HashSet<String>,
     /// Each subagent's run: its lane, start and the lanes it wrote under.
     agent_lane: HashMap<String, AgentRun>,
+    /// Agents whose long report was sent back once (Q-SD3).
+    report_sent_back: HashSet<String>,
     warned: HashMap<PathBuf, u64>,
     usage_cache: HashMap<PathBuf, (u64, Option<(String, u64)>)>,
     log: Option<mpsc::Sender<LogRow>>,
@@ -484,8 +532,11 @@ pub struct Hooks {
     /// before a command hook's process exits.
     log_thread: Option<std::thread::JoinHandle<()>>,
     router: crate::hook_rewrite::Router,
-    /// Where the one-time settings offer reads and records its state.
+    /// Where the settings offer reads and records its state.
     offer: Option<crate::claude_settings::Paths>,
+    /// The session has no user, so SessionStart asks nothing and spends no
+    /// question (see [`crate::claude_settings::unattended_session`]).
+    unattended: bool,
     /// The store's record count, at the stamp it was read.
     records: Option<((i64, u64), i64)>,
     /// Files an Edit or Write changed, re-indexed by [Hooks::after].
@@ -510,11 +561,24 @@ pub struct Hooks {
     cwd: String,
     /// Lookups per session, for post-compaction misses.
     misses: crate::compact::MissTracker,
+    /// Sessions already told about hook drift (at their first prompt).
+    drift_told: HashSet<String>,
     /// The records the last answer injected, for the memory eval.
     last: Vec<Injected>,
     /// The vaults and sources, by name, that lines refs resolve against.
     roots: Vec<crate::compact::RefRoot>,
+    /// Orchestrator mode: the agents counted against the caps.
+    orch: crate::orchestrate::Agents,
+    /// Reads a PR's number and head for the merge gate (`gh pr view`).
+    pr_head: PrHead,
+    /// Idea capture (`memory.ideas`); `None` when it is off, so an off store
+    /// reads nothing, writes nothing and adds nothing to context.
+    ideas: Option<crate::ideas::Live>,
 }
+
+/// How the merge gate reads a PR's number and head sha, given the merge
+/// and the working folder.
+pub type PrHead = fn(&crate::reviews::Merge, &str) -> crate::reviews::HeadResult;
 
 /// The repository a record is about, lowercased: its `repo:` frontmatter,
 /// else the `repo` the tree configuration maps its `branch:` to. `None`
@@ -534,6 +598,14 @@ pub fn repo_tag(meta: &str, tree: Option<&crate::memory::tree::TreeSpec>) -> Opt
 pub type StoreOpener = Box<dyn Fn() -> Result<crate::store::Store> + Send>;
 
 impl Hooks {
+    /// True once a background embedder has been started (for the rescore
+    /// test that the pre-embed leaves it nothing to do; xtask cannot see
+    /// `cfg(test)` items, so this is public and hidden).
+    #[doc(hidden)]
+    pub fn embedding_started(&self) -> bool {
+        self.sem.as_ref().is_some_and(|s| s.embedding.is_some())
+    }
+
     /// Opens the hook state: its own store connection, and a token-log
     /// thread writing to the index database.
     ///
@@ -545,6 +617,7 @@ impl Hooks {
         let (log, log_thread) = start_log(&settings).unzip();
         let router = crate::hook_rewrite::Router::new(&settings);
         let offer = crate::claude_settings::Paths::detect_in(None, &settings.index_db, settings.user_state.as_deref());
+        let ideas = crate::ideas::Live::open(&settings.ideas, &settings.store);
         Ok(Hooks {
             sem: None,
             model_tried: false,
@@ -555,6 +628,7 @@ impl Hooks {
             spent: HashMap::new(),
             pending_recall: HashSet::new(),
             agent_lane: HashMap::new(),
+            report_sent_back: HashSet::new(),
             warned: HashMap::new(),
             usage_cache: HashMap::new(),
             log,
@@ -568,14 +642,32 @@ impl Hooks {
             index: None,
             project_roots: None,
             offer_ctx: None,
+            unattended: false,
             tracker: crate::project::Tracker::default(),
             session: String::new(),
             // Until an event names one: the folder the server runs in.
             cwd: std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(),
             misses: crate::compact::MissTracker::default(),
+            drift_told: HashSet::new(),
             last: Vec::new(),
             roots: Vec::new(),
+            orch: crate::orchestrate::Agents::default(),
+            pr_head: crate::reviews::gh_head,
+            ideas,
         })
+    }
+
+    /// Replaces how the merge gate reads a PR's head (tests; the default asks
+    /// `gh pr view`).
+    pub fn set_pr_head(&mut self, f: PrHead) {
+        self.pr_head = f;
+    }
+
+    /// Marks this state as a command hook's (one process per event): an
+    /// unfinished agent is then not excluded for being older than the
+    /// process, only for being stale.
+    pub fn set_command_hook(&mut self) {
+        self.orch.set_started(None);
     }
 
     /// Gives the hook state the index store's opener, so an edited note or
@@ -591,12 +683,21 @@ impl Hooks {
     /// vault or source is rescanned. Fails open: an error is logged as a miss
     /// and nothing else happens; the edit itself was never held.
     pub fn after(&mut self) {
+        self.file_ideas();
         self.index_transcripts();
         for path in std::mem::take(&mut self.edited) {
             if let Err(e) = self.reindex(&path) {
                 eprintln!("atlas reindex {path}: {e}");
                 self.router.miss_text(&format!("reindex {path}"), &e);
             }
+        }
+    }
+
+    /// Files the captures this event spooled; a command hook calls it after
+    /// printing.
+    pub fn file_ideas(&mut self) {
+        if let Some(i) = self.ideas.as_mut() {
+            i.after(&mut self.store);
         }
     }
 
@@ -654,6 +755,13 @@ impl Hooks {
         self.roots = roots;
     }
 
+    /// Says the session has no user to answer SessionStart's questions: nothing
+    /// is asked, and none is spent. `atlas --hook` reads it from the session; the
+    /// MCP `hook` tool sets it always, since a server cannot tell.
+    pub fn set_unattended(&mut self, unattended: bool) {
+        self.unattended = unattended;
+    }
+
     /// Turns on the project offer of a project-scoped configuration.
     pub fn set_offer_ctx(&mut self, ctx: Option<crate::claude_settings::OfferCtx>) {
         self.offer_ctx = ctx;
@@ -666,7 +774,7 @@ impl Hooks {
         self.tracker.active(g, session, cwd)
     }
 
-    /// Points the one-time settings offer at other files (tests use a
+    /// Points the settings offer at other files (tests use a
     /// scratch home), or turns it off with `None`.
     pub fn set_offer_paths(&mut self, p: Option<crate::claude_settings::Paths>) {
         self.offer = p;
@@ -760,12 +868,33 @@ impl Hooks {
                 if ev.prompt.starts_with("<task-notification>") {
                     a.context = self.notification(&ev.prompt, &ev.transcript_path)?;
                 } else {
-                    let (t, k) = self.recall(&ev.session_id, &ev.prompt)?;
+                    // After recall, so it cannot recall itself, and whatever
+                    // recall answered: an error or a spent budget files all the same.
+                    let recalled = self.recall(&ev.session_id, &ev.prompt);
+                    if let Some(i) = self.ideas.as_mut() {
+                        i.on_prompt(&mut self.store, &ev.session_id, &ev.prompt, &ev.transcript_path);
+                    }
+                    let (t, k) = recalled?;
                     a.context = t;
                     keys = k;
                 }
+                // A session's first prompt: live atlas hooks that drifted from
+                // hooks/hooks.json (a hook every setup has, unlike SessionStart).
+                if self.drift_told.insert(ev.session_id.clone()) {
+                    let (ideas_on, asks_on) = (self.ideas.is_some(), self.ideas.as_ref().is_some_and(crate::ideas::Live::asks));
+                    if let Some(line) = self.offer.as_ref().and_then(|p| crate::claude_settings::hook_drift_line(p, ideas_on, asks_on)) {
+                        if !a.context.is_empty() {
+                            a.context.push('\n');
+                        }
+                        a.context.push_str(&line);
+                    }
+                }
             }
             "SubagentStart" => {
+                // The launch's pending record ends here: the agent is running.
+                if self.settings.orchestrate.enabled && !ev.transcript_path.is_empty() {
+                    self.orch.started(&crate::orchestrate::subagents_dir(&ev.transcript_path), &ev.agent_id);
+                }
                 self.agent_lane.entry(ev.agent_id.clone()).or_insert_with(|| AgentRun { start: crate::memory::now(), ..AgentRun::default() });
                 let brief = self.briefs.get_mut(&ev.session_id).and_then(VecDeque::pop_front);
                 match brief {
@@ -795,7 +924,28 @@ impl Hooks {
                 }
                 if sub || self.settings.cap.main_session {
                     let path = if sub { subagent_transcript(&ev.transcript_path, &ev.agent_id) } else { PathBuf::from(&ev.transcript_path) };
-                    self.cap(ev, &path, &mut a)?;
+                    self.cap(ev, &path, &mut a);
+                }
+                if a.deny.is_none() && (ev.tool_name == "Agent" || ev.tool_name == "Task") {
+                    let brief = if ev.tool_prompt.is_empty() { ev.tool_input.get("prompt").and_then(Value::as_str).unwrap_or("") } else { &ev.tool_prompt };
+                    let launch = crate::orchestrate::Launch { transcript: &ev.transcript_path, tool_use_id: &ev.tool_use_id, input: &ev.tool_input, brief };
+                    a.deny = self.orch.admit(&self.settings.orchestrate, &launch, std::time::SystemTime::now(), std::time::Instant::now());
+                    let admitted = a.deny.is_none();
+                    self.queue_launch(ev, brief, &mut a);
+                    if admitted && a.deny.is_some() {
+                        self.orch.release_last();
+                    }
+                }
+                if a.deny.is_none() && ev.tool_name == "SendMessage" {
+                    self.resume_gate(ev, &mut a);
+                }
+                if a.deny.is_none() && matches!(ev.tool_name.as_str(), "Bash" | "PowerShell") {
+                    self.review_gate(ev, &mut a);
+                }
+                // A report handed back through a tool is the tool's input.
+                if a.deny.is_none() && sub && is_handback_tool(&ev.tool_name) {
+                    let report = ev.tool_input.get("message").and_then(Value::as_str).unwrap_or("");
+                    a.deny = self.report_backstop(&ev.agent_id, report, false);
                 }
                 if sub && is_journal_tool(&ev.tool_name) {
                     // The lane the agent itself writes under, when the hook
@@ -834,6 +984,25 @@ impl Hooks {
                     }
                 }
             }
+            // The turn is over: the one moment a question interrupts nothing.
+            "Stop" if ev.agent_id.is_empty() => {
+                if let Some(i) = self.ideas.as_mut() {
+                    // Both arrays present and empty: an input without them says nothing.
+                    let none = |v: &Value| v.as_array().is_some_and(Vec::is_empty);
+                    let idle = none(&ev.background_tasks) && none(&ev.session_crons);
+                    a.block = i.on_stop(&mut self.store, &ev.session_id, ev.stop_hook_active, idle, &ev.transcript_path);
+                }
+            }
+            // Compaction's summariser fires this too, with an agent id and no agent
+            // type: it is no agent's report, so it is neither filed nor sent back.
+            "SubagentStop" if !ev.agent_id.is_empty() && !ev.agent_type.is_empty() => {
+                a.block = self.report_backstop(&ev.agent_id, &ev.last_message, ev.stop_hook_active);
+            }
+            "PostToolUse" if ev.tool_name == "AskUserQuestion" => {
+                if let (Some(i), true) = (self.ideas.as_mut(), ev.agent_id.is_empty()) {
+                    i.on_ask(&mut self.store, &ev.session_id, &ev.tool_input, &ev.tool_response);
+                }
+            }
             "PostToolUse" => {
                 // R7: a file an edit changed is re-indexed once the answer is out.
                 if matches!(ev.tool_name.as_str(), "Edit" | "Write" | "MultiEdit") {
@@ -860,20 +1029,39 @@ impl Hooks {
                     }
                 }
             }
-            // Nothing, except once: the settings offer (at most 60 tokens).
+            // Nothing, except the first-session questions, each until answered:
+            // the settings offer among them (at most 60 tokens).
             "SessionStart" => {
-                if let Some(line) = self.offer.as_ref().and_then(crate::claude_settings::session_start_line) {
+                // A session with no user gets no question, and none is spent: `-p`
+                // would print the question as its output. The questions stay until
+                // answered, so they are put once a session: a resume or a
+                // compaction is the same session.
+                let asks = !self.unattended && !matches!(ev.source.as_str(), "resume" | "compact");
+                if let Some(line) = self.offer.as_ref().filter(|_| asks).and_then(crate::claude_settings::session_start_line) {
                     a.context = line;
                 }
-                // Once per folder: whether to add this project as a source
-                // (or, with projects, its repositories as a project).
+                // Per folder: whether to add this project as a source (or,
+                // with projects, its repositories as a project).
                 let mut lines: Vec<String> = Vec::new();
+                // Per user: whether to work in orchestrated mode.
+                lines.extend(self.offer.as_ref().filter(|_| asks).and_then(crate::claude_settings::orchestrate_line));
                 match (self.offer.as_ref(), self.offer_ctx.as_ref()) {
                     (Some(p), Some(ctx)) if ctx.scoped => {
-                        lines.extend(crate::claude_settings::repos_line(p, Path::new(&ev.cwd), ctx));
-                        lines.extend(crate::claude_settings::unmapped_line(p, ctx));
+                        let cwd = Path::new(&ev.cwd);
+                        if asks {
+                            lines.extend(crate::claude_settings::repos_line(p, cwd, ctx));
+                            // A folder in no project and holding no repositories
+                            // gets the question a fresh install's folder gets.
+                            if !crate::claude_settings::folder_of_repos(cwd) && !crate::project::is_repo(cwd) && crate::project::find_project_file(cwd).is_none() {
+                                let roots = self.project_roots.as_deref().unwrap_or(&ctx.known);
+                                lines.extend(crate::claude_settings::project_line(p, cwd, roots));
+                            }
+                            // A notice, marked when shown: not spent on a session
+                            // with no user, or on a resume.
+                            lines.extend(crate::claude_settings::unmapped_line(p, ctx));
+                        }
                     }
-                    (Some(p), _) => {
+                    (Some(p), _) if asks => {
                         if let Some(roots) = self.project_roots.as_ref() {
                             // A folder of repositories is offered as a new
                             // project (add-project --new moves the setup into
@@ -889,14 +1077,39 @@ impl Hooks {
                     }
                     _ => {}
                 }
-                // Once per folder: the Compact instructions for its CLAUDE.md
-                // (experimental compaction only).
-                if let Some(p) = self.offer.as_ref().filter(|_| self.settings.compact.enabled) {
-                    lines.extend(crate::claude_settings::compact_md_line(p, Path::new(&ev.cwd)));
-                }
                 for line in lines {
                     if !a.context.is_empty() {
                         a.context.push(' ');
+                    }
+                    a.context.push_str(&line);
+                }
+                // A new or cleared session: where the work stands
+                // (`memory.resume_card`). Compaction has its own card. The
+                // card is advisory: a store error loses it, not the lines
+                // above.
+                let fresh = ev.source == "startup" || ev.source == "clear";
+                let mut ideas_line = if fresh { self.ideas.as_ref().and_then(|i| i.resume_line(&self.store)) } else { None };
+                if fresh && self.settings.resume_card {
+                    match crate::resume::card_with(&self.store, &self.settings.orchestrate, &ev.transcript_path, &crate::memory::now(), ev.source == "clear", ideas_line.as_deref()) {
+                        Ok(Some(card)) => {
+                            // A full card may have cut it: then it stays a line of its own.
+                            if ideas_line.as_deref().is_some_and(|l| card.contains(l)) {
+                                ideas_line = None;
+                            }
+                            if !a.context.is_empty() {
+                                a.context.push('\n');
+                            }
+                            a.context.push_str(&card);
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("atlas resume card: {e}"),
+                    }
+                }
+                // No card to carry it (the card is off or has nothing else):
+                // the user with no goal and no agents still sees the count.
+                if let Some(line) = ideas_line {
+                    if !a.context.is_empty() {
+                        a.context.push('\n');
                     }
                     a.context.push_str(&line);
                 }
@@ -936,6 +1149,14 @@ impl Hooks {
                 // session it was forked from.
                 let (t, from) = crate::checkpoint::tail_settled(Path::new(&ev.transcript_path), &ev.session_id, crate::checkpoint::SETTLE_WAIT);
                 if self.settings.compact.defer {
+                    // The window guess reads the whole session's largest
+                    // context, which the tail alone does not hold.
+                    let mut t = t.clone();
+                    let read = match &from {
+                        crate::checkpoint::TailFrom::Parent(p) => p.clone(),
+                        _ => PathBuf::from(&ev.transcript_path),
+                    };
+                    t.max_ctx = t.max_ctx.max(crate::checkpoint::history_max_context(&read));
                     let w = crate::checkpoint::window(self.settings.compact.window, &t);
                     if let Some(reason) = crate::checkpoint::defer(&ev.trigger, &t, w) {
                         if let Some(l) = &self.log {
@@ -953,8 +1174,22 @@ impl Hooks {
                 };
                 let lane = format!("session:{}", ev.session_id);
                 let scope = crate::checkpoint::Lanes::for_project(self.settings.graph.as_deref());
-                let state = crate::checkpoint::state(&self.store, &ev.session_id, &t.start, "", scope)?;
+                // Bounded by the transcript's own newest record: never a record the
+                // session could not have seen.
+                let state = crate::checkpoint::state(&self.store, &ev.session_id, &t.start, &t.end, scope)?;
                 let mut body = crate::checkpoint::body(&state, &t, self.settings.bytes_for(self.settings.compact.card_tokens));
+                // The chain card: every part of the segment by a group key,
+                // then the last links (its own cap, outside the body's).
+                let read = match &from {
+                    crate::checkpoint::TailFrom::Parent(p) => p.clone(),
+                    _ => PathBuf::from(&ev.transcript_path),
+                };
+                if let Some(c) = crate::chain::card(&read) {
+                    body.push_str(&c);
+                    // Only with a card: the text tells the summarizer to leave
+                    // out what the card lists. A later error answers nothing.
+                    a.instructions = crate::claude_settings::COMPACT_INSTRUCTIONS;
+                }
                 // Never a silent 0-context card: say what is missing.
                 if matches!(from, crate::checkpoint::TailFrom::Unread) {
                     body.push_str(crate::checkpoint::UNREAD_LINE);
@@ -987,7 +1222,7 @@ impl Hooks {
             _ => {}
         }
         self.last = keys.clone();
-        if matches!(ev.event.as_str(), "UserPromptSubmit" | "SubagentStart") || !a.context.is_empty() || a.deny.is_some() || a.updated_input.is_some() || a.updated_output.is_some() {
+        if matches!(ev.event.as_str(), "UserPromptSubmit" | "SubagentStart") || !a.context.is_empty() || !a.instructions.is_empty() || a.deny.is_some() || a.updated_input.is_some() || a.updated_output.is_some() || (ev.event == "Stop" && a.block.is_some()) {
             let returned = a.to_json(&ev.event).len();
             if let Some(l) = &self.log {
                 let brief = (ev.event == "SubagentStart").then(|| (ev.session_id.clone(), ev.agent_id.clone()));
@@ -1100,7 +1335,7 @@ impl Hooks {
         let records = match self.records {
             Some((s, n)) if s == stamp => n,
             _ => {
-                let n: i64 = self.store.conn().query_row("SELECT COUNT(*) FROM records_fts", [], |x| x.get(0))?;
+                let n: i64 = self.store.conn().query_row("SELECT COUNT(*) FROM records_fts_docsize", [], |x| x.get(0))?;
                 self.records = Some((stamp, n));
                 n
             }
@@ -1119,7 +1354,7 @@ impl Hooks {
         // below it a record is not injected at all.
         passed.retain(|c| c.cos.is_none_or(|x| x >= r.inject_floor));
         if let Some(best) = passed.iter().filter_map(|c| c.cos).reduce(f32::max) {
-            passed.retain(|c| c.cos.is_none_or(|x| x >= best - r.cos_margin));
+            passed.retain(|c| c.lifted() || c.cos.is_none_or(|x| x >= best - r.cos_margin));
             passed.sort_by(|a, b| b.cos.unwrap_or(f32::MIN).total_cmp(&a.cos.unwrap_or(f32::MIN)));
         }
         // Records about the active repository, then its neighbours, first:
@@ -1140,11 +1375,17 @@ impl Hooks {
                 passed.sort_by_key(|c| rank(c));
             }
         }
+        // The ruling that holds comes before what matches better.
+        passed.sort_by_key(|c| !c.lifted());
         let sel = r.select;
         // The records sent so far, for the collapse check.
         let mut sent: Vec<(i64, String, String)> = Vec::new();
+        let headlines = r.rules == crate::memory::rules::Mode::Live;
         for cand in passed {
             let whole = pointer(&cand.head);
+            // A ruling's headline stands in for a fragment of it; a tag says
+            // what it replaces or amends.
+            let head_line = (headlines && crate::memory::rules::managed_kind(&cand.head.kind)).then(|| crate::memory::rules::pointer(&cand.head, &cand.tags));
             let (one, how) = if sel.enabled {
                 let rtext = crate::memory::select::record_words_text(&cand.head);
                 let dup = sent.iter().find(|(rid, _, t)| {
@@ -1154,9 +1395,10 @@ impl Hooks {
                 match dup {
                     Some((_, k, _)) => (collapsed(&cand.head.key, k), Sel::Collapsed),
                     None => {
-                        let line = match crate::memory::select::excerpt(&cand.head, text, sel.trim_chars) {
-                            Some(x) => format!("- {}: {}\n", cand.head.key, x.render(&cand.head)),
-                            None => whole.clone(),
+                        let line = match (&head_line, crate::memory::select::excerpt(&cand.head, text, sel.trim_chars)) {
+                            (Some(h), _) => h.clone(),
+                            (None, Some(x)) => format!("- {}: {}\n", cand.head.key, x.render(&cand.head)),
+                            (None, None) => whole.clone(),
                         };
                         let how = if line == whole { Sel::Whole } else { Sel::Trimmed };
                         sent.push((cand.head.rid, cand.head.key.clone(), rtext));
@@ -1164,7 +1406,10 @@ impl Hooks {
                     }
                 }
             } else {
-                (whole.clone(), Sel::Whole)
+                match &head_line {
+                    Some(h) => (h.clone(), Sel::Trimmed),
+                    None => (whole.clone(), Sel::Whole),
+                }
             };
             if POINTER_HEAD.len() + lines.len() + one.len() + 32 > budget {
                 more += 1;
@@ -1203,10 +1448,10 @@ impl Hooks {
         // Turn refs resolve against the transcripts beside this one.
         let dir = Path::new(&ev.transcript_path).parent().map(Path::to_path_buf).unwrap_or_default();
         for r in crate::compact::refs_in(&c.summary) {
-            let crate::compact::Target::Turn { session8, line } = &r.target else { continue };
+            let crate::compact::Target::Turn { session8, at } = &r.target else { continue };
             let file = std::fs::read_dir(&dir).ok().and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "jsonl") && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(session8.as_str()))));
             check.unchecked = check.unchecked.saturating_sub(1);
-            if file.and_then(|f| crate::transcripts::check_line(&f, *line, &r.hash)) != Some(true) {
+            if file.and_then(|f| crate::transcripts::check(&f, *at, &r.hash)) != Some(true) {
                 check.dangling.push(r.text.clone());
             }
         }
@@ -1247,8 +1492,193 @@ impl Hooks {
     fn notification(&mut self, prompt: &str, transcript: &str) -> Result<String> {
         let id = prompt.split("<task-id>").nth(1).and_then(|r| r.split("</task-id>").next()).unwrap_or("").trim().to_string();
         if id.is_empty() || is_interim(prompt) {
-            return Ok(String::new());
+            // A goal check-in has no task id; an interim stop gets nothing.
+            let checkin = id.is_empty() && prompt.contains("Goal check-in:");
+            return Ok(if checkin { self.ideas_line() } else { String::new() });
         }
+        self.orch.finished(&id, std::time::SystemTime::now());
+        let fresh = self.fresh_line(&id);
+        let rest = self.journal_check(&id, transcript)?;
+        // A slot may have freed: the launches waiting for one.
+        // Scheduling reads declarations only, so no known lanes are needed.
+        let queued = match crate::queue::items(&self.store, &crate::memory::now()) {
+            Ok((heads, items)) if !items.is_empty() => {
+                let running = self.holders(transcript, &[]);
+                let p = crate::queue::propose(&self.settings.orchestrate, &items, &running);
+                crate::queue::proposal_line(&items, &heads, &p, 3)
+            }
+            Ok(_) => String::new(),
+            Err(e) => {
+                eprintln!("atlas queue: {e}");
+                String::new()
+            }
+        };
+        Ok(fresh + &rest + &queued + &self.ideas_line())
+    }
+
+    /// The pending ideas' line for a check-in or a task notification, when
+    /// this session has not seen the newest of them.
+    fn ideas_line(&mut self) -> String {
+        let session = self.session.clone();
+        self.ideas.as_mut().and_then(|i| i.line(&mut self.store, &session)).unwrap_or_default()
+    }
+
+    /// The session's running agents as lane and resource holders (none
+    /// without a transcript or with the caps off). The list the cap's
+    /// admission just read is reused.
+    fn holders(&mut self, transcript: &str, known: &[String]) -> Vec<crate::lanes::Holder> {
+        if transcript.is_empty() || !self.settings.orchestrate.enabled {
+            return Vec::new();
+        }
+        let dir = crate::orchestrate::subagents_dir(transcript);
+        let running = match self.orch.take_seen(&dir) {
+            Some(r) => Ok(r),
+            None => self.orch.running(&self.settings.orchestrate, &dir, std::time::SystemTime::now()),
+        };
+        match running {
+            Ok(r) => crate::queue::holders(&r, &dir, known),
+            Err(e) => {
+                eprintln!("atlas queue: {}: {e}", dir.display());
+                Vec::new()
+            }
+        }
+    }
+
+    /// The launch queue around an Agent launch the cap decided on: a denied
+    /// launch is filed (and the reason names its key), an admitted one that
+    /// was waiting leaves the queue. Errors file nothing and change no
+    /// decision.
+    fn queue_launch(&mut self, ev: &HookEvent, brief: &str, a: &mut HookAnswer) {
+        if !self.settings.orchestrate.enabled {
+            return;
+        }
+        let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
+        let description = f("description");
+        let kind = crate::orchestrate::classify(&self.settings.orchestrate, brief, f("subagent_type"), f("isolation"));
+        let known = self.known_lanes();
+        let class = crate::lanes::classify(brief, &known);
+        if a.deny.is_none() {
+            // Q-QL2: a conflict declared on both sides is denied and
+            // queued; one that rests on an inference is let through with a
+            // warning.
+            let running = self.holders(&ev.transcript_path, &known);
+            let c = crate::lanes::conflicts(kind, &class, &running, &self.settings.orchestrate.lanes);
+            let (hard, soft): (Vec<_>, Vec<_>) = c.into_iter().partition(|c| c.declared);
+            if !hard.is_empty() {
+                a.deny = Some(format!(
+                    "atlas queue: this launch conflicts with running work ({}), declared on both sides. Do not retry now; start it when that work finishes.",
+                    hard.iter().map(|c| c.what.as_str()).collect::<Vec<_>>().join("; ")
+                ));
+            } else {
+                let line = match crate::queue::started(&mut self.store, description, brief) {
+                    Ok(crate::queue::Started::NotWaiting(k)) => format!("atlas queue: the brief's `Queue: {k}` names no waiting item (`atlas queue` lists them)."),
+                    Ok(_) => String::new(),
+                    Err(e) => {
+                        eprintln!("atlas queue: {e}");
+                        String::new()
+                    }
+                };
+                if !line.is_empty() {
+                    if !a.context.is_empty() {
+                        a.context.push('\n');
+                    }
+                    a.context.push_str(&line);
+                }
+                if !soft.is_empty() {
+                    if !a.context.is_empty() {
+                        a.context.push('\n');
+                    }
+                    a.context.push_str(&format!(
+                        "atlas queue: this launch may conflict with running work ({}); atlas inferred it, so it was let through. If the conflict is real, stop it and start it when that work finishes; a `Lane:` or `Uses:` line in the brief corrects a wrong inference.",
+                        soft.iter().map(|c| c.what.as_str()).collect::<Vec<_>>().join("; ")
+                    ));
+                }
+                return;
+            }
+        }
+        let meta = class.meta();
+        let launch = crate::queue::Launch { kind, lane: class.lane.as_deref(), description, subagent_type: f("subagent_type"), prompt: brief, session: &ev.session_id, class_meta: &meta };
+        match crate::queue::add(&mut self.store, &launch) {
+            Ok((key, new)) => {
+                if let Some(r) = a.deny.as_mut() {
+                    r.push_str(&format!(
+                        " atlas {} it as {key}: launch it again with the same description and brief once a slot is free, and it leaves the queue (`atlas queue` lists what waits).",
+                        if new { "queued" } else { "has already queued" }
+                    ));
+                }
+            }
+            Err(e) => eprintln!("atlas queue: {e}"),
+        }
+    }
+
+    /// The SubagentStop backstop (Q-SD3): a report over
+    /// [`crate::report::WHOLE_UP_TO`] bytes is sent back once, in orchestrated
+    /// mode. atlas files it whole in the agent's lane and asks for the
+    /// digest form, with its mechanical draft attached. A report within the
+    /// bound, a second stop, or a filing error lets the stop through.
+    fn report_backstop(&mut self, agent_id: &str, report: &str, already_blocked: bool) -> Option<String> {
+        let report = report.trim();
+        if !self.settings.orchestrate.enabled || already_blocked || report.len() <= crate::report::WHOLE_UP_TO || self.report_sent_back.contains(agent_id) {
+            return None;
+        }
+        let lane = match self.lane_of(agent_id) {
+            l if l.starts_with("agent:") => "reports".to_string(),
+            l => l,
+        };
+        let first = report.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        let d = crate::memory::Draft {
+            // The library title rule; the report itself is the body.
+            title: crate::memory::short_title(&format!("full report of agent {agent_id}: {first}")),
+            meta: format!("agent: {agent_id}
+bytes: {}", report.len()),
+            body: report.to_string(),
+            reason: "a report over the digest bound, filed whole by the SubagentStop backstop".into(),
+            author: "hook".into(),
+            client: "atlas-hook".into(),
+            provenance: None,
+            time: None,
+        };
+        let filed = (|| -> Result<String> {
+            let mut w = self.store.writer()?;
+            let key = w.next_key(&format!("journal:{lane}:"), 4)?;
+            w.create(&key, "journal", "note", &lane, &d, None)?;
+            w.commit()?;
+            Ok(key)
+        })();
+        let key = match filed {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("atlas report backstop: {e}");
+                return None;
+            }
+        };
+        self.report_sent_back.insert(agent_id.to_string());
+        let draft = crate::report::digest(report, crate::report::budget(report.len()));
+        Some(format!(
+            "atlas report backstop: this report is {} bytes, over the {}-byte digest bound, and stays in the orchestrator's context for every later turn. atlas filed it whole as {key}. Hand back the digest form instead: the outcome first (PR, branch, merge, verdict), then the numbers, every open question under a `## Questions` heading, and every risk (a denied action, an unverified claim, a failure left open); cite {key} for the rest. Keep every fact the orchestrator acts on. This is asked once. atlas's mechanical draft ({} bytes) follows; correct and shorten it:
+
+{draft}",
+            report.len(),
+            crate::report::WHOLE_UP_TO,
+            draft.len()
+        ))
+    }
+
+    /// The line that follows a finished agent that passed its handoff point:
+    /// start a fresh agent from its handoff (`fresh: auto`) or ask the user
+    /// first (`fresh: ask`). Never resume it.
+    fn fresh_line(&mut self, id: &str) -> String {
+        use crate::orchestrate::Fresh;
+        let Some((lane, kind)) = self.orch.take_passed(id) else { return String::new() };
+        match self.settings.orchestrate.limits(kind).fresh {
+            Fresh::Auto => format!("atlas: agent {id} passed its handoff point; do not resume it. Start a FRESH {} agent from its handoff (recall lane={lane}).\n", kind.name()),
+            Fresh::Ask => format!("atlas: agent {id} passed its handoff point; do not resume it. Ask the user before starting a fresh {} agent from its handoff (recall lane={lane}).\n", kind.name()),
+        }
+    }
+
+    /// The no-journal check of a finished agent (see [`Hooks::notification`]).
+    fn journal_check(&mut self, id: &str, transcript: &str) -> Result<String> {
+        let id = id.to_string();
         let own = Some(transcript).filter(|t| !t.is_empty()).map(|t| subagent_transcript(t, &id)).filter(|p| p.is_file());
         let mut run = self.agent_lane.get(&id).cloned().unwrap_or_default();
         if let Some(p) = &own {
@@ -1279,7 +1709,8 @@ impl Hooks {
         Ok(format!("atlas: agent {id} finished with no journal entry for lane {first} since it started; check its report against the journal.\n"))
     }
 
-    fn cap(&mut self, ev: &HookEvent, path: &Path, a: &mut HookAnswer) -> Result<()> {
+    /// The context size of a transcript's last request, cached by file length.
+    fn context_of(&mut self, path: &Path) -> Option<u64> {
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let usage = match self.usage_cache.get(path) {
             Some((l, u)) if *l == len => u.clone(),
@@ -1289,37 +1720,155 @@ impl Hooks {
                 u
             }
         };
-        let Some((_, ctx)) = usage else { return Ok(()) };
-        let c = self.settings.cap.clone();
-        let lane = self.agent_lane.get(&ev.agent_id).and_then(|r| r.wrote.first().cloned().or_else(|| r.lane.clone())).unwrap_or_else(|| format!("agent:{}", ev.agent_id));
-        if ctx >= c.block_tokens {
-            if !passes_cap(&ev.tool_name) {
-                a.deny = Some(format!(
-                    "atlas context cap: this agent's context is {ctx} tokens (cap {}). Every tool is blocked except the atlas `handoff` tool: write your handoff now (lane {lane}); a fresh agent continues from it.",
-                    c.block_tokens
-                ));
-                if self.warned.get(path).copied().unwrap_or(0) < c.block_tokens {
-                    self.warned.insert(path.to_path_buf(), c.block_tokens);
-                    self.cap_entry(&lane, ctx, "blocked")?;
-                }
-            }
-        } else if ctx >= c.warn_tokens {
-            let last = self.warned.get(path).copied().unwrap_or(0);
-            if last == 0 || ctx >= last + c.warn_every {
-                self.warned.insert(path.to_path_buf(), ctx);
-                a.context = format!(
-                    "atlas context cap: this agent's context is {ctx} tokens (warn {}, block {}). Finish the current step, commit, push, and write your handoff with the atlas `handoff` tool (lane {lane}).",
-                    c.warn_tokens, c.block_tokens
-                );
-                if last == 0 {
-                    self.cap_entry(&lane, ctx, "warned")?;
-                }
-            }
-        }
-        Ok(())
+        usage.map(|(_, c)| c)
     }
 
-    fn cap_entry(&mut self, lane: &str, ctx: u64, what: &str) -> Result<()> {
+    /// The lane an agent writes under, else its brief's, else `agent:<id>`.
+    fn lane_of(&self, agent_id: &str) -> String {
+        self.agent_lane.get(agent_id).and_then(|r| r.wrote.first().cloned().or_else(|| r.lane.clone())).unwrap_or_else(|| format!("agent:{agent_id}"))
+    }
+
+    /// The context limit of the calling agent (or the main session): past
+    /// the handoff point it is told to wrap up, past the hard limit every
+    /// tool but the handoff is denied (mode `enforced`). With orchestrated
+    /// mode off this is the plain cap of v0.2 (`cap.warn_tokens` and
+    /// `cap.block_tokens`, enforced, for every agent): the per-kind limits
+    /// and modes apply only in orchestrated mode.
+    fn cap(&mut self, ev: &HookEvent, path: &Path, a: &mut HookAnswer) {
+        use crate::orchestrate::{Kind, Mode};
+        let Some(ctx) = self.context_of(path) else { return };
+        let sub = !ev.agent_id.is_empty();
+        let orchestrated = self.settings.orchestrate.enabled;
+        let kind = if sub && orchestrated {
+            let dir = crate::orchestrate::subagents_dir(&ev.transcript_path);
+            self.orch.kind_of(&self.settings.orchestrate, &dir, &ev.agent_id, &ev.agent_type)
+        } else {
+            Kind::None
+        };
+        let (handoff, limit, mode) = if sub && orchestrated {
+            let lim = self.settings.orchestrate.limits(kind);
+            (lim.handoff, lim.limit, lim.mode)
+        } else {
+            (self.settings.cap.warn_tokens, self.settings.cap.block_tokens, if orchestrated { self.settings.orchestrate.other.mode } else { Mode::Enforced })
+        };
+        if mode == Mode::Off || ctx < handoff {
+            return;
+        }
+        let every = self.settings.cap.warn_every;
+        let lane = self.lane_of(&ev.agent_id);
+        if sub && orchestrated {
+            self.orch.passed(&ev.agent_id, &lane, kind);
+        }
+        let what = match (sub, orchestrated) {
+            (false, _) => "main session".to_string(),
+            (true, true) => format!("{} limits", kind.name()),
+            (true, false) => "cap".to_string(),
+        };
+        if ctx >= limit && mode == Mode::Enforced {
+            if !passes_cap(&ev.tool_name) {
+                a.deny = Some(format!(
+                    "atlas context cap: this agent's context is {ctx} tokens (hard limit {limit}, {what}). Every tool is blocked except the atlas `handoff` tool: write your handoff now (lane {lane}); a fresh agent continues from it."
+                ));
+                if self.warned.get(path).copied().unwrap_or(0) < limit {
+                    self.warned.insert(path.to_path_buf(), limit);
+                    self.cap_entry(&lane, ctx, "blocked");
+                }
+            }
+            return;
+        }
+        let last = self.warned.get(path).copied().unwrap_or(0);
+        if last == 0 || ctx >= last + every {
+            self.warned.insert(path.to_path_buf(), ctx);
+            a.context = if ctx >= limit {
+                format!(
+                    "atlas context cap: this agent's context is {ctx} tokens, past its hard limit {limit} ({what}, advisory). Stop new work: commit, push, and write your handoff with the atlas `handoff` tool now (lane {lane}); a fresh agent continues from it."
+                )
+            } else {
+                format!(
+                    "atlas context cap: this agent's context is {ctx} tokens (handoff point {handoff}, hard limit {limit}, {what}). Wrap up at your next clean stopping point: finish the current step, commit, push, and write your handoff with the atlas `handoff` tool (lane {lane}). A fresh agent continues from it."
+                )
+            };
+            if last == 0 {
+                self.cap_entry(&lane, ctx, "warned");
+            }
+        }
+    }
+
+    /// The required-reviews merge gate (`orchestrate.reviews`): a shell
+    /// command with a `gh pr merge` whose PR lacks a review of its head
+    /// from each role is denied (enforced) or warned about (advisory).
+    /// Fails open on a store error.
+    fn review_gate(&mut self, ev: &HookEvent, a: &mut HookAnswer) {
+        let s = &self.settings.orchestrate.reviews;
+        let command = ev.tool_input.get("command").and_then(Value::as_str).unwrap_or("");
+        if !s.on() {
+            return;
+        }
+        let (head_of, cwd) = (self.pr_head, if ev.cwd.is_empty() { self.cwd.as_str() } else { ev.cwd.as_str() });
+        match crate::reviews::gate(&self.store, s, command, &|m| head_of(m, cwd)) {
+            Ok(Some(g)) if g.deny => a.deny = Some(g.message),
+            Ok(Some(g)) => {
+                if !a.context.is_empty() {
+                    a.context.push('\n');
+                }
+                a.context.push_str(&g.message);
+            }
+            Ok(None) => {}
+            Err(e) => self.router.miss_text("review gate", &e),
+        }
+    }
+
+    /// A SendMessage to an agent: refused past the agent's hard limit
+    /// (mode `enforced`), and past its handoff point the sender is told to
+    /// send a wrap-up only. An agent named rather than given by id, or
+    /// without a transcript, gives no decision.
+    fn resume_gate(&mut self, ev: &HookEvent, a: &mut HookAnswer) {
+        use crate::orchestrate::Mode;
+        let to = ev.tool_input.get("to").and_then(Value::as_str).unwrap_or("").trim();
+        if !self.settings.orchestrate.enabled || to.is_empty() || ev.transcript_path.is_empty() {
+            return;
+        }
+        let id = to.strip_prefix("agent-").unwrap_or(to).to_string();
+        // An id is a file-name part; anything else (a path) is not looked up.
+        if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return;
+        }
+        let dir = crate::orchestrate::subagents_dir(&ev.transcript_path);
+        let path = dir.join(format!("agent-{id}.jsonl"));
+        if !path.is_file() {
+            return;
+        }
+        let Some(ctx) = self.context_of(&path) else { return };
+        let kind = self.orch.kind_of(&self.settings.orchestrate, &dir, &id, "");
+        let lim = self.settings.orchestrate.limits(kind).clone();
+        if lim.mode == Mode::Off || ctx < lim.handoff {
+            return;
+        }
+        let lane = self.lane_of(&id);
+        if ctx >= lim.limit && lim.mode == Mode::Enforced {
+            a.deny = Some(format!(
+                "atlas context cap: agent {id} is at {ctx} context tokens, past its hard limit {} ({} limits). Do not resume it: start a fresh agent from its handoff and the lane {lane} journal.",
+                lim.limit,
+                kind.name()
+            ));
+        } else {
+            a.context = format!(
+                "atlas context cap: agent {id} is past its handoff point ({ctx} of {} tokens, hard limit {}). Send it a wrap-up message only; new work goes to a fresh agent started from its handoff (lane {lane}).",
+                lim.handoff, lim.limit
+            );
+        }
+    }
+
+    /// Files the cap's journal entry. A write error is logged, never
+    /// returned: the deny or warning it records is already decided and
+    /// must not be dropped with it (ORCH-RETRO F3).
+    fn cap_entry(&mut self, lane: &str, ctx: u64, what: &str) {
+        if let Err(e) = self.write_cap_entry(lane, ctx, what) {
+            eprintln!("atlas context cap: journal entry for lane {lane}: {e}");
+        }
+    }
+
+    fn write_cap_entry(&mut self, lane: &str, ctx: u64, what: &str) -> Result<()> {
         let d = Draft {
             title: format!("context cap {what} at {ctx} tokens"),
             meta: String::new(),

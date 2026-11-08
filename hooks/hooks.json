@@ -11,13 +11,21 @@
       {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
                   "input": {"event": "SubagentStart", "session_id": "${session_id}", "agent_id": "${agent_id}", "agent_type": "${agent_type}", "transcript_path": "${transcript_path}"}}]}
     ],
+    "SubagentStop": [
+      {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
+                  "input": {"event": "SubagentStop", "session_id": "${session_id}", "agent_id": "${agent_id}", "agent_type": "${agent_type}", "transcript_path": "${transcript_path}", "last_assistant_message": "${last_assistant_message}", "stop_hook_active": "${stop_hook_active}"}}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
+                  "input": {"event": "Stop", "session_id": "${session_id}", "transcript_path": "${transcript_path}", "stop_hook_active": "${stop_hook_active}", "background_tasks": "${background_tasks}", "session_crons": "${session_crons}"}}]}
+    ],
     "PreToolUse": [
       {"matcher": "*",
        "hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
                   "input": {"event": "PreToolUse", "session_id": "${session_id}", "agent_id": "${agent_id}", "tool_name": "${tool_name}", "tool_use_id": "${tool_use_id}", "transcript_path": "${transcript_path}", "cwd": "${cwd}", "permission_mode": "${permission_mode}", "tool_prompt": "${tool_input.prompt}", "tool_input": "${tool_input}"}}]}
     ],
     "PostToolUse": [
-      {"matcher": "Bash|PowerShell|Read|Grep|Glob|Edit|Write",
+      {"matcher": "Bash|PowerShell|Read|Grep|Glob|Edit|Write|AskUserQuestion",
        "hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
                   "input": {"event": "PostToolUse", "session_id": "${session_id}", "agent_id": "${agent_id}", "tool_name": "${tool_name}", "transcript_path": "${transcript_path}", "cwd": "${cwd}", "tool_input": "${tool_input}", "tool_response": "${tool_response}"}}]}
     ],

@@ -1,0 +1,61 @@
+=== query: what is the bound on the widget cache entries
+== rules:r00001 rule active v1 <time> @L4
+- 2026-01-02 Alex: the widget cache is bounded at sixty four entries.
+more records, best first (key score: title; read one with recall key=KEY):
+- rules:r00003 3.3: 2026-01-04 Alex: this reverses r00001; the widget cache grows freely.
+- widget-note 1.7: Widget note - a widget note
+=== query: how are exports written
+== rules:r00006 rule active v1 <time> @L5
+- 2026-01-03 Blake: exports are written atomically through a rename and a flush.
+more records, best first (key score: title; read one with recall key=KEY):
+- export-note 0.9: Export note - an export note
+=== query: gamma queue order
+== rules:r00005 rule active v1 <time> @L8
+- 2026-01-06 Alex: the gamma queue drains oldest first.
+more records, best first (key score: title; read one with recall key=KEY):
+- widget-note 1.3: Widget note - a widget note
+=== query: delta lane snapshot folder
+== rules:r00007 rule active v1 <time> @L8
+- 2026-01-07 Blake: the delta lane keeps its own snapshot folder.
+=== query: older queue split
+== rules:r00005 rule active v1 <time> @L8
+- 2026-01-06 Alex: the gamma queue drains oldest first.
+=== query: widget cap withdrawn
+== widget-note memory/feedback active v1 <time>
+- [Widget note](widget-note.md) - a widget note
+The old widget cap was withdrawn after the gamma run.
+more records, best first (key score: title; read one with recall key=KEY):
+- rules:r00003 1.3: 2026-01-04 Alex: this reverses r00001; the widget cache grows freely.
+- rules:r00001 1.3: 2026-01-02 Alex: the widget cache is bounded at sixty four entries.
+=== query: a question about nothing stored here zebra quokka
+no records match; grep the exports and report_miss what grep finds
+=== key: rules:r00001
+== rules:r00001 rule active v1 <time> @L4
+- 2026-01-02 Alex: the widget cache is bounded at sixty four entries.
+sha <hash>
+=== key: rules:r00002
+== rules:r00002 rule superseded by rules:r00006 v1 <time> @L5
+- 2026-01-03 Blake: exports are written atomically through a rename.
+sha <hash>
+=== key: rules:r00004
+== rules:r00004 rule retired v1 <time> @L7
+- 2026-01-05 Blake: the older queue split is scrapped.
+sha <hash>
+=== hook: what is the bound on the widget cache entries
+atlas recall (related records; read one with recall key=KEY):
+- rules:r00001: 2026-01-02 Alex: the widget cache is bounded at sixty four entries.
+=== hook: how are exports written
+atlas recall (related records; read one with recall key=KEY):
+- rules:r00006: 2026-01-03 Blake: exports are written atomically through a rename and a flush.
+=== hook: gamma queue order
+
+=== hook: delta lane snapshot folder
+atlas recall (related records; read one with recall key=KEY):
+- rules:r00007: 2026-01-07 Blake: the delta lane keeps its own snapshot folder.
+=== hook: older queue split
+
+=== hook: widget cap withdrawn
+atlas recall (related records; read one with recall key=KEY):
+- widget-note: Widget note - a widget note
+=== hook: a question about nothing stored here zebra quokka
+

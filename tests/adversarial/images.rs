@@ -220,7 +220,7 @@ fn decode_ref(png: &[u8]) -> Image {
     assert_eq!(adler, adler32_plain(&raw), "adler32");
     let bpp = if ctype == 6 { 4 } else { 3 };
     let px = unfilter_ref(&raw, w, h, bpp);
-    let rgba = if bpp == 4 { px } else { px.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect() };
+    let rgba = if bpp == 4 { px } else { px.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect() };
     Image { width: w, height: h, rgba }
 }
 

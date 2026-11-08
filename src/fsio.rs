@@ -118,6 +118,22 @@ pub fn replace_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// Whether [`replace_atomic`] could write `target`, changing nothing: a temporary
+/// file can be made beside it, and it is no folder and (on Windows, where the
+/// rename would fail) not read-only.
+pub fn can_replace(target: &Path) -> bool {
+    if target.is_dir() || (cfg!(windows) && fs::metadata(target).is_ok_and(|m| m.permissions().readonly())) {
+        return false;
+    }
+    match write_temp(target, b"") {
+        Ok(tmp) => {
+            let _ = fs::remove_file(tmp);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Creates a new note, failing if anything already exists at the path.
 ///
 /// # Arguments
@@ -155,5 +171,75 @@ pub fn create_exclusive(target: &Path, bytes: &[u8]) -> Result<()> {
             Ok(())
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// How long a change waits for another atlas process changing the same file.
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// An exclusive advisory lock guarding the read, backup and write of one
+/// file; released when dropped or when the process ends, however it ends.
+///
+/// The lock is on `<file>.lock`, a dedicated file that is never replaced or
+/// removed: the guarded file itself is renamed over by [`replace_atomic`], so
+/// a lock on it would guard a file nothing else opens again. A second lock
+/// in one process waits on the first, on every OS, so a command takes it once,
+/// at its entry, and passes the guard down.
+#[derive(Debug)]
+pub struct FileLock {
+    _file: Option<File>,
+}
+
+/// The lock file guarding `target`.
+pub fn lock_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    target.with_file_name(name)
+}
+
+impl FileLock {
+    /// Takes the lock on `target`, waiting up to [`LOCK_WAIT`].
+    ///
+    /// # Errors
+    ///
+    /// As [`FileLock::acquire_within`].
+    pub fn acquire(target: &Path) -> std::result::Result<FileLock, String> {
+        FileLock::acquire_within(target, LOCK_WAIT)
+    }
+
+    /// Takes the lock on `target`, waiting up to `wait` and saying so once on
+    /// stderr. A file system without locks gets one stderr line and goes on.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the lock file when it cannot be opened or stays held
+    /// past `wait`: the caller writes nothing.
+    pub fn acquire_within(target: &Path, wait: std::time::Duration) -> std::result::Result<FileLock, String> {
+        let path = lock_path(target);
+        if let Some(d) = path.parent() {
+            fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let start = std::time::Instant::now();
+        let mut said = false;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(FileLock { _file: Some(file) }),
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(e)) if e.kind() == ErrorKind::Unsupported => {
+                    eprintln!("atlas: this file system has no file locks, so {} guards nothing; going on without it", path.display());
+                    return Ok(FileLock { _file: None });
+                }
+                Err(fs::TryLockError::Error(e)) => return Err(format!("{}: {e}", path.display())),
+            }
+            if start.elapsed() >= wait {
+                return Err(format!("{}: another atlas command held this lock for {} s; nothing written. Run the command again when it has finished", path.display(), wait.as_secs()));
+            }
+            if !said {
+                said = true;
+                eprintln!("atlas: waiting for {}: another atlas command is changing {}", path.display(), target.display());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }

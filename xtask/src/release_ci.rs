@@ -71,6 +71,34 @@ pub fn address_allowed(addr: &str, public_email: &str) -> bool {
     addr == public_email || addr == "noreply@github.com" || (addr.ends_with("[bot]@users.noreply.github.com") && !addr.contains(['<', '>', ' ']))
 }
 
+/// Merges of the public repo whose author address GitHub's web merge took
+/// from the merger's account, not the public one; Brandon accepted them in
+/// history as they are (2026-11-04), so the check passes over these commits
+/// and nothing else.
+const ACCEPTED_MERGES: [&str; 2] = [
+    "ffd0eb1ee745af6bd89f7ddf0f93f66aef612786", // atlas v0.2.1 (#4)
+    "006539d2ee2f170ab9749ddcfc1990266bc661c2", // atlas v0.2.1 (#5)
+];
+
+/// The addresses in `git log --format="%H %ae %ce"` output that may not
+/// appear in the public history, sorted and once each.
+pub fn other_addresses(log: &str, public_email: &str) -> Vec<String> {
+    let mut other = Vec::new();
+    for line in log.lines() {
+        // A line without a sha is checked whole, so it is refused.
+        let (sha, addrs) = line.split_once(' ').unwrap_or(("", line));
+        if ACCEPTED_MERGES.contains(&sha) {
+            continue;
+        }
+        for a in addrs.split(' ').filter(|a| !address_allowed(a, public_email)) {
+            other.push(if a.is_empty() { "<empty>".to_string() } else { a.to_string() });
+        }
+    }
+    other.sort();
+    other.dedup();
+    other
+}
+
 /// The version, from Cargo.toml and plugin.json, which must agree.
 fn version_of(root: &Path) -> R<String> {
     let version = cargo_version(&read_text(&root.join("Cargo.toml"))?).ok_or("no version in Cargo.toml")?;
@@ -745,12 +773,9 @@ pub fn sign(s: &Sign) -> R<Signed> {
         }
         say("main already has this release's binaries commit (an earlier run); checking it");
     }
-    let mut addrs: Vec<String> = git_out(&public, &["log", "--format=%ae%n%ce"])?.lines().map(str::to_string).collect();
-    addrs.sort();
-    addrs.dedup();
-    let other: Vec<&String> = addrs.iter().filter(|a| !address_allowed(a, &s.ident.email)).collect();
+    let other = other_addresses(&git_out(&public, &["log", "--format=%H %ae %ce"])?, &s.ident.email);
     if !other.is_empty() {
-        return Err(format!("the public history carries another address: {}", other.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(" ")));
+        return Err(format!("the public history carries another address: {}", other.join(" ")));
     }
 
     let bin = public.join("bin");
@@ -1044,6 +1069,17 @@ mod tests {
         assert!(address_allowed("123+atlas-release[bot]@users.noreply.github.com", me));
         assert!(!address_allowed("someone@example.com", me));
         assert!(!address_allowed("2+other@users.noreply.github.com", me));
+    }
+
+    #[test]
+    fn only_the_accepted_merges_may_carry_another_address() {
+        let me = "1+me@users.noreply.github.com";
+        let log = format!("{} a@example.com noreply@github.com\n{} a@example.com noreply@github.com\nabc123 {me} {me}\n", ACCEPTED_MERGES[0], ACCEPTED_MERGES[1]);
+        assert!(other_addresses(&log, me).is_empty());
+        let log = format!("{log}def456 b@example.com noreply@github.com\nfed789 b@example.com {me}\n");
+        assert_eq!(other_addresses(&log, me), ["b@example.com"]);
+        assert_eq!(other_addresses(&format!("abc123  {me}\n"), me), ["<empty>"]);
+        assert_eq!(other_addresses(&format!("{}\n", ACCEPTED_MERGES[0]), me), [ACCEPTED_MERGES[0]]);
     }
 
     #[test]

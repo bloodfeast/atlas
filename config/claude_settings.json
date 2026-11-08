@@ -12,7 +12,7 @@
       "title": "Keep subagents' prompt cache for an hour",
       "what": "Subagents normally keep their prompt cache for 5 minutes. When one waits longer than that (a build, a test run), its whole context is written to the cache again on the next turn.",
       "cost": "Cache writes cost 2x the input price instead of 1.25x, but the full re-writes after idle waits stop.",
-      "basis": "69 builder lanes: 130 M of 155 M cache-write tokens were full re-writes after 5-60 min idles; about -20% lane cost.",
+      "basis": "69 builder lanes: 130 M of 155 M cache-write tokens were full re-writes after idles (wiki: Token savings and method).",
       "docs": "https://code.claude.com/docs/en/prompt-caching.md",
       "choices": ["5m", "1h"],
       "default_note": "Claude Code default: 5m"
@@ -69,6 +69,103 @@
       "cost": "No fixes or improvements arrive until the pin is removed.",
       "basis": "For a known-good build, or a machine that must not change.",
       "default_note": "atlas default: no pin (latest release)"
+    },
+    {
+      "id": "orchestrate",
+      "kind": "atlas",
+      "key": "orchestrate.enabled",
+      "type": "bool",
+      "short": "agent caps",
+      "title": "Cap how many agents of each kind run at once",
+      "what": "The PreToolUse hook counts the session's running agents by kind (builders, reviewers, research) and denies a launch past its kind's cap, with a reason telling the session to queue it. It never allows a call, so permission prompts are unchanged. See the orchestrate skill and docs/design/orchestrate.md.",
+      "cost": "A launch past a cap waits for a running agent to finish. Fan-outs of many small agents need a higher research cap or a Kind line in their briefs.",
+      "basis": "Long multi-agent sessions on one machine: more than two compiling agents at once kept a compiler running all the time, and measured runs starved waiting for a quiet machine.",
+      "default_note": "atlas default: off"
+    },
+    {
+      "id": "memory-rules",
+      "kind": "atlas",
+      "key": "memory.rules",
+      "type": "bool",
+      "short": "memory and rules",
+      "title": "Experimental, off by default: manage the memory folder and rule files",
+      "what": "atlas finds the project's Claude Code memory folder and root CLAUDE.md and keeps them in its store. A query that hits a replaced ruling answers with the live one, tagged with what it replaces, and hook pointers on rules and memories are one-line headlines. Never asked: turn it on with atlas settings set memory-rules true. atlas settings off memory-rules removes the key, back to unset. Setting false is not the same as unset: it also stops sync and query recall of the memory and rule files the configuration names by hand, and keeps the store. See https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files.",
+      "cost": "Nothing in your files is rewritten. A headline holds less of a ruling, so an agent may need one more recall to read it. On a test set, not a promise: the 1.5x token bar was missed (hook 1.027x, query 0.921x, so a query costs more), memory-eval strict pass fell from 98 to 82 and tokens per question rose 13%.",
+      "basis": "A 1,582-item rules file: a reversal word finds most reversals, and only about 1 in 12 names the record it reverses, so the rest are asked (atlas rules sitting).",
+      "default_note": "atlas default: unset, what the configuration names by hand stays as it is",
+      "warn": {"true": "experimental: known limits are listed at https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files.", "false": "false is not unset: it also stops sync and query recall of the memory and rule files the configuration names by hand. atlas settings off memory-rules returns to unset."}
+    },
+    {
+      "id": "agents-builders",
+      "kind": "atlas",
+      "key": "orchestrate.kinds.builder.max",
+      "range": {"min": 0, "max": 100, "integer": true},
+      "short": "builder cap",
+      "title": "Builders at once",
+      "what": "How many agents that write and compile code may run at once while agent caps are on. Clamped to Claude Code's own limit (CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS, 20 by default). 0 launches none.",
+      "cost": "Higher runs more compiles at once: faster queues, a busier machine.",
+      "basis": "Two builders left the machine quiet often enough for clean measurements.",
+      "default_note": "atlas default: 2"
+    },
+    {
+      "id": "agents-reviewers",
+      "kind": "atlas",
+      "key": "orchestrate.kinds.reviewer.max",
+      "range": {"min": 0, "max": 100, "integer": true},
+      "short": "reviewer cap",
+      "title": "Reviewers at once",
+      "what": "How many read-only review agents may run at once while agent caps are on. Clamped to Claude Code's own limit. 0 launches none.",
+      "cost": "Higher spends more tokens at once on reviews.",
+      "basis": "The same practice as the builder cap: two reviewers and one research agent beside two builders.",
+      "default_note": "atlas default: 2"
+    },
+    {
+      "id": "agents-research",
+      "kind": "atlas",
+      "key": "orchestrate.kinds.research.max",
+      "range": {"min": 0, "max": 100, "integer": true},
+      "short": "research cap",
+      "title": "Research and design agents at once",
+      "what": "How many research or design agents may run at once while agent caps are on (Claude Code's Explore and Plan agents count here). Clamped to Claude Code's own limit. 0 launches none.",
+      "cost": "Higher allows wider fan-outs of searches.",
+      "basis": "The same practice as the builder cap: two reviewers and one research agent beside two builders.",
+      "default_note": "atlas default: 1"
+    },
+    {
+      "id": "context-mode",
+      "kind": "atlas",
+      "key": "orchestrate.mode",
+      "choices": ["enforced", "advisory", "off"],
+      "short": "context limits",
+      "title": "How agents' context limits are applied",
+      "what": "Past its handoff point an agent is told to wrap up and hand off at its next clean stopping point. Past its hard limit, enforced denies every tool but the handoff (and any resume of the agent); advisory only tells it; off does nothing. Per-kind values in the configuration override this.",
+      "cost": "Enforced can stop an agent mid-step if it ignores the wrap-up warnings; the handoff tool always still runs.",
+      "basis": "Agents resumed near a full 1M window re-read their whole context on every turn; fresh agents started from the handoff and the lane journal lost nothing.",
+      "default_note": "atlas default: enforced"
+    },
+    {
+      "id": "context-limit",
+      "kind": "atlas",
+      "key": "cap.block_tokens",
+      "range": {"min": 10000, "max": 10000000, "integer": true},
+      "short": "hard limit",
+      "title": "An agent's hard context limit",
+      "what": "The context size, in tokens, by which an agent must have handed off, for every kind without its own limit.",
+      "cost": "Higher lets agents run longer before a fresh one takes over; each turn past it re-reads a larger context.",
+      "basis": "Handoffs between about 285k and 450k context on a 1M window left room to finish the current step.",
+      "default_note": "atlas default: 450,000 scaled to the context window"
+    },
+    {
+      "id": "context-handoff",
+      "kind": "atlas",
+      "key": "cap.warn_tokens",
+      "range": {"min": 10000, "max": 10000000, "integer": true},
+      "short": "handoff point",
+      "title": "Where an agent is told to wrap up",
+      "what": "The context size, in tokens, from which an agent is told to wrap up and write its handoff at its next clean stopping point, for every kind without its own handoff point. At most the hard limit.",
+      "cost": "Lower hands off sooner: more fresh agents, each cheaper per turn.",
+      "basis": "Agents told to wrap up from about 285k on a 1M window handed off with room left to finish their current step.",
+      "default_note": "atlas default: 285,000 scaled to the context window"
     }
   ]
 }

@@ -580,6 +580,13 @@ fn the_transcript_source_is_off_by_default_and_serves_this_project_only() {
     assert_eq!(found.lines().count(), 1, "the other project's copy is never served: {found}");
     let e = s.answer("recall", &json!({"key": "turn:abcdef12:2@0123456789ab"})).unwrap_err().to_string();
     assert!(e.contains("dangling"), "{e}");
+    // A checkpoint's byte ref names the same turn; an offset inside a record
+    // names none.
+    let off = "{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n".len();
+    let t = s.answer("recall", &json!({"key": format!("turn:abcdef12:b{off}@{hash}")})).unwrap().into_text();
+    assert!(t.contains("(current)") && t.contains("error E0599 in frame_pacer at step 7311"), "{t}");
+    let e = s.answer("recall", &json!({"key": format!("turn:abcdef12:b{}@{hash}", off + 1)})).unwrap_err().to_string();
+    assert!(e.contains("dangling"), "{e}");
 }
 
 /// A fresh store whose exports were never written passes the check: a file
@@ -914,4 +921,381 @@ fn an_uncommitted_versions_refs_go_with_it_though_the_store_has_a_like_row() {
     let w = store.writer().unwrap();
     w.commit().unwrap();
     assert_eq!(fs::read_to_string(&jsonl).unwrap(), committed);
+}
+
+/// A journal or handoff text whose first line is too long for a title
+/// keeps that line whole in its body: the title clip loses nothing.
+#[test]
+fn a_first_line_longer_than_a_title_is_kept_in_the_body() {
+    let f = fixture("mem-long-title");
+    drop(import_all(&f));
+    let (mut s, _fx) = server(&f);
+    let long = format!("{} the tail that must survive", "word ".repeat(50));
+    s.answer("journal", &json!({"lane": "L", "entry": "note", "text": long})).unwrap();
+    s.answer("journal", &json!({"lane": "L", "entry": "note", "text": format!("{long}\nsecond line")})).unwrap();
+    s.answer("handoff", &json!({"lane": "L", "text": long})).unwrap();
+    s.answer("journal", &json!({"lane": "L", "entry": "note", "text": "short title\nthe body"})).unwrap();
+    drop(s);
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    for key in ["journal:L:0001", "journal:L:0002", "handoff:L:001"] {
+        let h = store.head(key).unwrap().unwrap();
+        assert!(h.title.chars().count() <= atlas::memory::TITLE_CHARS && h.body.contains("the tail that must survive"), "{key}: {h:?}");
+        // The title is cut between words, never inside one.
+        assert!(h.title.ends_with("word"), "{key}: {}", h.title);
+    }
+    assert!(store.head("journal:L:0002").unwrap().unwrap().body.contains("second line"));
+    let short = store.head("journal:L:0003").unwrap().unwrap();
+    assert_eq!((short.title.as_str(), short.body.trim()), ("short title", "the body"));
+    drop(store);
+    // A long title given as its own argument: a handoff's and a decision's
+    // stay whole in the body; a memory's or a rule's is refused, not cut.
+    let (mut s, _fx) = server(&f);
+    s.answer("handoff", &json!({"lane": "M", "title": long, "text": "the handoff"})).unwrap();
+    s.answer("remember", &json!({"kind": "decision", "title": long, "reason": "the title clip test", "body": "the decision"})).unwrap();
+    let memory = json!({"kind": "memory", "key": "a-memory", "sub": "project", "title": long, "reason": "the title clip test", "body": "- the text"});
+    let rule = json!({"kind": "rule", "title": long, "reason": "the title clip test", "body": "- the text"});
+    for (kind, a) in [("memory", memory), ("rule", rule)] {
+        let e = s.answer("remember", &a).unwrap_err().to_string();
+        assert!(e.contains("at most 120 characters"), "{kind}: {e}");
+    }
+    drop(s);
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let h = store.head("handoff:M:001").unwrap().unwrap();
+    assert!(h.body.contains("the tail that must survive") && h.body.contains("the handoff"), "{h:?}");
+    let decided = store.heads(Some("decision"), None).unwrap();
+    assert!(decided.iter().any(|d| d.body.contains("the tail that must survive") && d.title.chars().count() <= atlas::memory::TITLE_CHARS), "{decided:?}");
+}
+
+/// `journal` with `amend: KEY` rewrites an entry's title and body as a new
+/// version under the same key, at the head the caller read; kind, entry,
+/// lane, meta and refs stay, so the queue still sees an amended item.
+#[test]
+fn a_journal_entry_is_amended_in_place_at_its_head() {
+    let f = fixture("mem-amend");
+    drop(import_all(&f));
+    let (mut s, _fx) = server(&f);
+    s.answer("journal", &json!({"lane": "PARSER", "entry": "queued", "text": "Fix the rea", "meta": "kind: builder\nuses: compile"})).unwrap();
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let v1 = store.head("journal:PARSER:0001").unwrap().unwrap();
+    drop(store);
+    let amend = |text: &str, sha: &str| json!({"lane": "PARSER", "entry": "queued", "amend": "journal:PARSER:0001", "expected_sha": sha, "text": text});
+    // A stale sha, a wrong lane, a meta line or no sha is refused.
+    assert!(s.answer("journal", &amend("Fix the reader\nThe scope.", "000000000000")).is_err());
+    let wrong = json!({"lane": "DOCS", "entry": "queued", "amend": "journal:PARSER:0001", "expected_sha": v1.sha, "text": "x"});
+    let e = s.answer("journal", &wrong).unwrap_err().to_string();
+    assert!(e.contains("is lane PARSER entry queued"), "{e}");
+    let meta = json!({"lane": "PARSER", "entry": "queued", "amend": "journal:PARSER:0001", "expected_sha": v1.sha, "text": "x", "meta": "kind: reviewer"});
+    assert!(s.answer("journal", &meta).unwrap_err().to_string().contains("meta lines and refs are kept"));
+    let nosha = json!({"lane": "PARSER", "entry": "queued", "amend": "journal:PARSER:0001", "text": "x"});
+    assert!(s.answer("journal", &nosha).is_err());
+    s.answer("journal", &amend("Fix the reader\nThe scope.", &v1.sha)).unwrap();
+    drop(s);
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let v2 = store.head("journal:PARSER:0001").unwrap().unwrap();
+    assert_eq!((v2.title.as_str(), v2.body.trim(), v2.seq), ("Fix the reader", "The scope.", v1.seq + 1));
+    assert_eq!((v2.kind.as_str(), v2.sub.as_str(), v2.scope.as_str(), v2.status.as_str(), v2.meta.as_str()), (v1.kind.as_str(), v1.sub.as_str(), v1.scope.as_str(), v1.status.as_str(), v1.meta.as_str()));
+    assert_eq!(store.history("journal:PARSER:0001").unwrap().len(), 2);
+    let (_, items) = atlas::queue::items(&store, &atlas::memory::now()).unwrap();
+    assert!(items.iter().any(|i| i.key == "journal:PARSER:0001"), "the amended item left the queue");
+    drop(store);
+    // A review entry is amended like any other: its meta is kept, not asked
+    // again.
+    let (mut s, _fx) = server(&f);
+    s.answer("journal", &json!({"lane": "PARSER", "entry": "review", "text": "Reviewd", "meta": "role: cost\npr: 9\nhead: abcdef0\nverdict: pass"})).unwrap();
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let r = store.head("journal:PARSER:0002").unwrap().unwrap();
+    drop(store);
+    s.answer("journal", &json!({"lane": "PARSER", "entry": "review", "amend": "journal:PARSER:0002", "expected_sha": r.sha, "text": "Reviewed"})).unwrap();
+    drop(s);
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let r2 = store.head("journal:PARSER:0002").unwrap().unwrap();
+    assert_eq!((r2.title.as_str(), r2.meta.as_str()), ("Reviewed", r.meta.as_str()));
+}
+
+/// Amending a launch the hook queued moves its `brief_sha` to the new
+/// brief, so the same launch made again is known as the amended one.
+#[test]
+fn an_amended_hook_launch_keeps_its_queue_identity() {
+    let f = fixture("mem-amend-launch");
+    drop(import_all(&f));
+    let mut store = MemoryStore::open(&f.settings.store).unwrap();
+    let launch = |prompt: &'static str| atlas::queue::Launch { kind: atlas::orchestrate::Kind::Builder, lane: Some("P"), description: "fix the reader", subagent_type: "", prompt, session: "s0", class_meta: "" };
+    let (key, new) = atlas::queue::add(&mut store, &launch("Lane: P\nOld brief.")).unwrap();
+    assert!(new);
+    let sha = store.head(&key).unwrap().unwrap().sha;
+    drop(store);
+    let (mut s, _fx) = server(&f);
+    s.answer("journal", &json!({"lane": "P", "entry": "queued", "amend": key, "expected_sha": sha, "text": "fix the reader\nLane: P\nNew brief."})).unwrap();
+    drop(s);
+    let mut store = MemoryStore::open(&f.settings.store).unwrap();
+    let (again, new) = atlas::queue::add(&mut store, &launch("Lane: P\nNew brief.")).unwrap();
+    assert_eq!((again.as_str(), new), (key.as_str(), false));
+
+    // A description past a title: the title is cut by the library rule and
+    // the whole line kept, so only the same whole description matches.
+    let long = format!("{}the end", "fix the reader again, ".repeat(8));
+    let long_launch = |description: &'static str, prompt: &'static str| atlas::queue::Launch { description, ..launch(prompt) };
+    let long: &'static str = Box::leak(long.into_boxed_str());
+    let (lkey, new) = atlas::queue::add(&mut store, &long_launch(long, "Lane: P\nLong brief.")).unwrap();
+    assert!(new);
+    let h = store.head(&lkey).unwrap().unwrap();
+    assert!(h.title.chars().count() <= atlas::memory::TITLE_CHARS && h.meta.contains(&format!("description: {long}")), "{h:?}");
+    assert_eq!(atlas::queue::add(&mut store, &long_launch(long, "Lane: P\nLong brief.")).unwrap(), (lkey.clone(), false));
+    let other: &'static str = Box::leak(format!("{long} too").into_boxed_str());
+    assert!(atlas::queue::add(&mut store, &long_launch(other, "Lane: P\nLong brief.")).unwrap().1, "a different long description is another launch");
+    // Amended with a first line past a title: the brief alone is hashed,
+    // so the amended launch made again is still known.
+    let sha = store.head(&lkey).unwrap().unwrap().sha;
+    drop(store);
+    let (mut s, _fx) = server(&f);
+    s.answer("journal", &json!({"lane": "P", "entry": "queued", "amend": lkey, "expected_sha": sha, "text": format!("{long}\nLane: P\nAmended brief.")})).unwrap();
+    drop(s);
+    let mut store = MemoryStore::open(&f.settings.store).unwrap();
+    assert_eq!(atlas::queue::add(&mut store, &long_launch(long, "Lane: P\nAmended brief.")).unwrap(), (lkey, false));
+}
+
+/// The `journal` tool's `queued` entry is the MCP path for planned work: it
+/// is checked and filed with the meta `atlas queue plan` writes.
+#[test]
+fn a_queued_journal_entry_is_filed_as_planned_work() {
+    let f = fixture("mem-planned");
+    drop(import_all(&f));
+    let (mut s, _fx) = server(&f);
+    let out = s.answer("journal", &json!({"lane": "PARSER", "entry": "queued", "text": "Fix the reader\nThe scope.", "meta": "kind: builder\nuses: compile, gpu\norder: 2\nreview: simplicity, cost"})).unwrap().into_text();
+    assert!(out.contains("journal:PARSER:0001"), "{out}");
+    let bad = [
+        (json!({"lane": "P", "entry": "queued", "text": "t", "meta": "kind: blender"}), "unknown kind"),
+        (json!({"lane": "P", "entry": "queued", "text": "t", "meta": "priority: soon"}), "priority"),
+        (json!({"lane": "P", "entry": "queued", "text": "t", "meta": "order: first"}), "order needs a number"),
+        (json!({"lane": "P", "entry": "queued", "text": "t", "meta": "after: journal:NOPE:0001"}), "no such queued item"),
+        // A review entry's verdict is one of the four words, never a guess.
+        (json!({"lane": "P", "entry": "review", "text": "t", "meta": "role: cost\npr: 9\nhead: abcdef0\nverdict: reject"}), "merge with follow-ups or request changes"),
+        (json!({"lane": "P", "entry": "review", "text": "t", "meta": "role: cost\npr: 9\nhead: abcdef0\nverdict: do not merge"}), "merge with follow-ups or request changes"),
+    ];
+    for (args, want) in bad {
+        let e = s.answer("journal", &args).unwrap_err().to_string();
+        assert!(e.contains(want), "{e}");
+    }
+    s.answer("journal", &json!({"lane": "DOCS", "entry": "queued", "text": "Write the guide", "meta": "after: journal:PARSER:0001, the release"})).unwrap();
+    s.answer("journal", &json!({"lane": "FRAC", "entry": "queued", "text": "A fractional place", "meta": "order: 9.5"})).unwrap();
+    s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": "role: cost\npr: 9\nhead: abcdef0\nverdict: Merge-With-Follow-Ups"})).unwrap();
+    drop(s);
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let h = store.head("journal:PARSER:0001").unwrap().unwrap();
+    assert_eq!((h.title.as_str(), h.body.trim()), ("Fix the reader", "The scope."));
+    assert!(h.meta.contains("priority: normal (default)") && h.meta.contains("uses: compile, gpu") && h.meta.contains("review: simplicity, cost") && h.meta.contains("planned: true"), "{}", h.meta);
+    let (_, items) = atlas::queue::items(&store, &atlas::memory::now()).unwrap();
+    assert!(store.head("journal:FRAC:0001").unwrap().unwrap().meta.lines().any(|l| l == "order: 9.5"));
+    assert_eq!(items.iter().find(|i| i.key == "journal:FRAC:0001").unwrap().order.as_ref().map(ToString::to_string).as_deref(), Some("9.5"));
+    let docs = items.iter().find(|i| i.key == "journal:DOCS:0001").unwrap();
+    assert_eq!(docs.unmet, ["journal:PARSER:0001", "the release"]);
+}
+
+/// Records another scope or kind holds must not use up the window the filter is
+/// applied in: the list finds what matches, and says when it cut.
+#[test]
+fn a_filter_does_not_cut_a_list_silently() {
+    let f = fixture("recall-filter-cut");
+    let (mut s, _fx) = server(&f);
+    // Short bodies all about the word rank ahead of the long ones about much else.
+    for i in 0..40 {
+        call(&mut s, "remember", json!({"key": format!("crowd-{i}"), "kind": "memory", "sub": "project", "scope": "CROWD", "title": format!("widget {i}"), "summary": "s", "body": "widget widget widget"}));
+    }
+    let long = "other words ".repeat(60);
+    for i in 0..5 {
+        call(&mut s, "remember", json!({"key": format!("rare-{i}"), "kind": "memory", "sub": "project", "scope": "RARE", "title": format!("item {i}"), "summary": "s", "body": format!("widget {long}")}));
+    }
+    // In a small store a common word scores near zero: such a hit is counted, not shown.
+    let weak = |a: &str| a.lines().find(|l| l.contains("scoring near zero")).and_then(|l| l.strip_prefix('+')).and_then(|l| l.split(' ').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+    let hits = |a: &str| (0..5).filter(|i| a.contains(&format!("rare-{i}"))).count() + weak(a);
+    let a = text(call(&mut s, "recall", json!({"query": "widget", "scope": "RARE", "limit": 3, "budget_tokens": 5000})));
+    assert_eq!(hits(&a), 3, "{a}");
+    assert!(a.contains("+more (limit=3)"), "five match, three shown: {a}");
+    let a = text(call(&mut s, "recall", json!({"query": "widget", "scope": "RARE", "limit": 5, "budget_tokens": 5000})));
+    assert_eq!(hits(&a), 5, "{a}");
+    assert!(!a.contains("+more ("), "all there: {a}");
+    // Limit 0 keeps the search's own window of 8, and says when it cut.
+    let a = text(call(&mut s, "recall", json!({"query": "widget", "scope": "CROWD", "limit": 0, "budget_tokens": 5000})));
+    assert!(a.contains("+more (limit=0"), "{a}");
+    // The kind filter shares the window.
+    call(&mut s, "journal", json!({"lane": "RARE", "entry": "note", "text": format!("widget {long}")}));
+    let a = text(call(&mut s, "recall", json!({"query": "widget", "kind": "journal", "limit": 3, "budget_tokens": 5000})));
+    assert!(a.contains("journal:RARE:"), "{a}");
+}
+
+/// Words are picked by how rare they are in the whole store. A filter's only record
+/// can hold just the commoner ones: over 12 known words must not lose it, and the
+/// answer must not say nothing matches.
+#[test]
+fn a_filter_keeps_the_words_only_its_records_hold() {
+    let f = fixture("recall-filter-terms");
+    let (mut s, _fx) = server(&f);
+    // Thirteen words known to the store, the first twelve each in one other scope's
+    // record, and "gadget" commoner than any of them, in the one record of scope ONE.
+    let rare: Vec<String> = (0..12).map(|i| format!("rareword{}", char::from(b'a' + i))).collect();
+    for w in &rare {
+        call(&mut s, "remember", json!({"key": format!("other-{w}"), "kind": "memory", "sub": "project", "scope": "OTHER", "title": w, "summary": "s", "body": "gadget"}));
+    }
+    call(&mut s, "remember", json!({"key": "only-one", "kind": "memory", "sub": "reference", "scope": "ONE", "title": "the gadget", "summary": "s", "body": "gadget"}));
+    let long = format!("{} gadget", rare.join(" "));
+    let a = text(call(&mut s, "recall", json!({"query": long.clone(), "scope": "ONE"})));
+    assert!(a.contains("only-one") && !a.contains("no records match") && !a.contains("not searched"), "{a}");
+    // The hook's case stays as it was: no filter, the 12 rarest, so "gadget" goes.
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let terms: Vec<String> = long.split(' ').map(str::to_string).collect();
+    assert!(!store.rarest(&terms, atlas::memory::SEARCH_TERMS).unwrap().contains(&"gadget".to_string()));
+    assert!(store.search(&terms, None, None, 50).unwrap().iter().all(|(h, _, _)| h.key != "only-one"));
+    // Each filter alone keeps every word, at the store too.
+    assert!(store.search(&terms, None, Some("ONE"), 50).unwrap().iter().any(|(h, _, _)| h.key == "only-one"));
+    let kinds = store.search(&terms, Some("memory"), None, 50).unwrap();
+    assert!(kinds.iter().any(|(h, _, _)| h.key == "only-one"), "{}", kinds.len());
+}
+
+/// The tokenizer folds diacritics, so the vocabulary does not hold the word as typed.
+#[test]
+fn a_word_with_diacritics_is_found() {
+    let f = fixture("recall-diacritics");
+    let (mut s, _fx) = server(&f);
+    call(&mut s, "remember", json!({"key": "the-name", "kind": "memory", "sub": "project", "title": "a note on Müller", "summary": "s", "body": "the café"}));
+    for q in ["Müller", "müller", "muller", "café"] {
+        let a = text(call(&mut s, "recall", json!({"query": q})));
+        assert!(a.contains("the-name") && !a.contains("no records match"), "{q}: {a}");
+    }
+    // The hook's search goes the same way.
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    assert_eq!(store.rarest(&["müller".to_string()], 12).unwrap(), ["müller"]);
+    // A word nothing holds is still none, and takes no place from one that is held:
+    // a long prompt in another script keeps its known words.
+    let a = text(call(&mut s, "recall", json!({"query": "Größenwahn"})));
+    assert!(a.contains("no records match"), "{a}");
+    let unknown: Vec<String> = (0..14).map(|i| format!("слово{}", char::from(b'a' + i))).collect();
+    let terms: Vec<String> = unknown.iter().cloned().chain(["müller".to_string(), "note".to_string()]).collect();
+    assert_eq!(store.rarest(&terms, 2).unwrap().len(), 2);
+    let a = text(call(&mut s, "recall", json!({"query": format!("{} Müller", unknown.join(" "))})));
+    assert!(a.contains("the-name"), "{a}");
+}
+
+/// Past the terms' cap, words go unsearched by position: the answer says so, whether
+/// it found something or not, so a "none" there is not taken for an answer.
+#[test]
+fn a_filtered_answer_says_when_words_went_unsearched() {
+    let f = fixture("recall-filter-cap");
+    let (mut s, _fx) = server(&f);
+    call(&mut s, "remember", json!({"key": "held", "kind": "memory", "sub": "project", "scope": "ONE", "title": "firstword", "summary": "s", "body": "tailword"}));
+    let filler: Vec<String> = (0..47).map(|i| format!("fill{}{}", char::from(b'a' + i / 26), char::from(b'a' + i % 26))).collect();
+    let q = |tail: &str| format!("{} {tail}", filler.join(" "));
+    // The 48th word is searched and the two after it are not.
+    let a = text(call(&mut s, "recall", json!({"query": q("firstword extraone extratwo"), "scope": "ONE"})));
+    assert!(a.contains("held") && a.contains("+2 more words were not searched"), "{a}");
+    let a = text(call(&mut s, "recall", json!({"query": q("nosuchword tailword"), "scope": "ONE"})));
+    assert!(a.contains("no records match") && a.contains("+1 more word was not searched"), "{a}");
+    // Exactly at the cap, and with no filter, nothing is said.
+    let a = text(call(&mut s, "recall", json!({"query": q("firstword"), "scope": "ONE"})));
+    assert!(a.contains("held") && !a.contains("not searched"), "{a}");
+    let a = text(call(&mut s, "recall", json!({"query": q("firstword extraone extratwo")})));
+    assert!(!a.contains("not searched"), "{a}");
+}
+
+/// A filter's matches can rank past the first window of matches: they come back
+/// by name, in rank order, not merely counted. Filler keeps the word's score real
+/// (when most of the store holds a word, every score sits under the pointer floor
+/// and the row is hidden, so a count would prove nothing).
+#[test]
+fn a_filter_finds_its_records_past_the_first_window() {
+    let f = fixture("recall-filter-past");
+    let (mut s, _fx) = server(&f);
+    for i in 0..30 {
+        call(&mut s, "remember", json!({"key": format!("crowd-{i}"), "kind": "memory", "sub": "project", "scope": "CROWD", "title": format!("widget {i}"), "summary": "s", "body": "widget widget widget"}));
+    }
+    for i in 0..80 {
+        call(&mut s, "remember", json!({"key": format!("filler-{i}"), "kind": "memory", "sub": "project", "scope": "FILL", "title": format!("other {i}"), "summary": "s", "body": "nothing about it"}));
+    }
+    for i in 0..3 {
+        // A little longer each time, so the ranking among them is known.
+        let long = "other words ".repeat(20 + i * 5);
+        call(&mut s, "remember", json!({"key": format!("rare-{i}"), "kind": "memory", "sub": "project", "scope": "RARE", "title": format!("item {i}"), "summary": "s", "body": format!("widget {long}")}));
+    }
+    // The tool asks for limit + 1, so its window at limit 3 is (3 + 1) * 2 + 8 rows.
+    let window = (3 + 1) * 2 + 8;
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let terms = vec!["widget".to_string()];
+    let ranked: Vec<String> = store.search(&terms, None, None, 500).unwrap().into_iter().map(|(h, _, _)| h.key).collect();
+    let rank = |k: &str| ranked.iter().position(|x| x == k).unwrap();
+    for k in ["rare-0", "rare-1", "rare-2"] {
+        assert!(rank(k) >= window, "{k} at {} of {ranked:?}", rank(k));
+    }
+    let a = text(call(&mut s, "recall", json!({"query": "widget", "scope": "RARE", "limit": 3, "budget_tokens": 5000})));
+    for k in ["rare-0", "rare-1", "rare-2"] {
+        assert!(a.contains(k), "{k}: {a}");
+    }
+    assert!(!a.contains("scoring near zero"), "{a}");
+    // Best first among them, as the unfiltered ranking has them.
+    let keys: Vec<String> = store.search(&terms, None, Some("RARE"), 2).unwrap().into_iter().map(|(h, _, _)| h.key).collect();
+    assert_eq!(keys, ["rare-0", "rare-1"]);
+    // The same with both filters, and the kind alone finds what the scope holds.
+    let keys: Vec<String> = store.search(&terms, Some("memory"), Some("RARE"), 5).unwrap().into_iter().map(|(h, _, _)| h.key).collect();
+    assert_eq!(keys, ["rare-0", "rare-1", "rare-2"]);
+    call(&mut s, "journal", json!({"lane": "RARE", "entry": "note", "text": format!("widget {}", "other words ".repeat(20))}));
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let keys: Vec<String> = store.search(&terms, Some("journal"), None, 3).unwrap().into_iter().map(|(h, _, _)| h.key).collect();
+    assert!(keys.len() == 1 && keys[0].starts_with("journal:RARE:"), "{keys:?}");
+    // A filter nothing holds, and a kind the scope lacks.
+    assert!(store.search(&terms, None, Some("NO-SUCH"), 3).unwrap().is_empty());
+    assert!(store.search(&terms, Some("rule"), Some("RARE"), 3).unwrap().is_empty());
+}
+
+/// The recall hook has no filter, but its status check drops superseded rows: more
+/// of them ranked better than the hook's window of 24 * 2 + 8 must not hide a live
+/// match. The memory eval never reaches this path.
+#[test]
+fn the_hook_search_reads_past_superseded_rows() {
+    use atlas::memory::recall::{candidates, Gate};
+    let f = fixture("recall-hook-past");
+    let (mut s, _fx) = server(&f);
+    for i in 0..60 {
+        let old = format!("old-{i}");
+        call(&mut s, "remember", json!({"key": old, "kind": "memory", "sub": "project", "scope": "OLD", "title": format!("widget {i}"), "summary": "s", "body": "widget widget widget"}));
+        call(&mut s, "supersede", json!({"old": format!("old-{i}"), "key": format!("new-{i}"), "title": format!("replaced {i}"), "summary": "s", "body": "nothing about it now"}));
+    }
+    for i in 0..100 {
+        call(&mut s, "remember", json!({"key": format!("filler-{i}"), "kind": "memory", "sub": "project", "scope": "FILL", "title": format!("other {i}"), "summary": "s", "body": "nothing about it"}));
+    }
+    let long = "other words ".repeat(20);
+    call(&mut s, "remember", json!({"key": "live-one", "kind": "memory", "sub": "project", "scope": "LIVE", "title": "item", "summary": "s", "body": format!("widget {long}")}));
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    let terms = vec!["widget".to_string()];
+    let ranked: Vec<(String, String)> = store.search_with(&terms, None, None, 500, atlas::memory::rules::Mode::Live).unwrap().into_iter().map(|(h, _, _)| (h.key, h.status)).collect();
+    let at = ranked.iter().position(|(k, _)| k == "live-one").unwrap();
+    assert!(at >= 24 * 2 + 8, "{at}");
+    assert!(ranked[..at].iter().all(|(_, st)| st == "superseded"), "{ranked:?}");
+    let g = Gate { rules: atlas::memory::rules::Mode::Today, fts_floor: 0.0, min_terms: 1, cos_floor: 0.0, cos_alone: 1.0 };
+    let found = candidates(&store, "widget", &g, None).unwrap();
+    assert!(found.iter().any(|c| c.head.key == "live-one"), "{:?}", found.iter().map(|c| &c.head.key).collect::<Vec<_>>());
+}
+
+/// Real session finding: in a small store every word scores next to nothing, so
+/// of 4 records holding "gear note" a query showed 2 and said nothing of the rest.
+#[test]
+fn recall_says_what_it_left_out() {
+    let f = fixture("recall-cut");
+    let (mut s, _fx) = server(&f);
+    for i in 0..4 {
+        call(&mut s, "remember", json!({"key": format!("gear-{i}"), "kind": "memory", "sub": "project", "title": format!("item {i}"), "summary": "s", "body": format!("gear note {i}")}));
+    }
+    let shown = |a: &str| (0..4).filter(|i| a.contains(&format!("gear-{i}"))).count();
+    let more = |a: &str, what: &str| a.lines().find(|l| l.contains(what)).and_then(|l| l.strip_prefix('+')).and_then(|l| l.split(' ').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+    for args in [json!({"query": "gear note"}), json!({"query": "gear note", "limit": 20, "budget_tokens": 2000})] {
+        let a = text(call(&mut s, "recall", args));
+        assert_eq!(shown(&a) + more(&a, "scoring near zero"), 4, "each record is shown or counted: {a}");
+    }
+    // A limit that cuts says so.
+    for i in 4..12 {
+        call(&mut s, "remember", json!({"key": format!("gear-{i}"), "kind": "memory", "sub": "project", "title": format!("item {i}"), "summary": "s", "body": format!("gear note {i}")}));
+    }
+    let a = text(call(&mut s, "recall", json!({"query": "gear note", "limit": 3})));
+    assert!(a.contains("+more (limit=3)"), "{a}");
+    let a = text(call(&mut s, "recall", json!({"query": "gear note", "limit": 0})));
+    assert!(shown(&a) + more(&a, "scoring near zero") > 1, "a limit of 0 keeps the search's own window: {a}");
+    let a = text(call(&mut s, "recall", json!({"query": "gear note", "limit": 200})));
+    assert!(!a.contains("(limit="), "{a}");
 }

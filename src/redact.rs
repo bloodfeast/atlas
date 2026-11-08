@@ -71,6 +71,16 @@ pub fn denylist() -> &'static [String] {
     })
 }
 
+/// Whether `ATLAS_LEAK_DENYLIST` names a file that cannot be read, where
+/// [`denylist`] reads as empty: what must not fail open should ask this.
+pub fn denylist_unreadable() -> bool {
+    unreadable(std::env::var_os("ATLAS_LEAK_DENYLIST"))
+}
+
+fn unreadable(path: Option<std::ffi::OsString>) -> bool {
+    path.filter(|v| !v.is_empty()).is_some_and(|p| std::fs::read_to_string(p).is_err())
+}
+
 /// A denylist file's terms: one per line, lowercased, blank lines and `#`
 /// comments skipped.
 pub fn parse_terms(text: &str) -> Vec<String> {
@@ -223,6 +233,54 @@ pub fn redact_with(text: &str, deny: &[String]) -> String {
     out
 }
 
+/// Every byte of `lower` inside an occurrence of a term, overlaps included. A
+/// term is what [`is_secret_line`] takes one to be: a non-empty lowercase
+/// substring of the ASCII-lowercased text, with no word boundary asked for.
+pub fn term_marks(lower: &[u8], deny: &[String]) -> Vec<bool> {
+    let mut marks = vec![false; lower.len()];
+    for t in deny.iter().map(String::as_bytes).filter(|t| !t.is_empty()) {
+        for (i, w) in lower.windows(t.len()).enumerate() {
+            if w == t {
+                marks[i..i + t.len()].fill(true);
+            }
+        }
+    }
+    marks
+}
+
+/// `text` with each run of term bytes replaced by [`REDACTED`], and whether
+/// anything was. For idea capture and its eval corpus only: everything else
+/// goes through [`redact_with`], which blanks the whole line.
+pub fn redact_terms(text: &str, deny: &[String]) -> (String, bool) {
+    let marks = term_marks(text.to_ascii_lowercase().as_bytes(), deny);
+    if !marks.contains(&true) {
+        return (text.to_string(), false);
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if marks[i] {
+            out.extend_from_slice(REDACTED.as_bytes());
+            while i < bytes.len() && marks[i] {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // A term is whole characters, so the cuts fall between characters.
+    (String::from_utf8_lossy(&out).into_owned(), true)
+}
+
+/// What idea capture keeps of `text`: the secret rules first, on the original
+/// text, so a term cut out cannot break up a key they would have caught; then
+/// the denylist's terms by span, the rest of their lines kept.
+pub fn redact_capture(text: &str, deny: &[String]) -> String {
+    redact_terms(&redact_with(text, &[]), deny).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +361,30 @@ mod tests {
         // A dash rule in prose is not a block.
         let prose = "-----BEGIN here-----x\n----- begin -----\nplain";
         assert_eq!(redact_with(prose, &[]), prose);
+    }
+
+    #[test]
+    fn an_unreadable_denylist_is_told_apart_from_none() {
+        assert!(!unreadable(None));
+        assert!(!unreadable(Some("".into())));
+        assert!(unreadable(Some("Z:/no/such/invented/list.txt".into())));
+    }
+
+    #[test]
+    fn capture_cuts_the_term_and_keeps_its_line() {
+        let deny = parse_terms("quillfeather");
+        assert_eq!(redact_capture("met QuillFeather at noon\nsecond line", &deny), "met [redacted] at noon\nsecond line");
+        // The secret rules still blank what they match, and run first.
+        assert_eq!(redact_capture("TOKEN=abcdef012345\nkeep quillfeathers", &deny), "[redacted]\nkeep [redacted]s");
+    }
+
+    /// Everything but idea capture keeps the whole-line rule, byte for byte.
+    #[test]
+    fn other_redaction_still_blanks_the_whole_line() {
+        let deny = parse_terms("quillfeather");
+        assert_eq!(redact_with("met quillfeather at noon\nsecond line", &deny), "[redacted]\nsecond line");
+        assert!(is_secret_line("met quillfeather at noon", &deny));
+        let plain = "no term here\nnor here";
+        assert_eq!(redact_with(plain, &deny), plain);
     }
 }

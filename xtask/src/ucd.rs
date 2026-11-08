@@ -120,7 +120,7 @@ impl Db {
             let s = cp - S_BASE;
             out.push(L_BASE + s / N_COUNT);
             out.push(V_BASE + (s % N_COUNT) / T_COUNT);
-            if s % T_COUNT != 0 {
+            if !s.is_multiple_of(T_COUNT) {
                 out.push(T_BASE + s % T_COUNT);
             }
             return;

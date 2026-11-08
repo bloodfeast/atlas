@@ -123,6 +123,7 @@ Subcommands:
   atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --digest]
   atlas slice --list [N]  the newest handles
   atlas digest [--as SHAPE] FILE|-   a digest of a file or stdin
+  atlas doctor                       say what it can check of the atlas hooks and project roots
   atlas crop IN OUT [--frames A[-B] --of N [--axis x|y]] [--rect X,Y,W,H] [--max W[xH]]   cut a picture
   atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--date YYYY-MM-DD] [--] TEXT
   atlas entry --title TITLE [--ref REF ...] [--date YYYY-MM-DD] [--time HH:MM] [--] TEXT
@@ -130,8 +131,13 @@ Subcommands:
   atlas settings list | set ID VALUE | off ID | undo [--yes] | offer [--yes ID...]
   atlas settings compact-md [DIR] [--yes]
   atlas settings add-project [--vault | --vault-at FOLDER | --new [--name NAME] [--vault-at FOLDER | --no-vault] | --to PROJECT] [--dry-run] (DIR | --yes)
+  atlas settings add-project --no DIR   record the answer no to the session's question about DIR
   atlas settings migrate-projects NAME
+  atlas settings orchestrate [--yes [--builders N] [--reviewers N] [--research N] [--mode M] [--handoff N] [--limit N] [--fresh auto|ask] | --no]
   atlas settings on|off update
+  atlas rules [scan | counts | sitting 1|2 | link | answer KEY | unmark KEY]   which ruling replaces which (experimental, off by default)
+  atlas queue [list | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next | add | plan]   the work queue: launches waiting to start, and the batch that can start now
+  atlas ideas [list | show ID | file TEXT... | dismiss ID... | answer ID yes|no | convert ID ruling|queue | labels]   ideas caught from prompts, and the questions about them
 
 SHAPE is test, build, grep, listing, source, summary or generic. More: https://github.com/bloodfeast/atlas/wiki
 ";
@@ -531,7 +537,31 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
 
 /// The bare words recognised as `argv[1]`, or after leading
 /// [`LEADING_OPTIONS`].
-const SUBCOMMANDS: &[&str] = &["run", "slice", "settings", "grammar", "ruling", "entry"];
+const SUBCOMMANDS: &[&str] = &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules"];
+
+/// The usage of a subcommand asked for its help, `None` when it was not: only
+/// the first word after it counts, so `atlas run -- cargo --help` still runs and a
+/// value or a note's text is never taken for it, plus the word after a settings
+/// command, which has help of its own. `help` counts only where the word
+/// already means help.
+fn sub_help(word: &str, rest: &[String]) -> Option<&'static str> {
+    let is_help = |w: Option<&String>| w.is_some_and(|w| w == "-h" || w == "--help");
+    let word_means_help = matches!(word, "settings" | "queue" | "ideas") && rest.first().is_some_and(|w| w == "help");
+    if !(is_help(rest.first()) || word_means_help || (word == "settings" && is_help(rest.get(1)))) {
+        return None;
+    }
+    Some(match word {
+        "run" => atlas::run::USAGE,
+        "slice" => atlas::handles::SLICE_USAGE,
+        "settings" => atlas::claude_settings::HELP,
+        "grammar" => atlas::grammar::USAGE,
+        "ruling" | "entry" => atlas::records::USAGE,
+        "queue" => atlas::queue::USAGE,
+        "ideas" => atlas::ideas::cli::USAGE,
+        "rules" => atlas::memory::rules::USAGE,
+        _ => return None,
+    })
+}
 
 /// The options (each with one value) that may come before a subcommand
 /// word and apply to it.
@@ -552,36 +582,6 @@ fn split_subcommand(argv: &mut Vec<String>) -> Option<(String, Vec<String>)> {
     let rest = argv.split_off(i + 1);
     let word = argv.pop()?;
     Some((word, rest))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::split_subcommand;
-
-    fn split(args: &[&str]) -> (Vec<String>, Option<(String, Vec<String>)>) {
-        let mut v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let sub = split_subcommand(&mut v);
-        (v, sub)
-    }
-
-    #[test]
-    fn a_subcommand_takes_the_leading_config_and_project() {
-        let (lead, sub) = split(&["--config", "c.json", "settings", "migrate-projects", "alpha"]);
-        assert_eq!(lead, vec!["--config", "c.json"]);
-        assert_eq!(sub, Some(("settings".into(), vec!["migrate-projects".into(), "alpha".into()])));
-        let (lead, sub) = split(&["--project", "p", "--config", "c.json", "run", "--", "x"]);
-        assert_eq!(lead, vec!["--project", "p", "--config", "c.json"]);
-        assert_eq!(sub.unwrap().0, "run");
-        let (lead, sub) = split(&["settings", "list"]);
-        assert!(lead.is_empty());
-        assert_eq!(sub, Some(("settings".into(), vec!["list".into()])));
-        // Not a subcommand: the option loop sees every argument.
-        for args in [&["--config", "c.json", "--rescan"][..], &["--config"], &["--rescan", "settings", "off", "update"], &["--config", "settings"]] {
-            let (lead, sub) = split(args);
-            assert!(sub.is_none(), "{args:?}");
-            assert_eq!(lead.len(), args.len());
-        }
-    }
 }
 
 /// What the command line resolved to.
@@ -658,11 +658,21 @@ fn run() -> Result<ExitCode, String> {
     let mut runs = 20usize;
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     // File tools that need no configuration, run before one is looked for.
+    if argv.first().is_some_and(|w| w == "doctor") {
+        // `config_path`, not `ensure_config`: the doctor writes nothing.
+        return atlas::claude_settings::doctor_cli(&argv[1..], config_path(None, false).as_deref());
+    }
     if let Some(w) = argv.first().filter(|w| *w == "digest" || *w == "crop").cloned() {
         let rest = argv.split_off(1);
         return if w == "digest" { atlas::digest::cli(rest) } else { atlas::crop::cli(rest) };
     }
     if let Some((word, rest)) = split_subcommand(&mut argv) {
+        // Help touches nothing: no first-run configuration, no store, no
+        // settings file, whatever state those are in.
+        if let Some(usage) = sub_help(&word, &rest) {
+            println!("{usage}");
+            return Ok(ExitCode::SUCCESS);
+        }
         // Everything after the word is the subcommand's own; the
         // configuration comes from `--config` or `--project` before the
         // word, else ATLAS_CONFIG or beside the binary.
@@ -963,6 +973,23 @@ fn run() -> Result<ExitCode, String> {
                 settings_mode(config.as_deref(), rest[0] == "on", "update")
             }
             "settings" => atlas::claude_settings::cli(rest, config.as_deref(), &setup.db, setup.memory.user_state.as_deref(), project.as_deref()),
+            "queue" => {
+                let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
+                let orch = atlas::orchestrate::resolve(loaded.as_ref().and_then(|c| c.orchestrate.as_ref()), None, None, |k| std::env::var(k).ok());
+                atlas::queue::cli(&rest, &mut store, &orch)
+            }
+            "ideas" => {
+                let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
+                let mut ruling = |a: Vec<String>| {
+                    let mut rules = setup.open()?;
+                    atlas::records::cli("ruling", a, &mut rules, &setup.memory, config.as_deref())
+                };
+                atlas::ideas::cli::cli(&rest, &mut store, &setup.memory.store, &mut ruling)
+            }
+            "rules" => {
+                let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
+                atlas::memory::rules::cli(rest, &mut store)
+            }
             "ruling" | "entry" => {
                 let mut store = setup.open()?;
                 atlas::records::cli(&word, rest, &mut store, &setup.memory, config.as_deref())
@@ -977,6 +1004,8 @@ fn run() -> Result<ExitCode, String> {
             let v = hook_input.unwrap_or(atlas::json::Value::Null);
             let ev = atlas::hooks::HookEvent::from_value(&v);
             let mut h = atlas::hooks::Hooks::open(setup.memory.clone()).map_err(|e| e.to_string())?;
+            h.set_command_hook();
+            h.set_unattended(atlas::claude_settings::unattended_session(|k| std::env::var(k).ok()));
             // SessionStart's first-run project offer needs the configuration file
             // (to add to) and the folders it already indexes.
             if let Some(c) = loaded.as_ref() {
@@ -987,6 +1016,7 @@ fn run() -> Result<ExitCode, String> {
             h.set_roots(ref_roots(&setup));
             print!("{}", h.handle(&ev).to_json(&ev.event));
             let _ = std::io::Write::flush(&mut std::io::stdout());
+            h.file_ideas();
             h.index_transcripts();
             Ok(ExitCode::SUCCESS)
         }
@@ -1439,6 +1469,8 @@ fn update_at_start(c: Option<&Config>, setup: &Setup, models: &atlas::models::Mo
 /// configuration file (rewritten as formatted JSON).
 fn settings_mode(config: Option<&std::path::Path>, on: bool, what: &str) -> Result<ExitCode, String> {
     let cp = config.ok_or("no configuration file to change (pass --config PATH)")?;
+    // The whole file is rewritten from this read. No backup here, as before.
+    let _held = atlas::fsio::FileLock::acquire(cp)?;
     let text = std::fs::read_to_string(cp).map_err(|e| format!("{}: {e}", cp.display()))?;
     let mut v = atlas::json::parse(&text).map_err(|e| format!("{}: {e}", cp.display()))?;
     let top = v.as_object_mut().ok_or_else(|| format!("{}: not a JSON object", cp.display()))?;
@@ -1520,6 +1552,36 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("atlas: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_subcommand;
+
+    fn split(args: &[&str]) -> (Vec<String>, Option<(String, Vec<String>)>) {
+        let mut v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let sub = split_subcommand(&mut v);
+        (v, sub)
+    }
+
+    #[test]
+    fn a_subcommand_takes_the_leading_config_and_project() {
+        let (lead, sub) = split(&["--config", "c.json", "settings", "migrate-projects", "alpha"]);
+        assert_eq!(lead, vec!["--config", "c.json"]);
+        assert_eq!(sub, Some(("settings".into(), vec!["migrate-projects".into(), "alpha".into()])));
+        let (lead, sub) = split(&["--project", "p", "--config", "c.json", "run", "--", "x"]);
+        assert_eq!(lead, vec!["--project", "p", "--config", "c.json"]);
+        assert_eq!(sub.unwrap().0, "run");
+        let (lead, sub) = split(&["settings", "list"]);
+        assert!(lead.is_empty());
+        assert_eq!(sub, Some(("settings".into(), vec!["list".into()])));
+        // Not a subcommand: the option loop sees every argument.
+        for args in [&["--config", "c.json", "--rescan"][..], &["--config"], &["--rescan", "settings", "off", "update"], &["--config", "settings"]] {
+            let (lead, sub) = split(args);
+            assert!(sub.is_none(), "{args:?}");
+            assert_eq!(lead.len(), args.len());
         }
     }
 }

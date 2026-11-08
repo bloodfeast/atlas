@@ -2,9 +2,11 @@
 //! rendering its exact export line.
 //!
 //! ```text
-//! atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--date YYYY-MM-DD] TEXT
+//! atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--supersedes KEY ...] [--date YYYY-MM-DD] TEXT
 //! atlas entry --title TITLE [--ref REF ...] [--date YYYY-MM-DD] [--time HH:MM] TEXT
 //! ```
+//!
+//! `--supersedes` belongs to memory rules: experimental, off by default.
 //!
 //! A ruling renders `- DATE BY: TEXT`, and when it defines identifiers, the
 //! marker `<!-- atlas defines: ID ... -->` after it (invisible when the
@@ -283,6 +285,9 @@ fn today() -> (String, String) {
     (t[..10].to_string(), t[11..16].to_string())
 }
 
+/// The usage of `atlas ruling` and `atlas entry`.
+pub const USAGE: &str = "usage: atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--supersedes KEY ...] [--date YYYY-MM-DD] [--] TEXT\n       atlas entry --title TITLE [--ref REF ...] [--date YYYY-MM-DD] [--time HH:MM] [--] TEXT\n(a --defines or --ref list ends at the next flag or a word with a space; run to the end, its last word is TEXT)\n(--supersedes is part of memory rules, experimental and off by default; it takes effect with memory.rules unset)";
+
 /// The `atlas ruling` and `atlas entry` subcommands.
 ///
 /// # Arguments
@@ -297,37 +302,48 @@ fn today() -> (String, String) {
 ///
 /// A message for the user.
 pub fn cli(word: &str, args: Vec<String>, store: &mut Store, mem: &Settings, config: Option<&Path>) -> Result<ExitCode, String> {
-    let usage = "usage: atlas ruling --by NAME [--defines ID ...] [--ref REF ...] [--date YYYY-MM-DD] [--] TEXT\n       atlas entry --title TITLE [--ref REF ...] [--date YYYY-MM-DD] [--time HH:MM] [--] TEXT\n(a --defines or --ref list ends at the next flag or a word with a space; run to the end, its last word is TEXT)";
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{usage}");
+        println!("{USAGE}");
         return Ok(if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS });
     }
-    let p = parse(args, &["defines", "ref"], &["by", "title", "date", "time"]).map_err(|e| format!("{e}\n{usage}"))?;
+    let p = parse(args, &["defines", "ref", "supersedes"], &["by", "title", "date", "time"]).map_err(|e| format!("{e}\n{USAGE}"))?;
     let get = |k: &str| p.flags.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     let all = |k: &str| -> Vec<String> { p.flags.iter().filter(|(n, _)| n == k).map(|(_, v)| v.clone()).collect() };
     let text = p.words.join(" ");
     let (d, t) = today();
     let date = get("date").unwrap_or(d);
     let refs = all("ref");
+    let old = all("supersedes");
+    if word != "ruling" && !old.is_empty() {
+        return Err(format!("--supersedes is for a ruling\n{USAGE}"));
+    }
     let (line, heading, which, kind, scope, prefix, title, author, defines) = match word {
         "ruling" => {
-            let r = Ruling { date, by: get("by").ok_or(format!("--by is required\n{usage}"))?, defines: all("defines"), refs: refs.clone(), text };
+            let r = Ruling { date, by: get("by").ok_or(format!("--by is required\n{USAGE}"))?, defines: all("defines"), refs: refs.clone(), text };
             r.validate()?;
             let title: String = r.text.chars().take(120).collect();
             (r.line(), r.heading(), "rulings", "rule", "rulings", "ruling:r", title, r.by.clone(), r.defines.clone())
         }
         _ => {
-            let e = Entry { date, time: get("time").unwrap_or(t), title: get("title").ok_or(format!("--title is required\n{usage}"))?, text, refs: refs.clone() };
+            let e = Entry { date, time: get("time").unwrap_or(t), title: get("title").ok_or(format!("--title is required\n{USAGE}"))?, text, refs: refs.clone() };
             e.validate()?;
             (e.line(), e.heading(), "entries", "section", "entries", "entry:s", e.title.clone(), "atlas".to_string(), Vec::new())
         }
     };
+    // Checked before the file is touched: a refused mark must leave no line.
+    let mut ms = MemoryStore::open(&mem.store).map_err(|e| e.to_string())?;
+    for k in &old {
+        match ms.head(k).map_err(|e| e.to_string())? {
+            Some(h) if h.status == "active" => {}
+            Some(h) => return Err(format!("{k} is already {}", h.status)),
+            None => return Err(format!("no record {k}")),
+        }
+    }
     let path = target(which, mem.lean.as_ref(), config, store)?;
     let at = append_under(&path, &heading, &line)?;
     // A canonical Windows root carries the verbatim prefix; it is noise here.
     let shown = path.display().to_string().trim_start_matches(r"\\?\").to_string();
     // The record, with its fields as refs.
-    let mut ms = MemoryStore::open(&mem.store).map_err(|e| e.to_string())?;
     let mut w = ms.writer().map_err(|e| e.to_string())?;
     let key = w.next_key(prefix, 5).map_err(|e| e.to_string())?;
     let draft = Draft {
@@ -344,6 +360,13 @@ pub fn cli(word: &str, args: Vec<String>, store: &mut Store, mem: &Settings, con
     let mut rr: Vec<(String, String)> = defines.iter().map(|d| ("defines".to_string(), d.clone())).collect();
     rr.extend(refs.iter().map(|r| ("ref".to_string(), r.clone())));
     w.add_refs(&key, &rr).map_err(|e| e.to_string())?;
+    for k in &old {
+        w.mark_superseded(k, &key, "atlas ruling --supersedes").map_err(|e| e.to_string())?;
+    }
+    // It said what it replaces, so a sitting does not ask.
+    if !old.is_empty() {
+        w.add_refs(&key, &[(crate::memory::rules::CHECKED.to_string(), "whole".to_string())]).map_err(|e| e.to_string())?;
+    }
     w.commit().map_err(|e| e.to_string())?;
     println!("{key} -> {shown}:{at} under \"## {heading}\"");
     println!("{line}");

@@ -63,12 +63,13 @@ pub fn lines_hash(text: &str, a: usize, b: usize) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     /// A transcript turn: `turn:<session8>:<line>` (the opt-in transcript
-    /// source, [`crate::transcripts`]).
+    /// source, [`crate::transcripts`]) or `turn:<session8>:b<offset>` (a
+    /// checkpoint's result ref, [`crate::checkpoint::turn_ref`]).
     Turn {
         /// The session id's first 8 characters.
         session8: String,
-        /// The record's 1-based line in the transcript.
-        line: usize,
+        /// Where its record starts in the transcript.
+        at: TurnAt,
     },
     /// A memory record by key.
     Record(String),
@@ -83,6 +84,16 @@ pub enum Target {
         /// Last line, inclusive.
         b: usize,
     },
+}
+
+/// Where a turn ref's record starts in its transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnAt {
+    /// Its 1-based line.
+    Line(usize),
+    /// Its byte offset: what a checkpoint writes, since finding a line
+    /// number means counting the whole history before the boundary.
+    Byte(u64),
 }
 
 /// One ref found in a text.
@@ -119,14 +130,19 @@ fn lines_target(s: &str) -> Option<Target> {
     Some(Target::Lines { src: src.to_string(), path: path.to_string(), a, b })
 }
 
-/// `turn:<session8>:<line>`.
+/// `turn:<session8>:<line>` or `turn:<session8>:b<offset>`.
 fn turn_target(s: &str) -> Option<Target> {
     let rest = s.strip_prefix("turn:")?;
     let (s8, line) = rest.split_once(':')?;
     if s8.is_empty() || s8.len() > 8 || !s8.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         return None;
     }
-    Some(Target::Turn { session8: s8.to_string(), line: line.parse().ok().filter(|n| *n > 0)? })
+    let at = match line.strip_prefix('b') {
+        Some(b) if !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()) => TurnAt::Byte(b.parse().ok()?),
+        Some(_) => return None,
+        None => TurnAt::Line(line.parse().ok().filter(|n| *n > 0)?),
+    };
+    Some(Target::Turn { session8: s8.to_string(), at })
 }
 
 /// Parses one ref, `key@hash` or `src:path:a-b@hash`.
@@ -288,6 +304,9 @@ pub fn resolve_lines(roots: &[RefRoot], src: &str, path: &str, a: usize, b: usiz
 /// [`crate::Error::Db`].
 pub fn resolve(store: &MemoryStore, roots: &[RefRoot], r: &Ref) -> Result<Status> {
     Ok(match &r.target {
+        // A chain key is checked by its own resolver against the transcript
+        // ([`crate::chain::resolve`]); no record has it.
+        Target::Record(_) if crate::chain::parse_key(&r.text).is_some() => Status::Unchecked,
         Target::Record(k) => resolve_record(store, k, &r.hash)?.0,
         Target::Lines { src, path, a, b } => resolve_lines(roots, src, path, *a, *b, &r.hash),
         // A transcript turn is checked against the transcript itself (see
@@ -329,7 +348,7 @@ pub fn check(store: &MemoryStore, roots: &[RefRoot], text: &str) -> Result<RefCh
         // atlas ref.
         if let Target::Record(k) = &r.target {
             let family = k.split_once(':').is_some_and(|(p, _)| prefixes.contains(p));
-            if !family && store.head(k)?.is_none() {
+            if !family && store.head(k)?.is_none() && crate::chain::parse_key(&r.text).is_none() {
                 continue;
             }
         }
@@ -426,8 +445,9 @@ pub struct Compaction {
     pub resume_bytes: usize,
     /// Whether an edit, write or commit was reached.
     pub resumed: bool,
-    /// Facts: identifier-like tokens used in the window's tool inputs that
-    /// the compacted segment's text held.
+    /// Facts: identifier-like tokens used in the window's tool inputs (not
+    /// the file text an edit or write carries) that the compacted segment's
+    /// text held.
     pub facts: usize,
     /// Of those, ones the summary holds.
     pub facts_in_summary: usize,
@@ -447,6 +467,78 @@ fn fact_tokens(text: &str) -> Vec<&str> {
         .map(|w| w.trim_matches(['.', ':', '-', '/']))
         .filter(|w| w.len() >= 6 && w.len() <= 120 && w.bytes().any(|b| b.is_ascii_digit() || matches!(b, b'/' | b'.' | b'_' | b':')))
         .collect()
+}
+
+/// Tool-input fields that hold text the call writes into a file, or must
+/// match a file's current text exactly: code the session authors or copies
+/// from a fresh read, not something it has to remember across a compaction.
+const AUTHORED: &[&str] = &["content", "old_string", "new_string", "edits", "new_source"];
+
+/// The text of a tool call's input that a fact can come from: its string
+/// and number values, one per line, except the [`AUTHORED`] fields. Values
+/// are read raw, so JSON escapes (`\\`, `\n`, `\"`) and the field names
+/// never make or split a fact.
+fn fact_input(input: &Value) -> String {
+    fn walk(v: &Value, out: &mut String) {
+        match v {
+            Value::String(s) => {
+                out.push_str(s);
+                out.push('\n');
+            }
+            Value::Number(n) => {
+                out.push_str(&n.to_string());
+                out.push('\n');
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(m) => m.iter().filter(|(k, _)| !AUTHORED.contains(&k.as_str())).for_each(|(_, x)| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    walk(input, &mut out);
+    out
+}
+
+/// Which text of a tool call's input a fact may come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactRule {
+    /// What a call names: its values except the [`AUTHORED`] fields (the
+    /// scored rule).
+    Named,
+    /// The input serialized as JSON, field names and escapes included (the
+    /// rule before the [`AUTHORED`] exclusion; scored beside it only).
+    Serialized,
+    /// Only the [`AUTHORED`] fields' values: file text an edit or write
+    /// carries, and TodoWrite's `content` (the same field name).
+    Authored,
+}
+
+/// The text of a tool call's input under `rule`.
+fn rule_input(input: &Value, rule: FactRule) -> String {
+    fn authored(v: &Value, inside: bool, out: &mut String) {
+        match v {
+            Value::String(s) if inside => {
+                out.push_str(s);
+                out.push('\n');
+            }
+            Value::Number(n) if inside => {
+                out.push_str(&n.to_string());
+                out.push('\n');
+            }
+            Value::Array(a) => a.iter().for_each(|x| authored(x, inside, out)),
+            Value::Object(m) => m.iter().for_each(|(k, x)| authored(x, inside || AUTHORED.contains(&k.as_str()), out)),
+            _ => {}
+        }
+    }
+    match rule {
+        FactRule::Named => fact_input(input),
+        FactRule::Serialized => input.to_string(),
+        FactRule::Authored => {
+            let mut out = String::new();
+            authored(input, false, &mut out);
+            out
+        }
+    }
 }
 
 fn content_texts(v: &Value, out: &mut Vec<String>) {
@@ -480,7 +572,18 @@ fn is_work(tool: &str, input: &Value) -> bool {
 /// segment's visible text held, each once. The same rule as [`replay`]'s
 /// facts at a recorded boundary, for any cut.
 pub fn facts_at(path: &Path, start: usize, cut: usize) -> Vec<String> {
+    facts_at_by(path, start, cut, FactRule::Named).into_iter().map(|(f, _)| f).collect()
+}
+
+/// [`facts_at`] under any [`FactRule`], each fact with the tool whose input
+/// it first came from.
+pub fn facts_at_by(path: &Path, start: usize, cut: usize, rule: FactRule) -> Vec<(String, String)> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    facts_in_by(&text, start, cut, rule)
+}
+
+/// [`facts_at_by`] over a transcript's text already read.
+pub fn facts_in_by(text: &str, start: usize, cut: usize, rule: FactRule) -> Vec<(String, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut segment = String::new();
     for l in lines.iter().take(cut).skip(start) {
@@ -496,7 +599,7 @@ pub fn facts_at(path: &Path, start: usize, cut: usize) -> Vec<String> {
             }
         }
     }
-    let mut used = Vec::new();
+    let mut used: Vec<(String, String)> = Vec::new();
     for l in lines.iter().skip(cut) {
         if used.len() >= MISS_WINDOW {
             break;
@@ -507,16 +610,17 @@ pub fn facts_at(path: &Path, start: usize, cut: usize) -> Vec<String> {
         let Ok(v) = crate::json::parse(l) else { continue };
         for b in v.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
             if b.get("type").and_then(Value::as_str) == Some("tool_use") && used.len() < MISS_WINDOW {
-                used.push(b.get("input").cloned().unwrap_or(Value::Null).to_string());
+                let tool = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                used.push((rule_input(b.get("input").unwrap_or(&Value::Null), rule), tool));
             }
         }
     }
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for u in &used {
+    for (u, tool) in &used {
         for t in fact_tokens(u) {
             if seen.insert(t.to_string()) && segment.contains(t) {
-                out.push(t.to_string());
+                out.push((t.to_string(), tool.clone()));
             }
         }
     }
@@ -633,7 +737,7 @@ pub fn replay(path: &Path) -> Vec<Compaction> {
             let in_window = window > 0;
             if in_window {
                 window -= 1;
-                used.push(input.to_string());
+                used.push(fact_input(&input));
             }
             let Some(sig) = lookup_sig(tool, &input) else { continue };
             if in_window {
@@ -793,15 +897,11 @@ pub fn totals(conn: &Connection, bytes_per_token: f64) -> Result<Option<Totals>>
 }
 
 /// The newest compaction recorded in a transcript: its metadata and
-/// summary, read from the file's end (at most the last 32 MiB).
+/// summary, read from the file's end (at most the last 32 MiB): only the
+/// lines from the newest boundary on are read and parsed.
 pub fn newest(path: &Path) -> Option<Compaction> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(32 << 20);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
+    let is_boundary = |l: &str| crate::json::parse(l).is_ok_and(|v| v.get("subtype").and_then(Value::as_str) == Some("compact_boundary"));
+    let (_, buf) = crate::checkpoint::last_line_where(path, 32 << 20, "\"compact_boundary\"", is_boundary)?;
     let text = String::from_utf8_lossy(&buf);
     let mut found: Option<Compaction> = None;
     for line in text.lines() {
@@ -880,6 +980,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn facts_come_from_what_a_call_names_not_the_text_it_writes() {
+        let edit = crate::json::parse(r#"{"file_path":"Z:\\dev\\ui\\app.js","old_string":"state.route = r;","new_string":"state.params = p;"}"#).unwrap();
+        let bash = crate::json::parse(r#"{"command":"cd ui\ncargo test -p lpt_core","timeout":120000}"#).unwrap();
+        let write = crate::json::parse(r#"{"file_path":"notes/css_patch.py","content":"body.in-ws { color: #7b8689 }"}"#).unwrap();
+        let toks = |v: &Value| fact_tokens(&fact_input(v)).into_iter().map(str::to_string).collect::<Vec<_>>();
+        // The path is a fact; the edit's old and new text are not.
+        assert_eq!(toks(&edit), ["app.js"]);
+        // A command's lines are read raw: no `ncargo` from an escaped newline, no field names.
+        assert_eq!(toks(&bash), ["lpt_core", "120000"]);
+        assert_eq!(toks(&write), ["notes/css_patch.py"]);
+        // The authored rule reads only those fields, TodoWrite's content too;
+        // the serialized rule reads the JSON text, field names and escapes.
+        let todo = crate::json::parse(r#"{"todos":[{"content":"run lpt_core tests","status":"pending"}]}"#).unwrap();
+        let by = |v: &Value, r: FactRule| fact_tokens(&rule_input(v, r)).into_iter().map(str::to_string).collect::<Vec<_>>();
+        let mut authored = by(&edit, FactRule::Authored);
+        authored.sort();
+        assert_eq!(authored, ["state.params", "state.route"]);
+        assert_eq!(by(&todo, FactRule::Authored), ["lpt_core"]);
+        assert_eq!(by(&bash, FactRule::Named), toks(&bash));
+        assert!(by(&edit, FactRule::Serialized).contains(&"file_path".to_string()));
+    }
+
+    #[test]
     fn refs_parse_and_skip_emails() {
         let r = refs_in("see rules:r00412@3f9c2a1b7e40, and vault:notes/a.md:3-5@0123abcd. mail me@example.com or x@deadbeef");
         let t: Vec<&str> = r.iter().map(|x| x.text.as_str()).collect();
@@ -890,6 +1013,26 @@ mod tests {
         assert_eq!(parse_ref("journal:lane:0007@0123abcd").unwrap().target, Target::Record("journal:lane:0007".into()));
         assert!(parse_ref("k@0123abc").is_none());
         assert!(parse_ref("k@0123ABCD").is_none());
+    }
+
+    #[test]
+    fn a_chain_key_a_summary_cites_is_unchecked_not_dangling() {
+        let d = std::env::temp_dir().join(format!("atlas-compact-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let store = MemoryStore::open(&d.join("memory.sqlite")).unwrap();
+        for k in ["turn:43f55b2e:b10-b20@0123456789ab", "compact:43f55b2e:b10@0123456789ab"] {
+            let r = parse_ref(k).unwrap();
+            assert_eq!(resolve(&store, &[], &r).unwrap(), Status::Unchecked, "{k}");
+        }
+        let c = check(&store, &[], "state: turn:43f55b2e:b10-b20@0123456789ab, compact:43f55b2e:b10@0123456789ab").unwrap();
+        assert_eq!((c.refs, c.unchecked), (2, 2), "{c:?}");
+        assert!(c.dangling.is_empty(), "{c:?}");
+        // Still a record to the check: a key of no family is someone else's notation.
+        assert_eq!(check(&store, &[], "pkg:left-pad@0123456789ab").unwrap().refs, 0);
+        // The short form the card prints is no plain ref: the check does not see it.
+        assert_eq!(check(&store, &[], "turn:43f5:b10-b20@012345").unwrap().refs, 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

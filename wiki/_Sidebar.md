@@ -17,6 +17,7 @@
 - [[Identifiers and freshness]]
 - [[Memory store and hooks]]
 - [[Memory tree]]
+- [[Memory and rule files]]
 - [[Discussions]]
 - [[Generated indices]]
 - [[Cross-vault links]]

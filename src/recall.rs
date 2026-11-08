@@ -239,10 +239,11 @@ pub fn check(store: &Store, extra: &[String]) -> Result<RecallReport> {
             if merged {
                 continue;
             }
-            if !indexed.contains_key(&d) {
-                indexed.insert(d, store.doc_idents(source, path)?);
-            }
-            let in_index = indexed[&d].contains(&(id.clone(), line as i64));
+            let idents = match indexed.entry(d) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(store.doc_idents(source, path)?),
+            };
+            let in_index = idents.contains(&(id.clone(), line as i64));
             report.id_misses.push(IdMiss {
                 id: id.clone(),
                 source: source.clone(),

@@ -1,7 +1,7 @@
 //! `cargo xtask`: atlas's development tasks, in Rust, never shipped.
 //!
 //! ```text
-//! cargo xtask calibrate-baseline --config CONFIG --transcripts DIR --before TIME [--handoff RE]
+//! cargo xtask calibrate-baseline --config CONFIG --transcripts DIR --before TIME [--handoff RE] [--project NAME] [--skip TEXT ...] [--audit FILE]
 //! cargo xtask token-use --config CONFIG --transcripts DIR --since TIME [--handoff RE] [--replay CONFIG]
 //! cargo xtask attrib TRANSCRIPT.jsonl [TRANSCRIPT.jsonl ...]
 //! cargo xtask calibrate-recall SCORES.tsv [MIN_TERMS]
@@ -15,6 +15,11 @@
 //! cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
 //! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
 //! cargo xtask memory-tree-check --config CONFIG [--dir DIR]
+//! cargo xtask digest-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS]
+//! cargo xtask report-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS] [--budget BYTES]
+//! cargo xtask lanes-eval --corpus DIR [--rows] [--bar] [--gate ROWS]
+//! cargo xtask clipped --store FILE
+//! cargo xtask restore-clipped --store FILE --from JSON
 //! cargo xtask langs-bench --lang LANG --root DIR [--scip FILE]
 //! ```
 //!
@@ -30,6 +35,17 @@
 //! * `memory-eval` scores atlas as a memory store on a fixed copy of one:
 //!   recall-check misses, a question set answered from tool output alone,
 //!   and the work-queue tools against the database (see `memory_eval.rs`).
+//! * `digest-eval` scores run digests on a corpus of real failing runs
+//!   with hand-labelled root-cause lines: the cause in the digest alone, in
+//!   the digest plus one follow-up slice, or missed, and the tokens of each
+//!   against the raw output (see `digest_eval.rs`).
+//! * `report-eval` scores report digests on a corpus of real subagent
+//!   reports with the facts an orchestrator needed labelled by hand: whole,
+//!   partial or missed, and the tokens against the report (see
+//!   `report_eval.rs`).
+//! * `lanes-eval` scores the work queue's brief classification (lane,
+//!   priority, resources) on a corpus of real briefs labelled by hand (see
+//!   `lanes_eval.rs`).
 //! * `memory-tree-check` checks the memory index tree: every memory within 3
 //!   reads of the root, pins in the root, no orphans or duplicates, and a
 //!   rebuild that would write nothing (see `memory_tree.rs`).
@@ -53,15 +69,22 @@
 //!   prints line and region coverage per module (see `coverage.rs`).
 
 mod attrib;
+mod bpe;
 mod calibrate;
 mod calibrate_recall;
 mod compact_live;
 mod coverage;
+mod digest_eval;
 mod langs_bench;
 mod leak;
 mod memory_eval;
+mod rules_eval;
 mod memory_tree;
 mod pack_embedder;
+mod lanes_eval;
+mod report_eval;
+mod restore_clipped;
+mod resume_eval;
 mod public_repo;
 mod py;
 mod release;
@@ -76,7 +99,7 @@ mod wiki;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --transcripts DIR --before TIME [--handoff RE]
+const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --transcripts DIR --before TIME [--handoff RE] [--project NAME] [--skip TEXT ...] [--audit FILE]
        cargo xtask token-use --config CONFIG --transcripts DIR --since TIME [--handoff RE] [--replay CONFIG]
        cargo xtask attrib TRANSCRIPT.jsonl [TRANSCRIPT.jsonl ...]
        cargo xtask calibrate-recall SCORES.tsv [MIN_TERMS]
@@ -89,8 +112,21 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
        cargo xtask verify-macos
        cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
        cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
+       cargo xtask rules-eval --config CONFIG --holds FILE [--project NAME] [--cwd DIR] [--rows] [--dump DIR]
        cargo xtask memory-tree-check --config CONFIG [--dir DIR]
-       cargo xtask compact-live --transcripts DIR --work DIR [--atlas-bin EXE --atlas-config FILE] [--claude EXE] [--sessions N] [--per-session N] [--thresholds T,T] [--per-threshold N] [--only JOB,JOB] [--dry-run | --score]
+       cargo xtask digest-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS]
+       cargo xtask report-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS] [--budget BYTES]
+       cargo xtask lanes-eval --corpus DIR [--rows] [--bar] [--gate ROWS]
+       cargo xtask clipped --store FILE
+       cargo xtask restore-clipped --store FILE --from JSON
+       cargo xtask resume-eval --store FILE --transcript PATH --now TIME --questions FILE [--source clear|startup] [--max-tokens N] [--rows]
+       cargo xtask token-ratio FILE ... [--bench]
+       cargo xtask compact-live --transcripts DIR --work DIR [--atlas-bin EXE --atlas-config FILE] [--claude EXE] [--sessions N] [--per-session N] [--thresholds T,T] [--per-threshold N] [--samples N] [--calibrate DIR] [--index-newer-ok] [--stop-at TOKENS] [--only JOB,JOB] [--dry-run | --score | --spend | --measure]
+           --only runs the jobs whose names start with one of JOB, on a fresh or a resumed plan; run.json keeps every job.
+           --stop-at is checked only before each job, never mid-job, against the input tokens of finished jobs (cache
+           reads and writes included), so the first job always runs and a run can pass it by about one job. It is not a
+           dollar guard: a smoke's guard is --only plus the orchestrator's go.
+       cargo xtask hook-time LOG -- EXE ARGS...
        cargo xtask langs-bench --lang LANG --root DIR [--scip FILE]";
 
 fn main() -> ExitCode {
@@ -101,7 +137,23 @@ fn main() -> ExitCode {
         "calibrate-baseline" => calibrate_baseline(args, false),
         "token-use" => calibrate_baseline(args, true),
         "memory-eval" => memory_eval(args),
+        "rules-eval" => rules_eval(args),
         "memory-tree-check" => memory_tree_check(args),
+        "digest-eval" => digest_eval(args),
+        "report-eval" => report_eval(args),
+        "lanes-eval" => lanes_eval(args),
+        "clipped" => clipped(args),
+        "restore-clipped" => restore_clipped(args),
+        "resume-eval" => resume_eval(args),
+        "token-ratio" => {
+            let bench = args.iter().any(|a| a == "--bench");
+            let files: Vec<String> = args.into_iter().filter(|a| a != "--bench").collect();
+            if files.is_empty() {
+                Err(USAGE.to_string())
+            } else {
+                bpe::token_ratio(&files, bench)
+            }
+        }
         "attrib" => attrib(args),
         "calibrate-recall" => calibrate_recall(args),
         "pack-embedder" => pack_embedder::Args::parse(args).and_then(|a| pack_embedder::run(&a)).map(|s| println!("{s}")),
@@ -114,6 +166,10 @@ fn main() -> ExitCode {
         },
         "coverage" => coverage::run(args),
         "compact-live" => compact_live::run(args),
+        "hook-time" => match compact_live::hook_time(args) {
+            Ok(code) => return ExitCode::from(code),
+            Err(e) => Err(e),
+        },
         "langs-bench" => langs_bench::run(args),
         "verify-macos" => match verify_macos::run() {
             Ok(0) => Ok(()),
@@ -169,6 +225,51 @@ fn memory_tree_check(args: Vec<String>) -> Result<(), String> {
     }
 }
 
+fn digest_eval(args: Vec<String>) -> Result<(), String> {
+    let mut o = digest_eval::Opts::default();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{a} needs a value
+{USAGE}"));
+        match a.as_str() {
+            "--cases" => o.cases = PathBuf::from(val()?),
+            "--rows" => o.rows = true,
+            "--show" => o.show.push(val()?),
+            "--gate" => o.gate = Some(PathBuf::from(val()?)),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    if o.cases.as_os_str().is_empty() {
+        return Err(USAGE.into());
+    }
+    if digest_eval::run(&o)? {
+        Ok(())
+    } else {
+        Err("digest eval: a case is caught at a worse level than in the gate's rows".into())
+    }
+}
+
+fn rules_eval(args: Vec<String>) -> Result<(), String> {
+    let mut o = rules_eval::Opts { config: PathBuf::new(), holds: PathBuf::new(), project: None, cwd: None, rows: false, dump: None };
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{a} needs a value\n{USAGE}"));
+        match a.as_str() {
+            "--config" => o.config = PathBuf::from(val()?),
+            "--holds" => o.holds = PathBuf::from(val()?),
+            "--project" => o.project = Some(val()?),
+            "--cwd" => o.cwd = Some(PathBuf::from(val()?)),
+            "--dump" => o.dump = Some(PathBuf::from(val()?)),
+            "--rows" => o.rows = true,
+            _ => return Err(USAGE.into()),
+        }
+    }
+    if o.config.as_os_str().is_empty() || o.holds.as_os_str().is_empty() {
+        return Err(USAGE.into());
+    }
+    rules_eval::run(&o)
+}
+
 fn memory_eval(args: Vec<String>) -> Result<(), String> {
     let mut o = memory_eval::Opts { config: PathBuf::new(), questions: PathBuf::new(), fresh_from: None, floors: Vec::new(), rows: false, show: Vec::new(), project: None, cwd: None };
     let mut it = args.into_iter();
@@ -205,6 +306,9 @@ fn memory_eval(args: Vec<String>) -> Result<(), String> {
 
 fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> {
     let (mut config, mut dir, mut before, mut handoff, mut replay) = (None, None, None, calibrate::DEFAULT_HANDOFF.to_string(), None);
+    let mut audit: Option<PathBuf> = None;
+    let mut project: Option<String> = None;
+    let mut skip: Vec<String> = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{a} needs a value\n{USAGE}"));
@@ -213,6 +317,9 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
             "--transcripts" => dir = Some(PathBuf::from(val()?)),
             "--before" | "--since" => before = Some(val()?),
             "--handoff" => handoff = val()?,
+            "--audit" if !token_use => audit = Some(PathBuf::from(val()?)),
+            "--project" => project = Some(val()?),
+            "--skip" if !token_use => skip.push(val()?),
             "--replay" if token_use => replay = Some(PathBuf::from(val()?)),
             _ => return Err(USAGE.into()),
         }
@@ -221,7 +328,11 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
         (Some(c), Some(d), Some(b)) => (c, d, b),
         _ => return Err(USAGE.into()),
     };
-    let c = atlas::config::Config::load(&config).map_err(|e| e.to_string())?;
+    // A configuration with projects resolves to one (`--project`, else the
+    // working folder's), as the server does.
+    let raw = atlas::config::Config::load(&config).map_err(|e| e.to_string())?;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let c = atlas::project::resolve(&raw, &cwd, project.as_deref()).map_err(|e| e.to_string())?.config;
     let db = c.db.clone().ok_or("the configuration names no db")?;
     let vaults: Vec<PathBuf> = c.vaults.iter().map(|v| v.path.clone()).collect();
     let sources: Vec<(PathBuf, Vec<String>)> = c.sources.iter().map(|s| (s.root.clone(), s.include.clone())).collect();
@@ -246,7 +357,13 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
         }
         return Ok(());
     }
-    let b = calibrate::measure(&dir, &before, &t);
+    let b = match &audit {
+        Some(p) => {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?);
+            calibrate::measure_audited(&dir, &before, &t, &skip, Some(&mut f))
+        }
+        None => calibrate::measure_audited(&dir, &before, &t, &skip, None),
+    };
     let conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
     atlas::baseline::save(&conn, &b).map_err(|e| e.to_string())?;
     let side = atlas::baseline::AtlasSide::read(&conn).map_err(|e| e.to_string())?;
@@ -269,4 +386,137 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
     println!("ratio per answer, upper bound (grep + read counterfactual / returned): {:.1}x", side.upper());
     println!("saved to {}", db.display());
     Ok(())
+}
+
+/// Lists, read-only, the journal and handoff entries whose text the title
+/// clip cut: the head version's title is exactly
+/// [`restore_clipped::CLIP_CHARS`] characters and its body is empty, so
+/// everything past that character of a one-line text was lost (journals from b5304ff, handoffs from 39db6c9, until the
+/// title clip kept the long line in the body).
+fn clipped(args: Vec<String>) -> Result<(), String> {
+    let store = match args.as_slice() {
+        [flag, path] if flag == "--store" => PathBuf::from(path),
+        _ => return Err(USAGE.into()),
+    };
+    let db = rusqlite::Connection::open_with_flags(&store, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| format!("{}: {e}", store.display()))?;
+    let mut q = db
+        .prepare(
+            "SELECT r.key, r.status, v.time FROM records r JOIN versions v ON v.vid = r.head \
+             WHERE r.kind IN ('journal', 'handoff') AND length(v.title) = ?1 AND trim(v.body, ' ' || char(10) || char(13)) = '' ORDER BY v.time",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String, String)> = q
+        .query_map([restore_clipped::CLIP_CHARS as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .and_then(Iterator::collect)
+        .map_err(|e| e.to_string())?;
+    for (key, status, time) in &rows {
+        println!("{key}\t{status}\t{time}");
+    }
+    println!("clipped: {}", rows.len());
+    Ok(())
+}
+
+/// Applies the restore JSON to a store (see `restore_clipped`).
+fn restore_clipped(args: Vec<String>) -> Result<(), String> {
+    let (mut store, mut from) = (None, None);
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--store" => store = it.next().map(PathBuf::from),
+            "--from" => from = it.next().map(PathBuf::from),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let (Some(store), Some(from)) = (store, from) else { return Err(USAGE.into()) };
+    let t = restore_clipped::run(&store, &from)?;
+    for (what, keys) in [("intact (nothing was cut)", &t.intact), ("not clipped any more", &t.not_clipped), ("mismatch (lane, entry or title)", &t.mismatch), ("missing from the store", &t.missing), ("not a journal entry", &t.not_journal)] {
+        if !keys.is_empty() {
+            println!("skipped, {what}: {}", keys.join(", "));
+        }
+    }
+    println!(
+        "restored {}, intact {}, not clipped {}, mismatch {}, missing {}, not a journal entry {}",
+        t.restored.len(),
+        t.intact.len(),
+        t.not_clipped.len(),
+        t.mismatch.len(),
+        t.missing.len(),
+        t.not_journal.len()
+    );
+    Ok(())
+}
+
+fn resume_eval(args: Vec<String>) -> Result<(), String> {
+    let mut o = resume_eval::Opts::default();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{a} needs a value
+{USAGE}"));
+        match a.as_str() {
+            "--store" => o.store = PathBuf::from(val()?),
+            "--transcript" => o.transcript = val()?,
+            "--now" => o.now = val()?,
+            "--questions" => o.questions = PathBuf::from(val()?),
+            "--source" => o.source = val()?,
+            "--max-tokens" => o.max_tokens = Some(val()?.parse().map_err(|_| "--max-tokens needs an integer".to_string())?),
+            "--rows" => o.rows = true,
+            _ => return Err(USAGE.into()),
+        }
+    }
+    if o.store.as_os_str().is_empty() || o.now.is_empty() || o.questions.as_os_str().is_empty() {
+        return Err(USAGE.into());
+    }
+    if resume_eval::run(&o)? {
+        Ok(())
+    } else {
+        Err("resume eval: a question missed a fact in the card, or the card is over its token ceiling".into())
+    }
+}
+
+fn lanes_eval(args: Vec<String>) -> Result<(), String> {
+    let mut o = lanes_eval::Opts::default();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{a} needs a value
+{USAGE}"));
+        match a.as_str() {
+            "--corpus" => o.corpus = PathBuf::from(val()?),
+            "--rows" => o.rows = true,
+            "--bar" => o.bar = true,
+            "--gate" => o.gate = Some(PathBuf::from(val()?)),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    if o.corpus.as_os_str().is_empty() {
+        return Err(USAGE.into());
+    }
+    if lanes_eval::run(&o)? {
+        Ok(())
+    } else {
+        Err("lanes eval: the bar is not met, or a brief regressed against the gate's rows".into())
+    }
+}
+
+fn report_eval(args: Vec<String>) -> Result<(), String> {
+    let mut o = report_eval::Opts::default();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{a} needs a value\n{USAGE}"));
+        match a.as_str() {
+            "--cases" => o.cases = PathBuf::from(val()?),
+            "--rows" => o.rows = true,
+            "--show" => o.show.push(val()?),
+            "--gate" => o.gate = Some(PathBuf::from(val()?)),
+            "--budget" => o.budget = Some(val()?.parse().map_err(|_| format!("--budget needs a number of bytes\n{USAGE}"))?),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    if o.cases.as_os_str().is_empty() {
+        return Err(USAGE.into());
+    }
+    if report_eval::run(&o)? {
+        Ok(())
+    } else {
+        Err("report eval: a case keeps fewer facts than in the gate's rows".into())
+    }
 }

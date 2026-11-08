@@ -275,7 +275,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
-        let w = Watcher::start(&[dir.clone()]);
+        let w = Watcher::start(std::slice::from_ref(&dir));
         assert!(w.snapshot(0).healthy);
         assert!(w.is_clean(0));
         let mut seen = w.events();

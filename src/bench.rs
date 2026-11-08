@@ -434,6 +434,74 @@ pub fn run(setup: &Setup, runs: usize, opts: &Opts) -> Result<(), String> {
         Some((_, b)) => println!("tools/list: before {b} bytes ({:.0} tokens), after {list} bytes ({:.0} tokens)", *b as f64 / bpt, list as f64 / bpt),
         None => println!("tools/list: {list} bytes ({:.0} tokens)", list as f64 / bpt),
     }
+    queue_rows(setup, runs)
+}
+
+/// The work queue's rows: `atlas queue next`'s work (read the items, check
+/// their `after` conditions, propose) on a store seeded with 100 and with
+/// 1,000 queued items (refused briefs of 2 KB, and of 20 KB as the hook
+/// files them), and brief classification on a 20 KB brief with nothing
+/// declared, against no lanes and against the configured memory store's
+/// lanes. The queue store is a scratch file beside the database.
+fn queue_rows(setup: &Setup, runs: usize) -> Result<(), String> {
+    let e = |x: atlas::Error| x.to_string();
+    let orch = atlas::orchestrate::OrchSettings::default();
+    for (n, repeat) in [(100usize, 60usize), (1000, 60), (1000, 600)] {
+        let path = setup.db.with_file_name("atlas-bench-queue.sqlite");
+        let clean = || {
+            for ext in ["", "-wal", "-shm", ".jsonl"] {
+                let _ = std::fs::remove_file(path.with_file_name(format!("atlas-bench-queue.sqlite{ext}")));
+            }
+        };
+        clean();
+        let brief = "Kind: builder\nLane: L\nUses: compile\n\n".to_string() + &"Fix the reader and run the tests. ".repeat(repeat);
+        {
+            let mut m = atlas::memory::MemoryStore::open(&path).map_err(e)?;
+            // Four in five are planned, in chains of ten on a lane (each
+            // after the one before); the rest are refused launches with a
+            // brief and the meta the hook writes.
+            for i in 0..n {
+                let lane = format!("BENCH-{}", i / 10);
+                if i % 5 == 4 {
+                    let class = atlas::lanes::classify(&brief, &[]);
+                    let meta = class.meta();
+                    let title = format!("refused {i}");
+                    let l = atlas::queue::Launch { kind: atlas::orchestrate::Kind::Builder, lane: Some(&lane), description: &title, subagent_type: "general-purpose", prompt: &brief, session: "s", class_meta: &meta };
+                    atlas::queue::add(&mut m, &l).map_err(e)?;
+                } else {
+                    let after = if i % 10 == 0 { Vec::new() } else { vec![format!("journal:{lane}:{:04}", i % 10)] };
+                    let p = atlas::queue::Planned { lane, kind: "builder".into(), uses: vec!["compile".into()], after, order: i.to_string().parse().ok(), title: format!("planned {i}"), ..atlas::queue::Planned::default() };
+                    atlas::queue::add_planned(&mut m, &p).map_err(e)?;
+                }
+            }
+        }
+        let m = atlas::memory::MemoryStore::open(&path).map_err(e)?;
+        let now = atlas::memory::now();
+        let mut t = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let (r, d) = time(|| atlas::queue::items(&m, &now).map(|(_, its)| atlas::queue::propose(&orch, &its, &[]).start.len()));
+            r.map_err(e)?;
+            t.push(d);
+        }
+        show(&format!("queue next (items, after, propose), {n} items, {} KB briefs", (brief.len() + 512) / 1024), &stats(t));
+        drop(m);
+        clean();
+    }
+    let brief = "Fix the reader, then update the notes and check the output by hand. ".repeat(300);
+    // The lanes the hook passes: the configured store's, when it exists.
+    let known = if setup.memory.store.exists() {
+        atlas::memory::MemoryStore::open(&setup.memory.store).map(|m| atlas::queue::known_lanes(&m)).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for lanes in [&[][..], &known[..]] {
+        let mut t = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let (_, d) = time(|| atlas::lanes::classify(&brief, lanes));
+            t.push(d);
+        }
+        show(&format!("classify a {} KB brief, nothing declared, {} known lanes", brief.len() / 1024, lanes.len()), &stats(t));
+    }
     Ok(())
 }
 

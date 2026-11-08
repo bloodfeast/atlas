@@ -493,12 +493,18 @@ impl Router {
                 // model windowed itself gets more room.
                 let build = matches!(crate::digest::shape("bash", c, ""), crate::digest::Shape::CargoTest | crate::digest::Shape::CargoBuild);
                 let limit = if build { th.min(self.cfg.build_threshold_bytes) } else if windowed(c) { th * 3 } else { th };
-                if stdout.len() + stderr.len() < limit {
-                    // Small: whole, with a failure said the way Claude Code says it.
+                let small = stdout.len() + stderr.len() < limit;
+                // A command naming a denied file is never kept as a handle:
+                // left alone as small output is, except that a failure's
+                // text is what Claude Code holds, not its persisted file.
+                let denied = !small && command_denied(cmd, &ev.cwd);
+                if small || denied {
+                    // Whole, with a failure said the way Claude Code says it.
                     if exit == Some(-1) {
+                        let shown = if denied { strip_marker(s(resp, "stdout")) } else { stdout.as_str() };
                         let mut out = resp.clone();
                         if let Some(o) = out.as_object_mut() {
-                            o.insert("stdout".into(), Value::from(format!("Exit code nonzero\n{stdout}")));
+                            o.insert("stdout".into(), Value::from(format!("Exit code nonzero\n{shown}")));
                         }
                         return Ok(Some(out));
                     }
@@ -555,6 +561,10 @@ impl Router {
                     (names.join("\n"), "files")
                 };
                 if text.len() < th {
+                    return Ok(None);
+                }
+                // A search of a denied file, by path or by glob: as for Read.
+                if command_denied(s(input, "path"), &ev.cwd) || crate::sources::glob_names_denied(s(input, "glob")) {
                     return Ok(None);
                 }
                 let label = format!("Grep {pattern:?} {}", s(input, "path"));
@@ -1080,6 +1090,17 @@ fn absolute(file: &str, dir: &str) -> String {
     } else {
         format!("{}/{}", dir.trim_end_matches(['/', '\\']), file.trim_start_matches("./"))
     }
+}
+
+/// Whether a command or a path, run from `cwd`, names a deny-listed file:
+/// [`crate::sources::command_names_denied`], or a word that is a link to such a
+/// file, or the whole text as one path (it may hold spaces). `cwd` is the
+/// session's, which is not this process's, so a word is joined to it before the
+/// link check. That check touches the disk: call this only for output large
+/// enough to be kept.
+pub(crate) fn command_denied(cmd: &str, cwd: &str) -> bool {
+    use crate::sources::{command_names_denied, command_path_words, path_denied};
+    !cmd.trim().is_empty() && (command_names_denied(cmd) || std::iter::once(cmd).chain(command_path_words(cmd)).any(|w| path_denied(Path::new(&absolute(w, cwd)))))
 }
 
 /// `/c/x` as `C:/x` on Windows; anything else as it is.

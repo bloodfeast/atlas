@@ -40,7 +40,10 @@ of flat records as one table under `key: N`, and every element of every list: th
 - A snippet is about 120 characters centred on the matched identifier or word, cut on character boundaries,
   with `…` where it was cut. Repeat mentions in one section are one row with a count (`n`).
 - Default limits are small (`lookup` mentions 3, `search` 50 lines or 5 sections, `ids` 50, `misses` 20) and a cut list ends with
-  `+N more (limit=L)`. The query is not echoed.
+  `+N more (limit=L)`. `recall {query}` ends with what it left out: `+N more over budget_tokens`, `+N more scoring near
+  zero`, `+more (limit=L)`. A `kind` or `scope` filter searches every word of the query up to its first 48, and a query longer
+  than that ends with `+N more words were not searched`; with no filter, a long query is searched by its 12 rarest
+  words. The query is not echoed.
 - Freshness says nothing when everything is fresh; otherwise one `stale SOURCE:PATH STATE[, reindexed]` line per
   file, up to 8 per source; past that one `stale SOURCE N files (REASON)[, reindexed]` line, where REASON is why the
   source is rebuilt from empty (`schema rebuild`, `index rules changed`, `first index`) or the count per state

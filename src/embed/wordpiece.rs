@@ -110,9 +110,7 @@ impl Tokenizer {
                 continue;
             }
             // Lowercase and strip accents (one or more characters, or none).
-            let norm: Option<&str> = if !self.lowercase {
-                None
-            } else if cp < 0x80 {
+            let norm: Option<&str> = if !self.lowercase || cp < 0x80 {
                 None
             } else {
                 self.map.get(&cp).map(String::as_str)

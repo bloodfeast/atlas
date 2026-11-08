@@ -222,6 +222,8 @@ fn len_of(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+type Fetches = Vec<(String, Result<Fetched, FetchError>)>;
+
 impl Models {
     /// Resolves the configured list.
     ///
@@ -267,7 +269,7 @@ impl Models {
     ///
     /// [`FetchError::Busy`] if another process holds the lock, or an I/O
     /// error creating the folder.
-    pub fn fetch_missing(&self, quiet: bool) -> Result<Vec<(String, Result<Fetched, FetchError>)>, FetchError> {
+    pub fn fetch_missing(&self, quiet: bool) -> Result<Fetches, FetchError> {
         let missing = self.missing();
         if missing.is_empty() {
             return Ok(Vec::new());

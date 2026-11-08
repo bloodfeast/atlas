@@ -21,12 +21,12 @@ pub fn test_totals(log: &str) -> (u64, u64) {
     log.lines().filter(|l| l.starts_with("test result")).fold((0, 0), |(p, f), l| (p + count(l, "passed"), f + count(l, "failed")))
 }
 
-fn grep<'a>(log: &'a str, pred: impl Fn(&str) -> bool) -> Vec<&'a str> {
+fn grep(log: &str, pred: impl Fn(&str) -> bool) -> Vec<&str> {
     log.lines().filter(|l| pred(l)).collect()
 }
 
 /// A test line `test NAME ... OUTCOME`.
-fn test_line<'a>(l: &'a str) -> Option<(&'a str, &'a str)> {
+fn test_line(l: &str) -> Option<(&str, &str)> {
     let rest = l.strip_prefix("test ")?;
     let (name, outcome) = rest.split_once(" ... ")?;
     Some((name, outcome))

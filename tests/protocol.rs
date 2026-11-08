@@ -219,10 +219,12 @@ fn no_network_code() {
         // just swapped in (session start only); `atlas run` spawns the command
         // the user names, from the command line only (never from a tool or
         // hook); the settings step runs `claude --version` (an interactive
-        // offer only, for the min_version gate). Nothing else spawns. Unsafe code lives only in the platform FFI and the
+        // offer only, for the min_version gate); the merge gate runs `gh pr view`
+        // (PreToolUse on a `gh pr merge` only, with review roles configured;
+        // Q-RV1). Nothing else spawns. Unsafe code lives only in the platform FFI and the
         // SIMD kernels (scan, embedding GEMM).
         let platform = path.parent().is_some_and(|p| p.ends_with("platform"));
-        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || platform;
+        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || platform;
         let ffi = platform || path.ends_with("scan.rs") || path.ends_with("gemm.rs");
         // Only the server's code: not the test modules, not comments.
         let body = src.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(&src);
@@ -232,6 +234,11 @@ fn no_network_code() {
                 continue;
             }
             assert!(!code.contains(bad), "{bad} in {}", path.display());
+        }
+        // The merge gate's one spawn is gh, and nothing else.
+        if path.ends_with("reviews.rs") {
+            assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
+            assert!(code.contains("Command::new(\"gh\")"), "{}", path.display());
         }
     }
 }
@@ -252,13 +259,155 @@ fn a_leading_byte_order_mark_is_ignored() {
     assert!(v.get("error").is_none(), "{v}");
 }
 
+/// The `hook` tool does not say a user is there, so SessionStart asks nothing
+/// and spends nothing, on the route `tools_memory` answers.
+#[test]
+fn the_hook_tool_asks_nothing_at_session_start() {
+    let fx = Fx::new("p-hook-start");
+    let mut s = fx.server();
+    let state = fx.tmp.path().join("mem");
+    s.set_memory(atlas::memory::settings::Settings::from_config(None, &state.join("index.sqlite")).unwrap());
+    let input = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"hook","arguments":{"event":"SessionStart","session_id":"s","source":"startup"}}}
+"#;
+    let mut out = Vec::new();
+    atlas::protocol::serve(&mut s, &input[..], &mut out).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("\"id\":7") && !out.contains("On by default") && !out.contains("Claude Code setting"), "{out}");
+    assert!(!state.join(atlas::claude_settings::OFFER_STATE).exists(), "nothing spent: {out}");
+}
+
+/// The words a source file's `match` arms take, with the given indent, after
+/// `from`. An arm under `#[cfg(feature = "dev")]` is skipped, so this holds with
+/// and without `dev`. Read from the source so that a new arm cannot be missed.
+fn arm_words(file: &str, from: &str, indent: usize, prefix: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+    let body = &text[text.find(from).unwrap_or_else(|| panic!("{from} in {file}"))..];
+    let mut out = Vec::new();
+    let mut dev = false;
+    for line in body.lines() {
+        let at = line.len() - line.trim_start().len();
+        if at == indent && line.trim() == "#[cfg(feature = \"dev\")]" {
+            dev = true;
+            continue;
+        }
+        if at == indent && line[at..].starts_with('"') && line.contains("=>") && !dev {
+            let pats = line.split("=>").next().unwrap();
+            let word = pats.split('|').next().unwrap().trim().trim_matches('"');
+            if word.starts_with(prefix) {
+                out.push(word.to_string());
+            }
+        }
+        dev = false;
+    }
+    out
+}
+
+/// Every mode, subcommand and queue or ideas word, read from the source.
 #[test]
 fn help_lists_every_mode_and_subcommand() {
     let out = Command::new(bin()).arg("--help").output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    for want in ["--setup", "--hook", "--memory-check", "--memory-snapshot", "--token-report", "--code-index", "atlas run ", "atlas slice ", "atlas digest ", "atlas crop ", "atlas ruling ", "atlas entry ", "atlas grammar ", "settings list", "undo [--yes]", "add-project", "migrate-projects", "on|off update"] {
-        assert!(text.contains(want), "--help lacks {want:?}:\n{text}");
+    let words = |line: &str| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).map(str::to_string).collect::<Vec<_>>();
+    let all = words(&text);
+    let main_rs = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")).unwrap();
+    let flags = arm_words("src/main.rs", "while let Some(a) = args.next() {", 12, "--");
+    assert!(flags.len() > 25, "the arms were found: {flags:?}");
+    for f in &flags {
+        assert!(all.contains(f), "--help lacks {f}:\n{text}");
+    }
+    let subs = main_rs.split("const SUBCOMMANDS: &[&str] = &[").nth(1).unwrap().split(']').next().unwrap();
+    let subs: Vec<&str> = subs.split(',').map(|w| w.trim().trim_matches('"')).collect();
+    assert!(subs.contains(&"ideas") && subs.len() > 5, "{subs:?}");
+    for w in subs.iter().copied().chain(["digest", "crop", "doctor"]) {
+        assert!(text.contains(&format!("  atlas {w} ")) || text.contains(&format!("  atlas {w}\n")), "--help lacks atlas {w}:\n{text}");
+    }
+    for (word, file) in [("queue", "src/queue.rs"), ("ideas", "src/ideas/cli.rs")] {
+        let arms = arm_words(file, "pub fn cli(", 8, "");
+        let arms: Vec<&String> = arms.iter().filter(|a| !a.starts_with('-')).collect();
+        assert!(arms.len() > 4, "{file}: {arms:?}");
+        let line = text.lines().find(|l| l.starts_with(&format!("  atlas {word} "))).unwrap();
+        let on_line = words(line);
+        for a in arms {
+            assert!(on_line.contains(a), "--help's atlas {word} line lacks {a}: {line}");
+        }
     }
     assert!(text.lines().count() > 20, "{text}");
+}
+
+/// Every file and folder under `dir`, with each file's bytes.
+fn tree(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Option<Vec<u8>>)>) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.push((p.clone(), None));
+            tree(&p, out);
+        } else {
+            out.push((p.clone(), Some(std::fs::read(&p).unwrap())));
+        }
+    }
+    out.sort();
+}
+
+/// Help writes nothing and reads nothing it could trip on, for every
+/// subcommand, with and without a leading `--config`. N6 of the v0.3 audit.
+#[test]
+fn help_touches_nothing() {
+    let main_rs = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")).unwrap();
+    let subs = main_rs.split("const SUBCOMMANDS: &[&str] = &[").nth(1).unwrap().split(']').next().unwrap();
+    let subs: Vec<&str> = subs.split(',').map(|w| w.trim().trim_matches('"')).collect();
+    let t = std::env::temp_dir().join(format!("atlas-help-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&t);
+    std::fs::create_dir_all(t.join(".claude")).unwrap();
+    // A malformed settings file: `settings` read it first, so its help failed.
+    std::fs::write(t.join(".claude").join("settings.json"), "{broken").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(bin())
+            .args(args)
+            .current_dir(&t)
+            .env("HOME", &t)
+            .env("USERPROFILE", &t)
+            .env("APPDATA", t.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", t.join("AppData/Local"))
+            .env("ATLAS_HOME", t.join("atlas-home"))
+            .env("CLAUDE_CONFIG_DIR", t.join(".claude"))
+            .env_remove("ATLAS_CONFIG")
+            .env_remove("ATLAS_PROJECT")
+            .output()
+            .unwrap()
+    };
+    let snapshot = || {
+        let mut v = Vec::new();
+        tree(&t, &mut v);
+        v
+    };
+    let before = snapshot();
+    let none = t.join("no-such-config.json");
+    let none = none.to_str().unwrap();
+    for w in subs.iter().copied().chain(["digest", "crop", "doctor"]) {
+        for flag in ["--help", "-h"] {
+            let out = run(&[w, flag]);
+            assert!(out.status.success(), "{w} {flag}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("atlas {w}")), "{w} {flag}: {}", String::from_utf8_lossy(&out.stdout));
+            assert!(snapshot() == before, "{w} {flag} changed the tree");
+            if subs.contains(&w) {
+                let out = run(&["--config", none, w, flag]);
+                assert!(out.status.success(), "--config {w} {flag}: {}", String::from_utf8_lossy(&out.stderr));
+                assert!(snapshot() == before, "--config {w} {flag} changed the tree");
+            }
+        }
+    }
+    for args in [&["--help"][..], &["-h"], &["settings", "orchestrate", "--help"], &["settings", "help"], &["queue", "help"], &["ideas", "help"]] {
+        let out = run(args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(snapshot() == before, "{args:?} changed the tree");
+    }
+    // The word after the first is the command's own, and `ruling help` is text.
+    let exe = bin();
+    let out = run(&["run", "--", exe.to_str().unwrap(), "--version"]);
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("atlas "), "{}", String::from_utf8_lossy(&out.stdout));
+    let out = run(&["run", "--", exe.to_str().unwrap(), "--help"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Modes:"), "the child's help, not atlas run's: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(snapshot() != before, "a real run does make the first-run configuration, so the tree check can see a write");
+    let _ = std::fs::remove_dir_all(&t);
 }

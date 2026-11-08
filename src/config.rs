@@ -259,6 +259,14 @@ pub struct MemorySpec {
     /// Index the session transcripts as an opt-in source (default false;
     /// see `crate::transcripts`).
     pub transcripts: Option<bool>,
+    /// The resume card at a new or cleared session (default true; see
+    /// `crate::resume`).
+    pub resume_card: Option<bool>,
+    /// Experimental, off by default: whether atlas manages the memory folder and rule files (see
+    /// `crate::memory::rules::Mode`): unset keeps what is configured by hand.
+    pub rules: Option<bool>,
+    /// Idea capture and its surfaces (`memory.ideas`; see `crate::ideas`).
+    pub ideas: Option<crate::ideas::IdeaSettings>,
     /// The memory index as a tree (see `crate::memory::tree`); `None` keeps
     /// the index as it is.
     pub tree: Option<crate::memory::tree::TreeSpec>,
@@ -367,9 +375,9 @@ pub struct SelectSpec {
 /// The context-cap hook's settings.
 #[derive(Debug, Clone, Default)]
 pub struct CapSpec {
-    /// Warn at this many context tokens (default 450000).
+    /// Warn at this many context tokens (default 285000 scaled to the window; every agent kind without its own handoff point).
     pub warn_tokens: Option<usize>,
-    /// Block every tool but `handoff` at this many (default 500000).
+    /// Block every tool but `handoff` at this many (default 450000 scaled to the window; every agent kind without its own limit).
     pub block_tokens: Option<usize>,
     /// Warn again after this many more tokens (default 25000).
     pub warn_every: Option<usize>,
@@ -381,8 +389,8 @@ pub struct CapSpec {
 #[derive(Debug, Clone, Default)]
 pub struct CompactSpec {
     /// Turn on the experimental compaction features: the PreCompact
-    /// checkpoint, the SessionStart(compact) card and ref report, the
-    /// Compact instructions offer and `defer` (default false).
+    /// checkpoint, the SessionStart(compact) card and ref report, `atlas
+    /// settings compact-md` and `defer` (default false).
     pub enabled: Option<bool>,
     /// Block a proactive automatic compaction while a tool chain is running,
     /// up to a hard ceiling (default false).
@@ -437,6 +445,9 @@ pub struct Config {
     pub cap: Option<CapSpec>,
     /// Compaction: the checkpoint card and `compact.defer`.
     pub compact: Option<CompactSpec>,
+    /// Orchestrator mode: agent caps and per-kind context limits (see
+    /// [`crate::orchestrate`]).
+    pub orchestrate: Option<crate::orchestrate::OrchestrateSpec>,
     /// The model files downloaded at setup.
     pub models: Option<ModelsSpec>,
     /// The release check at session start.
@@ -453,7 +464,7 @@ pub struct Config {
 /// The keys of the configuration file's top level that are not about
 /// projects.
 pub const TOP_KEYS: &[&str] =
-    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "models", "update", "lean"];
+    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "orchestrate", "models", "update", "lean"];
 
 pub(crate) fn absolute(base: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -533,6 +544,78 @@ impl<'a> Fields<'a> {
             Some(_) => Err(self.bad(k, "a list")),
         }
     }
+}
+
+/// Reads the `orchestrate` section; an unknown kind, mode or choice is an
+/// error, so the hook never meets one.
+fn parse_orchestrate(v: &Value) -> Result<crate::orchestrate::OrchestrateSpec> {
+    use crate::orchestrate::{Fresh, Kind, KindSpec, Mode, OrchestrateSpec};
+    fn named<T>(f: &Fields<'_>, k: &str, parse: fn(&str) -> Option<T>, what: &str) -> Result<Option<T>> {
+        match f.string(k)? {
+            None => Ok(None),
+            Some(s) => parse(&s).map(Some).ok_or_else(|| f.bad(k, what)),
+        }
+    }
+    const KINDS: &str = "builder, reviewer, research or none";
+    const MODES: &str = "enforced, advisory or off";
+    const FRESH: &str = "auto or ask";
+    let f = Fields::new("orchestrate", v, &["enabled", "window", "stale_minutes", "default_kind", "mode", "fresh", "types", "kinds", "resources", "aging_minutes", "reviews"])?;
+    let mut o = OrchestrateSpec {
+        enabled: f.boolean("enabled")?,
+        window: f.uint("window")?,
+        stale_minutes: f.uint("stale_minutes")?,
+        default_kind: named(&f, "default_kind", Kind::parse, KINDS)?,
+        mode: named(&f, "mode", Mode::parse, MODES)?,
+        fresh: named(&f, "fresh", Fresh::parse, FRESH)?,
+        aging_minutes: f.uint("aging_minutes")?,
+        ..OrchestrateSpec::default()
+    };
+    if let Some(rv) = f.get("resources") {
+        let m = rv.as_object().ok_or_else(|| f.bad("resources", "an object from resource name to capacity"))?;
+        for (n, c) in m.iter() {
+            let c = c.as_u64().ok_or_else(|| Error::InvalidArgument(format!("orchestrate.resources.{n} must be a whole number (0: never serialize)")))?;
+            o.resources.push((n.to_ascii_lowercase(), c as usize));
+        }
+    }
+    if let Some(rv) = f.get("reviews") {
+        let g = Fields::new("orchestrate.reviews", rv, &["roles", "mode"])?;
+        o.review_roles = g.strings("roles")?.unwrap_or_default();
+        o.review_mode = named(&g, "mode", Mode::parse, MODES)?;
+    }
+    if let Some(tv) = f.get("types") {
+        let m = tv.as_object().ok_or_else(|| f.bad("types", "an object from agent type to kind"))?;
+        for (t, k) in m.iter() {
+            let k = k.as_str().and_then(Kind::parse).ok_or_else(|| Error::InvalidArgument(format!("orchestrate.types.{t} must be {KINDS}")))?;
+            o.types.push((t.clone(), k));
+        }
+    }
+    if let Some(kv) = f.get("kinds") {
+        let kf = Fields::new("orchestrate.kinds", kv, &["builder", "reviewer", "research"])?;
+        for kind in [Kind::Builder, Kind::Reviewer, Kind::Research] {
+            let Some(x) = kf.get(kind.name()) else { continue };
+            // Each label is written out, so the docs test reads every key.
+            let g = match kind {
+                Kind::Builder => Fields::new("orchestrate.kinds.builder", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
+                Kind::Reviewer => Fields::new("orchestrate.kinds.reviewer", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
+                _ => Fields::new("orchestrate.kinds.research", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
+            };
+            let pct = g.uint("handoff_pct")?;
+            if pct.is_some_and(|p| p == 0 || p > 100) {
+                return Err(g.bad("handoff_pct", "1 to 100"));
+            }
+            let spec = KindSpec {
+                max: g.uint("max")?,
+                window: g.uint("window")?,
+                limit: g.uint("limit")?,
+                handoff: g.uint("handoff")?,
+                handoff_pct: pct,
+                mode: named(&g, "mode", Mode::parse, MODES)?,
+                fresh: named(&g, "fresh", Fresh::parse, FRESH)?,
+            };
+            o.kinds.push((kind, spec));
+        }
+    }
+    Ok(o)
 }
 
 /// Reads a code root's `scip`: `true` or absent (the convention), `false`
@@ -780,7 +863,7 @@ impl Config {
             c.update = Some(UpdateSpec { enabled: f.boolean("enabled")?, pin, url });
         }
         if let Some(mv) = top.get("memory") {
-            let f = Fields::new("memory", mv, &["store", "export_dir", "exports", "snapshot_hours", "snapshot_dir", "snapshot_cap_mb", "brief_reference", "tree", "transcripts"])?;
+            let f = Fields::new("memory", mv, &["store", "export_dir", "exports", "snapshot_hours", "snapshot_dir", "snapshot_cap_mb", "brief_reference", "tree", "transcripts", "resume_card", "ideas", "rules"])?;
             let mut m = MemorySpec {
                 store: f.string("store")?.map(|p| absolute(base, Path::new(&p))),
                 export_dir: f.string("export_dir")?.map(|p| absolute(base, Path::new(&p))),
@@ -789,8 +872,27 @@ impl Config {
                 snapshot_cap_mb: f.uint("snapshot_cap_mb")?,
                 brief_reference: f.string("brief_reference")?.map(|p| absolute(base, Path::new(&p))),
                 transcripts: f.boolean("transcripts")?,
+                resume_card: f.boolean("resume_card")?,
+                rules: f.boolean("rules")?,
                 ..MemorySpec::default()
             };
+            if let Some(iv) = mv.get("ideas") {
+                let i = Fields::new("memory.ideas", iv, &["enabled", "weights", "band_below", "band_above", "asks_per_day"])?;
+                let d = crate::ideas::IdeaSettings::default();
+                let band = |k: &str, or: f32| -> Result<f32> {
+                    match iv.get(k) {
+                        None => Ok(or),
+                        Some(v) => v.as_f64().filter(|x| *x >= 0.0).map(|x| x as f32).ok_or_else(|| i.bad(k, "a number, 0 or more")),
+                    }
+                };
+                m.ideas = Some(crate::ideas::IdeaSettings {
+                    enabled: i.boolean("enabled")?.unwrap_or(d.enabled),
+                    weights: i.string("weights")?.map(|p| absolute(base, Path::new(&p))),
+                    band_below: band("band_below", d.band_below)?,
+                    band_above: band("band_above", d.band_above)?,
+                    asks_per_day: i.uint("asks_per_day")?.unwrap_or(d.asks_per_day),
+                });
+            }
             for (i, x) in f.list("exports")?.iter().enumerate() {
                 let e = Fields::new(&format!("memory.exports[{i}]"), x, &["name", "shape", "path", "index", "handoffs", "index_cap", "index_topics"])?;
                 let shape = e.req_string("shape")?;
@@ -875,6 +977,9 @@ impl Config {
         if let Some(cv) = top.get("compact") {
             let f = Fields::new("compact", cv, &["enabled", "defer", "window", "card_tokens"])?;
             c.compact = Some(CompactSpec { enabled: f.boolean("enabled")?, defer: f.boolean("defer")?, window: f.uint("window")?, card_tokens: f.uint("card_tokens")? });
+        }
+        if let Some(ov) = top.get("orchestrate") {
+            c.orchestrate = Some(parse_orchestrate(ov)?);
         }
         if let Some(lv) = top.get("lean") {
             if lv.as_object().is_none() {
@@ -969,6 +1074,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_orchestrate_section() {
+        use crate::orchestrate::{Fresh, Kind, Mode};
+        let c = Config::parse(r#"{"orchestrate": {"enabled": true, "window": 200000, "mode": "advisory", "types": {"critic": "reviewer"}, "kinds": {"builder": {"max": 3, "handoff_pct": 60, "fresh": "ask"}}}}"#, Path::new(".")).unwrap();
+        let o = c.orchestrate.unwrap();
+        assert_eq!((o.enabled, o.window, o.mode), (Some(true), Some(200_000), Some(Mode::Advisory)));
+        assert_eq!(o.types, vec![("critic".to_string(), Kind::Reviewer)]);
+        assert_eq!(o.kinds[0].0, Kind::Builder);
+        assert_eq!((o.kinds[0].1.max, o.kinds[0].1.handoff_pct, o.kinds[0].1.fresh), (Some(3), Some(60), Some(Fresh::Ask)));
+    }
+
+    #[test]
     fn the_shipped_template_parses() {
         let c = Config::parse(TEMPLATE, Path::new("b")).unwrap();
         let m = c.models.expect("the template lists the models");
@@ -997,6 +1113,13 @@ mod tests {
             r#"{"recall": {"select": {"dup_cos": 1.5}}}"#,
             r#"{"recall": {"select": {"trim": 90}}}"#,
             r#"{"recall": {"select": true}}"#,
+            r#"{"orchestrate": {"kinds": {"wizard": {"max": 1}}}}"#,
+            r#"{"orchestrate": {"kinds": {"builder": {"mode": "strict"}}}}"#,
+            r#"{"orchestrate": {"kinds": {"builder": {"handoff_pct": 120}}}}"#,
+            r#"{"orchestrate": {"types": {"Explore": "scout"}}}"#,
+            r#"{"orchestrate": {"default_kind": "boss"}}"#,
+            r#"{"orchestrate": {"fresh": "maybe"}}"#,
+            r#"{"orchestrate": {"cap": 2}}"#,
         ] {
             assert!(Config::parse(bad, base).is_err(), "accepted {bad}");
         }

@@ -1,6 +1,6 @@
 [package]
 name = "atlas"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "A local, stdio-only MCP index and memory store for agents over Obsidian vaults and read-only Markdown sources: identifiers, sections, a code index, semantic recall. No network at query time."
 authors = ["Brandon White"]

@@ -102,6 +102,8 @@ fn a_read_only_database() {
     }
     let after = fs::read_to_string(fx.perf().join("Index.md")).unwrap();
     assert!(after == before || after.contains("ro"), "{after}");
+    // The test puts its own fixture's file back as it was.
+    #[allow(clippy::permissions_set_readonly_false)]
     perm.set_readonly(false);
     let _ = fs::set_permissions(&fx.db, perm);
 }

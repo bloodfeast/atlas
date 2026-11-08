@@ -23,8 +23,18 @@ const STOP: &[&str] = &[
 /// The words of a question worth searching for: lowercase, at least three
 /// characters, not a stop word, each once, at most 48.
 pub fn terms(text: &str) -> Vec<String> {
+    scan_terms(text, false).0
+}
+
+/// [`terms`], and how many more distinct words the query had past the 48.
+pub fn terms_and_rest(text: &str) -> (Vec<String>, usize) {
+    scan_terms(text, true)
+}
+
+fn scan_terms(text: &str, count_rest: bool) -> (Vec<String>, usize) {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut rest = 0;
     for w in text.split(|c: char| !c.is_alphanumeric()) {
         if w.chars().count() < 3 || w.chars().all(|c| c.is_ascii_digit()) {
             continue;
@@ -33,12 +43,15 @@ pub fn terms(text: &str) -> Vec<String> {
         if STOP.contains(&l.as_str()) || !seen.insert(l.clone()) {
             continue;
         }
-        out.push(l);
-        if out.len() == 48 {
+        if out.len() < super::FILTERED_TERMS {
+            out.push(l);
+        } else if count_rest {
+            rest += 1;
+        } else {
             break;
         }
     }
-    out
+    (out, rest)
 }
 
 /// One record as text: a header line, then the body (a memory's body only,
@@ -194,6 +207,8 @@ pub struct Gate {
     pub cos_floor: f32,
     /// The cosine at which a record passes on meaning alone.
     pub cos_alone: f32,
+    /// What happens to rules and memories (`memory.rules`).
+    pub rules: super::rules::Mode,
 }
 
 /// The semantic side of a gated recall.
@@ -224,6 +239,17 @@ pub struct Candidate {
     pub cos: Option<f32>,
     /// Whether it clears the gate.
     pub pass: bool,
+    /// What it replaces or amends, or what amends it (`replaces KEY`), with
+    /// `memory.rules` on.
+    pub tags: Vec<String>,
+}
+
+impl Candidate {
+    /// With `memory.rules` on: it passed and carries a replacement or an
+    /// amendment, so it comes ahead of what merely matches better.
+    pub fn lifted(&self) -> bool {
+        self.pass && !self.tags.is_empty()
+    }
 }
 
 /// The gate's rule for one candidate. Lexical: the bm25 floor and the
@@ -247,7 +273,17 @@ pub fn passes(g: &Gate, fts: f64, matched: usize, need: usize, cos: Option<f32>)
 pub fn candidates(store: &MemoryStore, query: &str, g: &Gate, sem: Option<&Semantic<'_>>) -> Result<Vec<Candidate>> {
     let t = terms(query);
     let need = g.min_terms.min(t.len().max(1));
-    let lex = if t.is_empty() { Vec::new() } else { store.search(&t, None, None, 24)? };
+    let live = g.rules == super::rules::Mode::Live;
+    let mut lex = if t.is_empty() { Vec::new() } else { store.search_with(&t, None, None, 24, g.rules)? };
+    if live && !t.is_empty() {
+        // Past the 24 rows' reach, so a better match elsewhere cannot hide them;
+        // the gate still decides.
+        for row in store.search_sure(&t, None, None, need)? {
+            if !lex.iter().any(|(h, _, _)| h.rid == row.0.rid) {
+                lex.push(row);
+            }
+        }
+    }
     let near = sem.map(|s| s.vecs.top(s.isa, s.query, VEC_CANDIDATES)).unwrap_or_default();
     let lex_ids: Vec<i64> = lex.iter().map(|(h, _, _)| h.rid).collect();
     let near_ids: Vec<i64> = near.iter().map(|x| x.0).collect();
@@ -262,12 +298,35 @@ pub fn candidates(store: &MemoryStore, query: &str, g: &Gate, sem: Option<&Seman
     let mut out = Vec::with_capacity(order.len());
     for rid in order {
         let Some((head, fts, matched)) = by_rid.remove(&rid) else { continue };
-        if head.status != "active" || !super::vectors::recallable(&head.kind) {
+        if !super::vectors::recallable(&head.kind) || (g.rules == super::rules::Mode::Off && super::rules::managed_kind(&head.kind)) {
             continue;
         }
         let cos = sem.and_then(|s| s.vecs.cos(s.isa, rid, s.query));
         let pass = passes(g, fts, matched, need, cos);
-        out.push(Candidate { head, fts, matched, need, cos, pass });
+        if g.rules != super::rules::Mode::Live {
+            if head.status == "active" {
+                out.push(Candidate { head, fts, matched, need, cos, pass, tags: Vec::new() });
+            }
+            continue;
+        }
+        // The later record comes first and takes the hit's scores: it may
+        // not share the words the query matched.
+        for (h, tags) in super::rules::live_view(store, head)? {
+            match out.iter_mut().find(|c: &&mut Candidate| c.head.rid == h.rid) {
+                Some(c) => {
+                    c.pass |= pass;
+                    for t in tags {
+                        if !c.tags.contains(&t) {
+                            c.tags.push(t);
+                        }
+                    }
+                }
+                None => out.push(Candidate { head: h, fts, matched, need, cos, pass, tags }),
+            }
+        }
+    }
+    if live {
+        out.sort_by_key(|c| !c.lifted());
     }
     Ok(out)
 }
@@ -295,6 +354,9 @@ pub fn gated(store: &MemoryStore, query: &str, budget: usize, g: &Gate, sem: Opt
         }
         let mut one = String::new();
         render(&mut one, &cand.head);
+        if !cand.tags.is_empty() {
+            one.push_str(&format!("[{}]\n", cand.tags.join("; ")));
+        }
         // 40 bytes stay free for the `+N more` line.
         if c.text.len() + one.len() + 40 > budget {
             c.more += 1;
@@ -356,19 +418,22 @@ pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&
     if all.is_empty() {
         return Ok(LaneView::default());
     }
-    let answered: HashSet<String> = store.answered(lane)?.into_iter().collect();
+    // Open by the store's one test (`memory::OPEN_QUESTION_SQL`), as the
+    // resume card and `lanes()` count them.
+    let open: HashSet<String> = store.open_questions()?.into_iter().filter(|(l, _, _)| l == lane).map(|(_, k, _)| k).collect();
     let sub = |s: &str| -> Vec<&Head> { all.iter().rev().filter(|h| h.kind == "journal" && h.sub == s).collect() };
-    let mut order: Vec<(&str, Vec<&Head>)> = Vec::new();
-    // The newest handoff by time (an active one before a superseded one),
-    // not the last inserted: an import can insert out of order.
-    order.push(("handoff", all.iter().filter(|h| h.kind == "handoff").max_by(|a, b| (a.status == "active", &a.time).cmp(&(b.status == "active", &b.time))).into_iter().collect()));
-    order.push(("brief", sub("brief").into_iter().take(1).collect()));
-    order.push(("open questions", sub("question").into_iter().filter(|h| !answered.contains(&h.key)).collect()));
-    order.push(("next", sub("next").into_iter().take(1).collect()));
-    order.push(("decisions", sub("decision")));
-    order.push(("measurements", sub("measurement")));
-    order.push(("commits", sub("commit")));
-    order.push(("notes", sub("note").into_iter().chain(sub("cap")).collect()));
+    let order: Vec<(&str, Vec<&Head>)> = vec![
+        // The newest handoff by time (an active one before a superseded one),
+        // not the last inserted: an import can insert out of order.
+        ("handoff", all.iter().filter(|h| h.kind == "handoff").max_by(|a, b| (a.status == "active", &a.time).cmp(&(b.status == "active", &b.time))).into_iter().collect()),
+        ("brief", sub("brief").into_iter().take(1).collect()),
+        ("open questions", sub("question").into_iter().filter(|h| open.contains(&h.key)).collect()),
+        ("next", sub("next").into_iter().take(1).collect()),
+        ("decisions", sub("decision")),
+        ("measurements", sub("measurement")),
+        ("commits", sub("commit")),
+        ("notes", sub("note").into_iter().chain(sub("cap")).collect()),
+    ];
     let mut out = format!("lane {lane}: {} entries\n", all.len());
     let mut more = 0usize;
     let mut v = LaneView::default();
@@ -385,7 +450,12 @@ pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&
             render(&mut whole, h);
             match cut {
                 Some((q, max)) => {
-                    let body = super::select::clauses(h, q, max).filter(|(x, _)| x.part == super::select::Part::Body).map(|(x, _)| x.render(h)).unwrap_or_default();
+                    // A long headline kept whole at the top of the body
+                    // opens with the title, already framed: its clauses are
+                    // not candidates, and the next best one is shown. A
+                    // short title's body is all new text.
+                    let from = if opens_with(&h.body, &h.title) { h.body.find(h.title.trim()).map_or(0, |i| i + h.title.trim().len()) } else { 0 };
+                    let body = super::select::clauses(h, q, max, from).filter(|(x, _)| x.part == super::select::Part::Body).map(|(x, _)| x.render(h)).unwrap_or_default();
                     frame(&mut one, &header(h), Some(h.title.trim_end()), &body);
                     if one.len() < whole.len() {
                         v.trimmed += 1;
@@ -435,9 +505,41 @@ mod tests {
         assert!(!opens_with("alpha", "alpha beta"));
     }
 
+    /// The trimmed lane dump shows the clause that matches best: for a short
+    /// title it may open the body (new text); for a long headline kept whole
+    /// in the body, the clauses the title already shows are skipped and the
+    /// next best one is shown.
+    #[test]
+    fn a_trimmed_dump_shows_the_best_clause_the_title_does_not() {
+        let d = std::env::temp_dir().join(format!("atlas-recall-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut s = MemoryStore::open(&d.join("memory.sqlite")).unwrap();
+        let filler = "unrelated words about something else entirely. ".repeat(12);
+        let headline = format!("{}, then the zebra clause", "the walrus headline runs long with many words ".repeat(3).trim_end());
+        let (long_title, long_body) = crate::memory::title_and_body(&headline, &format!("{filler}\nThe yak tail clause.\n"));
+        assert!(long_body.starts_with(&headline), "{long_body}");
+        let entries = [
+            ("journal:L:0001", "Short title".to_string(), format!("The walrus opens the body.\n{filler}\n")),
+            ("journal:L:0002", long_title, long_body),
+        ];
+        for (key, title, body) in &entries {
+            let dr = crate::memory::Draft { title: title.clone(), body: body.clone(), reason: "t".into(), author: "t".into(), client: "t".into(), ..Default::default() };
+            let mut w = s.writer().unwrap();
+            w.create(key, "journal", "decision", "L", &dr, None).unwrap();
+            w.commit().unwrap();
+        }
+        let out = lane_with(&s, "L", 1 << 20, Some(("walrus yak", 200))).unwrap().text;
+        assert!(out.contains("The walrus opens the body."), "{out}");
+        let long = out.split("journal:L:0002").nth(1).unwrap_or("");
+        assert!(long.contains("yak tail clause") && !long.contains(&headline), "{out}");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn the_gate_rule() {
-        let g = Gate { fts_floor: 10.0, min_terms: 3, cos_floor: 0.5, cos_alone: 0.8 };
+        let g = Gate { rules: crate::memory::rules::Mode::Today, fts_floor: 10.0, min_terms: 3, cos_floor: 0.5, cos_alone: 0.8 };
         // Lexical alone, without a vector.
         assert!(passes(&g, 10.0, 3, 3, None));
         assert!(!passes(&g, 9.9, 3, 3, None));

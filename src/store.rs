@@ -318,6 +318,8 @@ fn begin(conn: &mut Connection) -> Result<Transaction<'_>> {
     Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
 }
 
+type Only = (String, Vec<paths::Found>, Vec<String>);
+
 impl Store {
     /// Opens (or creates) the database and brings its schema up to date.
     ///
@@ -503,7 +505,7 @@ impl Store {
         if plans.iter().all(|p| matches!(p, atlas::Plan::Skip(..))) {
             return Ok(RescanStats { elapsed_us: t0.elapsed().as_micros(), ..Default::default() });
         }
-        let mut only: Option<Vec<(String, Vec<paths::Found>, Vec<String>)>> = Some(Vec::new());
+        let mut only: Option<Vec<Only>> = Some(Vec::new());
         for (n, p) in names.iter().zip(&plans) {
             match p {
                 atlas::Plan::Skip(..) => {}
@@ -529,7 +531,7 @@ impl Store {
 
     /// The rescan proper: every vault walked when `only` is `None`, else
     /// only the listed files (found, with their stat) and gone paths.
-    fn rescan_inner(&mut self, only: Option<&[(String, Vec<paths::Found>, Vec<String>)]>, t0: Instant) -> Result<RescanStats> {
+    fn rescan_inner(&mut self, only: Option<&[Only]>, t0: Instant) -> Result<RescanStats> {
         let served: HashSet<&str> = self.vaults.all().iter().map(|v| v.name.as_str()).collect();
         // A full walk compares against the map of the last one while the
         // database is unchanged (see `atlas::KnownCache`).
@@ -554,7 +556,8 @@ impl Store {
                             known.insert(k, v);
                         }
                     };
-                    let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<((String, String), (i64, i64, String), Option<String>)> {
+                    type DocRow = ((String, String), (i64, i64, String), Option<String>);
+                    let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<DocRow> {
                         Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?, r.get(4)?), r.get::<_, Option<String>>(5)?))
                     };
                     match only {

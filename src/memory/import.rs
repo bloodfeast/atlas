@@ -78,7 +78,9 @@ pub fn split_items(text: &str) -> Vec<Piece> {
         if is_item(l) {
             out.push(Piece { kind: PieceKind::Item, text: l.to_string(), line: i + 1, target: String::new() });
         } else if is_continuation(l) && out.last().is_some() {
-            out.last_mut().map(|p| p.text.push_str(l));
+            if let Some(p) = out.last_mut() {
+                p.text.push_str(l);
+            }
         } else {
             push(&mut out, PieceKind::Block, i + 1, l);
         }

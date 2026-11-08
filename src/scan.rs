@@ -83,6 +83,32 @@ pub fn memchr2_swar(a: u8, b: u8, hay: &[u8]) -> Option<usize> {
     memchr2_scalar(a, b, &hay[i..]).map(|k| i + k)
 }
 
+/// How many bytes of `hay` equal `b`: the line count of a transcript's
+/// history before its newest boundary, which is hundreds of megabytes on a
+/// long session.
+#[inline]
+pub fn count(b: u8, hay: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if hay.len() >= 32 {
+            if avx2() {
+                // SAFETY: AVX2 was detected at run time just above.
+                return unsafe { x86::count_avx2(b, hay) };
+            }
+            // SAFETY: SSE2 is part of the x86_64 baseline.
+            return unsafe { x86::count_sse2(b, hay) };
+        }
+    }
+    count_scalar(b, hay)
+}
+
+/// The scalar [`count`], the reference the vector versions are tested
+/// against.
+#[inline]
+pub fn count_scalar(b: u8, hay: &[u8]) -> usize {
+    hay.iter().filter(|&&x| x == b).count()
+}
+
 /// The first byte of `hay` a JSON string scan must stop at: a quote, a
 /// backslash or a control byte; `hay.len()` when there is none.
 #[inline]
@@ -230,6 +256,61 @@ mod x86 {
             return r.map(|k| i + k);
         }
         None
+    }
+
+    /// # Safety
+    ///
+    /// SSE2 (the x86_64 baseline). Loads never read past `hay`. A match
+    /// compares to all ones (-1), so subtracting it adds 1 to a byte lane;
+    /// the lanes are summed (`psadbw`) before any can pass 255.
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn count_sse2(b: u8, hay: &[u8]) -> usize {
+        let n = hay.len();
+        let p = hay.as_ptr();
+        let v = _mm_set1_epi8(b as i8);
+        let zero = _mm_setzero_si128();
+        let mut total = 0usize;
+        let mut i = 0;
+        while i + 16 <= n {
+            let mut acc = _mm_setzero_si128();
+            let mut k = 0;
+            while k < 255 && i + 16 <= n {
+                // SAFETY: i + 16 <= n, so the 16 bytes at p + i are in `hay`.
+                acc = _mm_sub_epi8(acc, _mm_cmpeq_epi8(unsafe { _mm_loadu_si128(p.add(i).cast()) }, v));
+                i += 16;
+                k += 1;
+            }
+            let s = _mm_sad_epu8(acc, zero);
+            total += (_mm_cvtsi128_si64(s) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(s, s))) as usize;
+        }
+        total + super::count_scalar(b, &hay[i..])
+    }
+
+    /// # Safety
+    ///
+    /// AVX2 (checked at run time by the caller). Loads never read past
+    /// `hay`. The [`count_sse2`] method on 32-byte lanes.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn count_avx2(b: u8, hay: &[u8]) -> usize {
+        let n = hay.len();
+        let p = hay.as_ptr();
+        let v = _mm256_set1_epi8(b as i8);
+        let zero = _mm256_setzero_si256();
+        let mut total = 0usize;
+        let mut i = 0;
+        while i + 32 <= n {
+            let mut acc = _mm256_setzero_si256();
+            let mut k = 0;
+            while k < 255 && i + 32 <= n {
+                // SAFETY: i + 32 <= n, so the 32 bytes at p + i are in `hay`.
+                acc = _mm256_sub_epi8(acc, _mm256_cmpeq_epi8(unsafe { _mm256_loadu_si256(p.add(i).cast()) }, v));
+                i += 32;
+                k += 1;
+            }
+            let s = _mm256_sad_epu8(acc, zero);
+            total += (_mm256_extract_epi64::<0>(s) + _mm256_extract_epi64::<1>(s) + _mm256_extract_epi64::<2>(s) + _mm256_extract_epi64::<3>(s)) as usize;
+        }
+        total + super::count_scalar(b, &hay[i..])
     }
 
     /// # Safety
@@ -382,5 +463,15 @@ mod tests {
             assert_eq!(json_stop(&hay), json_stop_scalar(&hay), "{hay:?}");
         }
         assert_eq!(find(b"ab", b"abc"), None);
+        // Counts, across the 255-block flush of the vector paths and with
+        // any byte values (0xff is the compare's own all-ones).
+        for len in (0..300).chain([255 * 16 - 1, 255 * 16, 255 * 32 + 17, 70_000]) {
+            let hay: Vec<u8> = (0..len).map(|_| xorshift(&mut s) as u8 % 4 * 85).collect();
+            for b in [0, 85, 255, b'\n'] {
+                assert_eq!(count(b, &hay), count_scalar(b, &hay), "len {len} byte {b}");
+            }
+            let all = vec![b'\n'; len];
+            assert_eq!(count(b'\n', &all), len);
+        }
     }
 }

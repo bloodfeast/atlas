@@ -12,7 +12,7 @@ files. The server must make the worst instruction it can follow cheap to undo:
 | Losing notes | no delete or rename tool exists; creates are exclusive; edits need the current sha (`replace_section`) or are additive |
 | Torn or interleaved writes | temp file + rename in the same folder; all writers take the SQLite write lock first; a file that changed between read and write is refused |
 | Silent changes | every write must state a reason, and lands in the `writes` table and in the append-only `state/writes.jsonl`: time, tool, vault, path, sha before and after, client name, pid, reason; `write_log` reads it back |
-| Prompt-shaped output | tool descriptions are short and factual; note text comes back only as a JSON string field; `instructions` is one line naming the vaults |
+| Prompt-shaped output | tool descriptions are short and factual; `instructions` is one line naming the vaults. Note text comes back as written, in plain text under a `vault:path sha256=... bytes=N` line ([[Tools reference]]), or as a JSON string with `format: "json"`. Nothing marks it as data, so this is no defence against prompt-shaped text in a note: treat a vault as trusted as your own prompts |
 | Resource exhaustion | reads capped at 1 MiB, write payloads at 256 KiB, search results at 200, listings at 2,000, messages at 4 MiB, regex programs at 20,000 instructions and a search's backtracking state at 256 Mibit (32 MiB, freed after the search; a regex search past it is refused, naming the note, the line and what to narrow), globs at 128 bytes and 8 `*` |
 
 ## Path confinement (`src/paths.rs`)
@@ -32,7 +32,9 @@ write the target itself).
 
 ## Dependencies
 
-Two, each a named exception to the rule that atlas owns its code:
+Two direct dependencies, each a named exception to the rule that atlas owns its code. They bring their own
+transitive crates (`rusqlite` brings `libsqlite3-sys`, `hashlink`, `bitflags` and others, and `cc` to build
+SQLite), and `Cargo.lock` lists every one:
 
 - `rusqlite` (feature `bundled`, so the SQLite C library is compiled in and no system SQLite is loaded): the
   durable store.
@@ -82,7 +84,12 @@ opened only after its canonical path is checked to be under the canonical root.
 **Deny-list**, fixed in code (`sources::is_denied`), checked before a file is stat'ed and again before it is
 opened, and refused in a config's globs. It holds for sources, for vaults (a denied note or folder is not
 walked, indexed, read or written, by name or through a link), for the CLI file tools (`atlas digest`, `atlas
-crop`), and for files Claude Code reads (never kept as a `slice` handle or read again from disk). The names: `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
+crop`), and for files Claude Code reads (never kept as a `slice` handle or read again from disk). The output of a
+Bash or PowerShell command, `atlas run` or Grep is not kept as a handle when the command names a denied file
+(`sources::command_names_denied`; for Grep, its `path` or `glob`), or a word in it is a link to one. This catches named files only: a shell command
+can hide a path (`F=.e; cat ${F}nv`, a link reached after `cd`), and handles for shell output in general stay. It
+over-matches on purpose, so `grep credentials src` gets no handle either, which costs a digest and no secret. A
+handle already stored stays until it expires (7 days). The names: `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
 `*.jks`, `*.keystore`, `*.kdbx`, `*.asc`, `*.gpg`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*`,
 `credentials`, `credentials.*`, `*.credentials`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`, `secrets.*`,
 `*.secret`. The name rules (`id_rsa*` and the other key names, `credentials`, `credentials.*`, `_netrc`,

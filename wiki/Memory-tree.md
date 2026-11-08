@@ -58,6 +58,9 @@ atlas --config C --memory-tree [DIR] --check    # write nothing; report what a r
 cargo xtask memory-tree-check --config C [--dir DIR]   # the navigation and stability check, as CI would run it
 ```
 
+The tree is opt-in: without a `memory.tree` block both commands stop with `memory.tree is not configured` and
+exit 1, `--check` included. That is not a fault in the store.
+
 The check walks the tree as a reader would: every memory file within three reads of the root, every pinned memory
 in the root, no memory listed by two hubs (a pinned one also by the root), no generated hub that no link reaches,
 no dangling link, no hub over `hub_max`; and a rebuild of what is on disk would write nothing. It prints the root's

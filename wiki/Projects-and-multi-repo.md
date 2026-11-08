@@ -7,7 +7,7 @@ folder, is imported into every project (a project's own memory of the same name 
 
 ## Quickstart: one repository
 
-Open Claude Code in the repository. The first session asks once, in one line: *create a vault for this
+Open Claude Code in the repository. The first session asks (a session with no user, such as `claude -p`, asks nothing and spends nothing), in one line, and asks again each new session until answered: *create a vault for this
 project at `<path>`? yes / other folder / no*. Yes runs `atlas settings add-project --vault`, which adds the
 folder's Markdown as a source, the folder as a code root when it holds code, and a new vault for the
 project's notes (see [[Install and setup]]). To do it by hand:
@@ -141,7 +141,11 @@ cached per process.
 `atlas settings migrate-projects NAME` moves `db`, `vaults`, `sources`, `ids`, `code` and `memory` into project
 NAME (an absent `db` is written as the path it resolved to, so the database and memory store stay where they
 are), sets its root to the deepest folder holding its vaults and sources, and makes it `default_project`, so
-every session resolves as before. A backup is taken first (`atlas settings undo` restores it), and running it
+every session resolves as before. atlas's own configuration folder does not count towards the root while
+anything else is left, and no root is ever your home folder, a folder holding it, or a drive root: if the deepest
+folder would be one, each folder gets its own root. A session in a folder in no project still reads the default
+project, and atlas asks about that folder once. A configuration that already holds such a root is left as it is;
+`atlas doctor` names it. `add-project --new` run in one of those folders refuses, and says what to do. A backup is taken first (`atlas settings undo` restores it), and running it
 again changes nothing.
 
 `atlas settings add-project --new` does this on its own when the configuration has no projects yet (every
@@ -164,7 +168,7 @@ supersede of a user-layer record follows it there. Hand-written index lines are 
 the store has not read is never written over. Scope `user` is for memories only, and an error where no user
 layer is configured.
 
-Some state is per user, not per project: the asked-once offer state (settings offered, folders asked about,
+Some state is per user, not per project: the offer state (settings answered, folders answered,
 unmapped repositories reported) and the routing switch live in `projects_dir`, so one answer and one switch serve
 every project. They are moved there once from the per-project files at the first start that finds none.
 

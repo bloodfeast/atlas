@@ -113,3 +113,16 @@ tokenizer's tables packed into the model file); they are not compiled into
 the binaries. Copyright (c) 1991-2026 Unicode, Inc. They are distributed
 under the Unicode License V3, whose full text is in
 xtask/ucd/15.1.0/LICENSE.txt.
+
+
+4. Token vocabulary in this repository
+--------------------------------------
+
+xtask/vocab/vocab-500.txt is trained here by xtask/vocab/train.py, which rebuilds
+it deterministically (sources in manifest order, members by the SHA-256 of their
+name, among equal frequencies the greatest pair of byte strings). It holds 500
+short byte strings counted from the public text xtask/vocab/manifest.json names,
+each source with its URL, commit, hash and licence (MIT, Apache-2.0, MIT or
+Apache-2.0, BSD-3-Clause, or Unlicense or MIT); none of that text is in this
+repository. It is compiled only into the development tasks in xtask, and into no
+shipped binary.

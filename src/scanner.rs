@@ -474,7 +474,8 @@ impl Scanner {
         let mut depth: i32 = 0;
         // The logical line in progress: its first line's indent, what it
         // opens if it ends in `:`, and the definitions it made.
-        let mut header: Option<(usize, Option<(&'static str, String, Option<usize>)>, usize)> = None;
+        type Header = (usize, Option<(&'static str, String, Option<usize>)>, usize);
+        let mut header: Option<Header> = None;
         let close = |stack: &mut Vec<IBlock>, out: &mut Vec<Def>, b: IBlock| {
             if let Some(o) = b.owner {
                 out[o].end = b.last.max(out[o].line);

@@ -442,11 +442,11 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "journal",
-        description: "Append a lane journal entry: brief, decision, measurement (with conditions), commit, question, answered, next, note.",
+        description: "Append a lane journal entry: brief, decision, measurement (with conditions), commit, question, answered, next, note. amend KEY with expected_sha rewrites one's text.",
         read_only: false,
         schema: || {
             obj(
-                json!({"lane": s(""), "entry": e(crate::memory::ENTRIES), "text": s("First line is the headline."), "meta": s("key: value lines (branch, worktree, conditions)."), "refs": strs("answers:<key> for an answered question.")}),
+                json!({"lane": s(""), "entry": e(crate::memory::ENTRIES), "text": s("First line is the headline."), "meta": s("key: value lines (branch, worktree, conditions)."), "refs": strs("answers:<key> for an answered question."), "amend": s("A journal key: rewrite its title and body as a new version (meta and refs kept)."), "expected_sha": s("With amend: the head's sha (recall shows it).")}),
                 &["lane", "entry", "text"],
             )
         },
@@ -475,7 +475,7 @@ const TOOLS: &[ToolDef] = &[
         read_only: false,
         schema: || {
             obj(
-                json!({"event": s(""), "session_id": s(""), "agent_id": s(""), "agent_type": s(""), "transcript_path": s(""), "prompt": s(""), "tool_name": s(""), "tool_use_id": s(""), "tool_prompt": s(""), "trigger": s(""), "source": s(""), "cwd": s(""), "permission_mode": s(""), "tool_input": s("JSON text."), "tool_response": s("JSON text."), "last_assistant_message": s(""), "stop_hook_active": s("true or false.")}),
+                json!({"event": s(""), "session_id": s(""), "agent_id": s(""), "agent_type": s(""), "transcript_path": s(""), "prompt": s(""), "tool_name": s(""), "tool_use_id": s(""), "tool_prompt": s(""), "trigger": s(""), "source": s(""), "cwd": s(""), "permission_mode": s(""), "tool_input": s("JSON text."), "tool_response": s("JSON text."), "last_assistant_message": s(""), "stop_hook_active": s("true or false."), "background_tasks": s("JSON text."), "session_crons": s("JSON text.")}),
                 &["event"],
             )
         },
@@ -1067,7 +1067,7 @@ impl Server {
         let schema = input_schema(def);
         let props = schema["properties"].as_object().cloned().unwrap_or_default();
         // `format` is taken by every tool: text by default, JSON on request.
-        if let Some(k) = a.keys().find(|k| !props.contains_key(*k) && !matches!(k.as_str(), "format" | "fresh")) {
+        if let Some(k) = a.keys().find(|k| !props.contains_key(k) && !matches!(k.as_str(), "format" | "fresh")) {
             return Err(Error::InvalidArgument(format!("unknown argument {k:?} for {name}")));
         }
         // A write without a usable reason is refused before anything is read or written.
@@ -1313,7 +1313,7 @@ impl Server {
             return Err(Error::InvalidArgument("query must be 1 to 512 bytes".into()));
         }
         let mode = opt_str(a, "mode")?.unwrap_or("substring");
-        if let Some(k) = ["source", "raw", "refresh", "full"].into_iter().find(|k| a.contains_key(*k)) {
+        if let Some(k) = ["source", "raw", "refresh", "full"].into_iter().find(|k| a.contains_key(k)) {
             return Err(Error::InvalidArgument(format!("{k} applies to mode sections only")));
         }
         let limit = opt_uint(a, "limit", 50, MAX_RESULTS)?.max(1);
