@@ -38,6 +38,26 @@ pub enum Error {
     Io(String),
     /// The SQLite store refused an operation.
     Db(String),
+    /// A store was made or upgraded by a newer atlas than this one. It is
+    /// not opened, and nothing in it is changed: an older binary that ran its
+    /// own schema over it would downgrade it (or drop and rebuild it).
+    StoreTooNew {
+        /// Which store: "memory store", "index store" or "code index".
+        store: String,
+        /// The store file.
+        path: String,
+        /// The schema version the store holds.
+        found: String,
+        /// The newest schema version this binary reads.
+        supported: String,
+    },
+}
+
+impl Error {
+    /// True for [`Error::StoreTooNew`]: the store is newer than this binary.
+    pub fn is_store_too_new(&self) -> bool {
+        matches!(self, Error::StoreTooNew { .. })
+    }
 }
 
 impl fmt::Display for Error {
@@ -56,6 +76,11 @@ impl fmt::Display for Error {
             Error::TooLarge(m) => write!(f, "too large: {m}"),
             Error::Io(m) => write!(f, "io: {m}"),
             Error::Db(m) => write!(f, "database: {m}"),
+            Error::StoreTooNew { store, path, found, supported } => write!(
+                f,
+                "store too new: the {store} at {path} is schema {found}, written by a newer atlas; this atlas ({}) reads up to schema {supported}. It was not opened and nothing in it was changed. Update atlas (atlas --version names this one).",
+                env!("CARGO_PKG_VERSION")
+            ),
         }
     }
 }

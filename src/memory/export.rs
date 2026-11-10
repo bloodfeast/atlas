@@ -404,8 +404,27 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Io`], [`Error::Db`].
+/// [`crate::Error::StoreTooNew`] when a newer atlas upgraded the store since
+/// this one opened it (checked under the write lock before any file is
+/// written, so neither a file nor a row changes), [`Error::Io`],
+/// [`Error::Db`].
 pub fn write(store: &MemoryStore, spec: &ExportSpec, dir: &Path, adopt: bool) -> Result<WriteReport> {
+    // The files and their rows are written under the store's write lock.
+    // Inside a caller's transaction (tools_memory's `after_write`) the check
+    // runs in that one, which holds the lock already.
+    let own = if store.conn().is_autocommit() { Some(rusqlite::Transaction::new_unchecked(store.conn(), rusqlite::TransactionBehavior::Immediate)?) } else { None };
+    super::check_locked(store.conn(), store.path())?;
+    let r = write_files(store, spec, dir, adopt);
+    // The rows of the files already written are kept on an error, as each
+    // row's own commit kept them before: a file on disk without its row
+    // would read as a hand edit next time.
+    if let Some(tx) = own {
+        tx.commit()?;
+    }
+    r
+}
+
+fn write_files(store: &MemoryStore, spec: &ExportSpec, dir: &Path, adopt: bool) -> Result<WriteReport> {
     let mut rep = WriteReport::default();
     let time = super::now();
     for (rel, text) in render(store, spec)? {
@@ -531,4 +550,36 @@ pub fn round_trip(store: &MemoryStore, spec: &ExportSpec) -> Result<Vec<String>>
         }
     }
     Ok(errs)
+}
+
+#[cfg(test)]
+mod storeguard_tests {
+    use super::*;
+    use crate::store::skew_support::dump;
+
+    /// An export on a store a newer atlas upgraded since this one opened it
+    /// is refused before any file: neither the file nor a row changes, and
+    /// no table is made. At the current version the same call writes both.
+    #[test]
+    fn an_export_checks_the_version_before_any_file() {
+        let store = MemoryStore::in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!("atlas-storeguard-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = ExportSpec { name: "e".into(), shape: Shape::Items, path: PathBuf::from("e.md"), index: String::new(), handoffs: false, index_cap: None, index_topics: None };
+        std::fs::write(dir.join("e.md"), "kept by hand\n").unwrap();
+        store.conn().execute_batch(&format!("PRAGMA user_version = {};", super::super::SCHEMA_VERSION + 1)).unwrap();
+        let before = dump(store.conn());
+        let e = write(&store, &spec, &dir, true).expect_err("refused");
+        assert!(e.is_store_too_new(), "{e}");
+        assert!(store.conn().is_autocommit(), "rolled back");
+        assert_eq!(std::fs::read(dir.join("e.md")).unwrap(), b"kept by hand\n", "the file is not rewritten");
+        assert_eq!(dump(store.conn()), before, "no row and no table changed");
+        store.conn().execute_batch(&format!("PRAGMA user_version = {};", super::super::SCHEMA_VERSION)).unwrap();
+        let rep = write(&store, &spec, &dir, true).unwrap();
+        assert_eq!(rep.written.len(), 1);
+        assert_eq!(std::fs::read(dir.join("e.md")).unwrap(), b"");
+        assert_ne!(dump(store.conn()), before, "the row is recorded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

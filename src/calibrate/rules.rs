@@ -1,60 +1,16 @@
-//! `calibrate-baseline`: what agents actually spent on rule and handoff
-//! lookups before atlas, from real Claude Code transcripts.
+//! The lookup rules: which pre-atlas tool calls were rule and handoff
+//! lookups, and how they group into episodes (see [`super`] for the method).
 //!
-//! The token ledger's counterfactual (`atlas::tokens`) is an upper bound:
-//! the bytes a literal grep prints plus every file window a reader would
-//! open. `cargo xtask calibrate-baseline` measures the other side: the bytes of
-//! the tool results agents read when they looked something up in the files
-//! atlas now serves, in transcripts dated before atlas. Every number comes
-//! from a fixed rule below; nothing is estimated. The result is saved to
-//! `baseline_log`, and `--token-report` heads its output with the measured
-//! ratio, the upper bound beside it labelled as such.
-//!
-//! # Method (all rules are mechanical)
-//!
-//! 1. Transcripts: every `*.jsonl` below `--transcripts` (main sessions and
-//!    `subagents/`), read only. Only tool calls timestamped before
-//!    `--before` count, and a transcript stops counting at its first call to
-//!    an atlas tool (`mcp__atlas__*`, `mcp__plugin_atlas_*`) or to its
-//!    ancestor, the vault server (`mcp__vault__*`), which served the same
-//!    vaults.
-//! 2. Lookup targets: the configuration's vault and source roots: a path
-//!    below a vault root, a path below a source root that one of its
-//!    `include` globs matches, or a file whose name matches the handoff
-//!    pattern (default: a Markdown file with "handoff" in its name).
-//! 3. Lookup calls:
-//!    * search: `Grep` whose `path` is a target or below a target root;
-//!      `Bash` or `PowerShell` whose command runs grep, rg, findstr or
-//!      Select-String and reads only targets: one of its words (shell-split)
-//!      is a target path, absolute or relative to the session folder, or has
-//!      the file name an include names exactly, or a handoff file name, and
-//!      no word names a file (by its extension) that is not a target. A
-//!      compound command that also reads other files is not a lookup.
-//!    * read: `Read` of a target file; `Bash` or `PowerShell` whose command
-//!      runs cat, sed -n, head, tail, awk, less, type or Get-Content and
-//!      reads only targets, by the same rule.
-//!
-//!    Commands that also write (`sed -i`, a `>` redirect to a file, `git`,
-//!    `python`, `py`, `Out-File`, `Set-Content`) are not lookups.
-//! 4. Episodes: a search call opens a new episode; a read call joins the
-//!    open episode when the previous tool call in the same transcript was a
-//!    lookup call, else it opens one. An episode is one question answered.
-//! 5. Bytes: the UTF-8 bytes of each lookup call's tool result as the agent
-//!    received it (the text parts of the result content).
-//! 6. The atlas side, read from the token ledger when reported: answers of
-//!    the comparable read tools (`atlas::baseline::COMPARABLE`), their returned bytes, and
-//!    their counterfactual (grep + read).
-//!
-//! Ratios per answer: the **measured** ratio is the median bytes of a
-//! pre-atlas episode over the median bytes atlas returned per answer (the
-//! means are printed beside it); the **upper bound** is the sum of the
-//! counterfactual over the sum returned, over answers that have one.
+//! Everything that turns a transcript's tool calls into the measured
+//! numbers is in this file, and its text (comments and blank lines
+//! removed) is hashed by a test against [`super::RULES_HISTORY`]: a change
+//! here that is not recorded there with a new [`super::RULES_VERSION`]
+//! fails the build's tests, and a new version recalibrates every store.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use atlas::baseline::{median, quantile, Baseline};
-use atlas::json::Value;
-use atlas::regex::{Regex, RegexBuilder};
+use crate::json::Value;
+use crate::regex::{Regex, RegexBuilder};
 
 /// The default handoff file pattern.
 pub const DEFAULT_HANDOFF: &str = r"handoff[^/]*\.md$";
@@ -80,9 +36,22 @@ fn norm(p: &str) -> String {
     s.trim_end_matches('/').to_string()
 }
 
+/// Whether a normalised path is absolute: a drive (`h:`) or `/`-rooted
+/// (Unix; `/h/x` and `/mnt/h/x` are drives already).
 fn absolute(p: &str) -> bool {
     let b = p.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    b.first() == Some(&b'/') || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+}
+
+/// Whether a normalised word names a path outside the cwd: a drive, or a
+/// `/`-rooted word that looks like a path, not a sed address or a grep
+/// pattern (`/^## next/,/^## /p`, `/api`): two or more components and
+/// none of `^ $ * ? [ ] { } , + \` or whitespace.
+fn path_word(p: &str) -> bool {
+    match p.strip_prefix('/') {
+        Some(r) => r.contains('/') && !r.contains(|c: char| c.is_whitespace() || "^$*?[]{},+\\".contains(c)),
+        None => absolute(p),
+    }
 }
 
 fn base_name(p: &str) -> &str {
@@ -143,7 +112,7 @@ impl Targets {
                 match inc {
                     None => return true,
                     Some(globs) => {
-                        if globs.iter().any(|g| atlas::glob::matches(g, rel) || atlas::glob::matches(g, base_name(rel))) {
+                        if globs.iter().any(|g| crate::glob::matches(g, rel) || crate::glob::matches(g, base_name(rel))) {
                             return true;
                         }
                     }
@@ -183,7 +152,7 @@ impl Targets {
                         // An absolute path outside every target (a scratch
                         // folder, a build log), or a path through a
                         // variable (unknown): not only targets.
-                        || (absolute(&n) && !self.holds_a_root(&n))
+                        || (path_word(&n) && !self.holds_a_root(&n))
                         || (n.starts_with('$') && n.contains('/')))
                 {
                     return false;
@@ -207,6 +176,19 @@ impl Targets {
     /// (`cd R:/work && grep ... repo/docs/a.md`).
     fn holds_a_root(&self, p: &str) -> bool {
         self.roots.iter().any(|(r, _)| r.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
+    }
+
+    /// The roots and their include globs, one per line, for a fingerprint.
+    pub fn describe(&self) -> String {
+        self.roots
+            .iter()
+            .map(|(r, inc)| match inc {
+                None => format!("vault {r}
+"),
+                Some(g) => format!("source {r} {}
+", g.join(",")),
+            })
+            .collect()
     }
 }
 
@@ -325,7 +307,8 @@ pub fn classify(name: &str, input: &Value, cwd: &str, t: &Targets) -> Option<Kin
     }
 }
 
-fn result_bytes(c: Option<&Value>) -> usize {
+/// The UTF-8 bytes of a tool result as the agent received it (its text parts).
+pub fn result_bytes(c: Option<&Value>) -> usize {
     match c {
         Some(Value::String(s)) => s.len(),
         Some(Value::Array(a)) => a.iter().filter(|x| x.get("type").and_then(Value::as_str) == Some("text")).filter_map(|x| x.get("text").and_then(Value::as_str)).map(str::len).sum(),
@@ -350,7 +333,8 @@ pub struct Episode {
     pub calls: Vec<String>,
 }
 
-fn call_line(name: &str, input: &Value) -> String {
+/// A lookup call as one audit line: the tool and what it read.
+pub fn call_line(name: &str, input: &Value) -> String {
     let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
     let what = match name {
         "Grep" => format!("{} in {}", s("pattern"), s("path")),
@@ -361,124 +345,91 @@ fn call_line(name: &str, input: &Value) -> String {
     format!("{name}: {what}")
 }
 
-/// The byte totals of the lookup episodes of one transcript.
-#[cfg(test)]
-pub fn scan(path: &Path, before: &str, t: &Targets) -> Vec<usize> {
-    scan_episodes(path, before, t).into_iter().map(|e| e.bytes).collect()
+
+/// One tool call before the cutoff, as the rules read it: what a
+/// calibration stores, so that new rules or targets apply to it after
+/// Claude Code has deleted the transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    /// The `tool_use` id.
+    pub id: String,
+    /// When it was made.
+    pub time: String,
+    /// The session folder of its line.
+    pub cwd: String,
+    /// The tool.
+    pub name: String,
+    /// The input keys the rules read ([`kept_input`]).
+    pub input: Value,
+    /// The bytes of its result ([`result_bytes`]); 0 for a tool whose input
+    /// is not kept.
+    pub bytes: usize,
 }
 
-/// The lookup episodes of one transcript (see the module docs).
-pub fn scan_episodes(path: &Path, before: &str, t: &Targets) -> Vec<Episode> {
-    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
-    let mut calls: Vec<(String, Option<Kind>, String, String)> = Vec::new();
-    let mut results: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut stopped = false;
-    for line in text.lines() {
-        if !line.contains("\"tool_use\"") && !line.contains("\"tool_result\"") {
-            continue;
-        }
-        let Ok(v) = atlas::json::parse(line) else { continue };
-        let ts = v.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        let cwd = v.get("cwd").and_then(Value::as_str).unwrap_or("");
-        let Some(Value::Array(items)) = v.pointer("/message/content") else { continue };
-        for x in items {
-            let id = |k: &str| x.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-            match x.get("type").and_then(Value::as_str) {
-                Some("tool_use") if !stopped => {
-                    let name = id("name");
-                    if ts >= before || is_atlas_tool(&name) {
-                        stopped = true;
-                        continue;
-                    }
-                    let input = x.get("input").cloned().unwrap_or(Value::Null);
-                    let kind = classify(&name, &input, cwd, t);
-                    let line = if kind.is_some() { call_line(&name, &input) } else { String::new() };
-                    calls.push((id("id"), kind, line, ts.to_string()));
-                }
-                Some("tool_result") => {
-                    results.insert(id("tool_use_id"), result_bytes(x.get("content")));
-                }
-                _ => {}
-            }
-        }
+/// The input keys the rules and the audit line read, by tool; every other
+/// tool's input is not read (its call only closes an episode).
+pub fn kept_keys(name: &str) -> &'static [&'static str] {
+    match name {
+        "Grep" => &["pattern", "path", "glob", "type"],
+        "Read" => &["file_path"],
+        "Bash" | "PowerShell" => &["command"],
+        _ => &[],
     }
-    let mut episodes: Vec<Episode> = Vec::new();
+}
+
+/// A call's input cut to [`kept_keys`] (`null` when none are kept).
+pub fn kept_input(name: &str, input: &Value) -> Value {
+    let keys = kept_keys(name);
+    if keys.is_empty() {
+        return Value::Null;
+    }
+    Value::Object(keys.iter().filter_map(|k| input.get(k).map(|v| (k.to_string(), v.clone()))).collect())
+}
+
+/// The lookup episodes of one transcript's calls, in order (see the module
+/// docs of [`super`]). With `seen`, a call whose id is already in it (a
+/// replay's or a resumed session's copy of a call another transcript
+/// holds) counts nothing and closes the open episode; every id is added.
+pub fn episodes(calls: &[Call], t: &Targets, mut seen: Option<&mut std::collections::HashSet<String>>) -> Vec<Episode> {
+    let mut out: Vec<Episode> = Vec::new();
     let mut prev: Option<Kind> = None;
-    for (id, kind, line, ts) in calls {
+    for c in calls {
+        let copy = match seen.as_deref_mut() {
+            Some(s) if !c.id.is_empty() => !s.insert(c.id.clone()),
+            _ => false,
+        };
+        let kind = if copy { None } else { classify(&c.name, &c.input, &c.cwd, t) };
         let Some(k) = kind else {
             prev = None;
             continue;
         };
-        let b = results.get(&id).copied().unwrap_or(0);
-        match (k, prev, episodes.last_mut()) {
+        let line = format!("{} ({} B)", call_line(&c.name, &c.input), c.bytes);
+        match (k, prev, out.last_mut()) {
             (Kind::Read, Some(_), Some(last)) => {
-                last.bytes += b;
-                last.calls.push(format!("{line} ({b} B)"));
+                last.bytes += c.bytes;
+                last.calls.push(line);
             }
-            _ => episodes.push(Episode { bytes: b, time: ts, calls: vec![format!("{line} ({b} B)")] }),
+            _ => out.push(Episode { bytes: c.bytes, time: c.time.clone(), calls: vec![line] }),
         }
         prev = Some(k);
     }
-    episodes
-}
-
-pub fn transcripts(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            match e.file_type() {
-                Ok(t) if t.is_dir() => stack.push(e.path()),
-                Ok(t) if t.is_file() && e.path().extension().is_some_and(|x| x == "jsonl") => out.push(e.path()),
-                _ => {}
-            }
-        }
-    }
-    out.sort();
     out
 }
 
-/// Measures every transcript below `dir`, reporting progress on stderr
-/// every 50 files.
-#[cfg(test)]
-pub fn measure(dir: &Path, before: &str, t: &Targets) -> Baseline {
-    measure_audited(dir, before, t, &[], None)
-}
-
-/// [`measure`] over the transcripts whose path holds none of `skip`
-/// (replays and eval runs are not real sessions), also writing one line per episode to `audit` (transcript,
-/// time, bytes, then each call) for a hand check.
-pub fn measure_audited(dir: &Path, before: &str, t: &Targets, skip: &[String], mut audit: Option<&mut dyn std::io::Write>) -> Baseline {
-    use std::io::Write as _;
-    let mut files = transcripts(dir);
-    files.retain(|p| !skip.iter().any(|s| p.to_string_lossy().contains(s.as_str())));
-    let mut all: Vec<f64> = Vec::new();
-    let mut used = 0;
-    for (i, p) in files.iter().enumerate() {
-        let e = scan_episodes(p, before, t);
-        used += usize::from(!e.is_empty());
-        if let Some(w) = audit.as_mut() {
-            for x in &e {
-                let _ = writeln!(w, "{}	{}	{}	{}", p.display(), x.time, x.bytes, x.calls.join(" | "));
-            }
-        }
-        all.extend(e.into_iter().map(|x| x.bytes as f64));
-        if (i + 1) % 50 == 0 || i + 1 == files.len() {
-            eprintln!("[{}/{}] transcripts scanned, {} lookup episodes", i + 1, files.len(), all.len());
-        }
-    }
+/// The measured numbers over every episode's bytes.
+pub fn summarize(before: &str, transcripts: usize, used: usize, mut all: Vec<f64>) -> crate::baseline::Baseline {
     all.sort_by(f64::total_cmp);
     let total: f64 = all.iter().sum();
-    Baseline {
+    crate::baseline::Baseline {
         before: before.to_string(),
-        transcripts: files.len(),
+        transcripts,
         used,
         episodes: all.len(),
         mean: if all.is_empty() { 0.0 } else { total / all.len() as f64 },
-        median: median(&all),
-        p90: quantile(&all, 0.9),
+        median: crate::baseline::median(&all),
+        p90: crate::baseline::quantile(&all, 0.9),
         total: total as u64,
+        ..Default::default()
     }
 }
 
@@ -562,7 +513,7 @@ mod tests {
     #[test]
     fn shell_commands_count_only_when_they_read_only_targets() {
         let t = targets();
-        let c = |cmd: &str| classify("Bash", &atlas::json!({ "command": cmd }), "R:/repo", &t);
+        let c = |cmd: &str| classify("Bash", &crate::json!({ "command": cmd }), "R:/repo", &t);
         assert_eq!(c("grep -n FOO /r/repo/.claude/RULES.md | head"), Some(Kind::Search));
         assert_eq!(c("cd /r/repo/.claude && sed -n 1,40p RULES.md"), Some(Kind::Read));
         assert_eq!(c("cat \"V:/notes vault/a.md\""), Some(Kind::Read));
@@ -580,11 +531,33 @@ mod tests {
         assert_eq!(c("perl -pi -e s/a/b/ RULES.md"), None);
         // A folder above a target root is not a read of anything else.
         assert_eq!(c("cd /r && grep -n x repo/.claude/RULES.md"), Some(Kind::Search));
-        let g = classify("Grep", &atlas::json!({"pattern": "x", "path": "R:/repo/docs"}), "", &t);
+        // A `/`-led sed address or grep pattern is not a path.
+        assert_eq!(c("sed -n '/^## Next/,/^## /p' notes/handoff.md"), Some(Kind::Read));
+        assert_eq!(c("grep -n \"/api\" docs/a.md"), Some(Kind::Search));
+        let g = classify("Grep", &crate::json!({"pattern": "x", "path": "R:/repo/docs"}), "", &t);
         assert_eq!(g, None, "a globbed root searched whole");
-        let g = classify("Grep", &atlas::json!({"pattern": "x", "path": "R:/repo/docs", "glob": "*.md"}), "", &t);
+        let g = classify("Grep", &crate::json!({"pattern": "x", "path": "R:/repo/docs", "glob": "*.md"}), "", &t);
         assert_eq!(g, Some(Kind::Search));
-        assert_eq!(classify("Read", &atlas::json!({"file_path": "R:/repo/src/a.rs"}), "", &t), None);
+        assert_eq!(classify("Read", &crate::json!({"file_path": "R:/repo/src/a.rs"}), "", &t), None);
+    }
+
+    /// Unix paths: `/`-rooted, no drive. Every OS runs this, so a check
+    /// that only knows drive letters fails on Windows too.
+    #[test]
+    fn unix_paths_are_absolute() {
+        let t = Targets::new(&[PathBuf::from("/home/u/work/notes")], &[(PathBuf::from("/home/u/work/repo/docs"), vec!["*.md".into()])], DEFAULT_HANDOFF).unwrap();
+        assert!(t.is_target("/home/u/work/notes/a.md", "/home/u/work"));
+        assert!(t.is_target("/home/u/work/notes/a.md", ""));
+        assert!(t.is_target("notes/a.md", "/home/u/work"));
+        assert!(t.is_target("/home/u/work/repo/docs/b.md", "/tmp/elsewhere"));
+        assert!(!t.is_target("/home/u/work/repo/src/main.rs", "/home/u/work"));
+        assert!(t.is_globbed_root("/home/u/work/repo/docs", "/home/u/work"));
+        let c = |cmd: &str| classify("Bash", &crate::json!({ "command": cmd }), "/home/u/work", &t);
+        assert_eq!(c("cat /home/u/work/notes/a.md"), Some(Kind::Read));
+        assert_eq!(c("grep -n x /home/u/work/notes/a.md /tmp/scratch/out"), None);
+        assert_eq!(c("sed -n '/^## Next/,/^## /p' notes/handoff.md"), Some(Kind::Read));
+        assert_eq!(c("grep -n \"/api\" notes/a.md"), Some(Kind::Search));
+        assert_eq!(classify("Read", &crate::json!({"file_path": "/home/u/work/notes/a.md"}), "/home/u/work", &t), Some(Kind::Read));
     }
 
     #[test]
@@ -593,32 +566,4 @@ mod tests {
         assert_eq!(shell_words("a ''"), vec!["a", ""]);
     }
 
-    #[test]
-    fn episodes_group_reads_after_a_search() {
-        let dir = std::env::temp_dir().join(format!("atlas-baseline-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
-        let use_ = |id: &str, name: &str, input: Value, ts: &str| atlas::json!({"type": "assistant", "timestamp": ts, "cwd": "R:/repo", "message": {"content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}}).to_string();
-        let res = |id: &str, n: usize| atlas::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": "x".repeat(n)}]}}).to_string();
-        let lines = [
-            use_("1", "Grep", atlas::json!({"pattern": "a", "path": "R:/repo/docs", "glob": "*.md"}), "2026-01-01T00:00:00Z"),
-            res("1", 100),
-            use_("2", "Read", atlas::json!({"file_path": "R:/repo/docs/a.md"}), "2026-01-01T00:00:01Z"),
-            res("2", 1000),
-            use_("3", "Bash", atlas::json!({"command": "cargo build"}), "2026-01-01T00:00:02Z"),
-            res("3", 5),
-            use_("4", "Read", atlas::json!({"file_path": "R:/repo/.claude/RULES.md"}), "2026-01-01T00:00:03Z"),
-            res("4", 40),
-            use_("4b", "mcp__vault__read_note", atlas::json!({}), "2026-01-01T00:00:03Z"),
-            use_("5", "mcp__atlas__recall", atlas::json!({}), "2026-01-01T00:00:04Z"),
-            use_("6", "Read", atlas::json!({"file_path": "R:/repo/.claude/RULES.md"}), "2026-01-01T00:00:05Z"),
-            res("6", 7),
-        ];
-        std::fs::write(&p, lines.join("\n")).unwrap();
-        assert_eq!(scan(&p, "2027", &targets()), vec![1100, 40]);
-        assert_eq!(scan(&p, "2026-01-01T00:00:01Z", &targets()), vec![100]);
-        let b = measure(&dir, "2027", &targets());
-        assert_eq!((b.episodes, b.median, b.total), (2, 570.0, 1140));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

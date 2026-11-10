@@ -125,7 +125,8 @@ pub fn embed_pending(conn: &mut Connection, model: &Model, limit: usize, threads
     }
     let texts: Vec<String> = todo.iter().map(|t| t.1.clone()).collect();
     let vecs = model.embed_many(&texts, threads);
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // `begin` refuses a store a newer atlas upgraded since this one opened it.
+    let tx = crate::store::begin(conn)?;
     {
         let mut st = tx.prepare_cached("INSERT OR REPLACE INTO vec_cache(model, sha, vec) VALUES(?1, ?2, ?3)")?;
         for ((sha, _), v) in todo.iter().zip(&vecs) {
@@ -140,10 +141,14 @@ pub fn embed_pending(conn: &mut Connection, model: &Model, limit: usize, threads
 ///
 /// # Errors
 ///
+/// [`crate::error::Error::StoreTooNew`] (nothing deleted, no table made), or
 /// [`crate::error::Error::Db`] from SQLite.
 pub fn prune(conn: &Connection, model: &str) -> Result<usize> {
-    ensure_schema(conn)?;
-    Ok(conn.execute("DELETE FROM vec_cache WHERE model = ?1 AND sha NOT IN (SELECT sha FROM sections)", [model])?)
+    // The table is made inside the checked transaction too.
+    crate::store::guarded(conn, || {
+        ensure_schema(conn)?;
+        Ok(conn.execute("DELETE FROM vec_cache WHERE model = ?1 AND sha NOT IN (SELECT sha FROM sections)", [model])?)
+    })
 }
 
 /// The section vectors of one model, as one row-major matrix.
@@ -269,7 +274,7 @@ impl Embedder {
         let failed = Arc::new(Mutex::new(None));
         let (d, e, f) = (done.clone(), embedded.clone(), failed.clone());
         let run = move || -> Result<()> {
-            let mut conn = Connection::open(&db)?;
+            let mut conn = crate::store::open_raw(&db)?;
             conn.busy_timeout(Duration::from_secs(30))?;
             loop {
                 let n = embed_pending(&mut conn, &model, 256, threads)?;
@@ -341,5 +346,31 @@ mod tests {
         let t = ix.top(gemm::Isa::detect(), &[0.6, 0.8], 2);
         assert_eq!(t.iter().map(|x| x.0).collect::<Vec<_>>(), [12, 11]);
         assert!(ix.top(gemm::Isa::Scalar, &[1.0, 0.0], 0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod storeguard_tests {
+    use super::*;
+    use crate::store::skew_support::{dump, make_index_newer};
+
+    /// `prune` on a store a newer atlas upgraded since this one opened it
+    /// deletes nothing and makes no table.
+    #[test]
+    fn prune_checks_the_version_under_the_lock() {
+        let c = Connection::open_in_memory().unwrap();
+        make_index_newer(&c);
+        let before = dump(&c);
+        assert!(prune(&c, "m").expect_err("refused").is_store_too_new());
+        assert_eq!(dump(&c), before, "no table made");
+        let c = Connection::open_in_memory().unwrap();
+        ensure_schema(&c).unwrap();
+        c.execute_batch("CREATE TABLE sections(sha TEXT);").unwrap();
+        c.execute("INSERT INTO vec_cache(model, sha, vec) VALUES('m', 'gone', x'00')", []).unwrap();
+        make_index_newer(&c);
+        let before = dump(&c);
+        assert!(prune(&c, "m").expect_err("refused").is_store_too_new());
+        assert!(c.is_autocommit(), "rolled back");
+        assert_eq!(dump(&c), before, "the stale vector stays");
     }
 }

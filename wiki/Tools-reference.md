@@ -106,11 +106,19 @@ hook's own gate), `--rows` lists every key, and `--tune-floor SCALE` prints the 
 floor that maximises the bytes the kept hits save net of the bytes injected (SCALE is the share of a hit's
 counterfactual credited: 1 for the upper bound).
 
-The counterfactual is an upper bound. `cargo xtask calibrate-baseline --config C --transcripts DIR --before TIME` (a dev-only task) measures the other
-side from real Claude Code transcripts below DIR dated before TIME: the bytes of the Grep, Read and shell-read
-results agents read when they looked something up in the files atlas serves, grouped into one episode per
-question, and saves it. `--token-report` then heads its output with the measured ratio (median pre-atlas
-episode over median atlas answer) and the upper bound, labelled as such. The rules are in `xtask/src/calibrate.rs`.
+The counterfactual is an upper bound. atlas measures the other side itself, from your own Claude Code
+transcripts: the bytes of the Grep, Read and shell-read results agents read when they looked something up in the
+files atlas serves, before atlas, grouped into one episode per question. The server does it in the background,
+never on a hook's path, at its first start and again when the lookup rules or the configured targets change;
+`atlas --calibrate` does it by hand, with progress. The cutoff is the earlier of the store's first atlas answer
+and the first atlas call in the project's transcripts, kept from the first run; the transcripts are those whose
+session ran in one of the project's folders (every one without projects), less temporary, scratch, eval and
+replay folders (`calibrate.skip`); a call another transcript already holds (a replay, a resumed session) counts
+once. What the rules read of each pre-cutoff call (never a result's text) is kept in the store, so a later
+recalibration does not lose history Claude Code has since deleted. `--token-report` then heads its output with
+the measured ratio (median pre-atlas episode over median atlas answer), when it was measured, from how many
+episodes and transcripts and with which rules version, and the upper bound, labelled as such. With fewer than 30
+episodes from 5 transcripts it gives the upper bound alone and says why. The rules are in `src/calibrate/`.
 
 | Tool | Writes | What it does |
 |---|---|---|

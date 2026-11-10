@@ -92,9 +92,103 @@ CREATE TRIGGER IF NOT EXISTS records_key_fixed BEFORE UPDATE OF key, kind, rid O
     BEGIN SELECT RAISE(ABORT, 'a record key and kind never change'); END;
 ";
 
-/// The schema's version (`PRAGMA user_version`); a change re-runs [`SCHEMA`],
-/// whose statements are all `IF NOT EXISTS`.
+/// The schema's version (`PRAGMA user_version`). An older store is brought up
+/// by [`migrate`], a newer one is refused (see [`MemoryStore::open`]).
 pub const SCHEMA_VERSION: i64 = 2;
+
+/// Brings a store at version `from` (0 is a fresh file) up to
+/// [`SCHEMA_VERSION`]. Run by [`MemoryStore::open`] inside its one
+/// `BEGIN IMMEDIATE` transaction, so the steps and the version land together.
+///
+/// Versions 0, 1 and 2 differ only by what [`SCHEMA`] makes with
+/// `IF NOT EXISTS`, so every older store takes that one step. A step that
+/// transforms rows for version N goes after it as `if from < N { ... }`; the
+/// version is written last.
+fn migrate(conn: &Connection, from: i64) -> rusqlite::Result<()> {
+    debug_assert!(from < SCHEMA_VERSION);
+    conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+}
+
+/// The refusal for a memory store at `version`, when it is newer than this
+/// binary reads.
+fn too_new(path: &Path, version: i64) -> Option<Error> {
+    (version > SCHEMA_VERSION).then(|| Error::StoreTooNew {
+        store: "memory store".into(),
+        path: path.display().to_string(),
+        found: version.to_string(),
+        supported: SCHEMA_VERSION.to_string(),
+    })
+}
+
+/// Runs `f`, a side-table write on the memory store (`mem_meta`), as one
+/// write transaction after [`check_locked`]. Already inside a transaction,
+/// `f` runs in it.
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`] (nothing written), or what `f` returns.
+pub(crate) fn guarded<T>(conn: &Connection, path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !conn.is_autocommit() {
+        return f();
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    check_locked(&tx, path)?;
+    let r = f()?;
+    tx.commit()?;
+    Ok(r)
+}
+
+/// The check at the start of every write transaction (`conn` holds the write
+/// lock): one `PRAGMA user_version` read, so a session that opened the store
+/// before a newer atlas upgraded it stops writing from then on.
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`], or [`Error::Db`].
+pub(crate) fn check_locked(conn: &Connection, path: &Path) -> Result<()> {
+    let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    match too_new(path, v) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// The schema step of [`MemoryStore::open`], under the write lock: reads the
+/// version again (another binary may have changed it since the first read),
+/// refuses a newer store with nothing written, migrates an older one, and
+/// leaves a current one alone.
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`] (rolled back), or [`Error::Db`].
+fn make_schema(conn: &Connection, path: &Path) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let made = (|| -> Result<()> {
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if let Some(e) = too_new(path, v) {
+            return Err(e);
+        }
+        if v < SCHEMA_VERSION {
+            migrate(conn, v)?;
+        }
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+    if made.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    made
+}
+
+/// Whether the memory store at `path` is newer than this binary reads, read
+/// without writing anything: a read-only open of `user_version` (for
+/// `atlas doctor`). `None` when it is not, or when it cannot be read.
+pub fn store_skew(path: &Path) -> Option<Error> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
+    let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()?;
+    too_new(path, v)
+}
 
 /// The most words one search sends to FTS5 (the rarest ones).
 pub const SEARCH_TERMS: usize = 12;
@@ -478,22 +572,14 @@ fn void_line(len: usize) -> Vec<u8> {
 /// committed lines, appended after each commit). Without it a fresh store's
 /// first batch killed between its append and its commit left a line that
 /// read as an older writer's committed one.
-fn record_jsonl_end(c: &Connection, jsonl: &Path) -> Result<()> {
-    c.execute_batch("BEGIN IMMEDIATE")?;
-    let made = (|| -> Result<()> {
+fn record_jsonl_end(c: &Connection, path: &Path, jsonl: &Path) -> Result<()> {
+    guarded(c, path, || {
         if jsonl_end(c)?.is_none() {
             let len = std::fs::metadata(jsonl).map_or(0, |m| m.len());
             c.prepare_cached("INSERT INTO mem_meta(key, value) VALUES('jsonl_end', ?1)")?.execute([len.to_string()])?;
         }
         Ok(())
-    })();
-    match made {
-        Ok(()) => Ok(c.execute_batch("COMMIT")?),
-        Err(e) => {
-            let _ = c.execute_batch("ROLLBACK");
-            Err(e)
-        }
-    }
+    })
 }
 
 /// The `.jsonl` copy beside a store file.
@@ -644,7 +730,9 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// [`Error::Db`] or [`Error::Io`] if it cannot be opened or its schema made.
+    /// [`Error::StoreTooNew`] if a newer atlas made the store: it is then not
+    /// opened and nothing in it is written. [`Error::Db`] or [`Error::Io`] if
+    /// it cannot be opened or its schema made.
     pub fn open(path: &Path) -> Result<MemoryStore> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
@@ -653,13 +741,21 @@ impl MemoryStore {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // The schema is made once; a store at the current version opens
         // with two pragma reads (start to first answer is an aim of 5 ms).
+        // A newer store is refused before anything is written: running this
+        // binary's schema over it and writing its version would downgrade it.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != SCHEMA_VERSION {
+        if let Some(e) = too_new(path, version) {
+            return Err(e);
+        }
+        if version < SCHEMA_VERSION {
             // Two sessions can open a fresh store at once. Switching to WAL
             // answers SQLITE_BUSY at once (the busy handler is not consulted
             // for a journal mode change), so it is retried until the busy
             // timeout; the schema is then made under the write lock, and
-            // only by the first session to take it.
+            // only by the first session to take it. The switch runs before
+            // the version is read again under that lock, so in the race a
+            // newer binary that upgraded the store just now can see its
+            // journal mode set to WAL: harmless while every version uses WAL.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
@@ -670,24 +766,12 @@ impl MemoryStore {
                     Err(e) => return Err(e.into()),
                 }
             }
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let made = (|| -> rusqlite::Result<()> {
-                let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-                if v != SCHEMA_VERSION {
-                    conn.execute_batch(SCHEMA)?;
-                    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-                }
-                conn.execute_batch("COMMIT")
-            })();
-            if let Err(e) = made {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e.into());
-            }
+            make_schema(&conn, path)?;
         }
         conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         let jsonl = jsonl_path(path);
         if jsonl_end(&conn)?.is_none() {
-            record_jsonl_end(&conn, &jsonl)?;
+            record_jsonl_end(&conn, path, &jsonl)?;
         }
         Ok(MemoryStore { conn, path: path.to_path_buf(), jsonl, vocab: Default::default() })
     }
@@ -737,6 +821,10 @@ impl MemoryStore {
     /// copy cannot be cut back.
     pub fn writer(&mut self) -> Result<Writer<'_>> {
         let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Under the lock: a newer atlas may have upgraded the store since this
+        // one opened it, and then nothing more is written (dropping `tx`
+        // rolls back).
+        check_locked(&tx, &self.path)?;
         if !self.jsonl.as_os_str().is_empty() {
             let end = jsonl_end(&tx)?;
             if let (Some(end), Ok(m)) = (end, std::fs::metadata(&self.jsonl)) {
@@ -1337,14 +1425,17 @@ impl MemoryStore {
         Ok(self.conn.prepare_cached("SELECT value FROM mem_meta WHERE key = ?1")?.query_row([key], |r| r.get(0)).optional()?)
     }
 
-    /// Sets a value in the store's own key/value table.
+    /// Sets a value in the store's own key/value table, after the
+    /// write-time version re-check ([`guarded`]).
     ///
     /// # Errors
     ///
-    /// [`Error::Db`].
+    /// [`Error::StoreTooNew`] (nothing written), or [`Error::Db`].
     pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.prepare_cached("INSERT INTO mem_meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?.execute([key, value])?;
-        Ok(())
+        guarded(&self.conn, &self.path, || {
+            self.conn.prepare_cached("INSERT INTO mem_meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?.execute([key, value])?;
+            Ok(())
+        })
     }
 
     /// The next free key `<prefix><n>` (n zero-padded to `width`).
@@ -1923,5 +2014,176 @@ impl Writer<'_> {
             return Err(e.into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+
+    /// A fresh folder under the temp dir.
+    fn dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        let d = std::env::temp_dir().join(format!("atlas-skew-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A store a newer atlas made: rollback journal (so a WAL switch would
+    /// show), version SCHEMA_VERSION + 1, one table with one row, and none of
+    /// the tables SCHEMA makes.
+    fn newer(path: &Path) {
+        let c = Connection::open(path).unwrap();
+        c.execute_batch(&format!(
+            "PRAGMA journal_mode=DELETE; CREATE TABLE future(x TEXT); INSERT INTO future VALUES('kept'); PRAGMA user_version = {};",
+            SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+    }
+
+    /// A side-table write (`mem_meta`) on a store a newer atlas upgraded
+    /// since this one opened it is refused, and rolled back.
+    #[test]
+    fn a_side_table_write_checks_the_version_under_the_lock() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(&format!("CREATE TABLE mem_meta(key TEXT PRIMARY KEY, value TEXT); PRAGMA user_version = {};", SCHEMA_VERSION + 1)).unwrap();
+        let write = || {
+            c.execute("INSERT INTO mem_meta VALUES('k', 'v')", [])?;
+            Ok(())
+        };
+        let e = guarded(&c, Path::new("m"), write).expect_err("refused");
+        assert!(e.is_store_too_new(), "{e}");
+        assert!(c.is_autocommit());
+        c.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};")).unwrap();
+        guarded(&c, Path::new("m"), write).unwrap();
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM mem_meta", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// `meta_set` (the sync no-op path, the check snapshot time) on a store a
+    /// newer atlas upgraded since this one opened it is refused, and writes
+    /// nothing; at the current version it writes.
+    #[test]
+    fn meta_set_checks_the_version_under_the_lock() {
+        let store = MemoryStore::in_memory().unwrap();
+        store.conn().execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1)).unwrap();
+        let e = store.meta_set("k", "v").expect_err("refused");
+        assert!(e.is_store_too_new(), "{e}");
+        assert!(store.conn().is_autocommit());
+        assert_eq!(store.meta_get("k").unwrap(), None);
+        store.conn().execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};")).unwrap();
+        store.meta_set("k", "v").unwrap();
+        assert_eq!(store.meta_get("k").unwrap().as_deref(), Some("v"));
+    }
+
+    /// Everything a refused open must leave as it was.
+    fn assert_untouched(path: &Path, bytes: &[u8]) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes, "the file is byte for byte the same");
+        assert!(!jsonl_path(path).exists(), "no .jsonl copy is begun");
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        assert!(!Path::new(&wal).exists(), "no WAL file");
+        let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "the version is not written back");
+        let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "delete", "the journal mode is not switched");
+        let made: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'records'", [], |r| r.get(0)).unwrap();
+        assert_eq!(made, 0, "SCHEMA is not run");
+        let rows: i64 = c.query_row("SELECT COUNT(*) FROM future", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "the data is not changed");
+    }
+
+    fn assert_refusal(e: &Error, path: &Path) {
+        let want = Error::StoreTooNew {
+            store: "memory store".into(),
+            path: path.display().to_string(),
+            found: (SCHEMA_VERSION + 1).to_string(),
+            supported: SCHEMA_VERSION.to_string(),
+        };
+        assert_eq!(e, &want);
+        let text = e.to_string();
+        assert!(text.contains(&format!("schema {}", SCHEMA_VERSION + 1)) && text.contains(&format!("up to schema {SCHEMA_VERSION}")) && text.contains("Update atlas"), "{text}");
+    }
+
+    #[test]
+    fn an_older_binary_never_opens_or_writes_a_newer_store() {
+        let d = dir("newer");
+        let path = d.join("memory.sqlite");
+        newer(&path);
+        let bytes = std::fs::read(&path).unwrap();
+        let e = MemoryStore::open(&path).err().expect("a newer store is refused");
+        assert_refusal(&e, &path);
+        assert_untouched(&path, &bytes);
+        // Doctor's read-only look names it, and writes nothing either.
+        assert_eq!(store_skew(&path), Some(e));
+        assert_untouched(&path, &bytes);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_check_under_the_write_lock_refuses_a_store_upgraded_since_the_first_read() {
+        // The race: this binary read an older version, a newer binary then
+        // upgraded the store, and this one takes the write lock. The step
+        // under the lock reads the version again and refuses.
+        let d = dir("race");
+        let path = d.join("memory.sqlite");
+        newer(&path);
+        let bytes = std::fs::read(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let e = make_schema(&conn, &path).unwrap_err();
+        assert_refusal(&e, &path);
+        assert!(conn.is_autocommit(), "the transaction is rolled back");
+        drop(conn);
+        assert_untouched(&path, &bytes);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_open_store_stops_writing_once_a_newer_binary_upgrades_it() {
+        // A session opened the store; a newer atlas then upgraded it. The
+        // session's next write transaction reads the version again and is
+        // refused, with nothing written.
+        let d = dir("running");
+        let path = d.join("memory.sqlite");
+        let mut store = MemoryStore::open(&path).unwrap();
+        drop(store.writer().unwrap());
+        Connection::open(&path).unwrap().execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1)).unwrap();
+        let e = store.writer().err().expect("refused");
+        assert_refusal(&e, &path);
+        assert!(store.conn().is_autocommit(), "rolled back");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn fresh_current_and_older_stores_open() {
+        let d = dir("ladder");
+        let version = |p: &Path| -> i64 { Connection::open(p).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap() };
+        let has_records = |p: &Path| -> bool {
+            Connection::open(p).unwrap().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'records'", [], |r| r.get::<_, i64>(0)).unwrap() == 1
+        };
+        // Fresh: the schema is made and the version set.
+        let fresh = d.join("fresh.sqlite");
+        drop(MemoryStore::open(&fresh).unwrap());
+        assert_eq!(version(&fresh), SCHEMA_VERSION);
+        assert!(has_records(&fresh));
+        assert_eq!(store_skew(&fresh), None);
+        // Current: opens as it is.
+        drop(MemoryStore::open(&fresh).unwrap());
+        assert_eq!(version(&fresh), SCHEMA_VERSION);
+        // Older: migrated up, its rows kept.
+        let older = d.join("older.sqlite");
+        Connection::open(&older).unwrap().execute_batch("CREATE TABLE past(x TEXT); INSERT INTO past VALUES('kept'); PRAGMA user_version = 1;").unwrap();
+        drop(MemoryStore::open(&older).unwrap());
+        assert_eq!(version(&older), SCHEMA_VERSION);
+        assert!(has_records(&older));
+        let rows: i64 = Connection::open(&older).unwrap().query_row("SELECT COUNT(*) FROM past", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
+        // A missing file is not created by the read-only look.
+        let missing = d.join("missing.sqlite");
+        assert_eq!(store_skew(&missing), None);
+        assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

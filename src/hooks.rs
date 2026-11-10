@@ -191,6 +191,44 @@ impl HookAnswer {
     }
 }
 
+/// The hook events whose `additionalContext` reaches the session's own model
+/// (SubagentStart's goes to the subagent; PreCompact's plain text is summary
+/// instructions).
+const NOTICE_EVENTS: [&str; 3] = ["SessionStart", "UserPromptSubmit", "PostToolUse"];
+
+/// The hook answer while atlas refuses a store (an [`Error::StoreTooNew`] from
+/// opening it): once per session, on its first event that can carry context,
+/// the refusal as a `systemMessage` the user sees and as `additionalContext`
+/// the model sees; every other event answers nothing, as a hook with no store
+/// did before.
+#[derive(Debug, Default)]
+pub struct RefusalNotice {
+    told: HashSet<String>,
+}
+
+impl RefusalNotice {
+    /// The answer to `ev` while opening fails with `e`.
+    pub fn answer(&mut self, e: &crate::Error, ev: &HookEvent) -> String {
+        if !e.is_store_too_new() || !NOTICE_EVENTS.contains(&ev.event.as_str()) || !self.told.insert(ev.session_id.clone()) {
+            return String::new();
+        }
+        refusal_json(e, &ev.event)
+    }
+}
+
+/// The hook JSON that tells the user and the model atlas is off for this
+/// session because of `e`.
+pub fn refusal_json(e: &crate::Error, event: &str) -> String {
+    let text = format!("atlas is off for this session: {e}");
+    crate::json::object(text.len() * 2 + 96, |w| {
+        w.field("systemMessage", &text);
+        let inner = crate::json::object(text.len() + 64, |h| {
+            h.field("hookEventName", event).field("additionalContext", &text);
+        });
+        w.field("hookSpecificOutput", &crate::json::parse(&inner).unwrap_or(Value::Null));
+    })
+}
+
 /// The subagent's own transcript, derived from the parent's path and the
 /// agent id (measured: Claude Code 2.1.314).
 pub fn subagent_transcript(parent: &str, agent_id: &str) -> PathBuf {
@@ -705,7 +743,7 @@ impl Hooks {
     /// source (`memory.transcripts`); a command hook calls it after printing.
     pub fn index_transcripts(&mut self) {
         for path in std::mem::take(&mut self.transcripts) {
-            let r = rusqlite::Connection::open(&self.settings.index_db).map_err(crate::Error::from).and_then(|c| {
+            let r = crate::store::open_raw(&self.settings.index_db).and_then(|c| {
                 let _ = c.busy_timeout(std::time::Duration::from_secs(10));
                 crate::transcripts::index(&c, &path)
             });
@@ -931,7 +969,8 @@ impl Hooks {
                     let launch = crate::orchestrate::Launch { transcript: &ev.transcript_path, tool_use_id: &ev.tool_use_id, input: &ev.tool_input, brief };
                     a.deny = self.orch.admit(&self.settings.orchestrate, &launch, std::time::SystemTime::now(), std::time::Instant::now());
                     let admitted = a.deny.is_none();
-                    self.queue_launch(ev, brief, &mut a);
+                    let kind_refused = self.orch.kind_refused();
+                    self.queue_launch(ev, brief, kind_refused, &mut a);
                     if admitted && a.deny.is_some() {
                         self.orch.release_last();
                     }
@@ -1465,7 +1504,7 @@ impl Hooks {
             check,
             hook_ms: t0.elapsed().as_secs_f64() * 1e3,
         };
-        if let Ok(conn) = rusqlite::Connection::open(&self.settings.index_db) {
+        if let Ok(conn) = crate::store::open_raw(&self.settings.index_db) {
             let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
             let _ = crate::compact::log(&conn, &logged);
         }
@@ -1548,13 +1587,14 @@ impl Hooks {
     /// launch is filed (and the reason names its key), an admitted one that
     /// was waiting leaves the queue. Errors file nothing and change no
     /// decision.
-    fn queue_launch(&mut self, ev: &HookEvent, brief: &str, a: &mut HookAnswer) {
+    /// `kind_refused`: the deny in `a`, if any, is the kind cap's.
+    fn queue_launch(&mut self, ev: &HookEvent, brief: &str, kind_refused: bool, a: &mut HookAnswer) {
         if !self.settings.orchestrate.enabled {
             return;
         }
         let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
         let description = f("description");
-        let kind = crate::orchestrate::classify(&self.settings.orchestrate, brief, f("subagent_type"), f("isolation"));
+        let (kind, source) = crate::orchestrate::classify_source(&self.settings.orchestrate, brief, f("subagent_type"), f("isolation"));
         let known = self.known_lanes();
         let class = crate::lanes::classify(brief, &known);
         if a.deny.is_none() {
@@ -1571,7 +1611,7 @@ impl Hooks {
                 ));
             } else {
                 let line = match crate::queue::started(&mut self.store, description, brief) {
-                    Ok(crate::queue::Started::NotWaiting(k)) => format!("atlas queue: the brief's `Queue: {k}` names no waiting item (`atlas queue` lists them)."),
+                    Ok(crate::queue::Started::NotWaiting(k)) => format!("atlas queue: the prompt's `Queue: {k}` names no waiting item (`atlas queue` lists them)."),
                     Ok(_) => String::new(),
                     Err(e) => {
                         eprintln!("atlas queue: {e}");
@@ -1589,7 +1629,7 @@ impl Hooks {
                         a.context.push('\n');
                     }
                     a.context.push_str(&format!(
-                        "atlas queue: this launch may conflict with running work ({}); atlas inferred it, so it was let through. If the conflict is real, stop it and start it when that work finishes; a `Lane:` or `Uses:` line in the brief corrects a wrong inference.",
+                        "atlas queue: this launch may conflict with running work ({}); atlas inferred it, so it was let through. If the conflict is real, stop it and start it when that work finishes; a `Lane:` or `Uses:` line in the prompt corrects a wrong inference.",
                         soft.iter().map(|c| c.what.as_str()).collect::<Vec<_>>().join("; ")
                     ));
                 }
@@ -1602,9 +1642,15 @@ impl Hooks {
             Ok((key, new)) => {
                 if let Some(r) = a.deny.as_mut() {
                     r.push_str(&format!(
-                        " atlas {} it as {key}: launch it again with the same description and brief once a slot is free, and it leaves the queue (`atlas queue` lists what waits).",
+                        " atlas {} it as {key}: launch it again with the same description and prompt once a slot is free, and it leaves the queue (`atlas queue` lists what waits).",
                         if new { "queued" } else { "has already queued" }
                     ));
+                    // A relaunch with a new `Kind:` line is another prompt:
+                    // its `Queue:` line keeps it this entry (Q-QU3). Only a
+                    // kind-cap refusal is caused by the kind.
+                    if kind_refused && source != crate::orchestrate::KindSource::Line {
+                        r.push_str(&format!(" If you relaunch it with a `Kind:` line, add `Queue: {key}` too: the entry then takes the new kind and leaves the queue when it starts."));
+                    }
                 }
             }
             Err(e) => eprintln!("atlas queue: {e}"),
@@ -1904,7 +1950,7 @@ fn start_log(s: &Settings) -> Option<(mpsc::Sender<LogRow>, std::thread::JoinHan
             // Nothing is opened until the first row, so a server's start-up
             // does not contend with this thread for the database.
             let Ok(first) = rx.recv() else { return };
-            let Ok(conn) = rusqlite::Connection::open(&db) else { return };
+            let Ok(conn) = crate::store::open_raw(&db) else { return };
             let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
             if conn.execute_batch(crate::tokens::TOKEN_TABLE).is_err() {
                 return;

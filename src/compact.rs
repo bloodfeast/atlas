@@ -808,28 +808,32 @@ pub struct Logged {
 ///
 /// # Errors
 ///
+/// [`crate::Error::StoreTooNew`] (nothing written, no table made), or
 /// [`crate::Error::Db`].
 pub fn log(conn: &Connection, l: &Logged) -> Result<()> {
-    conn.execute_batch(COMPACT_TABLE)?;
-    conn.execute(
-        "INSERT INTO compact_log(time, session, trigger, pre_tokens, post_tokens, summary_bytes, refs, changed, dangling, bare, bare_missing, hook_ms)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            crate::memory::now(),
-            l.session,
-            l.trigger,
-            l.pre_tokens as i64,
-            l.post_tokens as i64,
-            l.summary_bytes as i64,
-            l.check.refs as i64,
-            l.check.changed.len() as i64,
-            l.check.dangling.len() as i64,
-            l.check.bare as i64,
-            l.check.bare_missing as i64,
-            l.hook_ms
-        ],
-    )?;
-    Ok(())
+    // The table is made inside the checked transaction too.
+    crate::store::guarded(conn, || {
+        conn.execute_batch(COMPACT_TABLE)?;
+        conn.execute(
+            "INSERT INTO compact_log(time, session, trigger, pre_tokens, post_tokens, summary_bytes, refs, changed, dangling, bare, bare_missing, hook_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                crate::memory::now(),
+                l.session,
+                l.trigger,
+                l.pre_tokens as i64,
+                l.post_tokens as i64,
+                l.summary_bytes as i64,
+                l.check.refs as i64,
+                l.check.changed.len() as i64,
+                l.check.dangling.len() as i64,
+                l.check.bare as i64,
+                l.check.bare_missing as i64,
+                l.hook_ms
+            ],
+        )?;
+        Ok(())
+    })
 }
 
 /// The compaction totals for `--token-report`.
@@ -1088,5 +1092,24 @@ mod tests {
             assert_eq!(read_below(&root, "pub/config"), None, "the link resolves into a dot folder");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod storeguard_tests {
+    use super::*;
+    use crate::store::skew_support::{dump, make_index_newer};
+
+    /// A compaction logged on a store a newer atlas upgraded since this one
+    /// opened it writes no row and makes no table.
+    #[test]
+    fn the_compaction_log_checks_the_version_under_the_lock() {
+        let c = Connection::open_in_memory().unwrap();
+        make_index_newer(&c);
+        let before = dump(&c);
+        let e = log(&c, &Logged::default()).expect_err("refused");
+        assert!(e.is_store_too_new(), "{e}");
+        assert!(c.is_autocommit(), "rolled back");
+        assert_eq!(dump(&c), before, "no table made, no row");
     }
 }

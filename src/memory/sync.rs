@@ -36,8 +36,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rusqlite::params;
-
 use crate::error::{Error, Result};
 
 use super::export::{ExportSpec, Shape};
@@ -738,7 +736,7 @@ pub fn apply(store: &mut MemoryStore, plan: &Plan) -> Result<Report> {
         }
     }
     w.commit()?;
-    store.conn().execute("INSERT INTO mem_meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![meta_key(export), plan.fingerprint])?;
+    store.meta_set(&meta_key(export), &plan.fingerprint)?;
     Ok(rep)
 }
 

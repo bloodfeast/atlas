@@ -52,55 +52,18 @@ fn content(text: String, is_error: bool) -> Value {
 ///
 /// The response, or `None` for notifications and stray responses.
 pub fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
-    let Some(obj) = msg.as_object() else {
-        return Some(error(Value::Null, -32600, "message must be a JSON object"));
+    let (id, method, params) = match request(msg) {
+        Ok(r) => r,
+        Err(reply) => return reply,
     };
-    let id = obj.get("id").cloned();
-    let Some(method) = obj.get("method").and_then(Value::as_str) else {
-        // A response to a request we never send, or garbage: ignore
-        // responses, reject the rest.
-        if obj.contains_key("result") || obj.contains_key("error") {
-            return None;
-        }
-        return Some(error(id.unwrap_or(Value::Null), -32600, "missing method"));
-    };
-    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return id.map(|id| error(id, -32600, "jsonrpc must be \"2.0\""));
-    }
-    let id = id?;
-    let params = obj.get("params").cloned().unwrap_or(Value::Null);
+    let method = method.as_str();
     match method {
         "initialize" => {
-            let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
-            let version = if SUPPORTED.contains(&asked) { asked } else { PROTOCOL_VERSION };
             if let Some(name) = params.pointer("/clientInfo/name").and_then(Value::as_str) {
                 server.set_client(name);
             }
-            Some(ok(
-                id,
-                json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}, "resources": {}},
-                    "serverInfo": {"name": "atlas", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": server.instructions()
-                }),
-            ))
+            Some(initialize(id, &params, server.instructions()))
         }
-        "ping" => Some(ok(id, json!({}))),
-        "tools/list" => Some(ok(id, json!({ "tools": tools::tool_list() }))),
-        // One resource: the tool reference the short tool list leaves out.
-        "resources/list" => Some(ok(
-            id,
-            json!({"resources": [{"uri": tools::HELP_URI, "name": "atlas tools", "description": "Every tool, op and argument.", "mimeType": "text/markdown"}]}),
-        )),
-        "resources/templates/list" => Some(ok(id, json!({"resourceTemplates": []}))),
-        "resources/read" => match params.get("uri").and_then(Value::as_str) {
-            Some(tools::HELP_URI) => {
-                Some(ok(id, json!({"contents": [{"uri": tools::HELP_URI, "mimeType": "text/markdown", "text": tools::help()}]})))
-            }
-            Some(u) => Some(error(id, -32002, &format!("resource not found: {u}"))),
-            None => Some(error(id, -32602, "resources/read needs params.uri")),
-        },
         "tools/call" => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Some(error(id, -32602, "tools/call needs params.name"));
@@ -120,7 +83,108 @@ pub fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
                 Err(e) => Some(ok(id, content(e.to_string(), true))),
             }
         }
-        _ => Some(error(id, -32601, &format!("method not found: {method}"))),
+        _ => Some(plain(id, method, &params)),
+    }
+}
+
+/// A message's request parts (id, method, params), or the reply to send
+/// instead (`None` for notifications and stray responses).
+fn request(msg: &Value) -> std::result::Result<(Value, String, Value), Option<Value>> {
+    let Some(obj) = msg.as_object() else {
+        return Err(Some(error(Value::Null, -32600, "message must be a JSON object")));
+    };
+    let id = obj.get("id").cloned();
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        // A response to a request we never send, or garbage: ignore
+        // responses, reject the rest.
+        if obj.contains_key("result") || obj.contains_key("error") {
+            return Err(None);
+        }
+        return Err(Some(error(id.unwrap_or(Value::Null), -32600, "missing method")));
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(id.map(|id| error(id, -32600, "jsonrpc must be \"2.0\"")));
+    }
+    let Some(id) = id else { return Err(None) };
+    Ok((id, method.to_string(), obj.get("params").cloned().unwrap_or(Value::Null)))
+}
+
+/// The `initialize` result, with `instructions`.
+fn initialize(id: Value, params: &Value, instructions: String) -> Value {
+    let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
+    let version = if SUPPORTED.contains(&asked) { asked } else { PROTOCOL_VERSION };
+    ok(
+        id,
+        json!({
+            "protocolVersion": version,
+            "capabilities": {"tools": {"listChanged": false}, "resources": {}},
+            "serverInfo": {"name": "atlas", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": instructions
+        }),
+    )
+}
+
+/// The answers that need no tool server: ping, the tool list, the help
+/// resource, and "method not found".
+fn plain(id: Value, method: &str, params: &Value) -> Value {
+    match method {
+        "ping" => ok(id, json!({})),
+        "tools/list" => ok(id, json!({ "tools": tools::tool_list() })),
+        // One resource: the tool reference the short tool list leaves out.
+        "resources/list" => ok(
+            id,
+            json!({"resources": [{"uri": tools::HELP_URI, "name": "atlas tools", "description": "Every tool, op and argument.", "mimeType": "text/markdown"}]}),
+        ),
+        "resources/templates/list" => ok(id, json!({"resourceTemplates": []})),
+        "resources/read" => match params.get("uri").and_then(Value::as_str) {
+            Some(tools::HELP_URI) => ok(id, json!({"contents": [{"uri": tools::HELP_URI, "mimeType": "text/markdown", "text": tools::help()}]})),
+            Some(u) => error(id, -32002, &format!("resource not found: {u}")),
+            None => error(id, -32602, "resources/read needs params.uri"),
+        },
+        _ => error(id, -32601, &format!("method not found: {method}")),
+    }
+}
+
+/// Serves until `input` closes while the index store is refused (`refusal`, an
+/// [`crate::Error::StoreTooNew`] from opening it at start): the server starts
+/// and stays up, so Claude Code does not hold it off, but every tool call
+/// answers the refusal as its error and the `hook` tool tells it once per
+/// session (see [`crate::hooks::RefusalNotice`]). Nothing opens a store.
+///
+/// # Errors
+///
+/// An I/O error reading `input` or writing `output`.
+pub fn serve_refused(refusal: &crate::Error, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
+    let mut buf = Vec::new();
+    let mut notice = crate::hooks::RefusalNotice::default();
+    let text = format!("atlas is off: {refusal}");
+    loop {
+        let msg = match read_incoming(&mut input, &mut buf)? {
+            Incoming::Eof => return Ok(()),
+            Incoming::Reply(r) => {
+                write_line(&mut output, &r)?;
+                continue;
+            }
+            Incoming::Message(m) => m,
+        };
+        let (id, method, params) = match request(&msg) {
+            Ok(r) => r,
+            Err(Some(r)) => {
+                write_line(&mut output, &r)?;
+                continue;
+            }
+            Err(None) => continue,
+        };
+        let r = match method.as_str() {
+            "initialize" => initialize(id, &params, text.clone()),
+            "tools/call" if params.get("name").and_then(Value::as_str) == Some("hook") => {
+                let ev = crate::hooks::HookEvent::from_value(&params.get("arguments").cloned().unwrap_or(Value::Null));
+                ok(id, content(notice.answer(refusal, &ev), false))
+            }
+            "tools/call" => ok(id, content(text.clone(), true)),
+            m => plain(id, m, &params),
+        };
+        write_line(&mut output, &r)?;
     }
 }
 
@@ -270,7 +334,12 @@ pub fn serve_with_hooks(
             let worker = std::thread::Builder::new().name("atlas-hooks".into()).spawn(move || {
                 let mut hooks: Option<crate::hooks::Hooks> = None;
                 let mut index = index;
-                let mut open = |hooks: &mut Option<crate::hooks::Hooks>| {
+                // Why the last open failed: a store too new for this binary is
+                // told once per session (the open is tried again on every
+                // hook, so installing a newer atlas recovers without a restart).
+                let mut failed: Option<crate::Error> = None;
+                let mut notice = crate::hooks::RefusalNotice::default();
+                let mut open = |hooks: &mut Option<crate::hooks::Hooks>, failed: &mut Option<crate::Error>| {
                     if hooks.is_none() {
                         match crate::hooks::Hooks::open(settings.clone()) {
                             Ok(mut h) => {
@@ -281,16 +350,26 @@ pub fn serve_with_hooks(
                                 h.set_index_opener(index.take());
                                 h.warm();
                                 *hooks = Some(h);
+                                *failed = None;
                             }
-                            Err(e) => eprintln!("atlas hooks: {e}"),
+                            Err(e) => {
+                                if failed.as_ref() != Some(&e) {
+                                    eprintln!("atlas hooks: {e}");
+                                }
+                                *failed = Some(e);
+                            }
                         }
                     }
                 };
                 for msg in rx {
-                    open(&mut hooks);
+                    open(&mut hooks, &mut failed);
                     let Some((id, args)) = msg else { continue };
                     let ev = crate::hooks::HookEvent::from_value(&args);
-                    let text = hooks.as_mut().map(|h| h.handle(&ev).to_json(&ev.event)).unwrap_or_default();
+                    let text = match (hooks.as_mut(), &failed) {
+                        (Some(h), _) => h.handle(&ev).to_json(&ev.event),
+                        (None, Some(e)) => notice.answer(e, &ev),
+                        (None, None) => String::new(),
+                    };
                     let r = ok(id, content(text, false));
                     if let Ok(mut w) = o.lock() {
                         let _ = write_line(&mut *w, &r);

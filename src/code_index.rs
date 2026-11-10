@@ -456,7 +456,9 @@ pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rus
     if own_rpcs != own_before {
         // The other roots' call sites of this root's rpcs are stale: their
         // fingerprints are cleared, so the next walk re-indexes them.
-        conn.execute("UPDATE code_roots SET fingerprint = '' WHERE root <> ?1", [&root.name])?;
+        // A refusal fails this root's run (RootState::Failed, logged once).
+        let c: &Connection = conn;
+        crate::store::guarded(c, || Ok(c.execute("UPDATE code_roots SET fingerprint = '' WHERE root <> ?1", [&root.name])?))?;
     }
     // The roots referring to a package this root started or stopped
     // defining: their stored cross-root references are stale.
@@ -867,7 +869,8 @@ fn now_s() -> i64 {
 /// [`Error::Db`] from SQLite.
 pub fn take_lease(conn: &mut Connection, holder: &str, ttl: Duration) -> Result<bool> {
     code::ensure_schema(conn)?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // `begin` refuses a store a newer atlas upgraded since this one opened it.
+    let tx = crate::store::begin(conn)?;
     let cur: Option<(String, i64)> = tx.query_row("SELECT holder, until FROM code_lease WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
     let now = now_s();
     let free = match &cur {
@@ -885,10 +888,13 @@ pub fn take_lease(conn: &mut Connection, holder: &str, ttl: Duration) -> Result<
 ///
 /// # Errors
 ///
+/// [`Error::StoreTooNew`] (the lease is left to expire at its TTL), or
 /// [`Error::Db`] from SQLite.
 pub fn release_lease(conn: &Connection, holder: &str) -> Result<()> {
-    conn.execute("DELETE FROM code_lease WHERE id = 1 AND holder = ?1", [holder])?;
-    Ok(())
+    crate::store::guarded(conn, || {
+        conn.execute("DELETE FROM code_lease WHERE id = 1 AND holder = ?1", [holder])?;
+        Ok(())
+    })
 }
 
 /// What the indexer is doing with a root.
@@ -1058,7 +1064,7 @@ fn set(shared: &Shared, name: &str, s: RootState) {
 }
 
 fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, watcher: &Watcher) -> Result<()> {
-    let mut conn = Connection::open(db)?;
+    let mut conn = crate::store::open_raw(db)?;
     conn.busy_timeout(Duration::from_secs(30))?;
     code::ensure_schema(&conn)?;
     let rust = rust.unwrap_or_else(|| match find_rust_analyzer(setup.rust_analyzer.as_deref()) {
@@ -1201,5 +1207,24 @@ mod tests {
     #[test]
     fn a_missing_binary_is_reported() {
         assert!(find_rust_analyzer(Some(Path::new("no-such-dir/rust-analyzer-missing"))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod storeguard_tests {
+    use super::*;
+    use crate::store::skew_support::{dump, make_index_newer};
+
+    /// Giving the lease back on a store a newer atlas upgraded since this one
+    /// opened it is refused; the lease is left to expire at its TTL.
+    #[test]
+    fn releasing_the_lease_checks_the_version_under_the_lock() {
+        let mut c = Connection::open_in_memory().unwrap();
+        assert!(take_lease(&mut c, "me", Duration::from_secs(60)).unwrap());
+        make_index_newer(&c);
+        let before = dump(&c);
+        assert!(release_lease(&c, "me").expect_err("refused").is_store_too_new());
+        assert!(c.is_autocommit(), "rolled back");
+        assert_eq!(dump(&c), before, "the lease row stays");
     }
 }

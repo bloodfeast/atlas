@@ -459,7 +459,7 @@ impl Server {
                 // A few on this thread (an edit or two), the rest in the
                 // background.
                 if ix.missing <= crate::semantic::INLINE_BUDGET {
-                    let mut c = rusqlite::Connection::open(&sem.db)?;
+                    let mut c = crate::store::open_raw(&sem.db)?;
                     c.busy_timeout(std::time::Duration::from_secs(30))?;
                     crate::semantic::embed_pending(&mut c, &model, crate::semantic::INLINE_BUDGET, 1)?;
                     ix = crate::semantic::VecIndex::load(conn, &model.id, model.dim)?;

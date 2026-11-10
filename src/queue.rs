@@ -134,18 +134,10 @@ fn titled(description: &str) -> (String, Option<&str>) {
     (t, whole)
 }
 
-/// Files a refused launch, unless the same launch (description and brief)
-/// is already waiting. Returns its key and whether it was filed now.
-///
-/// # Errors
-///
-/// [`crate::Error::Db`].
-pub fn add(store: &mut MemoryStore, l: &Launch<'_>) -> Result<(String, bool)> {
-    let named = queue_line(l.prompt);
-    if let Some(h) = waiting(store)?.into_iter().find(|h| same(h, l.description, l.prompt) || named.as_deref() == Some(h.key.as_str())) {
-        return Ok((h.key, false));
-    }
-    let lane = l.lane.filter(|x| !x.trim().is_empty()).unwrap_or(LANE);
+/// The meta a hook-queued launch is filed with: its kind, brief sha,
+/// agent type, session, classification, and the whole description when
+/// the title cut it.
+fn launch_meta(l: &Launch<'_>) -> String {
     let mut meta = format!("kind: {}\nbrief_sha: {}", l.kind.name(), sha_of(l.prompt));
     if !l.subagent_type.is_empty() {
         meta.push_str(&format!("\nsubagent_type: {}", l.subagent_type));
@@ -157,10 +149,45 @@ pub fn add(store: &mut MemoryStore, l: &Launch<'_>) -> Result<(String, bool)> {
         meta.push('\n');
         meta.push_str(l.class_meta);
     }
-    let (title, whole) = titled(l.description);
-    if let Some(w) = whole {
+    if let (_, Some(w)) = titled(l.description) {
         meta.push_str(&format!("\ndescription: {w}"));
     }
+    meta
+}
+
+/// Files a refused launch, unless the same launch (description and brief)
+/// is already waiting. Returns its key and whether it was filed now.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn add(store: &mut MemoryStore, l: &Launch<'_>) -> Result<(String, bool)> {
+    let named = queue_line(l.prompt);
+    if let Some(h) = waiting(store)?.into_iter().find(|h| same(h, l.description, l.prompt) || named.as_deref() == Some(h.key.as_str())) {
+        // A hook-queued launch relaunched by its `Queue:` key as another
+        // kind (a `Kind:` line added) is this launch now: its meta and brief
+        // are rebuilt from it, under the same key and lane.
+        let by_key = named.as_deref() == Some(h.key.as_str());
+        if by_key && meta_value(&h.meta, "brief_sha").is_some() && kind_of(&h) != Some(l.kind) {
+            let d = Draft {
+                title: h.title.clone(),
+                meta: launch_meta(l),
+                body: l.prompt.to_string(),
+                reason: "a queued launch relaunched as another kind".into(),
+                author: "hook".into(),
+                client: "atlas-hook".into(),
+                provenance: None,
+                time: None,
+            };
+            let mut w = store.writer()?;
+            w.revise(&h.key, None, &d)?;
+            w.commit()?;
+        }
+        return Ok((h.key, false));
+    }
+    let lane = l.lane.filter(|x| !x.trim().is_empty()).unwrap_or(LANE);
+    let meta = launch_meta(l);
+    let (title, _) = titled(l.description);
     let d = Draft {
         title,
         meta,

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH]
-//!       [--rescan | --recall-check [--phrase TEXT ...] | --token-report
+//!       [--rescan | --recall-check [--phrase TEXT ...] | --token-report | --calibrate [--audit FILE]
 //!        | --hook-report [--transcripts DIR] [--since TIME] [--rows]
 //!        | --code-index [NAME ...] [--scip FILE] | --version]
 //! ```
@@ -54,6 +54,11 @@
 //!   tokens returned, the counterfactual, and their ratio (see
 //!   [`atlas::tokens`]), headed by the measured ratio and the upper bound,
 //!   with the brief-without-atlas and hook-injection lines at the end.
+//! * `--calibrate [--audit FILE]` measures the pre-atlas baseline the
+//!   measured ratio divides by, now, printing progress and the result (see
+//!   [`atlas::calibrate`]); the server also runs it in the background at a
+//!   start when the stored one is missing or stale. `--audit` writes one line
+//!   per lookup episode.
 //! * `--compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...]` replays
 //!   every compaction in recorded Claude Code transcripts and prints numbers
 //!   only: the compaction ratio, refs and their dangling rate, post-compaction
@@ -82,10 +87,10 @@ mod bench;
 mod measure;
 
 #[cfg(not(feature = "dev"))]
-const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --token-report | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | settings on|off update | --version]";
+const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --token-report | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | settings on|off update | --version]";
 /// With the `dev` feature: the measuring modes too.
 #[cfg(feature = "dev")]
-const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --bench [RUNS] [--queries FILE] [--before EXE CONFIG] | --token-report | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | --judge FILE [--modes M,M] [--runs N] | --symbol-bench FILE [--runs N] | --recall-scores FILE [--runs N] | settings on|off update | --version]";
+const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --bench [RUNS] [--queries FILE] [--before EXE CONFIG] | --token-report | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | --judge FILE [--modes M,M] [--runs N] | --symbol-bench FILE [--runs N] | --recall-scores FILE [--runs N] | settings on|off update | --version]";
 
 /// `atlas --help`: every mode, subcommand and flag, one per line.
 const HELP: &str = "\
@@ -103,6 +108,7 @@ Modes:
   --hook                 a Claude Code command hook: the event JSON on stdin, the answer on stdout
   --recall-check [--phrase TEXT ...]   every identifier and phrase is found by lookup
   --token-report         the token ledger: what atlas answered against what reading would cost
+  --calibrate [--audit FILE]   measure the pre-atlas baseline of the measured ratio now
   --misses-week [--since TIME]         lookups that found nothing, this week
   --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE]
   --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...]
@@ -120,7 +126,7 @@ Modes:
 
 Subcommands:
   atlas run [--digest SHAPE] [--timeout S] [--label TEXT] -- CMD [ARGS...]   run a command, keep its output as a handle
-  atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --digest]
+  atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --page K | --digest]
   atlas slice --list [N]  the newest handles
   atlas digest [--as SHAPE] FILE|-   a digest of a file or stdin
   atlas doctor                       say what it can check of the atlas hooks and project roots
@@ -150,6 +156,8 @@ enum Mode {
     #[cfg(feature = "dev")]
     Bench(usize, bench::Opts),
     TokenReport,
+    /// `--calibrate [--audit FILE]`.
+    Calibrate(Option<PathBuf>),
     /// `--misses-week [--since TIME]`: the weekly top-10 misses pass.
     MissesWeek(String),
     /// `--hook-report [--transcripts DIR] [--since TIME] [--rows]`.
@@ -471,7 +479,7 @@ fn threshold_sweep(files: &[PathBuf], thresholds: &[u64], overhead: f64, summary
 fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str, rows: bool, tune: Option<f64>) -> Result<(), String> {
     use atlas::hook_hits::{self, Injection};
     let s = |e: atlas::Error| e.to_string();
-    let conn = rusqlite::Connection::open(&setup.db).map_err(|e| e.to_string())?;
+    let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
     let mut all = hook_hits::logged(&conn, since).map_err(s)?;
     let mem = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(s)?;
     if let Some(dir) = transcripts {
@@ -599,8 +607,14 @@ pub(crate) struct Setup {
 
 impl Setup {
     pub(crate) fn open(&self) -> Result<Store, String> {
-        let vaults = Vaults::new(&self.vaults).map_err(|e| e.to_string())?;
-        let mut store = Store::open_with(&self.db, vaults, self.atlas.clone()).map_err(|e| e.to_string())?;
+        self.open_typed().map_err(|e| e.to_string())
+    }
+
+    /// As [`Setup::open`], keeping the error's kind (a store too new for this
+    /// binary is served as a refusal, not a failed start).
+    pub(crate) fn open_typed(&self) -> atlas::Result<Store> {
+        let vaults = Vaults::new(&self.vaults)?;
+        let mut store = Store::open_with(&self.db, vaults, self.atlas.clone())?;
         store.set_memory_sync(Some(self.memory.clone()));
         Ok(store)
     }
@@ -691,6 +705,11 @@ fn run() -> Result<ExitCode, String> {
             "--rescan" => mode = Mode::Rescan,
             "--setup" => mode = Mode::Setup,
             "--token-report" => mode = Mode::TokenReport,
+            "--calibrate" => mode = Mode::Calibrate(None),
+            "--audit" => match &mut mode {
+                Mode::Calibrate(a) => *a = Some(PathBuf::from(args.next().ok_or("--audit needs a file")?)),
+                _ => return Err("--audit goes after --calibrate".into()),
+            },
             "--misses-week" => mode = Mode::MissesWeek(String::new()),
             "--hook-report" => mode = Mode::HookReport { transcripts: None, since: String::new(), rows: false, tune: None },
             "--tune-floor" => match &mut mode {
@@ -855,6 +874,10 @@ fn run() -> Result<ExitCode, String> {
     let mut model_path: Option<PathBuf> = None;
     let mut embed_threads = atlas::config::DEFAULT_EMBED_THREADS;
     let mut loaded: Option<Config> = None;
+    // The user configuration and the active project, for calibration.
+    let mut calib_src: Option<(Config, Option<atlas::project::Active>)> = None;
+    // Only the modes that calibrate or report it build a plan: never a hook.
+    let calibrates = matches!(mode, Mode::Serve | Mode::Calibrate(_) | Mode::TokenReport);
     if let Some(cp) = &config {
         let raw = Config::load(cp).map_err(|e| e.to_string())?;
         // The active project's own configuration over the user-level one
@@ -866,6 +889,9 @@ fn run() -> Result<ExitCode, String> {
             eprintln!("atlas: moving the offer state and routing switch to the user level: {e}");
         }
         offer_ctx = Some(atlas::claude_settings::OfferCtx::new(&raw, &r.graph));
+        if calibrates {
+            calib_src = Some((raw.clone(), r.active.clone()));
+        }
         let c = r.config;
         graph = r.graph;
         if let Some(d) = &c.db {
@@ -896,6 +922,10 @@ fn run() -> Result<ExitCode, String> {
         memory.graph = Some(std::sync::Arc::new(graph));
     }
     let setup = Setup { vaults: specs, db: db_path, atlas: atlas_setup, code, semantic_model, embed_threads, memory };
+    let calib_plan = match (&calib_src, loaded.as_ref()) {
+        (Some((raw, active)), Some(c)) => Some(atlas::calibrate::Plan::new(raw, c, active.as_ref(), &setup.db)),
+        _ => None,
+    };
     match mode {
         Mode::Setup => setup_mode(config.as_deref(), &setup, &models, loaded.as_ref()),
         Mode::Settings(on, what) => settings_mode(config.as_deref(), on, &what),
@@ -922,9 +952,33 @@ fn run() -> Result<ExitCode, String> {
             // No scan at startup: every tool brings what it touches up to date
             // (vault tools rescan the vaults, atlas tools check the sources
             // their answer draws on), so the first answer is not delayed.
-            let store = setup.open()?;
+            let store = match setup.open_typed() {
+                Ok(s) => s,
+                // A newer atlas's index store: refused, but never as a failed
+                // start (Claude Code would then hold the server off for 15
+                // minutes and show nothing). The server comes up and answers
+                // every call with the refusal; nothing else is started.
+                Err(e) if e.is_store_too_new() => {
+                    eprintln!("atlas: {e}");
+                    atlas::protocol::serve_refused(&e, BufReader::new(io::stdin()), io::stdout()).map_err(|e| e.to_string())?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+                Err(e) => return Err(e.to_string()),
+            };
             // The whole-corpus recall test, once per configuration, on its own connection.
-            atlas::grammar::spawn_first_index_check(setup.open()?, setup.db.clone());
+            // A second open: a store a newer atlas upgraded since the one
+            // above (or any other failure) skips the check, never the start.
+            match setup.open() {
+                Ok(s) => atlas::grammar::spawn_first_index_check(s, setup.db.clone()),
+                Err(e) => eprintln!("atlas: the first index check is skipped: {e}"),
+            }
+            // The baseline of the measured ratio, when missing or stale: its
+            // own thread and connection, never a hook's path.
+            match calib_plan {
+                Some(Ok(p)) => atlas::calibrate::spawn(p),
+                Some(Err(e)) => eprintln!("atlas calibrate: {e}"),
+                None => {}
+            }
             let roots: Vec<(String, PathBuf)> = store
                 .vaults()
                 .all()
@@ -1003,7 +1057,27 @@ fn run() -> Result<ExitCode, String> {
             // A command hook: the event JSON on stdin, the answer on stdout.
             let v = hook_input.unwrap_or(atlas::json::Value::Null);
             let ev = atlas::hooks::HookEvent::from_value(&v);
-            let mut h = atlas::hooks::Hooks::open(setup.memory.clone()).map_err(|e| e.to_string())?;
+            // A store a newer atlas made is told to the user and the model (a
+            // failing command hook shows only in verbose mode). The notice
+            // belongs to this process, and each `--hook` run is its own: the
+            // shipped hooks route only SessionStart here, so a session is
+            // told once, but a legacy settings file that routes
+            // UserPromptSubmit or PostToolUse here tells it on every event.
+            let refuse = |e: atlas::Error| -> Result<ExitCode, String> {
+                print!("{}", atlas::hooks::RefusalNotice::default().answer(&e, &ev));
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                Ok(ExitCode::SUCCESS)
+            };
+            // The index store first, read only: the hook's token log and
+            // reports write to it, and nothing may once a newer atlas made it.
+            if let Some(e) = atlas::store::index_skew(&setup.db).into_iter().next() {
+                return refuse(e);
+            }
+            let mut h = match atlas::hooks::Hooks::open(setup.memory.clone()) {
+                Ok(h) => h,
+                Err(e) if e.is_store_too_new() => return refuse(e),
+                Err(e) => return Err(e.to_string()),
+            };
             h.set_command_hook();
             h.set_unattended(atlas::claude_settings::unattended_session(|k| std::env::var(k).ok()));
             // SessionStart's first-run project offer needs the configuration file
@@ -1197,22 +1271,37 @@ fn run() -> Result<ExitCode, String> {
             compact_report(&setup, &dir, &since, rows, &sweep, bytes_per_token)?;
             Ok(ExitCode::SUCCESS)
         }
+        Mode::Calibrate(audit) => {
+            let plan = calib_plan.ok_or("atlas --calibrate needs a configuration")??;
+            let _lock = atlas::fsio::FileLock::acquire_within(&plan.lock_target(), std::time::Duration::ZERO)
+                .map_err(|_| "another atlas process is calibrating this store; run it again when that has finished".to_string())?;
+            let conn = atlas::calibrate::open(&plan.db)?;
+            let why = atlas::calibrate::stale(&conn, &plan)?.unwrap_or_else(|| "by hand".into());
+            match &plan.projects {
+                Some(p) => eprintln!("calibrating ({why}): transcripts in {}, skipping folders that match {}", p.display(), plan.skips.join(", ")),
+                None => eprintln!("calibrating ({why}): no home folder, so no Claude Code transcripts to read"),
+            }
+            let mut file = match &audit {
+                Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?)),
+                None => None,
+            };
+            let o = atlas::calibrate::run(&plan, &conn, &mut |m| eprintln!("{m}"), file.as_mut().map(|f| f as &mut dyn std::io::Write))?;
+            drop(file);
+            println!("{}", atlas::calibrate::summary(&o));
+            let side = atlas::baseline::AtlasSide::read(&conn).map_err(|e| e.to_string())?;
+            print_measured(o.kept.as_ref().unwrap_or(&o.baseline), None, &side, Some(&plan));
+            println!("upper bound per answer (grep + read counterfactual / returned): {:.1}x", side.upper());
+            Ok(ExitCode::SUCCESS)
+        }
         Mode::TokenReport => {
-            let conn = rusqlite::Connection::open(&setup.db).map_err(|e| e.to_string())?;
+            let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
+            // A background calibration may be writing; its first read may add columns.
+            conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
             let (by_tool, by_day) = atlas::tokens::report(&conn, bytes_per_token).map_err(|e| e.to_string())?;
             let side = atlas::baseline::AtlasSide::read(&conn).map_err(|e| e.to_string())?;
             match atlas::baseline::latest(&conn).map_err(|e| e.to_string())? {
-                Some((when, b)) => {
-                    let (med, mean) = side.measured(&b);
-                    println!(
-                        "measured ratio per answer: {med:.1}x (median; mean {mean:.1}x): {} pre-atlas lookup episodes before {}, calibrated {}, against {} atlas answers",
-                        b.episodes,
-                        b.before,
-                        when.get(..16).unwrap_or(&when),
-                        side.returned.len()
-                    );
-                }
-                None => println!("measured ratio per answer: not calibrated (run cargo xtask calibrate-baseline)"),
+                Some((when, b)) => print_measured(&b, Some(&when), &side, calib_plan.as_ref().and_then(|p| p.as_ref().ok())),
+                None => println!("measured ratio per answer: not calibrated yet; the server calibrates in the background at its next start, or run atlas --calibrate"),
             }
             println!("upper bound per answer (grep + read counterfactual / returned): {:.1}x", side.upper());
             println!("tokens at {bytes_per_token} bytes per token; the counterfactual columns are the upper bound (grep output + files read, see atlas::tokens)");
@@ -1288,7 +1377,7 @@ fn run() -> Result<ExitCode, String> {
             } else {
                 since
             };
-            let conn = rusqlite::Connection::open(&setup.db).map_err(|e| e.to_string())?;
+            let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
             let (misses, keys) = atlas::tokens::weekly_misses(&conn, &since, bytes_per_token).map_err(|e| e.to_string())?;
             println!("weekly misses pass since {since}: the open misses seen most, then the injected keys that cost the most");
             for (title, rows) in [("missed (report_miss, open)", misses), ("injected (hook_inject)", keys)] {
@@ -1325,7 +1414,7 @@ fn run() -> Result<ExitCode, String> {
             let model = atlas::embed::Model::load(&setup.semantic_model).map_err(|e| e.to_string())?;
             let load_ms = t0.elapsed().as_secs_f64() * 1e3;
             let threads = if threads == 0 { setup.embed_threads } else { threads };
-            let mut conn = rusqlite::Connection::open(&setup.db).map_err(|e| e.to_string())?;
+            let mut conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
             conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
             let pending = atlas::semantic::missing(&conn, &model.id).map_err(|e| e.to_string())?;
             let t1 = std::time::Instant::now();
@@ -1358,7 +1447,7 @@ fn run() -> Result<ExitCode, String> {
             };
             // Opening the store brings the schema up to date first.
             drop(setup.open()?);
-            let mut conn = rusqlite::Connection::open(&setup.db).map_err(|e| e.to_string())?;
+            let mut conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
             conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
             let holder = format!("pid {} (--code-index)", std::process::id());
             if !atlas::code_index::take_lease(&mut conn, &holder, code.timeout * 2).map_err(|e| e.to_string())? {
@@ -1406,7 +1495,43 @@ fn run() -> Result<ExitCode, String> {
     }
 }
 
-/// `--setup`: the configuration, the data folder and the models.
+/// The measured-ratio line of a baseline: the ratio with what it was
+/// measured from, or, with too little history, why there is none and when it
+/// runs again; then, judged against `plan`, whether it is stale.
+fn print_measured(b: &atlas::baseline::Baseline, when: Option<&str>, side: &atlas::baseline::AtlasSide, plan: Option<&atlas::calibrate::Plan>) {
+    let when = when.map(|w| format!(", calibrated {}", w.get(..16).unwrap_or(w))).unwrap_or_default();
+    let rules = b.rules.map_or_else(|| "unversioned lookup rules".to_string(), |v| format!("lookup rules v{v}"));
+    let source = b.cutoff_source.as_ref().map(|s| format!(" ({s})")).unwrap_or_default();
+    let from = format!("{} pre-atlas lookup episodes in {} of {} transcripts before {}{source}", b.episodes, b.used, b.transcripts, b.before);
+    if b.too_few {
+        println!(
+            "measured ratio per answer: none, too little pre-atlas history: {from}; needs {} episodes in {} transcripts ({rules}{when}). It runs again when the lookup rules or the configured targets change, or with atlas --calibrate; the upper bound below stands alone",
+            atlas::calibrate::MIN_EPISODES,
+            atlas::calibrate::MIN_TRANSCRIPTS
+        );
+    } else {
+        let (med, mean) = side.measured(b);
+        println!("measured ratio per answer: {med:.1}x (median; mean {mean:.1}x): {from}, {rules}{when}, against {} atlas answers", side.returned.len());
+    }
+    let stale = match (b.rules, plan) {
+        (None, _) => Some("it has no rules version".to_string()),
+        (Some(v), _) if v < atlas::calibrate::RULES_VERSION => Some(format!("these lookup rules are v{}", atlas::calibrate::RULES_VERSION)),
+        // Newer rules than this binary's: a newer atlas measured it, and it stands.
+        (Some(v), _) if v > atlas::calibrate::RULES_VERSION => None,
+        (_, Some(p)) if b.fingerprint.as_deref() != Some(p.fingerprint.as_str()) => Some("the configured targets changed".to_string()),
+        _ => None,
+    };
+    if let Some(why) = stale {
+        println!("  stale ({why}): the server recalibrates in the background at its next start, or run atlas --calibrate");
+    } else if b.rules.is_some_and(|v| v > atlas::calibrate::RULES_VERSION) {
+        println!(
+            "  measured by a newer atlas (lookup rules v{}, these are v{}): this one does not judge it or recalibrate over it",
+            b.rules.unwrap_or_default(),
+            atlas::calibrate::RULES_VERSION
+        );
+    }
+}
+
 /// The release check before the server starts: see [`atlas::update`].
 /// `Some(code)` when a newer release was swapped in and has served the
 /// session (its exit code is this process's); `None` to serve from this
@@ -1487,6 +1612,7 @@ fn settings_mode(config: Option<&std::path::Path>, on: bool, what: &str) -> Resu
     Ok(ExitCode::SUCCESS)
 }
 
+/// `--setup`: the configuration, the data folder and the models.
 fn setup_mode(config: Option<&std::path::Path>, setup: &Setup, models: &atlas::models::Models, c: Option<&Config>) -> Result<ExitCode, String> {
     match config {
         Some(c) => println!("config   {}", c.display()),

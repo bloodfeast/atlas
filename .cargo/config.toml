@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# Every server a test (or an xtask eval) starts would otherwise calibrate in
+# the background from the real ~/.claude transcripts (see atlas::calibrate).
+[env]
+ATLAS_CALIBRATE = "off"

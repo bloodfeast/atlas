@@ -30,7 +30,7 @@ mod atlas;
 pub use atlas::{utc, AtlasSetup, DefText, Freshness, IdHit, IdSummary, Lookup, Miss, Refresh, SectionHit, SourceInfo, StaleFile, MAX_SECTION_TEXT, MISSES_LOG, STALE_LIST_CAP};
 use atlas::{Atlas, DocRules};
 
-/// The derived tables' version; a mismatch rebuilds them, and the atlas
+/// The derived tables' version; an older one rebuilds them, and the atlas
 /// tables with them (it is part of the atlas fingerprint).
 ///
 /// It is the table shape (the leading number, bumped when the derived tables
@@ -38,7 +38,179 @@ use atlas::{Atlas, DocRules};
 /// grammar or chunking change what a file indexes as) and the crate version,
 /// so an index an older binary wrote rebuilds itself after an update instead
 /// of keeping that binary's reading of the files.
+///
+/// Across versions (see [`index_state`]): a higher shape or `parse-N` than
+/// this binary's is refused ([`Error::StoreTooNew`]), so bump one of them
+/// whenever an older binary must not read or write the new tables. A newer
+/// crate version with the same shape and parse rules opens as it is, with
+/// its `schema` row and open stamp left alone; an older one rebuilds once.
 const SCHEMA: &str = concat!("1/parse-1/", env!("CARGO_PKG_VERSION"));
+
+/// The numbers of a [`SCHEMA`] string: the table shape and the parse rules
+/// (which order it for refusal) and the crate version's numbers (which only
+/// decide whether an older binary's tables rebuild). A part that is missing
+/// or does not read as a number counts as 0, so an unreadable schema counts
+/// as older and rebuilds, as any mismatch did before.
+fn schema_parts(s: &str) -> ([u64; 2], [u64; 3]) {
+    let mut parts = s.split('/');
+    let num = |t: Option<&str>| t.and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
+    let shape = num(parts.next());
+    let parse = num(parts.next().and_then(|p| p.strip_prefix("parse-")));
+    // `0.4.1-dev+x`: the numbers before any pre-release or build suffix, so
+    // `0.3.1-dev` and `0.3.1` order as equal.
+    let crate_version = parts.next().unwrap_or("");
+    let mut v = crate_version.split(['-', '+']).next().unwrap_or("").split('.');
+    ([shape, parse], [num(v.next()), num(v.next()), num(v.next())])
+}
+
+/// The number of an `atlas-N` schema (the atlas tables' shape), 0 for any
+/// other text or none.
+fn atlas_number(s: Option<&str>) -> u64 {
+    s.and_then(|s| s.strip_prefix("atlas-")).and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+/// What this binary does with the derived tables it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skew {
+    /// None yet, this binary's own, or an older one's: as before (an older
+    /// schema drops and rebuilds them once, and this binary's is written).
+    Ours,
+    /// The same shape and parse rules, written by a newer (or equal-numbered)
+    /// crate version: opened as they are, and neither the `schema` row nor
+    /// the open stamp is written, so that binary never rebuilds after this
+    /// one's open.
+    Newer,
+}
+
+/// What the stored `schema` and `atlas_schema` rows say: [`Skew`], or the
+/// refusal when a newer atlas changed the table shape, the parse rules or
+/// the atlas tables' shape (opening them here would rebuild them with this
+/// binary's rules, and each binary would rebuild on the other's opens). The
+/// refusal names the shape and parse numbers (or the atlas schema), never
+/// the crate version.
+fn index_state(db_path: &Path, stored: Option<&str>, atlas_schema: Option<&str>) -> std::result::Result<Skew, Error> {
+    let refuse = |found: String, supported: String| Error::StoreTooNew { store: "index store".into(), path: db_path.display().to_string(), found, supported };
+    let Some(stored) = stored else { return Ok(Skew::Ours) };
+    let (theirs, their_crate) = schema_parts(stored);
+    let (ours, our_crate) = schema_parts(SCHEMA);
+    if theirs > ours {
+        let n = |[s, p]: [u64; 2]| format!("{s}/parse-{p}");
+        return Err(refuse(n(theirs), n(ours)));
+    }
+    if atlas_number(atlas_schema) > atlas_number(Some(atlas::ATLAS_SCHEMA)) {
+        return Err(refuse(atlas_schema.unwrap_or_default().to_string(), atlas::ATLAS_SCHEMA.to_string()));
+    }
+    Ok(if stored != SCHEMA && theirs == ours && their_crate >= our_crate { Skew::Newer } else { Skew::Ours })
+}
+
+/// The stored `schema` and `atlas_schema` rows (each `None` when there is no
+/// `meta` table yet, or no row).
+fn stored_schemas(conn: &Connection) -> (Option<String>, Option<String>) {
+    let get = |k: &str| conn.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get(0)).optional().ok().flatten();
+    (get("schema"), get("atlas_schema"))
+}
+
+/// [`index_state`] of the database `conn` has open.
+fn read_state(db_path: &Path, conn: &Connection) -> Result<Skew> {
+    let (schema, atlas_schema) = stored_schemas(conn);
+    index_state(db_path, schema.as_deref(), atlas_schema.as_deref())
+}
+
+/// The refusal for an index database a newer atlas made (its derived tables
+/// or its code index), else `Ok`. One read of `meta`: cheap enough for the
+/// start of every write transaction, so a server that opened the store
+/// before a newer binary upgraded it stops writing from then on.
+///
+/// Fail-closed: a missing `meta` table passes (nothing a newer atlas made),
+/// but an error reading or decoding its rows is returned, so the write it
+/// guards is refused rather than let through unchecked.
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`], or [`Error::Db`] from reading `meta`.
+pub(crate) fn guard(conn: &Connection) -> Result<()> {
+    let path = conn.path().unwrap_or("");
+    let (mut schema, mut atlas_schema, mut code) = (None, None, None);
+    // No `meta` table yet: nothing a newer atlas made.
+    if let Ok(mut st) = conn.prepare_cached("SELECT key, value FROM meta WHERE key IN ('schema', 'atlas_schema', 'code_schema')") {
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (k, v) = row?;
+            match k.as_str() {
+                "schema" => schema = Some(v),
+                "atlas_schema" => atlas_schema = Some(v),
+                _ => code = Some(v),
+            }
+        }
+    }
+    index_state(Path::new(path), schema.as_deref(), atlas_schema.as_deref())?;
+    match crate::code::code_schema_too_new(code.as_deref(), path) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Runs `f`, a side-table write on the index database (the token log, a
+/// handle, an index row), as one write transaction after [`guard`], so a
+/// server that opened the store before a newer atlas upgraded it stops
+/// writing these too. Already inside a transaction, `f` runs in it.
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`] (nothing written), or what `f` returns.
+pub(crate) fn guarded<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !conn.is_autocommit() {
+        return f();
+    }
+    let tx = begin_shared(conn)?;
+    let r = f()?;
+    tx.commit()?;
+    Ok(r)
+}
+
+/// [`begin`] on a shared connection: a write transaction taken at its start
+/// (`BEGIN IMMEDIATE`), after [`guard`] under the lock. For a caller that
+/// holds `&Connection` and opens its own transaction: a function that opens
+/// one must not be wrapped in [`guarded`] (SQLite refuses a nested `BEGIN`),
+/// and an `unchecked_transaction` is DEFERRED, so a check made in it would
+/// not run under the write lock.
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`] (nothing written), or [`Error::Db`] from SQLite,
+/// also when `conn` is already inside a transaction.
+pub(crate) fn begin_shared(conn: &Connection) -> Result<Transaction<'_>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    guard(&tx)?;
+    Ok(tx)
+}
+
+/// Opens the index database at `db_path` for a raw use (a report, a log,
+/// a side table) after the same check as [`Store::open`]: a database a newer
+/// atlas made is refused before anything is written.
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`], or [`Error::Db`] from SQLite.
+pub fn open_raw(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    guard(&conn)?;
+    Ok(conn)
+}
+
+/// Whether the index database at `db_path` holds a store or code index newer
+/// than this binary reads, read without writing anything (a read-only open,
+/// for `atlas doctor` and the command hook). Empty when neither is, and also
+/// when the file cannot be read (missing, locked or corrupt): this look says
+/// nothing then, and the open that follows reports its own error.
+pub fn index_skew(db_path: &Path) -> Vec<Error> {
+    let Ok(conn) = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Error> = read_state(db_path, &conn).err().into_iter().collect();
+    out.extend(crate::code::code_too_new(&conn, db_path));
+    out
+}
 
 /// Bumped whenever the durable tables gain a migration step, so the open
 /// fast path runs the checks once more.
@@ -86,7 +258,7 @@ CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, body, tokenize = 'unicode61');
 ";
 
-/// The handle store's table (see [`crate::handles`]): one row per stored
+/// The handle store's tables (see [`crate::handles`]): one row per stored
 /// output, whose bytes live in `<data dir>/handles/<sha[0..2]>/<sha>`.
 /// Durable, so a derived-table rebuild never orphans the files; the CLI
 /// creates it on its own connection without opening the whole store.
@@ -108,6 +280,32 @@ CREATE TABLE IF NOT EXISTS handles(
 );
 CREATE INDEX IF NOT EXISTS handles_used ON handles(last_used);
 CREATE INDEX IF NOT EXISTS handles_sha ON handles(sha);
+-- PR review rounds (`lean.pr_digest`, src/pr_digest.rs).
+CREATE TABLE IF NOT EXISTS pr_rounds(
+    pr TEXT NOT NULL,
+    round INTEGER NOT NULL,
+    whole TEXT NOT NULL,
+    handle TEXT NOT NULL,
+    head TEXT NOT NULL DEFAULT '',
+    created TEXT NOT NULL,
+    PRIMARY KEY(pr, round)
+);
+CREATE TABLE IF NOT EXISTS pr_parts(
+    pr TEXT NOT NULL,
+    round INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    exact TEXT NOT NULL,
+    norm TEXT NOT NULL,
+    handle TEXT NOT NULL,
+    PRIMARY KEY(pr, round, seq)
+);
+CREATE TABLE IF NOT EXISTS pr_heads(
+    pr TEXT NOT NULL,
+    head TEXT NOT NULL,
+    seen TEXT NOT NULL,
+    PRIMARY KEY(pr, head)
+);
 ";
 
 const DURABLE: &str = "
@@ -314,8 +512,18 @@ pub struct Store {
     pub(crate) memsync: Option<crate::memory::sync::Syncer>,
 }
 
-fn begin(conn: &mut Connection) -> Result<Transaction<'_>> {
-    Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
+/// A write transaction on the index database, taken at its start, after
+/// [`guard`] under the lock: once a newer atlas has upgraded the store, a
+/// server that opened it earlier stops writing (dropping the transaction
+/// rolls back).
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`], or [`Error::Db`] from SQLite.
+pub(crate) fn begin(conn: &mut Connection) -> Result<Transaction<'_>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard(&tx)?;
+    Ok(tx)
 }
 
 type Only = (String, Vec<paths::Found>, Vec<String>);
@@ -388,6 +596,10 @@ impl Store {
     fn open_once(db_path: &Path, vaults: &Vaults, atlas: &mut Atlas) -> Result<Connection> {
         let mut conn = Connection::open(db_path)?;
         conn.busy_timeout(Duration::from_secs(30))?;
+        // A newer binary's derived tables are refused before anything is
+        // written, the journal mode included: rebuilding them here would
+        // undo that binary's rebuild. Two point reads of `meta`.
+        let first = read_state(db_path, &conn)?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Db(format!("could not enable WAL (journal_mode is {mode})")));
@@ -420,21 +632,34 @@ impl Store {
         // Fast path: one read when nothing about the schema, the rules or the
         // vault roots changed since the last open, instead of a write
         // transaction of DDL and migration checks.
-        let stamp = format!("{SCHEMA}|{DURABLE_VERSION}|{fingerprint}");
+        // A newer crate version's tables are stamped with its schema: the
+        // stamp it wrote matches when nothing else differs, and this open
+        // never writes one.
+        let stamp_schema = match first {
+            Skew::Newer => stored(&conn, "schema").unwrap_or_default(),
+            Skew::Ours => SCHEMA.to_string(),
+        };
+        let stamp = format!("{stamp_schema}|{DURABLE_VERSION}|{fingerprint}");
         if stored(&conn, "open_stamp").as_deref() == Some(stamp.as_str()) {
+            atlas.keeps_newer = first == Skew::Newer;
             return Ok(conn);
         }
         let misses_log = atlas.misses_log.clone();
         let fingerprint = fingerprint.as_str();
         {
+            // `begin` checks again under the write lock (a newer binary may
+            // have upgraded them since the read above); dropping `tx` rolls
+            // back. The state is read again under the lock too.
             let tx = begin(&mut conn)?;
+            let keep = read_state(db_path, &tx)? == Skew::Newer;
+            atlas.keeps_newer = keep;
             tx.execute_batch(DURABLE)?;
             tx.execute_batch(HANDLES_SCHEMA)?;
             tx.execute_batch(atlas::ATLAS_DURABLE)?;
             migrate_durable(&tx)?;
             atlas::restore_misses(&tx, &misses_log)?;
             let schema: Option<String> = tx.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).optional()?;
-            if schema.as_deref() != Some(SCHEMA) {
+            if !keep && schema.as_deref() != Some(SCHEMA) {
                 tx.execute_batch(
                     "DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS tags; DROP TABLE IF EXISTS fts;",
                 )?;
@@ -446,7 +671,7 @@ impl Store {
             atlas::migrate_derived(&tx)?;
             tx.execute_batch(atlas::ATLAS_DERIVED)?;
             atlas.rebuilt = atlas::ensure_fingerprint(&tx, fingerprint)?;
-            if schema.is_some() && schema.as_deref() != Some(SCHEMA) {
+            if !keep && schema.is_some() && schema.as_deref() != Some(SCHEMA) {
                 atlas.rebuilt = Some("schema rebuild");
             }
             for v in vaults.all() {
@@ -467,7 +692,9 @@ impl Store {
                     tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)", params![key, root])?;
                 }
             }
-            atlas::write_stamp(&tx, &atlas.names, &stamp)?;
+            // Under a newer crate version's schema no stamp is written.
+            let ours = format!("{SCHEMA}|{DURABLE_VERSION}|{fingerprint}");
+            atlas::write_stamp(&tx, &atlas.names, (!keep).then_some(ours.as_str()))?;
             tx.commit()?;
         }
         Ok(conn)
@@ -1028,12 +1255,14 @@ impl Store {
     ///
     /// [`Error::Db`] on SQLite failure.
     pub fn record_index(&mut self, vault: &str, note: &str, name: &str, spec: &str, hash: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO indices(vault, note, name, spec, last_hash, updated) VALUES(?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             ON CONFLICT(vault, note, name) DO UPDATE SET spec = excluded.spec, last_hash = excluded.last_hash, updated = excluded.updated",
-            params![vault, note, name, spec, hash],
-        )?;
-        Ok(())
+        guarded(&self.conn, || {
+            self.conn.execute(
+                "INSERT INTO indices(vault, note, name, spec, last_hash, updated) VALUES(?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 ON CONFLICT(vault, note, name) DO UPDATE SET spec = excluded.spec, last_hash = excluded.last_hash, updated = excluded.updated",
+                params![vault, note, name, spec, hash],
+            )?;
+            Ok(())
+        })
     }
 
     /// Notes whose indexed text contains an index start marker.
@@ -1255,4 +1484,146 @@ fn audit(
     f.write_all(line.as_bytes())?;
     f.sync_data()?;
     Ok(())
+}
+
+/// What the store-skew tests of the modules that write either store share.
+#[cfg(test)]
+pub(crate) mod skew_support {
+    use rusqlite::types::ValueRef;
+    use rusqlite::Connection;
+
+    /// Marks the index database `conn` has open as one a newer atlas
+    /// upgraded since it was opened: a `schema` row with a higher table
+    /// shape (the `meta` table is made when missing).
+    pub(crate) fn make_index_newer(conn: &Connection) {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT OR REPLACE INTO meta VALUES('schema', '999/parse-0/0.0.1');").unwrap();
+    }
+
+    /// Every table's definition and every row, in a stable order: a refused
+    /// write must leave both as they were (its rows and its DDL).
+    pub(crate) fn dump(conn: &Connection) -> Vec<String> {
+        let tables: Vec<(String, String)> = {
+            let mut st = conn.prepare("SELECT name, ifnull(sql, '') FROM sqlite_master ORDER BY type, name").unwrap();
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let mut out: Vec<String> = tables.iter().map(|(n, s)| format!("{n}: {s}")).collect();
+        for (name, sql) in &tables {
+            if !sql.starts_with("CREATE TABLE") && !sql.starts_with("CREATE VIRTUAL TABLE") {
+                continue;
+            }
+            let mut st = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let n = st.column_count();
+            let mut rows = st.query([]).unwrap();
+            let mut lines = Vec::new();
+            while let Some(r) = rows.next().unwrap() {
+                let cells: Vec<String> = (0..n)
+                    .map(|i| match r.get_ref(i).unwrap() {
+                        ValueRef::Null => "null".to_string(),
+                        ValueRef::Integer(v) => v.to_string(),
+                        ValueRef::Real(v) => v.to_string(),
+                        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                        ValueRef::Blob(b) => format!("{b:?}"),
+                    })
+                    .collect();
+                lines.push(format!("{name} | {}", cells.join(" | ")));
+            }
+            lines.sort();
+            out.extend(lines);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+
+    /// The `meta` rows of an index made by another binary, in memory.
+    fn index_with(schema: &str, atlas_schema: Option<&str>) -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        c.execute("INSERT INTO meta VALUES('schema', ?1)", [schema]).unwrap();
+        if let Some(a) = atlas_schema {
+            c.execute("INSERT INTO meta VALUES('atlas_schema', ?1)", [a]).unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn shape_and_parse_refuse_and_the_crate_version_only_decides_a_rebuild() {
+        let state = |s: &str| index_state(Path::new("x"), Some(s), Some(atlas::ATLAS_SCHEMA));
+        let (shape_parse, _) = schema_parts(SCHEMA);
+        let ours = format!("{}/parse-{}", shape_parse[0], shape_parse[1]);
+        assert_eq!(state(SCHEMA), Ok(Skew::Ours), "the same schema opens");
+        assert_eq!(index_state(Path::new("x"), None, None), Ok(Skew::Ours), "a fresh store");
+        // An older crate version, an unreadable or older schema: rebuilt.
+        for s in [format!("{ours}/0.0.1"), "garbage".into(), String::new(), "0/parse-9/999.0.0".into()] {
+            assert_eq!(state(&s), Ok(Skew::Ours), "{s}");
+        }
+        // A newer crate version with the same shape and parse rules, or the
+        // same numbers with another suffix: opened as it is, never rebuilt.
+        for s in [format!("{ours}/999.0.0"), format!("{ours}/{}-dev", env!("CARGO_PKG_VERSION")), format!("{ours}/{}+other", env!("CARGO_PKG_VERSION"))] {
+            assert_eq!(state(&s), Ok(Skew::Newer), "{s}");
+        }
+        // Higher parse rules or table shape: refused, naming those numbers.
+        let next_parse = format!("{}/parse-{}", shape_parse[0], shape_parse[1] + 1);
+        let next_shape = format!("{}/parse-0", shape_parse[0] + 1);
+        for found in [&next_parse, &next_shape] {
+            let e = state(&format!("{found}/0.0.1")).unwrap_err();
+            assert_eq!(e, Error::StoreTooNew { store: "index store".into(), path: "x".into(), found: found.clone(), supported: ours.clone() });
+        }
+        // A newer shape of the atlas tables is refused too.
+        let next_atlas = format!("atlas-{}", atlas_number(Some(atlas::ATLAS_SCHEMA)) + 1);
+        let e = index_state(Path::new("x"), Some(SCHEMA), Some(&next_atlas)).unwrap_err();
+        assert!(matches!(&e, Error::StoreTooNew { found, supported, .. } if *found == next_atlas && supported == atlas::ATLAS_SCHEMA), "{e}");
+        assert_eq!(schema_parts("1/parse-2/0.4.1-dev+abc"), ([1, 2], [0, 4, 1]));
+    }
+
+    #[test]
+    fn every_write_transaction_checks_again_under_the_lock() {
+        // The race and the running server: this binary opened the store, a
+        // newer one then upgraded it, and this one starts a write. The
+        // check in `begin` refuses it and the transaction is rolled back.
+        let newer = format!("{}/parse-99/0.0.1", schema_parts(SCHEMA).0[0]);
+        let mut c = index_with(&newer, None);
+        let e = begin(&mut c).expect_err("refused under the lock");
+        assert!(e.is_store_too_new(), "{e}");
+        assert!(c.is_autocommit(), "rolled back");
+        // A newer code index is refused the same way.
+        let mut c = index_with(SCHEMA, None);
+        c.execute("INSERT INTO meta VALUES('code_schema', 'code-999')", []).unwrap();
+        assert!(begin(&mut c).err().is_some_and(|e| e.is_store_too_new()));
+        // A newer crate version with this binary's shape and rules writes on.
+        let mut c = index_with(&format!("{}/999.0.0", SCHEMA.rsplit_once('/').unwrap().0), Some(atlas::ATLAS_SCHEMA));
+        begin(&mut c).unwrap().commit().unwrap();
+        // So does a raw open, and the doctor's look says nothing then.
+        assert!(guard(&c).is_ok());
+    }
+
+    #[test]
+    fn a_side_table_write_checks_again_under_the_lock() {
+        // A token-log row after a newer binary upgraded the store: refused,
+        // and nothing written.
+        let newer = format!("{}/parse-99/0.0.1", schema_parts(SCHEMA).0[0]);
+        let rows = |c: &Connection| c.query_row("SELECT COUNT(*) FROM token_log", [], |r| r.get::<_, i64>(0)).unwrap();
+        let c = index_with(&newer, None);
+        c.execute_batch(crate::tokens::TOKEN_TABLE).unwrap();
+        let e = crate::tokens::log_row(&c, "lookup", 10, None).expect_err("refused under the lock");
+        assert!(e.is_store_too_new(), "{e}");
+        assert!(c.is_autocommit(), "rolled back");
+        assert_eq!(rows(&c), 0);
+        // This binary's store: written, and the transaction is closed.
+        let c = index_with(SCHEMA, None);
+        c.execute_batch(crate::tokens::TOKEN_TABLE).unwrap();
+        crate::tokens::log_row(&c, "lookup", 10, None).unwrap();
+        assert!(c.is_autocommit());
+        assert_eq!(rows(&c), 1);
+        // Inside a transaction already: written in it, which stays open.
+        c.execute_batch("BEGIN").unwrap();
+        crate::tokens::log_row(&c, "lookup", 10, None).unwrap();
+        assert!(!c.is_autocommit());
+        c.execute_batch("COMMIT").unwrap();
+        assert_eq!(rows(&c), 2);
+    }
 }

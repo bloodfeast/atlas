@@ -72,9 +72,11 @@ pub struct Injection {
 /// [`crate::Error::Db`].
 pub fn log_injection(conn: &Connection, hook: &str, session: &str, agent: &str, transcript: &str, k: &crate::hooks::Injected, read: usize) -> Result<()> {
     let time = crate::store::utc(SystemTime::now());
-    conn.prepare_cached("INSERT INTO hook_inject(time, session, agent, transcript, hook, key, fts, cos, bytes, read) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)")?
-        .execute(params![time, session, agent, transcript, hook, k.key, k.fts, k.cos.map(f64::from), k.bytes as i64, read as i64])?;
-    Ok(())
+    crate::store::guarded(conn, || {
+        conn.prepare_cached("INSERT INTO hook_inject(time, session, agent, transcript, hook, key, fts, cos, bytes, read) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)")?
+            .execute(params![time, session, agent, transcript, hook, k.key, k.fts, k.cos.map(f64::from), k.bytes as i64, read as i64])?;
+        Ok(())
+    })
 }
 
 /// The logged injections, oldest first.

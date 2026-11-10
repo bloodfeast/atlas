@@ -112,6 +112,18 @@ See [[Semantic search]].
 | `update.pin` | a version (`MAJOR.MINOR.PATCH`): atlas stays on what is installed |
 | `update.url` | where the release manifest is read (default the public repository's latest release; `https`, or `http` to loopback). The signature is checked against the built-in key wherever it comes from |
 
+## Calibration
+
+The baseline `--token-report`'s measured ratio divides by: what agents read on lookups before atlas, measured
+from your own Claude Code transcripts (see [[Tools reference]]). It runs by itself; these keys only adjust it.
+
+| Key | Meaning |
+|---|---|
+| `calibrate` | the self-calibration's settings |
+| `calibrate.auto` | calibrate in the background when the server starts and the stored baseline is missing or stale (default true). `ATLAS_CALIBRATE=off` in the environment turns it off too; `atlas --calibrate` runs it by hand either way |
+| `calibrate.skip` | what leaves a transcript out, matched against the folder its session ran in and the Claude Code folder its transcript is filed under (a replay keeps the folder of the session it copies): an entry with `/`, `\` or `:` is a folder (it and the folders below it), any other is a word that must be a whole word of the part of the folder's path below the project root that holds it (split at every character but a letter or digit; all of the path when no root holds it or there are no projects), so a project kept under a `temp` or `eval` folder still counts. `atlas --calibrate` names each folder and transcript a skip left out. It replaces the default, `["tmp", "temp", "scratch", "eval", "evals", "replay", "replays"]`. A changed list recalibrates |
+| `calibrate.handoff` | the handoff file-name pattern, a regular expression matched case-insensitively against a file's name (default `handoff[^/]*\.md$`). A changed pattern recalibrates |
+
 ## Memory store
 
 See [[Memory store and hooks]] and [[Memory tree]].
@@ -202,7 +214,7 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `orchestrate.reviews` | the required-reviews merge gate: a `gh pr merge` in a shell command needs a passing review of the PR's head from each role (see `docs/design/reviews.md`) |
 | `orchestrate.reviews.roles` | the review roles every PR needs, named by job, e.g. `["simplicity", "cost"]` (default none: the gate is off) |
 | `orchestrate.reviews.mode` | `enforced` denies the merge, `advisory` adds a warning, `off` does nothing (default `advisory`) |
-| `orchestrate.default_kind` | the kind of an agent no rule classifies: `builder`, `reviewer`, `research` or `none` (default `builder`). Rules, in order: a `Kind:` line in the brief's first 40 lines, `orchestrate.types`, an agent with `isolation: "worktree"` is a builder |
+| `orchestrate.default_kind` | the kind of an agent no rule classifies: `builder`, `reviewer`, `research` or `none` (default `builder`). Rules, in order: a `Kind:` line in the first 40 lines of the Agent launch prompt (not a brief file it names), `orchestrate.types`, an agent with `isolation: "worktree"` is a builder |
 | `orchestrate.types` | agent type to kind, over the built-in map (`Explore`, `Plan` and `claude-code-guide` are research; `statusline-setup` is none) |
 | `orchestrate.mode` | how context limits apply to a kind that sets none: `enforced` (past the hard limit every tool but the handoff is denied, and so is a SendMessage to the agent), `advisory` (told only) or `off` (default `enforced`) |
 | `orchestrate.fresh` | when an agent that passed its handoff point finishes, the orchestrator is told to start a fresh agent from its handoff (`auto`) or to ask the user first (`ask`) (default `auto`) |
@@ -229,6 +241,7 @@ and `atlas --hook-report --tune-floor`, never by hand.
 |---|---|
 | `lean` | the object below |
 | `lean.routing` | false turns routing off (default true; `atlas settings off routing` writes a flag with the same effect) |
+| `lean.pr_digest` | digests `gh pr diff` and `gh pr view` output per file and per comment, with rounds; false sends it the ordinary route, as before v0.4.0 (default true; see [[Handles and digests]]) |
 | `lean.annotate` | false stops the code-range annotations on Grep, Read and shell reads (default true) |
 | `lean.handles` | the handle store's settings, below |
 | `lean.digests` | the digests' settings, below |

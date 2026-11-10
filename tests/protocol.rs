@@ -221,10 +221,12 @@ fn no_network_code() {
         // hook); the settings step runs `claude --version` (an interactive
         // offer only, for the min_version gate); the merge gate runs `gh pr view`
         // (PreToolUse on a `gh pr merge` only, with review roles configured;
-        // Q-RV1). Nothing else spawns. Unsafe code lives only in the platform FFI and the
+        // Q-RV1); the PR digest reads the working directory's remotes and
+        // branch with local `git` (PostToolUse on a `gh pr` command, with
+        // `lean.pr_digest` on; no network). Nothing else spawns. Unsafe code lives only in the platform FFI and the
         // SIMD kernels (scan, embedding GEMM).
         let platform = path.parent().is_some_and(|p| p.ends_with("platform"));
-        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || platform;
+        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || platform;
         let ffi = platform || path.ends_with("scan.rs") || path.ends_with("gemm.rs");
         // Only the server's code: not the test modules, not comments.
         let body = src.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(&src);
@@ -239,6 +241,11 @@ fn no_network_code() {
         if path.ends_with("reviews.rs") {
             assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
             assert!(code.contains("Command::new(\"gh\")"), "{}", path.display());
+        }
+        // The PR digest's one spawn is git, and nothing else.
+        if path.ends_with("pr_digest.rs") {
+            assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
+            assert!(code.contains("Command::new(\"git\")"), "{}", path.display());
         }
     }
 }

@@ -1,0 +1,74 @@
+diff --git a/crates/ignore/src/dir.rs b/crates/ignore/src/dir.rs
+index 72faf48b7..61c249cd7 100644
+--- a/crates/ignore/src/dir.rs
++++ b/crates/ignore/src/dir.rs
+@@ -279,6 +279,31 @@ impl Ignore {
+         )
+     }
+ 
++    /// Like `add_child`, but reuse this matcher when the child adds no rules
++    /// or repository boundary. Incremental matching tracks directory paths
++    /// separately, so it doesn't need empty nodes in the matcher chain.
++    pub(crate) fn add_child_with_possible_reuse(
++        &self,
++        dir: &Path,
++    ) -> (Ignore, Option<Error>) {
++        let (ig, err) = self.add_child_path(dir);
++        if !ig.has_git
++            && ig.custom_ignore_matcher.is_empty()
++            && ig.ignore_matcher.is_empty()
++            && ig.git_ignore_matcher.is_empty()
++            && ig.git_exclude_matcher.is_empty()
++        {
++            return (self.clone(), err);
++        }
++        (
++            Ignore {
++                inner: Arc::new(ig),
++                absolute_base: self.absolute_base.clone(),
++            },
++            err,
++        )
++    }
++
+     /// Like add_child, but uses successful read_dir entries to reduce
+     /// probing when discovering ignore files.
+     pub(crate) fn add_child_with_entries<P: AsRef<Path>>(
+diff --git a/crates/ignore/src/incremental.rs b/crates/ignore/src/incremental.rs
+index 5030b0d00..0e805ee94 100644
+--- a/crates/ignore/src/incremental.rs
++++ b/crates/ignore/src/incremental.rs
+@@ -381,7 +381,7 @@ impl IncrementalIgnore {
+                 self.dirs.insert(dir.clone(), CachedDir::Ignored);
+                 return Some(IncrementalMatch::ignore());
+             }
+-            let (child, err) = ignore.add_child(&path);
++            let (child, err) = ignore.add_child_with_possible_reuse(&path);
+             errs.maybe_push(err);
+             self.dirs.insert(dir.clone(), CachedDir::Allowed(child.clone()));
+             ignore = child;
+@@ -1283,4 +1283,24 @@ mod tests {
+         assert!(dir.is_ignore());
+         assert!(!dir.is_within_depth());
+     }
++    #[test]
++    fn empty_directories_preserve_repository_boundaries() {
++        let td = tmpdir();
++        mkdirp(td.path().join(".git"));
++        mkdirp(td.path().join("a/b/.git"));
++        mkdirp(td.path().join("a/b/c"));
++        wfile(td.path().join(".gitignore"), "git-blocked\n");
++        wfile(td.path().join(".ignore"), "tool-blocked\n!allowed\n");
++
++        let mut m = one_matcher(&builder(td.path()));
++        assert!(matchedf(&mut m, "a/git-blocked").is_ignore());
++        assert!(matchedf(&mut m, "a/b/c/git-blocked").is_none());
++        assert!(matchedf(&mut m, "a/b/c/tool-blocked").is_ignore());
++        assert!(matchedf(&mut m, "a/b/c/allowed").is_whitelist());
++
++        wfile(td.path().join("a/b/c/.ignore"), "git-blocked\n");
++        assert!(matchedf(&mut m, "a/b/c/git-blocked").is_none());
++        let mut rebuilt = one_matcher(&builder(td.path()));
++        assert!(matchedf(&mut rebuilt, "a/b/c/git-blocked").is_ignore());
++    }
+ }

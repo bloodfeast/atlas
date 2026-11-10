@@ -34,7 +34,8 @@ pub const DEFAULT_HANDOFF: u64 = 285_000;
 const PENDING_TTL: Duration = Duration::from_secs(120);
 /// How much earlier than the process clock a file time may read.
 const FILE_CLOCK_SLACK: Duration = Duration::from_secs(1);
-/// Lines of a brief a `Kind:` line is looked for in.
+/// Lines of an Agent launch prompt a `Kind:` line is looked for in (a
+/// brief file the prompt names is never read).
 const KIND_LINES: usize = 40;
 
 /// What an agent is for, as the caps count it.
@@ -322,8 +323,9 @@ pub fn resolve(
     }
 }
 
-/// The kind a brief states on a `Kind:` line among its first lines
-/// (markdown bullets, quotes and bold around it are allowed).
+/// The kind a brief (the Agent launch prompt itself) states on a `Kind:`
+/// line among its first lines (markdown bullets, quotes and bold around it
+/// are allowed).
 pub fn brief_kind(brief: &str) -> Option<Kind> {
     for line in brief.lines().take(KIND_LINES) {
         let l = line.trim().trim_start_matches(['-', '*', '>', '#', ' ', '\t']).replace("**", "");
@@ -346,19 +348,63 @@ pub fn brief_kind_or(s: &OrchSettings, brief: &str) -> Kind {
     brief_kind(brief).unwrap_or(s.default_kind)
 }
 
+/// How [`classify_source`] decided an agent's kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindSource {
+    /// A `Kind:` line in the launch prompt's first [`KIND_LINES`] lines.
+    Line,
+    /// Its `subagent_type` in `orchestrate.types` (or the built-in map).
+    Type,
+    /// `isolation: "worktree"`.
+    Worktree,
+    /// `orchestrate.default_kind`.
+    Default,
+}
+
 /// An agent's kind: its brief's `Kind:` line, else its `subagent_type` in
-/// the map, else a worktree agent is a builder, else the default kind.
+/// the map, else a worktree agent is a builder, else the default kind. The
+/// brief is the Agent launch prompt, not a file it names.
 pub fn classify(s: &OrchSettings, brief: &str, subagent_type: &str, isolation: &str) -> Kind {
+    classify_source(s, brief, subagent_type, isolation).0
+}
+
+/// [`classify`], and which rule decided it.
+pub fn classify_source(s: &OrchSettings, brief: &str, subagent_type: &str, isolation: &str) -> (Kind, KindSource) {
     if let Some(k) = brief_kind(brief) {
-        return k;
+        return (k, KindSource::Line);
     }
     if let Some((_, k)) = s.types.iter().find(|(t, _)| !subagent_type.is_empty() && t.eq_ignore_ascii_case(subagent_type)) {
-        return *k;
+        return (*k, KindSource::Type);
     }
     if isolation.eq_ignore_ascii_case("worktree") {
-        return Kind::Builder;
+        return (Kind::Builder, KindSource::Worktree);
     }
-    s.default_kind
+    (s.default_kind, KindSource::Default)
+}
+
+/// Why a launch counts as `kind`, for the cap's refusal: the rule that
+/// decided it and, when no `Kind:` line did, how to set one.
+pub fn kind_reason(kind: Kind, source: KindSource, subagent_type: &str) -> String {
+    let none = format!("its prompt has no `Kind:` line naming a kind in its first {KIND_LINES} lines");
+    let why = match source {
+        KindSource::Line => return format!("This launch counts as a {}: its prompt's `Kind:` line says so.", noun(kind)),
+        KindSource::Type => format!("{none}, and the agent-type map (orchestrate.types) gives its subagent_type `{subagent_type}` the kind {}", kind.name()),
+        KindSource::Worktree => format!("{none}, and an agent with isolation: \"worktree\" counts as a builder"),
+        KindSource::Default => format!("{none} and no other rule classifies it, so orchestrate.default_kind ({}) applies", kind.name()),
+    };
+    format!(
+        "This launch counts as a {}: {why}. If the work is of another kind, put `Kind: builder`, `Kind: reviewer` or `Kind: research` in the prompt's first {KIND_LINES} lines (a brief file the prompt names is not read).",
+        noun(kind)
+    )
+}
+
+/// A kind as a noun for an agent: `builder`, `reviewer`, `research agent`.
+fn noun(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Research => "research agent",
+        Kind::None => "uncounted agent",
+        k => k.name(),
+    }
 }
 
 /// The folder Claude Code keeps a session's agents in, from the session's
@@ -445,6 +491,9 @@ pub struct Agents {
     /// The running list the last admitted launch was counted against, and
     /// its folder, for the queue's holders in the same hook call.
     seen: Option<(PathBuf, Vec<Running>)>,
+    /// The last launch [`Agents::admit`] judged was refused at its kind's
+    /// cap (not Claude Code's own limit).
+    kind_refused: bool,
 }
 
 /// A launch admitted and not yet started.
@@ -485,7 +534,14 @@ impl Agents {
             finished: HashMap::new(),
             passed: HashMap::new(),
             seen: None,
+            kind_refused: false,
         }
+    }
+
+    /// Whether the last launch [`Agents::admit`] judged was refused at its
+    /// kind's cap, where its kind is the cause.
+    pub fn kind_refused(&self) -> bool {
+        self.kind_refused
     }
 
     /// Frees the slot of the launch `admit` just let through, when a later
@@ -662,11 +718,12 @@ impl Agents {
         let Launch { transcript, tool_use_id, input, brief } = *launch;
         self.seen = None;
         self.last = None;
+        self.kind_refused = false;
         if !s.enabled || transcript.is_empty() {
             return None;
         }
         let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        let kind = classify(s, brief, &f("subagent_type"), &f("isolation"));
+        let (kind, source) = classify_source(s, brief, &f("subagent_type"), &f("isolation"));
         let dir = subagents_dir(transcript);
         let running = match self.running(s, &dir, now) {
             Ok(r) => r,
@@ -701,13 +758,14 @@ impl Agents {
             v.join("; ")
         };
         if kind != Kind::None && of(kind) >= lim.max {
+            self.kind_refused = true;
             return Some(format!(
-                "atlas agent cap: {} of {} {} slots are in use: {}. Do not retry now. Queue this launch and start it when one of them finishes (its task-notification). This launch is a {} (a `Kind:` line in the brief sets the kind). The cap is orchestrate.kinds.{}.max in atlas's configuration.",
+                "atlas agent cap: {} of {} {} slots are in use: {}. Do not retry now. Queue this launch and start it when one of them finishes (its task-notification). {} The cap is orchestrate.kinds.{}.max in atlas's configuration.",
                 of(kind),
                 lim.max,
                 kind.name(),
                 list(Some(kind)),
-                kind.name(),
+                kind_reason(kind, source, &f("subagent_type")),
                 kind.name()
             ));
         }
@@ -806,6 +864,30 @@ mod tests {
         assert_eq!(brief_kind(&late), None);
         assert_eq!(brief_kind("Kind: whatever"), None);
         assert_eq!(classify(&resolve(None, None, None, env(&[])), "x", "", ""), Kind::Builder);
+        // Which rule decided it.
+        assert_eq!(classify_source(&s, "Kind: reviewer", "Explore", "worktree"), (Kind::Reviewer, KindSource::Line));
+        assert_eq!(classify_source(&s, "Kind: whatever", "critic", "worktree"), (Kind::Reviewer, KindSource::Type));
+        assert_eq!(classify_source(&s, "x", "general-purpose", "Worktree"), (Kind::Builder, KindSource::Worktree));
+        assert_eq!(classify_source(&s, "x", "", ""), (Kind::Research, KindSource::Default));
+    }
+
+    #[test]
+    fn the_kind_reason_names_its_rule() {
+        let line = kind_reason(Kind::Reviewer, KindSource::Line, "");
+        assert_eq!(line, "This launch counts as a reviewer: its prompt's `Kind:` line says so.");
+        let ty = kind_reason(Kind::Research, KindSource::Type, "Explore");
+        assert!(
+            ty.starts_with("This launch counts as a research agent: ")
+                && ty.contains("no `Kind:` line naming a kind in its first 40 lines, and the agent-type map (orchestrate.types) gives its subagent_type `Explore` the kind research"),
+            "{ty}"
+        );
+        let wt = kind_reason(Kind::Builder, KindSource::Worktree, "");
+        assert!(wt.contains("an agent with isolation: \"worktree\" counts as a builder"), "{wt}");
+        let d = kind_reason(Kind::Research, KindSource::Default, "");
+        assert!(d.starts_with("This launch counts as a research agent: ") && d.contains("so orchestrate.default_kind (research) applies"), "{d}");
+        for r in [&ty, &wt, &d] {
+            assert!(r.contains("put `Kind: builder`, `Kind: reviewer` or `Kind: research` in the prompt's first 40 lines (a brief file the prompt names is not read)"), "{r}");
+        }
     }
 
     #[test]

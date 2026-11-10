@@ -53,6 +53,7 @@ pub struct Gh;
 
 impl Api for Gh {
     fn get(&self, path: &str) -> R<String> {
+        crate::release_ci::no_gh_in_tests();
         let o = Command::new("gh")
             .args(["api", path])
             .stdin(Stdio::null())

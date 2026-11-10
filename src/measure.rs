@@ -37,7 +37,7 @@ fn us(d: Duration) -> f64 {
 /// JSON text \t comma floats`).
 pub(crate) fn embed_check(setup: &Setup, dir: &Path, model_path: &Path) -> Result<(), String> {
     let model = Model::load(model_path).map_err(|e| e.to_string())?;
-    let conn = rusqlite::Connection::open(&setup.db).map_err(|e| e.to_string())?;
+    let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
     let mut texts: HashMap<String, String> = HashMap::new();
     {
         let mut st = conn
@@ -212,7 +212,7 @@ pub(crate) fn symbol_bench(setup: &Setup, file: &Path, runs: usize) -> Result<()
     let mut server = Server::new(store);
     let roots: Vec<(String, std::path::PathBuf)> = code.roots.iter().map(|r| (r.name.clone(), r.root.clone())).collect();
     server.set_code(atlas::tools::CodeState { setup: code, indexer: None });
-    let conn = rusqlite::Connection::open(&setup.db).map_err(|e| e.to_string())?;
+    let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
     let lim = atlas::code::Limits { defs: 10, refs: 10, impls: 10 };
     let (mut q, mut whole) = (Vec::new(), Vec::new());
     let (mut bytes, mut found) = (0usize, 0usize);

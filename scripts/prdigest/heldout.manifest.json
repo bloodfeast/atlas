@@ -1,0 +1,294 @@
+{
+ "rule": "Pick and fetch the PR digest held-out set (step 0).\n\nThe rule, fixed before any lever lands:\n\n* Repos: BurntSushi/ripgrep, astral-sh/ruff (Rust) and cli/cli (Go, the\n  non-Rust repo).\n* Candidates: merged PRs merged before 2026-11-08T00:00Z, among the 100 most\n  recently created merged PRs of each repo, newest merge first. Excluded: the\n  dev and inspected PRs (every PR in prdigest/raw), and bot authors.\n* Pre-filter: additions + deletions >= 150 (a cheaper stand-in that saves gh\n  calls; the size rule below is what decides).\n* Size: the final `gh pr diff` is at least 12 KB (12288 bytes).\n* Rounds: each distinct reviews[].commit.oid, in order of its first review.\n  A round's diff is `compare baseRefOid...oid`, or the final diff when the\n  oid is the head. A PR with no review is one round, its head. At most three\n  rounds are kept: the first two and the last. A round whose diff is larger\n  than the final diff and names a file the final diff does not was diffed\n  against another base (a stacked PR retargeted later, or a base merge); it\n  is dropped.\n* Picks: per repo the 4 most recent qualifying PRs; when fewer than 2 of them\n  have 2+ rounds, the oldest one-round picks give way to the next most recent\n  qualifying PRs with 2+ rounds. At most 9 diff fetches per repo.\n* Each pick also keeps its `gh pr view --json` and its inline review comments\n  (`pulls/N/comments`), for the view arm and the fidelity proxy.",
+ "cutoff": "2026-11-08T00:00:00Z",
+ "repos": {
+  "BurntSushi/ripgrep": {
+   "candidates": 10,
+   "log": [
+    "3558: 10044 B, under the floor"
+   ]
+  },
+  "astral-sh/ruff": {
+   "candidates": 23,
+   "log": []
+  },
+  "cli/cli": {
+   "candidates": 36,
+   "log": [
+    "14960: 10967 B, under the floor"
+   ]
+  }
+ },
+ "picks": [
+  {
+   "repo": "BurntSushi/ripgrep",
+   "number": 3554,
+   "name": "rg3554",
+   "mergedAt": "2026-10-23T15:59:08Z",
+   "bytes": 26391,
+   "head": "8b636534c68146ce8543fc6aeb1ceb49d6e74155",
+   "base": "7155f6408d370e699795dc75e954635abfaf08a6",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "8b636534c68146ce8543fc6aeb1ceb49d6e74155",
+     "file": "rg3554.diff"
+    }
+   ],
+   "dropped": []
+  },
+  {
+   "repo": "BurntSushi/ripgrep",
+   "number": 3573,
+   "name": "rg3573",
+   "mergedAt": "2026-10-23T14:16:28Z",
+   "bytes": 75213,
+   "head": "ced122bcbf1f9b2e4f701085bb195cfbebbd0deb",
+   "base": "7cc9c2f33cff3f027d42509489bae9942f833dae",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "ced122bcbf1f9b2e4f701085bb195cfbebbd0deb",
+     "file": "rg3573.diff"
+    }
+   ],
+   "dropped": []
+  },
+  {
+   "repo": "BurntSushi/ripgrep",
+   "number": 3482,
+   "name": "rg3482",
+   "mergedAt": "2026-07-20T11:52:43Z",
+   "bytes": 17899,
+   "head": "b0d8f7c9cb31050b86d36d5d493bc60130d5cb8c",
+   "base": "227381db0ee83dfa4341f1e27ff9617c0f5ad992",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "b0d8f7c9cb31050b86d36d5d493bc60130d5cb8c",
+     "file": "rg3482.diff"
+    }
+   ],
+   "dropped": []
+  },
+  {
+   "repo": "BurntSushi/ripgrep",
+   "number": 3420,
+   "name": "rg3420",
+   "mergedAt": "2026-06-05T11:02:49Z",
+   "bytes": 24135,
+   "head": "b6722c177f85a01ed2304781118651c058df3286",
+   "base": "48a6ad93f152dc848f1883ceb3bf2c7baab6738c",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "13134b25b6414ba2dea6c49a1b78f89f9b648588",
+     "file": "rg3420.r1.diff"
+    },
+    {
+     "round": 2,
+     "oid": "1ef689bee378444062866ffb977951f79288e925",
+     "file": "rg3420.r2.diff"
+    },
+    {
+     "round": 3,
+     "oid": "b6722c177f85a01ed2304781118651c058df3286",
+     "file": "rg3420.diff"
+    }
+   ],
+   "dropped": []
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "number": 30095,
+   "name": "ruff30095",
+   "mergedAt": "2026-11-07T17:07:12Z",
+   "bytes": 31051,
+   "head": "80f4b037ce163160342e5a4c220439c910e3f7e9",
+   "base": "bd1f9e366f50c1fa27f46f2fb0f64cd40d494b36",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "80f4b037ce163160342e5a4c220439c910e3f7e9",
+     "file": "ruff30095.diff"
+    }
+   ],
+   "dropped": []
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "number": 29944,
+   "name": "ruff29944",
+   "mergedAt": "2026-11-06T19:46:50Z",
+   "bytes": 242718,
+   "head": "5f3ce5f4d60435948369cf7fd888564fdf77e945",
+   "base": "65aee8892ce379af4ae9c8b5f6e0ab37b25d5ec9",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "5f3ce5f4d60435948369cf7fd888564fdf77e945",
+     "file": "ruff29944.diff"
+    }
+   ],
+   "dropped": []
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "number": 29955,
+   "name": "ruff29955",
+   "mergedAt": "2026-11-06T15:34:17Z",
+   "bytes": 197042,
+   "head": "c38ac7cef12d4d393c5790f15024c944c2c013c8",
+   "base": "fca4b6eb670cf5b70ae18adc3a2bc04c6159bcc5",
+   "rounds": [
+    {
+     "round": 2,
+     "oid": "16ce6fb534e3a25315e7f301d4286d46dcc30bbe",
+     "file": "ruff29955.r2.diff"
+    },
+    {
+     "round": 3,
+     "oid": "c38ac7cef12d4d393c5790f15024c944c2c013c8",
+     "file": "ruff29955.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 1,
+     "oid": "d56ee0f56d3bea023b4105348591f63ec687f11e",
+     "why": "another base"
+    }
+   ]
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "number": 30052,
+   "name": "ruff30052",
+   "mergedAt": "2026-11-06T07:42:43Z",
+   "bytes": 27266,
+   "head": "def9e661d67cdfed9c997e760319b68af8884058",
+   "base": "62852de1c0f43c793c0ba3a96fa06fc221cc2eef",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "31c6404a1a45e97b02bb891560a539703c202bfc",
+     "file": "ruff30052.r1.diff"
+    },
+    {
+     "round": 2,
+     "oid": "def9e661d67cdfed9c997e760319b68af8884058",
+     "file": "ruff30052.diff"
+    }
+   ],
+   "dropped": []
+  },
+  {
+   "repo": "cli/cli",
+   "number": 14976,
+   "name": "gh14976",
+   "mergedAt": "2026-11-07T01:48:47Z",
+   "bytes": 29742,
+   "head": "6ceb78a575d98dbe06ac366e42501c67aee2b1c4",
+   "base": "c235ae31c77c5aa99abdf947503b4f3649330938",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "86ef059323d9d802959ca79d5db769d5d152114d",
+     "file": "gh14976.r1.diff"
+    },
+    {
+     "round": 2,
+     "oid": "6ceb78a575d98dbe06ac366e42501c67aee2b1c4",
+     "file": "gh14976.diff"
+    }
+   ],
+   "dropped": []
+  },
+  {
+   "repo": "cli/cli",
+   "number": 14957,
+   "name": "gh14957",
+   "mergedAt": "2026-11-06T16:33:05Z",
+   "bytes": 139201,
+   "head": "8f4f216fc17f9ed822c4c7dd8d09455abb65a641",
+   "base": "93152e35cd55eb1bbc70dbd3ca81b097fcc906b6",
+   "rounds": [
+    {
+     "round": 3,
+     "oid": "8f4f216fc17f9ed822c4c7dd8d09455abb65a641",
+     "file": "gh14957.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 1,
+     "oid": "5fcaae119adb94c9b9f610a7df9c020143f71060",
+     "why": "another base"
+    },
+    {
+     "round": 2,
+     "oid": "67a362651641172759e23ccbf7b3f6986d1b1390",
+     "why": "another base"
+    }
+   ]
+  },
+  {
+   "repo": "cli/cli",
+   "number": 14956,
+   "name": "gh14956",
+   "mergedAt": "2026-11-06T16:33:04Z",
+   "bytes": 98185,
+   "head": "93152e35cd55eb1bbc70dbd3ca81b097fcc906b6",
+   "base": "972fb938a57a183cfd47f0963efe75b61d87c8df",
+   "rounds": [
+    {
+     "round": 3,
+     "oid": "93152e35cd55eb1bbc70dbd3ca81b097fcc906b6",
+     "file": "gh14956.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 1,
+     "oid": "84b5711fadf5b73c8a3c267c5a0e1af663146297",
+     "why": "another base"
+    },
+    {
+     "round": 2,
+     "oid": "9e4e44adc259cefb17f1a641f344b85a40b9ffac",
+     "why": "another base"
+    }
+   ]
+  },
+  {
+   "repo": "cli/cli",
+   "number": 14955,
+   "name": "gh14955",
+   "mergedAt": "2026-11-06T16:33:03Z",
+   "bytes": 162074,
+   "head": "972fb938a57a183cfd47f0963efe75b61d87c8df",
+   "base": "885d70b690f139c6f544769918bc6e325ae463ce",
+   "rounds": [
+    {
+     "round": 3,
+     "oid": "972fb938a57a183cfd47f0963efe75b61d87c8df",
+     "file": "gh14955.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 1,
+     "oid": "c730053441051e0280c54defdcfbdfe1a7e2fc49",
+     "why": "another base"
+    },
+    {
+     "round": 2,
+     "oid": "2143b96eeaec632a9da3c35d0d9e8a67f21db42d",
+     "why": "another base"
+    }
+   ]
+  }
+ ],
+ "set_sha256": "a06bdff78604330d145e252cf56402edcd24940099ec40d063d1536472b1387f",
+ "gh_calls": 0
+}

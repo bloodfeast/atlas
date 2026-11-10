@@ -32,9 +32,9 @@ reason names its key), and a task-notification lists what waits when an agent fi
 whose kind has a free slot, with the same description and brief (`recall KEY` reads it); that removes it from
 the queue. `atlas queue` lists the queue, and `atlas queue drop KEY` removes a launch you no longer want.
 
-The kind comes from a `Kind:` line in the brief. Without one, Explore and Plan agents count as research, an
-agent in its own worktree counts as a builder, and anything else gets the configured default kind (builder).
-So write the line.
+The kind comes from a `Kind:` line in the first 40 lines of the Agent launch prompt itself; a brief file the
+prompt names is not read. Without one, Explore and Plan agents count as research, an agent in its own worktree
+counts as a builder, and anything else gets the configured default kind (builder). So write the line.
 
 ## The brief
 
