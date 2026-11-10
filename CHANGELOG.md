@@ -10,6 +10,101 @@ wiki's Changelog page. A section has these parts, in this order, and leaves out 
 
 `cargo xtask release` refuses to release a version whose section is missing, empty or has no highlights.
 
+## v0.4.0
+
+### Highlights
+
+- **atlas calibrates itself.** The measured ratio in `atlas --token-report` divides by a baseline taken from your
+  own Claude Code transcripts: what agents read on rule and handoff lookups before atlas. The installed binary now
+  takes it by itself, in the background at the server's first start (and after an upgrade that changes the lookup
+  rules or a configuration change to the vaults, sources or skips), never on a hook's path; no repository or
+  cargo needed. It finds its own inputs: the cutoff is the earlier of the store's first atlas answer and the first
+  atlas call in the project's transcripts; the transcripts are those whose session ran in one of the project's
+  folders; temporary, scratch, eval and replay folders below the project's roots are skipped (`calibrate.skip`),
+  and `atlas --calibrate` names each folder and transcript a skip left out. `atlas --calibrate` runs it by hand with
+  progress.
+- **No made-up ratio.** With fewer than 30 lookup episodes from 5 transcripts before atlas, the report prints the
+  upper bound alone and says why and when it will measure again. Otherwise it says when the baseline was taken,
+  from how many episodes and transcripts, and with which version of the lookup rules.
+
+### Upgrade notes
+
+- `gh pr diff` and `gh pr view` output is now a PR digest by default; `lean.pr_digest: false` keeps `gh pr`
+  output as before.
+- A baseline saved before this release has no rules version, so the first server start after the update measures
+  it again. The new measurement counts a call that several transcripts hold (an eval replay, a resumed or forked
+  session) once, and skips eval and replay folders, so on a machine that replayed sessions the measured ratio
+  changes, by a large factor where many replays were counted. The old rows stay in the store; the report reads the
+  newest. A baseline measured by a newer atlas on the same store (with newer lookup rules) is left alone, so an
+  older and a newer binary sharing a store do not recalibrate in turn.
+- The first run reads every transcript that started before the cutoff once (a transcript that starts after it is
+  closed after its first line), and keeps what the lookup rules read of each earlier call in the store (tool,
+  the input keys the rules read, folder, result size; never the result's text), so a later recalibration does not
+  lose history Claude Code has deleted since.
+- `cargo xtask calibrate-baseline` stays for development, with explicit inputs; it now drops copies too
+  (`--keep-duplicates` keeps them, to reproduce an older run).
+- A store that a newer atlas has moved to a newer format is refused, by name, and never written. Before, an older binary opening it
+  downgraded or rebuilt it, so two versions sharing a store undid each other on every other open. Now the MCP
+  server still starts and says so: with a newer index store every tool answers with the refusal, and with a newer
+  memory store the memory tools do, while the vault tools keep working. The CLI and `atlas doctor` print
+  `store too new` and exit 1. Every message says to update atlas. v0.3.0 and older binaries do not refuse, so
+  update every atlas binary that shares a store together: the plugin install and any build from source.
+
+### Features
+
+- **PR review digests (on by default, `lean.pr_digest`).** A `gh pr diff` over the routing threshold becomes one
+  row per file with its own handle and each hunk's line range, lock, generated and vendored files one row each;
+  `gh pr view` becomes one row per body, comment and review with a handle to its text. Each diff is a round of its
+  PR, kept locally with no network call, so a later round, by the same reviewer or another, lists only the files
+  that changed and names the rest as unchanged since round N. See the wiki's Handles and digests page.
+  - A file read (`atlas slice h:F`) is the diff as stored, without line numbers or the header lines its row
+    already gives, paged between hunks with a `next page` line; `--lines A-B` reads lines as stored.
+  - An edited line shows once, as a word diff: `~` with `[-old-]` and `{+new+}`.
+  - A deleted file is one `deleted` row; its body stays behind its handle.
+  - On a later round, a changed file shows only the hunks no earlier round showed, with the whole file one
+    handle away.
+  - A file is also generated when its first 12 lines in the working tree carry a generated marker (read only
+    when the working directory is the PR's repository); an added marker counts only in the file's first 12 lines.
+  - Nothing is lost: every line of the diff is in a read or behind a handle the digest names, and the reads
+    decode back to the stored output byte for byte.
+
+  On 12 held-out public PRs (18 review rounds), what a review pulls through the generic digest is 1.24x what it
+  pulls through the PR digest at the median (1.31x in tokens), 1.22x on first rounds, and at least 1.17x on every
+  round. A 1.5x saving stays a later goal.
+  `lean.pr_digest: false` turns it off.
+
+### Fixes
+
+- **A cap refusal says where the launch's kind came from.** The kind is read from the Agent launch prompt's first
+  40 lines, never from a brief file the prompt names, so a reviewer whose prompt only named a builder's brief was
+  refused as a builder and told to fix the brief. The refusal now names what decided the kind (a `Kind:` line,
+  the agent type, `isolation: "worktree"` or `orchestrate.default_kind`) and, when no `Kind:` line did, where one
+  goes. A relaunch that adds a `Kind:` line can name its queue entry with `Queue: KEY`, so the entry leaves the
+  queue when the agent starts.
+- **A PR digest file read has one bound.** All the edited lines of one read share one word-diff step budget; once
+  it is spent, the rest are shown as stored, so a large read stays quick and still exact.
+- **Every store write checks the store's version under its lock.** Each write to the memory store and the index
+  store, side tables and background writers included, now checks the store's version under its write lock, so
+  once a newer atlas has upgraded a store, an older atlas (v0.4.0 or later) that opened it earlier stops writing
+  to it instead of writing in the old format. Memory exports hold the lock across their file writes.
+
+### Security hardening
+
+- **Releases are made by one command, with a typed answer per public act.** `cargo xtask release ship vX.Y.Z`,
+  run twice by the maintainer at a terminal, opens the release pull request from the exact commit it checked,
+  merges it only once he approved its head commit and every check passed (pinned to that head, never with the
+  admin bypass), and publishes behind one more prompt; the signing key's path is checked last and only openssl
+  opens it. The old direct-push release is gone. See the wiki's Releasing page.
+  When `main` moves on after the pull request opened, the next run exports the new commit to the same pull
+  request, behind a new `open` answer, and a fresh approval of its new head is needed; a closed release pull
+  request gives way to a new one once its branch is deleted.
+
+### Known limits
+
+- The rules version is checked by a test that hashes the lookup rules' code and `glob.rs`; a change elsewhere that
+  alters a result (the JSON or regex engine, the transcript reader) needs a new version by hand.
+- Without `projects` in the configuration every transcript is read; the vault and source roots decide what counts.
+
 ## v0.3.0
 
 ### Highlights

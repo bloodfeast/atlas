@@ -16,20 +16,21 @@
 //!     Build the binaries this machine can build into the stage folder's
 //!     bin/, and stop. Run it on a Mac for the macOS binaries, then copy them
 //!     into the publishing machine's prebuilt folder.
-//! cargo xtask release --remote URL [--push | --dry-run] [--allow-missing] [--skip-tests]
-//!     The release: checks, tests, builds, export, leak check, the commit and
-//!     the tag in a clone of URL. Without --push it stops before pushing and
-//!     says what it would push. Pushing anywhere that is not a local folder
-//!     also needs ATLAS_PUBLISH=vX.Y.Z in the environment, so a publish is
-//!     always a deliberate act. --dry-run does everything except push and
-//!     sign: it refuses --push and ignores ATLAS_SIGN_KEY.
+//! cargo xtask release --remote URL [--dry-run] [--allow-missing] [--skip-tests]
+//!     The local rehearsal: checks, tests, builds, export, leak check, the
+//!     commit and the tag in a clone of URL, the unsigned manifest and the
+//!     wiki commit, all in the stage folder. It never pushes and never signs
+//!     (--dry-run is accepted and changes nothing). The `--push` that
+//!     published from here is gone: it skipped the pull request, the owner's
+//!     approval and the public build, and needed the ruleset bypass. Every
+//!     release goes through `cargo xtask release ship vX.Y.Z`.
 //! ```
 //!
-//! This is the manual release. The CI release (`--pr`, `assets`, `sign`:
-//! a pull request to the public repository, its build on GitHub's runners,
-//! the owner's signature and publish) is in `release_ci.rs`; both share the
-//! checks, the export, the leak check, the notes, the manifest writer
-//! ([`manifest_json`]) and the signing.
+//! The CI release (`--pr`, `assets`, `sign`, `ship`: a pull request to the
+//! public repository, its build on GitHub's runners, the owner's signature
+//! and publish) is in `release_ci.rs` and `release_ship.rs`; it shares the
+//! checks, the export, the leak check, the notes and the manifest writer
+//! ([`manifest_json`]) with this one, and the signing lives there.
 //!
 //! Targets and where they come from:
 //!
@@ -72,33 +73,29 @@
 //! (`public_repo.rs`): its name is not a redirect, it is public, it is not
 //! the development repository, its owner is a user, only the admin role may
 //! bypass its rulesets and only the owner is an admin. A push to GitHub
-//! stops on a failed check; `--dry-run` and a local `--remote` report it.
+//! never happens here, so a failed check is reported.
 //!
 //! The wiki: `wiki/` of the exported tree, with the Changelog page
 //! generated from CHANGELOG.md, is leak-checked and committed to
-//! `<remote>.wiki.git` as one commit per release (`wiki.rs`). `--dry-run`
-//! and a run without `--push` print what would change; `--build-only`
-//! skips it. A wiki repository GitHub has not created yet stops the
+//! `<remote>.wiki.git` as one commit per release (`wiki.rs`); this run
+//! prints what would change and pushes nothing; `--build-only` skips it. A wiki repository GitHub has not created yet stops the
 //! release with the one-time step to create it.
 //! * ATLAS_PUBLIC_NAME, ATLAS_PUBLIC_EMAIL: the public commit author
 //! * CARGO_BUILD_JOBS: cargo's job count (default 4)
-//! * ATLAS_SIGN_KEY: the release signing key, an OpenSSL ed25519 PEM,
-//!   passphrase-encrypted, kept offline. Required to publish; openssl asks
-//!   for its passphrase. Its public half must equal TRUSTED_KEY_HEX in
-//!   src/update.rs. Never created, copied or printed here.
 //!
-//! Signed manifest: <stage>/release/ holds manifest.json (version, and per
-//! target the file, its download URL, SHA-256 and size), manifest.json.sig
-//! (the raw 64-byte ed25519 signature: openssl pkeyutl -sign -rawin) and the
-//! binaries, to upload as the GitHub release's assets. Atlas checks the
-//! signature against its built-in key before trusting anything in it.
+//! Manifest: <stage>/release/ holds manifest.json (version, and per target
+//! the file, its download URL, SHA-256 and size) and the binaries, unsigned.
+//! `release sign` signs the CI release's manifest (`sign_manifest`, the raw
+//! 64-byte ed25519 signature of openssl pkeyutl -sign -rawin); atlas checks
+//! the signature against its built-in key before trusting anything in it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Usage.
 pub const USAGE: &str = "usage: cargo xtask release --build-only
-       cargo xtask release --remote URL [--push | --dry-run] [--allow-missing] [--skip-tests]";
+       cargo xtask release --remote URL [--dry-run] [--allow-missing] [--skip-tests]
+       (publishing: cargo xtask release ship vX.Y.Z)";
 
 pub(crate) const TARGETS: [&str; 5] =
     ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"];
@@ -106,9 +103,12 @@ pub(crate) const TARGETS: [&str; 5] =
 /// The toolchain the clippy gate runs on, here and in `.github/workflows/ci.yml`.
 const CLIPPY_TOOLCHAIN: &str = "1.99.0";
 
-/// The build script run inside WSL: the Linux binary, from the same archive.
-const WSL_BUILD: &str = r#"set -eu
+/// The build script run inside WSL: the Linux binaries, from the same
+/// archive, one after the other, on the Windows side's job count (`$2`;
+/// WSL does not see CARGO_BUILD_JOBS), so the build keeps the machine's cap.
+pub(crate) const WSL_BUILD: &str = r#"set -eu
 stage="$1"
+export CARGO_BUILD_JOBS="${2:-4}"
 export PATH="$HOME/.cargo/bin:$PATH"
 work="$HOME/.cache/atlas-release"
 rm -rf "$work/src"
@@ -139,8 +139,6 @@ pub(crate) fn say(m: &str) {
 #[derive(Default)]
 struct Opts {
     build_only: bool,
-    push: bool,
-    dry_run: bool,
     allow_missing: bool,
     skip_tests: bool,
     remote: Option<String>,
@@ -199,11 +197,22 @@ pub(crate) fn size_of(p: &Path) -> R<u64> {
     Ok(std::fs::metadata(p).map_err(|e| format!("{}: {e}", p.display()))?.len())
 }
 
+/// Removes `p` and everything under it; a missing path is fine. On Windows
+/// a file that was just written (a fresh clone's `bin/atlas.exe`) can be
+/// held for a moment by a virus scanner, so a sharing violation (os error
+/// 32) or access denied (5) is retried for about five seconds first.
 pub(crate) fn rm_rf(p: &Path) -> R {
-    match std::fs::remove_dir_all(p) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("remove {}: {e}", p.display())),
+    let mut tries = 0;
+    loop {
+        match std::fs::remove_dir_all(p) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if tries < 25 && matches!(e.raw_os_error(), Some(5 | 32)) => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(format!("remove {}: {e}", p.display())),
+        }
     }
 }
 
@@ -511,9 +520,9 @@ pub(crate) fn platform_name(f: &str) -> &str {
     }
 }
 
-/// Whether a publish can sign, checked before anything is built: openssl
-/// is on PATH and ATLAS_SIGN_KEY names a file this user can open (its
-/// contents are not read here; openssl reads it when signing).
+/// The signing key's preflight, after every other check of a publish:
+/// openssl is on PATH and the key's path names a file. The file is not
+/// opened here; openssl alone opens it, when signing.
 pub(crate) fn signing_ready(key: Option<&str>, openssl: Option<&Path>) -> R {
     if openssl.is_none() {
         return Err("publishing signs the manifest and needs openssl on PATH".into());
@@ -523,7 +532,6 @@ pub(crate) fn signing_ready(key: Option<&str>, openssl: Option<&Path>) -> R {
     if !p.is_file() {
         return Err("ATLAS_SIGN_KEY is not a file".into());
     }
-    std::fs::File::open(p).map_err(|e| format!("ATLAS_SIGN_KEY is not readable: {e}"))?;
     Ok(())
 }
 
@@ -643,7 +651,8 @@ impl Ctx {
         };
         let win = self.stage.to_string_lossy().replace('\\', "/");
         let wsl_stage = output(&mut wsl(&["wslpath", "-a", &win]))?.trim_end_matches(['\r', '\n']).to_string();
-        if !status(&mut wsl(&["sh", &format!("{wsl_stage}/wsl-build.sh"), &wsl_stage]))? {
+        let jobs = env("CARGO_BUILD_JOBS").unwrap_or_else(|| "4".into());
+        if !status(&mut wsl(&["sh", &format!("{wsl_stage}/wsl-build.sh"), &wsl_stage, &jobs]))? {
             return Err("the WSL build failed".into());
         }
         Ok(())
@@ -655,7 +664,7 @@ impl Ctx {
     }
 
     /// Every target this host can build.
-    fn build_here(&self) -> R {
+    pub(crate) fn build_here(&self) -> R {
         if cfg!(windows) {
             self.build("x86_64-pc-windows-msvc", &[])?;
             if which("wsl.exe").is_some() {
@@ -699,8 +708,9 @@ fn parse(args: Vec<String>) -> R<Opts> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--build-only" => o.build_only = true,
-            "--push" => o.push = true,
-            "--dry-run" => o.dry_run = true,
+            "--push" => return Err("--push is gone: a release goes through `cargo xtask release ship vX.Y.Z` (wiki/Releasing.md)".into()),
+            // The local run never pushes or signs: --dry-run changes nothing.
+            "--dry-run" => {}
             "--allow-missing" => o.allow_missing = true,
             "--skip-tests" => o.skip_tests = true,
             "--remote" => o.remote = Some(it.next().ok_or("--remote needs a URL")?),
@@ -710,9 +720,6 @@ fn parse(args: Vec<String>) -> R<Opts> {
             }
             _ => return Err(format!("unknown argument {a}")),
         }
-    }
-    if o.dry_run && o.push {
-        return Err("--dry-run never pushes: drop --push".into());
     }
     Ok(o)
 }
@@ -756,7 +763,7 @@ pub fn run(args: Vec<String>) -> R {
         if !git(&["status", "--porcelain", "--untracked-files=no"])?.trim().is_empty() {
             return Err("uncommitted changes; the release is made from HEAD".into());
         }
-        remote = o.remote.clone().ok_or("--remote URL is required (a local bare repository for a dry run)")?;
+        remote = o.remote.clone().ok_or("--remote URL is required (a local bare repository, or the public repository to clone)")?;
         denylist = PathBuf::from(env("ATLAS_LEAK_DENYLIST").ok_or("ATLAS_LEAK_DENYLIST is not set")?);
         if std::fs::File::open(&denylist).is_err() {
             return Err("the denylist is not readable".into());
@@ -769,20 +776,12 @@ pub fn run(args: Vec<String>) -> R {
         if !named.is_empty() {
             return Err(format!("ATLAS_PUBLIC_REPO is {public_repo}, but {}: change the links or ATLAS_PUBLIC_REPO", named.join("; ")));
         }
-        // The guard, before anything is built: a push to GitHub stops here;
-        // a dry run or a local remote reports what a publish would meet.
+        // The guard, before anything is built: reported, as nothing is pushed.
         let dev = git(&["remote", "get-url", "origin"]).ok().map(|u| u.trim().to_string());
         let wiki = crate::wiki::wiki_remote(&remote);
-        let to_github = !Path::new(&remote).is_dir();
         match crate::public_repo::check(crate::public_repo::api().as_ref(), &public_repo, dev.as_deref(), &[&remote, &wiki]) {
             Ok(r) => say(&format!("public repo check: {public_repo} is public, user-owned, {} ruleset(s) with admin-only bypass (main and v* tags as required), no admin among {} collaborator(s) but the owner", r.rulesets, r.collaborators)),
-            Err(e) if o.push && to_github => return Err(format!("public repo check: {e}")),
             Err(e) => say(&format!("public repo check: {e} (a publish would stop here)")),
-        }
-        // Signing, before the tests and builds: a publish that cannot sign
-        // fails here, not at the end.
-        if o.push && to_github {
-            signing_ready(env("ATLAS_SIGN_KEY").as_deref(), which("openssl").as_deref())?;
         }
     }
 
@@ -943,17 +942,13 @@ pub fn run(args: Vec<String>) -> R {
     );
     write(&notes_path, &notes)?;
 
-    say("signed manifest");
-    let publishing = o.push && !Path::new(&remote).is_dir();
+    say("manifest");
     let update_rs = read_text(&root.join("src/update.rs"))?;
     let (trusted, test_key) = match (key_const(&update_rs, "TRUSTED_KEY_HEX"), key_const(&update_rs, "TEST_KEY_HEX")) {
         (Some(a), Some(b)) => (a, b),
         _ => return Err("cannot read TRUSTED_KEY_HEX and TEST_KEY_HEX from src/update.rs".into()),
     };
     if trusted == test_key {
-        if publishing {
-            return Err("the key built into atlas is the test key: put the release key in TRUSTED_KEY_HEX".into());
-        }
         say("warning: the key built into atlas is the test key");
     }
     let release_dir = stage.join("release");
@@ -966,15 +961,7 @@ pub fn run(args: Vec<String>) -> R {
     }
     let manifest = release_dir.join("manifest.json");
     write(&manifest, manifest_json(&version, &public_repo, &stage.join("bin"))?)?;
-    match env("ATLAS_SIGN_KEY") {
-        Some(_) if o.dry_run => say("manifest not signed (--dry-run never signs; ATLAS_SIGN_KEY ignored)"),
-        Some(key) => {
-            sign_manifest(Path::new(&key), &trusted, &manifest)?;
-            say("manifest signed; signature checked against the built-in key");
-        }
-        None if publishing => return Err("publishing needs ATLAS_SIGN_KEY (the release signing key)".into()),
-        None => say("manifest not signed (no ATLAS_SIGN_KEY; a dry run)"),
-    }
+    say("manifest not signed: this run never signs (ATLAS_SIGN_KEY is not read); `release ship` signs the release it publishes");
 
     say("commit");
     let public = stage.join("public");
@@ -1080,27 +1067,9 @@ pub fn run(args: Vec<String>) -> R {
         say("wiki: no page changed, nothing to commit");
     }
 
-    if !o.push {
-        say(&format!("not pushed (no --push). It would push main and {tag} to {remote}, and the wiki commit to {wiki_remote}."));
-    } else {
-        if !Path::new(&remote).is_dir() && env("ATLAS_PUBLISH").as_deref() != Some(tag.as_str()) {
-            return Err(format!("pushing to {remote} needs ATLAS_PUBLISH={tag}"));
-        }
-        if !status(&mut pubc(&["push", "-q", "origin", "main", &format!("refs/tags/{tag}")]))? {
-            return Err("push failed".into());
-        }
-        say(&format!("pushed main and {tag} to {remote}"));
-        crate::wiki::push(&wiki).map_err(|e| format!("the wiki push failed ({e}); the release itself is out: push {} by hand", wiki.clone.display()))?;
-        if wiki.changed {
-            say(&format!("pushed the wiki to {}", wiki.remote));
-        }
-    }
+    say(&format!("not pushed: this run never pushes. The commit and {tag} are in {}; the wiki commit would go to {wiki_remote}.", public.display()));
     say(&format!("release notes: {}", notes_path.display()));
-    say(&format!(
-        "then, on GitHub (by hand): gh release create {tag} --repo {public_repo} --title \"atlas {tag}\" --notes-file \"{}\" {}/*",
-        notes_path.display(),
-        release_dir.display()
-    ));
+    say(&format!("binaries and the unsigned manifest: {}", release_dir.display()));
     if model_dir.is_some() {
         say(&format!(
             "model assets (once per model set): gh release upload <models tag> {}/* --repo {public_repo}",
@@ -1123,7 +1092,7 @@ pub(crate) fn target_of(file: &str) -> Option<&str> {
 /// and the updater verifies): the version and, for each binary in `bins`
 /// (the launcher `atlas` skipped), its target, file name, download URL in
 /// the `v<version>` release of `repo`, SHA-256 and size, in `ls` order.
-/// The one writer: the `--push` release and `cargo xtask release assets`
+/// The one writer: the local run and `cargo xtask release assets`
 /// both call it, and the signature covers these exact bytes.
 pub(crate) fn manifest_json(version: &str, repo: &str, bins: &Path) -> R<String> {
     let mut entries = Vec::new();
@@ -1203,7 +1172,7 @@ pub(crate) fn check_public_files(tree: &Path) -> R {
 }
 
 /// The home folder as cargo finds it: USERPROFILE on Windows, HOME elsewhere.
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     let k = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     env(k).map(PathBuf::from).unwrap_or_default()
 }

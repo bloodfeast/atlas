@@ -160,8 +160,15 @@ impl<'a> Matcher<'a> {
         self.terms.len()
     }
 
+    /// The terms that can match: (term number, normalised term). For the
+    /// accepted-hits digests (`accept.rs`), which hash a term and never
+    /// print it.
+    #[allow(dead_code, reason = "tests/leak_check.rs includes this file and does not use it")]
+    pub fn terms(&self) -> &[(usize, String)] {
+        &self.terms
+    }
+
     /// Whether no term can match.
-    #[allow(dead_code, reason = "tests/leak_check.rs uses it; the release counts terms instead")]
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()
     }
@@ -339,7 +346,7 @@ fn utf16(bytes: &[u8], base: usize, big_endian: bool) -> Vec<(usize, char)> {
 }
 
 /// `(line, column)` of byte `at` in a reading, both from 1.
-fn line_col(reading: &[(usize, char)], at: usize) -> (usize, usize) {
+pub fn line_col(reading: &[(usize, char)], at: usize) -> (usize, usize) {
     let (mut line, mut col) = (1, 1);
     for &(o, c) in reading {
         if o >= at {

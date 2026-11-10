@@ -4,3 +4,4 @@
 /.crates.toml
 /.crates2.json
 /atlas.json
+__pycache__/

@@ -23,6 +23,7 @@
 #![deny(unsafe_code)]
 
 pub mod baseline;
+pub mod calibrate;
 pub mod chain;
 pub mod checkpoint;
 pub mod chunk;
@@ -58,6 +59,7 @@ pub mod outline;
 pub mod paths;
 pub mod picture;
 mod platform;
+pub mod pr_digest;
 pub mod project;
 pub mod proto;
 pub mod protobuf;

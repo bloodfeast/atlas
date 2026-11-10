@@ -271,7 +271,7 @@ impl Server {
             if !on {
                 return Err(Error::InvalidArgument("the transcript source is off (memory.transcripts); turn refs and kind turn need it on".into()));
             }
-            let conn = rusqlite::Connection::open(&idx)?;
+            let conn = crate::store::open_raw(&idx)?;
             // This project's turns only: the folder Claude Code files this
             // session's transcripts under.
             let project = crate::transcripts::project_of_cwd(&std::env::current_dir()?);
@@ -821,8 +821,16 @@ impl Server {
             // The write is committed already, so a failure here is reported
             // in the answer, not as an error.
             let locked = store.conn().execute_batch("BEGIN IMMEDIATE");
+            // Checked where the transaction opens: `export::write` runs
+            // inside this one, so a store a newer atlas upgraded since this
+            // session opened it is refused here, before any file.
+            let refused = locked.as_ref().ok().and_then(|()| crate::memory::check_locked(store.conn(), store.path()).err()).map(|e| e.to_string());
             for spec in settings.exports.iter().filter(|e| names.contains(&e.name)) {
-                match export::write(store, spec, dir, false) {
+                let written = match &refused {
+                    Some(e) => Err(e.clone()),
+                    None => export::write(store, spec, dir, false).map_err(|e| e.to_string()),
+                };
+                match written {
                     Ok(rep) => {
                         for (p, why) in rep.refused {
                             out.push_str(&format!("export refused: {}: {why}\n", p.display()));

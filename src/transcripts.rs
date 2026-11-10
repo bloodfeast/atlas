@@ -55,22 +55,31 @@ pub fn project_of_transcript(path: &Path) -> String {
 ///
 /// # Errors
 ///
+/// [`crate::Error::StoreTooNew`] when a newer atlas upgraded the store since
+/// this one opened it (nothing written, no table made),
 /// [`crate::Error::Db`] or [`crate::Error::Io`].
 pub fn index(conn: &Connection, path: &Path) -> Result<usize> {
     use std::io::{Seek, SeekFrom};
-    conn.execute_batch(TABLES)?;
+    // One write transaction, checked under the lock at its start, holds the
+    // tables, a rewrite's deletes and the new turns: a refusal or an error
+    // anywhere writes none of them.
+    let tx = crate::store::begin_shared(conn)?;
+    tx.execute_batch(TABLES)?;
     let key = path.to_string_lossy().into_owned();
-    let (offset, line): (u64, i64) = conn.query_row("SELECT offset, lines FROM turns_seen WHERE path = ?1", [&key], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))).optional()?.unwrap_or((0, 0));
+    let (offset, line): (u64, i64) = tx.query_row("SELECT offset, lines FROM turns_seen WHERE path = ?1", [&key], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))).optional()?.unwrap_or((0, 0));
     let mut f = std::fs::File::open(path)?;
     let len = f.metadata()?.len();
-    if len < offset {
+    let added = if len < offset {
         // Rewritten: start over.
-        conn.execute("DELETE FROM turns WHERE project = ?1 AND session8 = ?2", params![project_of_transcript(path), session8(path)])?;
-        conn.execute("DELETE FROM turns_secret WHERE path = ?1", [&key])?;
-        return index_from(conn, path, &key, &mut f, 0, 0);
-    }
-    f.seek(SeekFrom::Start(offset))?;
-    index_from(conn, path, &key, &mut f, offset, line)
+        tx.execute("DELETE FROM turns WHERE project = ?1 AND session8 = ?2", params![project_of_transcript(path), session8(path)])?;
+        tx.execute("DELETE FROM turns_secret WHERE path = ?1", [&key])?;
+        index_from(&tx, path, &key, &mut f, 0, 0)?
+    } else {
+        f.seek(SeekFrom::Start(offset))?;
+        index_from(&tx, path, &key, &mut f, offset, line)?
+    };
+    tx.commit()?;
+    Ok(added)
 }
 
 fn session8(path: &Path) -> String {
@@ -93,9 +102,8 @@ fn index_from(conn: &Connection, path: &Path, key: &str, f: &mut std::fs::File, 
         ids
     };
     let mut added = 0;
-    let tx = conn.unchecked_transaction()?;
     {
-        let mut ins = tx.prepare_cached("INSERT INTO turns(text, project, session8, line, role, hash) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?;
+        let mut ins = conn.prepare_cached("INSERT INTO turns(text, project, session8, line, role, hash) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?;
         for l in text.lines() {
             line += 1;
             if l.contains("\"isSidechain\":true") || !(l.contains("\"type\":\"user\"") || l.contains("\"type\":\"assistant\"")) {
@@ -111,7 +119,7 @@ fn index_from(conn: &Connection, path: &Path, key: &str, f: &mut std::fs::File, 
                     if input.lines().any(|x| crate::redact::is_secret_line(x, deny)) || crate::redact::is_secret_line(&input, deny) {
                         if let Some(id) = b.get("id").and_then(Value::as_str) {
                             secret_calls.insert(id.to_string());
-                            tx.execute("INSERT OR IGNORE INTO turns_secret(path, id) VALUES(?1, ?2)", params![key, id])?;
+                            conn.execute("INSERT OR IGNORE INTO turns_secret(path, id) VALUES(?1, ?2)", params![key, id])?;
                         }
                     }
                 }
@@ -135,8 +143,7 @@ fn index_from(conn: &Connection, path: &Path, key: &str, f: &mut std::fs::File, 
             added += 1;
         }
     }
-    tx.execute("INSERT INTO turns_seen(path, offset, lines) VALUES(?1, ?2, ?3) ON CONFLICT(path) DO UPDATE SET offset = excluded.offset, lines = excluded.lines", params![key, (offset + end as u64) as i64, line])?;
-    tx.commit()?;
+    conn.execute("INSERT INTO turns_seen(path, offset, lines) VALUES(?1, ?2, ?3) ON CONFLICT(path) DO UPDATE SET offset = excluded.offset, lines = excluded.lines", params![key, (offset + end as u64) as i64, line])?;
     Ok(added)
 }
 
@@ -319,6 +326,41 @@ mod tests {
         assert!(search(&conn, "H--proj-b", "4127", 5).unwrap().is_empty());
         assert_eq!(search(&conn, "H--proj-b", "build", 5).unwrap().len(), 1);
         assert!(get(&conn, "H--proj-b", "12345678", 4).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod storeguard_tests {
+    use super::*;
+    use crate::store::skew_support::{dump, make_index_newer};
+
+    /// Indexing on a store a newer atlas upgraded since this one opened it
+    /// writes no turn, makes no table and, for a rewritten transcript,
+    /// deletes nothing.
+    #[test]
+    fn indexing_checks_the_version_under_the_lock() {
+        let dir = std::env::temp_dir().join(format!("atlas-storeguard-turns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("H--proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let p = proj.join("12345678-aaaa.jsonl");
+        let rec = r#"{"type":"user","message":{"content":"run the build"}}"#;
+        std::fs::write(&p, format!("{rec}\n{rec}\n")).unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        assert_eq!(index(&c, &p).unwrap(), 2);
+        // Rewritten shorter: the start-over deletes are refused with the rest.
+        std::fs::write(&p, format!("{rec}\n")).unwrap();
+        make_index_newer(&c);
+        let before = dump(&c);
+        assert!(index(&c, &p).expect_err("refused").is_store_too_new());
+        assert!(c.is_autocommit(), "rolled back");
+        assert_eq!(dump(&c), before);
+        let c = Connection::open_in_memory().unwrap();
+        make_index_newer(&c);
+        let before = dump(&c);
+        assert!(index(&c, &p).expect_err("refused").is_store_too_new());
+        assert_eq!(dump(&c), before, "no table made");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

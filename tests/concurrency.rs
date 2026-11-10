@@ -541,3 +541,30 @@ fn a_handoff_behind_another_session_is_not_refused() {
 fn a_handoff_behind_another_on_an_empty_lane_leaves_one_active() {
     handoff_behind_another_session("handoff-empty", false);
 }
+
+/// Eight opens of one fresh memory store at once: every one succeeds and the
+/// store ends at the current version, its schema made once under the write
+/// lock (the others read the version again there and leave it). A store at
+/// the current version is never refused as too new by a racing open.
+#[test]
+fn opens_of_a_fresh_store_at_once_make_the_schema_once() {
+    let t = Temp::new("fresh-race");
+    let path = t.path().join("memory.sqlite");
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let opens: Vec<_> = (0..8)
+        .map(|_| {
+            let (gate, path) = (gate.clone(), path.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                atlas::memory::MemoryStore::open(&path).map(drop)
+            })
+        })
+        .collect();
+    for o in opens {
+        o.join().unwrap().expect("every open of a fresh store succeeds");
+    }
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, atlas::memory::SCHEMA_VERSION);
+    assert_eq!(atlas::memory::store_skew(&path), None);
+}

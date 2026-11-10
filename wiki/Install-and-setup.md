@@ -136,7 +136,7 @@ An older Claude Code is untested.
    ```
 
    (`atlas settings on update` turns them back on), or pin a version in `atlas.json` with
-   `"update": {"pin": "0.3.0"}`. A binary you build from source never updates itself.
+   `"update": {"pin": "0.4.0"}`. A binary you build from source never updates itself.
 
 5. Point atlas at your notes: edit `atlas.json` (see [[Configuration reference]]) to add vaults (folders atlas may add
    to) and read-only sources (folders it only indexes), then run `/mcp` and reconnect atlas, or restart

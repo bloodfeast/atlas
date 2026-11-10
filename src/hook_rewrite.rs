@@ -489,6 +489,15 @@ impl Router {
                 };
                 let stdout = strip_marker(&stdout).to_string();
                 let stderr = s(resp, "stderr");
+                if let Some(d) = self.pr_route(ev, cmd, &stdout, stderr, exit, &session) {
+                    let mut out = resp.clone();
+                    if let Some(o) = out.as_object_mut() {
+                        o.insert("stdout".into(), Value::from(d));
+                        o.remove("persistedOutputPath");
+                        o.remove("persistedOutputSize");
+                    }
+                    return Ok(Some(out));
+                }
                 // Build and test output digests well at any size; a read the
                 // model windowed itself gets more room.
                 let build = matches!(crate::digest::shape("bash", c, ""), crate::digest::Shape::CargoTest | crate::digest::Shape::CargoBuild);
@@ -623,6 +632,31 @@ impl Router {
         Ok(Some(out))
     }
 
+    /// The `gh pr` route (`lean.pr_digest`, on unless it is false; see
+    /// [`crate::pr_digest`]): the digest of a `gh pr diff` or `gh pr view`
+    /// output over the threshold, or `None` to go on as for any command
+    /// (switched off, another command, a PR it cannot place without the
+    /// network, a failure, a long stderr, a denied path, any error). A diff
+    /// under the threshold is still recorded as a round, and passes whole.
+    fn pr_route(&mut self, ev: &HookEvent, cmd: &str, stdout: &str, stderr: &str, exit: Option<i64>, session: &str) -> Option<String> {
+        let on = self.lean.as_ref().and_then(|l| l.get("pr_digest")).and_then(Value::as_bool) != Some(false);
+        if !on || exit == Some(-1) || stderr.len() > 2000 {
+            return None;
+        }
+        let pc = crate::pr_digest::parse_cmd(cmd)?;
+        if command_denied(cmd, &ev.cwd) {
+            return None;
+        }
+        let w = crate::pr_digest::resolve(&pc, &ev.cwd, &crate::pr_digest::LocalGit)?;
+        let small = stdout.len() + stderr.len() < self.cfg.threshold_bytes;
+        let kind = if ev.tool_name == "Bash" { "bash" } else { "powershell" };
+        let m = Meta { kind: kind.into(), label: cmd.lines().next().unwrap_or("").to_string(), cmd: cmd.into(), cwd: ev.cwd.clone(), session: session.to_string(), exit_code: exit, ..Meta::default() };
+        let h = self.handles().ok()?;
+        let d = crate::pr_digest::route(h, &pc, &w, stdout, &m, small).ok()??;
+        let _ = crate::tokens::log_row(h.conn(), "route:gh-pr", d.digest.len(), Some(crate::tokens::Counterfactual { grep: 0, read: stdout.len() }));
+        Some(d.digest)
+    }
+
     /// Annotations for a result that passes whole (see the module docs):
     /// the replacement output for a Grep, the context line for a Read.
     ///
@@ -735,7 +769,7 @@ impl Router {
     /// [`Error::Db`] from SQLite; the file's rows are unchanged then.
     pub fn reindex_code(&mut self, path: &str) -> Result<crate::code::Reindexed> {
         if self.code_conn.is_none() {
-            let c = rusqlite::Connection::open(&self.db)?;
+            let c = crate::store::open_raw(&self.db)?;
             c.busy_timeout(std::time::Duration::from_secs(10))?;
             self.code_conn = Some(c);
         }
@@ -747,10 +781,14 @@ impl Router {
     /// (a re-index) as a miss.
     pub fn miss_text(&mut self, query: &str, e: &crate::Error) {
         if let Ok(h) = self.handles() {
-            let _ = h.conn().execute(
-                "INSERT INTO misses(time, tool, query, returned, found, reason, client) VALUES(?1, 'route', ?2, '', '', ?3, 'atlas-hook')",
-                rusqlite::params![crate::store::utc(std::time::SystemTime::now()), query, e.to_string()],
-            );
+            let c = h.conn();
+            let _ = crate::store::guarded(c, || {
+                c.execute(
+                    "INSERT INTO misses(time, tool, query, returned, found, reason, client) VALUES(?1, 'route', ?2, '', '', ?3, 'atlas-hook')",
+                    rusqlite::params![crate::store::utc(std::time::SystemTime::now()), query, e.to_string()],
+                )?;
+                Ok(())
+            });
         }
     }
 
@@ -760,10 +798,14 @@ impl Router {
         eprintln!("atlas routing {} {}: {e}", ev.event, ev.tool_name);
         let query = format!("{} {}", ev.tool_name, s(&ev.tool_input, "command"));
         if let Ok(h) = self.handles() {
-            let _ = h.conn().execute(
-                "INSERT INTO misses(time, tool, query, returned, found, reason, client) VALUES(?1, 'route', ?2, '', '', ?3, 'atlas-hook')",
-                rusqlite::params![crate::store::utc(std::time::SystemTime::now()), query, e.to_string()],
-            );
+            let c = h.conn();
+            let _ = crate::store::guarded(c, || {
+                c.execute(
+                    "INSERT INTO misses(time, tool, query, returned, found, reason, client) VALUES(?1, 'route', ?2, '', '', ?3, 'atlas-hook')",
+                    rusqlite::params![crate::store::utc(std::time::SystemTime::now()), query, e.to_string()],
+                )?;
+                Ok(())
+            });
         }
     }
 }

@@ -1,0 +1,2356 @@
+//! PR digests (`lean.pr_digest`, on unless set to false): the output of `gh
+//! pr diff` and `gh pr view` for a review, as one row per file with a handle
+//! per file and a line range per hunk, instead of the generic digest of a
+//! long output.
+//!
+//! # Shape
+//!
+//! A diff is split into parts that cover it byte for byte: one part per file
+//! (from its `diff --git` line through its last hunk line, `\ No newline at
+//! end of file` included) and the text between files (a `--patch` commit
+//! header, a trailing signature). Each part is stored as its own handle, the
+//! whole output as one more, so [`Handles::text`] of the parts in order is the
+//! stored output exactly (the model's view, `atlas slice`, numbers the lines
+//! and caps a slice, so exactness is defined on the stored bytes).
+//!
+//! A file's row gives its status, `+`/`-` lines, its handle and each hunk's
+//! line range inside that handle. Lock files and generated files (by the
+//! repository's `.gitattributes` `linguist-generated`, by name, or by a
+//! "generated" marker in the file's first [`MARK_LINES`] lines: an added
+//! line there, or the working tree's head of the file when the working
+//! directory is the PR's repository) are one row each without hunk ranges;
+//! a vendored tree (`vendor/`, `third_party/`, `node_modules/`, or
+//! `linguist-vendored`) is one row for the whole tree with a handle of its
+//! own, and a deleted file is a `deleted` row whose body stays behind its
+//! handle. Whitespace-only hunks, `-w` and move detection are not handled.
+//!
+//! # Reads
+//!
+//! A file's handle read with no selector is diff-native: no line numbers,
+//! the header lines its row reproduces left out (kept by a handle no row
+//! backs: a vendored tree, an unchanged file that is not a plain
+//! modification, [`row_backed`]), and an edited line paired
+//! with its old line shown once as a word diff (`~`, [`wd_line`]). A read
+//! over the slice cap breaks between hunks and ends with a counted `next
+//! page: atlas slice ID --page K` line. Every hidden line is reachable from
+//! a handle the digest names: the read decodes back to the stored bytes, and
+//! `--lines A-B` reads them as stored. Context collapse (C1) is in the code
+//! for measurement only and is off in every shipped build ([`levers`]).
+//!
+//! `gh pr view` (the default text view, `--comments`, and `--json` with
+//! `body`, `comments` or `reviews`) becomes the short fields verbatim and one
+//! row per body, comment and review: author, state, size, first line, handle.
+//!
+//! # Rounds
+//!
+//! Every digested diff is recorded as a round of its PR, keyed by repository
+//! and PR number (or branch), never by asking GitHub: the hook makes no
+//! network call, and `gh pr diff` prints no head sha. A round is a manifest
+//! of (path, exact patch hash, normalized patch hash, handle). A later round
+//! with a different output says per file: unchanged since round N (the same
+//! handle id, since an id is a pure function of the bytes, kind and
+//! command), unchanged but moved (only `@@` offsets and `index` lines
+//! differ, as after a rebase), changed, new, or removed. A merge of the base
+//! branch that changes a file's patch shows it as changed. The same output
+//! seen again (another reviewer, a re-run) is the same round. Every round
+//! re-stores all of its parts, so a manifest never points at an evicted
+//! handle. Rounds are shared by everyone using the same index database.
+//!
+//! A diff under the routing threshold passes whole but is still recorded,
+//! so the next round can say what changed. A head sha is recorded only when
+//! one is seen: the last commit of a `--patch` output, or `headRefOid` in a
+//! `gh pr view --json` output.
+
+use std::path::Path;
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::error::Result;
+use crate::handles::{Handles, Meta};
+use crate::json::Value;
+
+/// The handle kind of a PR part.
+pub const KIND: &str = "gh-pr";
+/// File names that are lock files, collapsed to one row.
+pub const LOCK_NAMES: &[&str] = &[
+    "Cargo.lock", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock", "poetry.lock",
+    "Pipfile.lock", "uv.lock", "pdm.lock", "Gemfile.lock", "composer.lock", "go.sum", "flake.lock", "mix.lock", "Podfile.lock",
+    "Package.resolved", "packages.lock.json", "pubspec.lock", "gradle.lockfile", "conan.lock", "deno.lock",
+];
+/// Folder names whose trees are vendored.
+const VENDOR_DIRS: &[&str] = &["vendor", "vendored", "third_party", "third-party", "node_modules"];
+/// File name globs of generated files.
+const GENERATED_NAMES: &[&str] = &[
+    "*.min.js", "*.min.css", "*.min.map", "*.js.map", "*.pb.go", "*.pb.cc", "*.pb.h", "*_pb2.py", "*_pb2_grpc.py", "*_pb2.pyi",
+    "*.generated.*", "*.g.dart", "*.freezed.dart", "*.designer.cs", "*.g.cs",
+];
+/// Markers of a generated file, looked for in its first lines as written.
+const GENERATED_MARKS: &[&str] = &["@generated", "DO NOT EDIT", "Code generated by"];
+/// Phrases that say the file itself is generated, in any case. The word
+/// alone is not one: a hand-written file may say other things are
+/// "auto-generated" (ripgrep's zsh completions do, in their first lines),
+/// and neither is "auto-generated file" (prose about some other file).
+const GENERATED_PHRASES: &[&str] = &[
+    "file is auto-generated", "file is autogenerated", "file is automatically generated", "file was auto-generated", "file was autogenerated",
+    "file was automatically generated", "<auto-generated",
+];
+
+/// Whether a line holds a generated marker.
+fn marker(l: &str) -> bool {
+    GENERATED_MARKS.iter().any(|m| l.contains(m)) || {
+        let low = l.to_ascii_lowercase();
+        GENERATED_PHRASES.iter().any(|p| low.contains(p))
+    }
+}
+/// A file's first lines, searched for a marker: added lines at new-side
+/// line numbers up to this, and the working tree's head.
+pub const MARK_LINES: usize = 12;
+/// File rows listed before "N more".
+pub const MAX_ROWS: usize = 150;
+/// Hunk ranges listed on a row before "+N".
+const MAX_HUNKS_SHOWN: usize = 8;
+/// The longest quoted value or first line, in characters.
+const QUOTE: usize = 100;
+
+// ---- the command ---------------------------------------------------------
+
+/// The `gh pr` subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sub {
+    /// `gh pr diff`, `--patch` or not.
+    Diff {
+        /// `--patch`: per-commit patches.
+        patch: bool,
+    },
+    /// `gh pr view`.
+    View {
+        /// `--comments` (text).
+        comments: bool,
+        /// `--json FIELDS` with body, comments or reviews.
+        json: bool,
+    },
+}
+
+/// Which PR a command names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// None named: the current branch's.
+    Current,
+    /// A number (or a URL's).
+    Number(u64),
+    /// A branch name.
+    Branch(String),
+}
+
+/// A `gh pr diff` or `gh pr view` command this module digests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrCmd {
+    /// Which subcommand.
+    pub sub: Sub,
+    /// `-R`/`--repo`, or a URL's repository, normalized (`owner/repo`).
+    pub repo: Option<String>,
+    /// Which PR.
+    pub target: Target,
+}
+
+/// Shell words with `'` and `"` quoting; `None` for an unbalanced quote.
+fn words(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut any = false;
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                any = true;
+            }
+            None if c.is_whitespace() => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                any = false;
+            }
+            None => cur.push(c),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+/// `owner/repo` (or `host/owner/repo` off github.com), lower case, from a
+/// `-R` value, a repository URL or a remote URL.
+pub fn norm_repo(s: &str) -> Option<String> {
+    let mut s = s.trim();
+    let mut scheme = false;
+    for p in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(r) = s.strip_prefix(p) {
+            s = r;
+            scheme = true;
+        }
+    }
+    // `git@host:owner/repo` and `user@host/...`.
+    if let Some((user, rest)) = s.split_once('@') {
+        if !user.contains('/') {
+            s = rest;
+        }
+    }
+    // A URL's `host:port/`, else scp-style `host:owner/repo`.
+    let s = match (scheme, s.split_once('/')) {
+        (true, Some((host, rest))) => format!("{}/{rest}", host.split(':').next().unwrap_or(host)),
+        _ => s.replacen(':', "/", 1),
+    };
+    let s = s.trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    let (host, owner, repo) = match parts.as_slice() {
+        [o, r] => ("github.com", *o, *r),
+        [h, o, r] => (*h, *o, *r),
+        [h, o, r, ..] if h.contains('.') => (*h, *o, *r),
+        _ => return None,
+    };
+    let host = host.split(':').next().unwrap_or(host);
+    let ok = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    if !ok(owner) || !ok(repo) {
+        return None;
+    }
+    let base = format!("{owner}/{repo}").to_ascii_lowercase();
+    Some(if host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com") { base } else { format!("{}/{base}", host.to_ascii_lowercase()) })
+}
+
+/// A PR URL's repository and number.
+fn pr_url(s: &str) -> Option<(String, u64)> {
+    let i = s.find("/pull/")?;
+    let n: String = s[i + 6..].chars().take_while(char::is_ascii_digit).collect();
+    Some((norm_repo(&s[..i])?, n.parse().ok()?))
+}
+
+/// The next word as a flag's value: inline after `=`, else the next word.
+fn value(w: &[String], i: &mut usize, inline: Option<&str>) -> Option<String> {
+    if let Some(v) = inline {
+        return Some(v.to_string());
+    }
+    *i += 1;
+    w.get(*i).cloned()
+}
+
+/// Reads a `gh pr diff` or `gh pr view` command (the last step after `cd
+/// ... &&` and environment assignments). `None` for anything else: another
+/// command, a pipe, a redirect or a chain, `--name-only`, `--web`, colour,
+/// `--jq` or `--template`, a `--json` without `body`, `comments` or
+/// `reviews`, or a flag this does not know.
+pub fn parse_cmd(cmd: &str) -> Option<PrCmd> {
+    let step = crate::digest::last_step(cmd);
+    if step.contains(['|', '>', '<', ';', '`', '\n', '&']) || step.contains("$(") {
+        return None;
+    }
+    // What the dropped `cd` steps and assignments say: another folder, or
+    // `GH_REPO`/`GH_HOST`, places the PR elsewhere than the hook's cwd.
+    let before = cmd.trim().strip_suffix(step).unwrap_or("");
+    let elsewhere = before.split("&&").any(|s| s.trim_start().starts_with("cd ")) || before.contains("GH_REPO=") || before.contains("GH_HOST=");
+    let w = words(step)?;
+    let exe = w.first()?.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
+    if exe != "gh" && exe != "gh.exe" {
+        return None;
+    }
+    if w.get(1).map(String::as_str) != Some("pr") {
+        return None;
+    }
+    let diff = match w.get(2).map(String::as_str) {
+        Some("diff") => true,
+        Some("view") => false,
+        _ => return None,
+    };
+    let (mut repo, mut target) = (None, None);
+    let (mut patch, mut comments, mut json) = (false, false, false);
+    let mut i = 3;
+    while i < w.len() {
+        let a = w[i].as_str();
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v)),
+            _ => (a, None),
+        };
+        match flag {
+            "-R" | "--repo" => repo = Some(norm_repo(&value(&w, &mut i, inline)?)?),
+            "--patch" | "-c" | "--comments" if inline.is_some_and(|v| v != "true") => return None,
+            "--patch" if diff => patch = true,
+            "--color" if diff => {
+                if value(&w, &mut i, inline)? != "never" {
+                    return None;
+                }
+            }
+            "-c" | "--comments" if !diff => comments = true,
+            "--json" if !diff => {
+                let fields = value(&w, &mut i, inline)?;
+                if !fields.split(',').any(|f| matches!(f.trim(), "body" | "comments" | "reviews")) {
+                    return None;
+                }
+                json = true;
+            }
+            f if f.starts_with('-') => return None,
+            _ => {
+                if target.is_some() {
+                    return None;
+                }
+                let t = a.strip_prefix('#').unwrap_or(a);
+                target = Some(if let Ok(n) = t.parse::<u64>() {
+                    Target::Number(n)
+                } else if let Some((r, n)) = pr_url(a) {
+                    repo = repo.or(Some(r));
+                    Target::Number(n)
+                } else if a.contains("://") {
+                    return None;
+                } else {
+                    // `OWNER:BRANCH` names a fork's branch.
+                    Target::Branch(a.to_string())
+                });
+            }
+        }
+        i += 1;
+    }
+    if elsewhere && repo.is_none() {
+        return None;
+    }
+    let sub = if diff { Sub::Diff { patch } } else { Sub::View { comments, json } };
+    Some(PrCmd { sub, repo, target: target.unwrap_or(Target::Current) })
+}
+
+// ---- where: the repository, without the network ----------------------------
+
+/// What the working directory's git says, read locally.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Local {
+    /// `git config --get-regexp ^remote\.` output.
+    pub remotes: String,
+    /// The current branch (`HEAD` when detached).
+    pub branch: String,
+    /// The work tree's top folder.
+    pub toplevel: String,
+}
+
+/// The local git reads, behind a trait so tests need no repository.
+pub trait Git {
+    /// The working directory's remotes, branch and top folder; `None` outside
+    /// a repository.
+    fn local(&self, cwd: &str) -> Option<Local>;
+}
+
+/// [`Git`] by running `git`, which reads only local files here.
+pub struct LocalGit;
+
+fn git_out(cwd: &str, args: &[&str]) -> Option<String> {
+    let mut c = std::process::Command::new("git");
+    if !cwd.is_empty() {
+        c.arg("-C").arg(cwd);
+    }
+    c.args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let o = c.output().ok()?;
+    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+impl Git for LocalGit {
+    fn local(&self, cwd: &str) -> Option<Local> {
+        if cwd.is_empty() || !Path::new(cwd).is_dir() {
+            return None;
+        }
+        let rp = git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD", "--show-toplevel"])?;
+        let mut l = rp.lines();
+        let branch = l.next().unwrap_or("").trim().to_string();
+        let toplevel = l.next().unwrap_or("").trim().to_string();
+        let remotes = git_out(cwd, &["config", "--get-regexp", "^remote\\."]).unwrap_or_default();
+        Some(Local { remotes, branch, toplevel })
+    }
+}
+
+/// The repository `gh` picks from the remotes: one marked `gh-resolved`
+/// (`base`, or a repository named), else `upstream`, `github`, `origin`,
+/// then the first.
+pub fn remote_repo(remotes: &str) -> Option<String> {
+    let mut urls: Vec<(String, String)> = Vec::new();
+    let mut resolved: Option<String> = None;
+    for line in remotes.lines() {
+        let Some((k, v)) = line.trim().split_once(char::is_whitespace) else { continue };
+        let Some(rest) = k.strip_prefix("remote.") else { continue };
+        let v = v.trim();
+        if let Some(name) = rest.strip_suffix(".url") {
+            urls.push((name.to_string(), v.to_string()));
+        } else if let Some(name) = rest.strip_suffix(".gh-resolved") {
+            resolved = Some(if v == "base" { format!("remote:{name}") } else { v.to_string() });
+        }
+    }
+    if let Some(r) = resolved {
+        match r.strip_prefix("remote:") {
+            Some(name) => {
+                if let Some((_, u)) = urls.iter().find(|(n, _)| n == name) {
+                    return norm_repo(u);
+                }
+            }
+            None => return norm_repo(&r),
+        }
+    }
+    for want in ["upstream", "github", "origin"] {
+        if let Some((_, u)) = urls.iter().find(|(n, _)| n == want) {
+            return norm_repo(u);
+        }
+    }
+    urls.first().and_then(|(_, u)| norm_repo(u))
+}
+
+/// Where a PR's rounds and handles are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Where {
+    /// `owner/repo#N` or `owner/repo@BRANCH`, plus ` patch` for `--patch`.
+    pub key: String,
+    /// The `.gitattributes` text of the working directory's repository when
+    /// it is the PR's repository, else empty.
+    pub attributes: String,
+    /// That repository's working tree root under the same condition, else
+    /// empty: a changed file's first lines are read there for a generated
+    /// marker ([`file_head`]).
+    pub toplevel: String,
+}
+
+/// The PR a command names, from the command and local git only. `None` when
+/// it cannot tell (no repository, a detached head), and the output then
+/// takes the generic route.
+pub fn resolve(pc: &PrCmd, cwd: &str, git: &dyn Git) -> Option<Where> {
+    let local = git.local(cwd);
+    let here = local.as_ref().and_then(|l| remote_repo(&l.remotes));
+    let repo = pc.repo.clone().or_else(|| here.clone())?;
+    let pr = match &pc.target {
+        Target::Number(n) => format!("{repo}#{n}"),
+        Target::Branch(b) => format!("{repo}@{b}"),
+        Target::Current => {
+            let b = local.as_ref().map(|l| l.branch.as_str()).unwrap_or("");
+            if b.is_empty() || b == "HEAD" {
+                return None;
+            }
+            format!("{repo}@{b}")
+        }
+    };
+    let key = if matches!(pc.sub, Sub::Diff { patch: true }) { format!("{pr} patch") } else { pr };
+    let (attributes, toplevel) = match (&local, here.as_deref() == Some(repo.as_str())) {
+        (Some(l), true) if !l.toplevel.is_empty() => (std::fs::read_to_string(Path::new(&l.toplevel).join(".gitattributes")).unwrap_or_default(), l.toplevel.clone()),
+        _ => (String::new(), String::new()),
+    };
+    Some(Where { key, attributes, toplevel })
+}
+
+// ---- splitting a diff -----------------------------------------------------
+
+/// One file of a diff.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileDiff {
+    /// The new path (the old one for a deletion).
+    pub path: String,
+    /// The old path, when it differs (a rename or copy).
+    pub old_path: String,
+    /// `M`, `A`, `D`, `R` or `C`.
+    pub status: char,
+    /// Added lines.
+    pub add: usize,
+    /// Removed lines.
+    pub del: usize,
+    /// Each hunk's first (its `@@` line) and last line, 1-based, inside the
+    /// file's part.
+    pub hunks: Vec<(usize, usize)>,
+    /// A binary file.
+    pub binary: bool,
+    /// A mode line (`old mode`, `new mode`).
+    pub mode: bool,
+}
+
+/// A byte range of a diff: a file, or the text between files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    /// First byte.
+    pub start: usize,
+    /// One past the last byte.
+    pub end: usize,
+    /// The file, or `None` for other text.
+    pub file: Option<FileDiff>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum St {
+    Other,
+    Header,
+    Body,
+    Hunk(u64, u64),
+}
+
+/// `@@ -a[,b] +c[,d] @@`: the old and new line counts.
+fn hunk_counts(l: &str) -> Option<(u64, u64)> {
+    let rest = l.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let (new, _) = rest.split_once(" @@")?;
+    let count = |r: &str| -> Option<u64> {
+        match r.split_once(',') {
+            Some((a, b)) => {
+                a.parse::<u64>().ok()?;
+                b.parse().ok()
+            }
+            None => r.parse::<u64>().ok().map(|_| 1),
+        }
+    };
+    Some((count(old)?, count(new)?))
+}
+
+/// A `--patch` commit header line: `From <40 hex> <date>`.
+fn commit_line(l: &str) -> Option<&str> {
+    let rest = l.strip_prefix("From ")?;
+    let sha = rest.get(..40)?;
+    (sha.bytes().all(|b| b.is_ascii_hexdigit()) && rest[40..].starts_with(' ')).then_some(sha)
+}
+
+fn unquote(p: &str) -> String {
+    p.trim().trim_matches('"').to_string()
+}
+
+/// The new path of a `diff --git a/X b/Y` line.
+fn git_line_path(l: &str) -> String {
+    let rest = l.strip_prefix("diff --git ").unwrap_or(l);
+    // The same path on both sides (the usual case, spaces allowed).
+    if rest.len() >= 6 && (rest.len() - 5).is_multiple_of(2) {
+        let n = (rest.len() - 5) / 2;
+        if let (Some(a), Some(b)) = (rest.get(2..2 + n), rest.get(n + 5..)) {
+            if rest.starts_with("a/") && rest.get(2 + n..n + 5) == Some(" b/") && a == b {
+                return a.to_string();
+            }
+        }
+    }
+    if let Some(i) = rest.rfind(" \"b/") {
+        return unquote(&rest[i + 1..]).strip_prefix("b/").unwrap_or_default().to_string();
+    }
+    match rest.rfind(" b/") {
+        Some(i) => unquote(&rest[i + 3..]),
+        None => unquote(rest),
+    }
+}
+
+fn header_line(f: &mut FileDiff, l: &str) {
+    if l.starts_with("new file mode") {
+        f.status = 'A';
+    } else if l.starts_with("deleted file mode") {
+        f.status = 'D';
+    } else if let Some(p) = l.strip_prefix("rename from ") {
+        f.status = 'R';
+        f.old_path = unquote(p);
+    } else if let Some(p) = l.strip_prefix("rename to ") {
+        f.path = unquote(p);
+    } else if let Some(p) = l.strip_prefix("copy from ") {
+        f.status = 'C';
+        f.old_path = unquote(p);
+    } else if let Some(p) = l.strip_prefix("copy to ") {
+        f.path = unquote(p);
+    } else if l.starts_with("old mode") || l.starts_with("new mode") {
+        f.mode = true;
+    } else if l.starts_with("Binary files ") || l == "GIT binary patch" {
+        f.binary = true;
+    } else if let Some(p) = l.strip_prefix("+++ ") {
+        let p = unquote(p);
+        if p != "/dev/null" {
+            f.path = p.strip_prefix("b/").unwrap_or(&p).to_string();
+        }
+    }
+}
+
+/// Splits a diff into parts that cover it exactly, in order: each file from
+/// its `diff --git` line through its last hunk line, and the text between.
+/// A hunk's extent comes from its `@@` counts, so a removed line that looks
+/// like a header (`-- `, `diff --git`) stays in its hunk.
+pub fn split_diff(text: &str) -> Vec<Part> {
+    let mut parts: Vec<Part> = Vec::new();
+    let mut st = St::Other;
+    let mut pos = 0;
+    let mut line = 0usize; // lines of the current part so far
+    for raw in text.split_inclusive('\n') {
+        let start = pos;
+        pos += raw.len();
+        let l = raw.strip_suffix('\n').unwrap_or(raw);
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        if let St::Hunk(o, n) = st {
+            let next = match l.as_bytes().first() {
+                Some(b' ') | None => o.checked_sub(1).zip(n.checked_sub(1)),
+                Some(b'-') => o.checked_sub(1).map(|o| (o, n)),
+                Some(b'+') => n.checked_sub(1).map(|n| (o, n)),
+                Some(b'\\') => Some((o, n)),
+                _ => None,
+            };
+            if let (Some((o, n)), Some(p)) = (next, parts.last_mut()) {
+                p.end = pos;
+                line += 1;
+                if let Some(f) = p.file.as_mut() {
+                    match l.as_bytes().first() {
+                        Some(b'-') => f.del += 1,
+                        Some(b'+') => f.add += 1,
+                        _ => {}
+                    }
+                    if let Some(h) = f.hunks.last_mut() {
+                        h.1 = line;
+                    }
+                }
+                st = if o == 0 && n == 0 { St::Body } else { St::Hunk(o, n) };
+                continue;
+            }
+            st = St::Body;
+        }
+        if l.starts_with("diff --git ") {
+            let f = FileDiff { path: git_line_path(l), status: 'M', ..FileDiff::default() };
+            parts.push(Part { start, end: pos, file: Some(f) });
+            line = 1;
+            st = St::Header;
+            continue;
+        }
+        let in_file = matches!(st, St::Header | St::Body) && commit_line(l).is_none();
+        if in_file {
+            if let Some((o, n)) = l.starts_with("@@ ").then(|| hunk_counts(l)).flatten() {
+                if let Some(p) = parts.last_mut() {
+                    p.end = pos;
+                    line += 1;
+                    if let Some(f) = p.file.as_mut() {
+                        f.hunks.push((line, line));
+                    }
+                }
+                st = if o == 0 && n == 0 { St::Body } else { St::Hunk(o, n) };
+                continue;
+            }
+            let body_mark = st == St::Body && l.starts_with('\\');
+            if body_mark || (st == St::Header && l != "-- ") {
+                if let Some(Part { end, file: Some(f), .. }) = parts.last_mut() {
+                    *end = pos;
+                    line += 1;
+                    if body_mark {
+                        if let Some(h) = f.hunks.last_mut() {
+                            h.1 = line;
+                        }
+                    } else {
+                        header_line(f, l);
+                    }
+                    continue;
+                }
+            }
+        }
+        match parts.last_mut() {
+            Some(p) if p.file.is_none() && commit_line(l).is_none() => p.end = pos,
+            _ => parts.push(Part { start, end: pos, file: None }),
+        }
+        st = St::Other;
+    }
+    parts
+}
+
+/// SHA-256 of a file part with its `index` lines dropped and its `@@`
+/// offsets blanked: equal for a patch a rebase only moved.
+pub fn norm_hash(part: &str, f: &FileDiff) -> String {
+    let first_hunk = f.hunks.first().map_or(usize::MAX, |h| h.0);
+    let starts: std::collections::HashSet<usize> = f.hunks.iter().map(|h| h.0).collect();
+    let mut s = String::with_capacity(part.len());
+    for (i, raw) in part.split_inclusive('\n').enumerate() {
+        let n = i + 1;
+        if n < first_hunk && raw.starts_with("index ") {
+            continue;
+        }
+        if starts.contains(&n) {
+            let after = raw.get(2..).and_then(|r| r.find("@@").map(|j| &r[j + 2..])).unwrap_or("");
+            s.push_str("@@");
+            s.push_str(after);
+            continue;
+        }
+        s.push_str(raw);
+    }
+    crate::sha256::hex(s.as_bytes())
+}
+
+// ---- diff-native slices ---------------------------------------------------
+
+/// The header lines a file's row reproduces, as `git diff` prints them:
+/// `diff --git`, `---` and `+++`. A stored line is hidden from a file read
+/// only when it equals one of these byte for byte (so never a CRLF line or a
+/// quoted path).
+pub fn row_header(f: &FileDiff) -> [String; 3] {
+    let old = if f.old_path.is_empty() { f.path.as_str() } else { f.old_path.as_str() };
+    let minus = if f.status == 'A' { "--- /dev/null\n".to_string() } else { format!("--- a/{old}\n") };
+    let plus = if f.status == 'D' { "+++ /dev/null\n".to_string() } else { format!("+++ b/{}\n", f.path) };
+    [format!("diff --git a/{old} b/{}\n", f.path), minus, plus]
+}
+
+/// How a file part is read: `View(k)` is the default read from line `k`
+/// (the presentation levers on, paged on the bytes shown), `Raw(a, b)` lines
+/// `a..=b` as stored (a hunk read, `--lines`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSel {
+    /// The default read, from this 1-based line of the part.
+    View(usize),
+    /// Lines `a..=b` of the part, as stored.
+    Raw(usize, usize),
+}
+
+/// One page of a PR diff file part, diff-native: no line numbers. A page
+/// breaks only between hunks, unless one hunk alone is over `cap`; a cut
+/// page ends with one `next page: atlas slice ID ...` line, which is not
+/// counted in the cap.
+///
+/// * [`FileSel::Raw`] gives the stored bytes, and a cut page continues with
+///   `--lines K-B`.
+/// * [`FileSel::View`] applies the [`Levers`] ([`view`]) and, when
+///   `row_backed` (the handle is named only by a row that reproduces them),
+///   leaves out the header lines; a cut page continues with `--page K`.
+///
+/// `None` when `text` is not one file of a diff.
+pub fn file_slice(id: &str, text: &str, sel: FileSel, cap: usize, row_backed: bool) -> Option<String> {
+    let parts = split_diff(text);
+    let [Part { start: 0, end, file: Some(f) }] = parts.as_slice() else { return None };
+    if *end != text.len() {
+        return None;
+    }
+    let (a, b) = match sel {
+        FileSel::Raw(a, b) => (a, b),
+        FileSel::View(k) => {
+            let mut units = view(text, f, levers(), cap);
+            if !row_backed {
+                // No row gives the header back: show it as stored.
+                let lines: Vec<&str> = text.split_inclusive('\n').collect();
+                for p in units.iter_mut().flatten().filter(|p| p.text.is_empty()) {
+                    p.text = lines[p.first - 1].to_string();
+                }
+            }
+            return page_view(id, &units, k, cap);
+        }
+    };
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0;
+    for l in text.split_inclusive('\n') {
+        lines.push((pos, pos + l.len()));
+        pos += l.len();
+    }
+    let n = lines.len();
+    let (a, b) = (a.max(1), b.min(n));
+    if a > b {
+        return None;
+    }
+    let size = |k: usize| lines[k - 1].1 - lines[k - 1].0;
+    // Where a page may break: before each hunk.
+    let unit_end = |k: usize| f.hunks.iter().map(|h| h.0).find(|&s| s > k).map_or(b, |s| (s - 1).min(b));
+    let mut out = String::new();
+    let mut k = a;
+    while k <= b {
+        let e = unit_end(k);
+        let bytes: usize = (k..=e).map(size).sum();
+        if out.len() + bytes <= cap {
+            out.push_str(&text[lines[k - 1].0..lines[e - 1].1]);
+            k = e + 1;
+            continue;
+        }
+        if out.is_empty() || bytes > cap {
+            // One hunk over the cap is cut between lines anyway: it starts on
+            // this page, with at least one line on it.
+            while k <= e && (out.is_empty() || out.len() + size(k) <= cap) {
+                out.push_str(&text[lines[k - 1].0..lines[k - 1].1]);
+                k += 1;
+            }
+        }
+        break;
+    }
+    if k <= b {
+        out.push_str(&format!("next page: atlas slice {id} --lines {k}-{b}\n"));
+    }
+    Some(out)
+}
+
+/// Pages a default read from line `from`: whole units (the header, then
+/// each hunk) while they fit, a unit over the cap alone cut between pieces.
+fn page_view(id: &str, units: &[Vec<Piece>], from: usize, cap: usize) -> Option<String> {
+    let pieces: Vec<Vec<&Piece>> = units.iter().map(|u| u.iter().filter(|p| p.last >= from).collect::<Vec<_>>()).filter(|u| !u.is_empty()).collect();
+    if pieces.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut next: Option<usize> = None;
+    'units: for u in &pieces {
+        let bytes: usize = u.iter().map(|p| p.text.len()).sum();
+        if out.len() + bytes <= cap {
+            for p in u {
+                out.push_str(&p.text);
+            }
+            continue;
+        }
+        if out.is_empty() || bytes > cap {
+            for p in u {
+                if !out.is_empty() && out.len() + p.text.len() > cap {
+                    next = Some(p.first);
+                    break 'units;
+                }
+                out.push_str(&p.text);
+            }
+            continue;
+        }
+        next = Some(u[0].first);
+        break;
+    }
+    if let Some(k) = next {
+        out.push_str(&format!("next page: atlas slice {id} --page {k}\n"));
+    }
+    Some(out)
+}
+
+// ---- presentation levers --------------------------------------------------
+
+/// What a default file read does beyond the stored bytes, and whether a
+/// deleted file is a row only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Levers {
+    /// WD: a paired `-`/`+` edit shown once as a word diff ([`wd_line`]).
+    pub wd: bool,
+    /// C1: context more than one line from a change hidden behind a marker
+    /// that names its hunk.
+    pub c1: bool,
+    /// DEL: a deleted file is a `deleted` row; its body stays behind its
+    /// handle.
+    pub del: bool,
+}
+
+/// The shipped levers: WD and DEL on, C1 off (it hides lines a reader can
+/// only get back by a second slice, and has no fidelity eval yet). In a
+/// `dev` build `ATLAS_PRDIGEST_LEVERS` (a comma list of `wd`, `c1`, `del`)
+/// names the ones to keep instead, for measurement only; no configuration
+/// key reaches C1.
+pub fn levers() -> Levers {
+    #[cfg(feature = "dev")]
+    if let Ok(v) = std::env::var("ATLAS_PRDIGEST_LEVERS") {
+        let on = |k: &str| v.split(',').any(|w| w.trim() == k);
+        return Levers { wd: on("wd"), c1: on("c1"), del: on("del") };
+    }
+    SHIPPED
+}
+
+/// What [`levers`] returns outside measurement.
+pub const SHIPPED: Levers = Levers { wd: true, c1: false, del: true };
+
+/// Lines of the default read standing for original lines `first..=last`
+/// (1-based in the part).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Piece {
+    /// The first original line.
+    pub first: usize,
+    /// The last original line.
+    pub last: usize,
+    /// What is shown for them (empty for a header line the row reproduces).
+    pub text: String,
+    /// Whether the original lines are behind a C1 marker.
+    pub hidden: bool,
+}
+
+/// Similarity at or over which a paired line is shown as a word diff.
+const WD_SIMILARITY: f64 = 0.6;
+/// The longest stored line (with its `-`/`+` and newline, in bytes) a word
+/// diff pairs; a longer one is shown as stored.
+pub const WD_MAX_LINE: usize = 2000;
+/// The most steps the word diff's matcher takes on one pair before the pair
+/// is shown as stored ([`matching_blocks_within`]).
+pub const WD_MAX_STEPS: usize = 1 << 22;
+/// The most steps the word diff's matcher takes over all pairs of one read
+/// ([`view`]); once it is spent, every later pair is shown as stored, so a
+/// crafted diff of many costly pairs cannot stall a read.
+pub const WD_READ_STEPS: usize = 1 << 24;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cls {
+    Ctx,
+    Del,
+    Add,
+    Other,
+}
+
+fn cls(l: &str) -> Cls {
+    match l.as_bytes().first() {
+        Some(b' ') => Cls::Ctx,
+        Some(b'-') => Cls::Del,
+        Some(b'+') => Cls::Add,
+        Some(b'\n') | Some(b'\r') | None => Cls::Ctx,
+        _ => Cls::Other,
+    }
+}
+
+/// The default read of a file part as units (its header, then each hunk)
+/// of pieces covering every line in order.
+///
+/// * Header lines the row reproduces ([`row_header`]) show as nothing.
+/// * C1: a run of context lines each more than one line from the nearest
+///   change of its hunk is one marker line, `= N hidden --lines A-B`, where
+///   N is the exact count and `A-B` the hidden lines themselves (one slice
+///   of the file's handle holds them all; a whole hunk's slice can page).
+///   A run is hidden only when the marker is shorter than the run.
+/// * WD: in a change block (a run of `-` lines then a run of `+` lines,
+///   with no other change line on either side), the k-th `-` and k-th `+`
+///   lines are one [`wd_line`] when their [`similarity`] is at least 0.6.
+///   A line with no newline, one followed by `\ No newline at end of
+///   file`, or one over [`WD_MAX_LINE`] bytes, is never paired. A block with
+///   a word diff shows, position by position, the word diff or the `-` line
+///   then the `+` line; one over `cap` is shown as stored.
+pub fn view(text: &str, f: &FileDiff, lv: Levers, cap: usize) -> Vec<Vec<Piece>> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let n = lines.len();
+    let hide = row_header(f);
+    let header_end = f.hunks.first().map_or(n, |h| h.0 - 1);
+    let mut units: Vec<Vec<Piece>> = Vec::new();
+    let mut budget = WD_READ_STEPS;
+    let header: Vec<Piece> = (1..=header_end)
+        .map(|k| {
+            let l = lines[k - 1];
+            let t = if hide.iter().any(|x| x.as_str() == l) { String::new() } else { l.to_string() };
+            Piece { first: k, last: k, text: t, hidden: false }
+        })
+        .collect();
+    if !header.is_empty() {
+        units.push(header);
+    }
+    for (i, &(s, e)) in f.hunks.iter().enumerate() {
+        let unit_end = f.hunks.get(i + 1).map_or(n, |h| h.0 - 1);
+        let mut u = vec![Piece { first: s, last: s, text: lines[s - 1].to_string(), hidden: false }];
+        // The hunk's body: lines s+1..=e (1-based), as indexes from 0.
+        let body: Vec<&str> = lines[s..e.min(n)].to_vec();
+        let c: Vec<Cls> = body.iter().map(|l| cls(l)).collect();
+        let changes: Vec<usize> = (0..body.len()).filter(|&j| matches!(c[j], Cls::Del | Cls::Add)).collect();
+        let mut hidden = vec![false; body.len()];
+        if lv.c1 && !changes.is_empty() {
+            for j in 0..body.len() {
+                if c[j] == Cls::Ctx {
+                    let d = changes.iter().map(|&x| x.abs_diff(j)).min().unwrap_or(usize::MAX);
+                    hidden[j] = d > 1;
+                }
+            }
+        }
+        let mut j = 0;
+        while j < body.len() {
+            let at = s + 1 + j;
+            if hidden[j] {
+                let mut k = j;
+                while k < body.len() && hidden[k] {
+                    k += 1;
+                }
+                let run: usize = body[j..k].iter().map(|l| l.len()).sum();
+                let marker = format!("= {} hidden --lines {at}-{}\n", k - j, s + k);
+                if marker.len() < run {
+                    u.push(Piece { first: at, last: s + k, text: marker, hidden: true });
+                } else {
+                    for (q, l) in body[j..k].iter().enumerate() {
+                        u.push(Piece { first: at + q, last: at + q, text: l.to_string(), hidden: false });
+                    }
+                }
+                j = k;
+                continue;
+            }
+            if lv.wd && c[j] == Cls::Del && (j == 0 || c[j - 1] != Cls::Add) {
+                let m = (j..body.len()).take_while(|&k| c[k] == Cls::Del).count();
+                let nn = (j + m..body.len()).take_while(|&k| c[k] == Cls::Add).count();
+                let end = j + m + nn;
+                let closed = end == body.len() || c[end] != Cls::Del;
+                if nn > 0 && closed {
+                    let marked = body.get(end).is_some_and(|l| l.starts_with('\\'));
+                    // A word-diff line is at least as long as the longer of its
+                    // two stored lines, and an unpaired position shows both, so
+                    // this is a floor on the block's length: over `cap`, the
+                    // block would be shown as stored anyway. Checked first, so
+                    // a huge block is never word-diffed.
+                    let floor: usize = (0..m.max(nn)).map(|q| body[j..j + m].get(q).map_or(0, |l| l.len()).max(body[j + m..end].get(q).map_or(0, |l| l.len()))).sum();
+                    if floor <= cap {
+                        if let Some(t) = wd_block(&body[j..j + m], &body[j + m..end], marked, &mut budget).filter(|t| t.len() <= cap) {
+                            u.push(Piece { first: at, last: s + end, text: t, hidden: false });
+                            j = end;
+                            continue;
+                        }
+                    }
+                }
+                for (q, l) in body[j..end].iter().enumerate() {
+                    u.push(Piece { first: at + q, last: at + q, text: l.to_string(), hidden: false });
+                }
+                j = end;
+                continue;
+            }
+            u.push(Piece { first: at, last: at, text: body[j].to_string(), hidden: false });
+            j += 1;
+        }
+        // Lines past the hunk before the next one (none in a split part).
+        for k in e + 1..=unit_end {
+            u.push(Piece { first: k, last: k, text: lines[k - 1].to_string(), hidden: false });
+        }
+        units.push(u);
+    }
+    units
+}
+
+/// Whether each line of a file part (1-based, index 0 unused) is in its
+/// default read under `lv`, or behind a C1 marker. `None` when `text` is not
+/// one file of a diff.
+pub fn shown_lines(text: &str, lv: Levers, cap: usize) -> Option<Vec<bool>> {
+    let parts = split_diff(text);
+    let [Part { start: 0, file: Some(f), .. }] = parts.as_slice() else { return None };
+    let n = text.split_inclusive('\n').count();
+    let mut v = vec![true; n + 1];
+    for p in view(text, f, lv, cap).iter().flatten().filter(|p| p.hidden) {
+        v[p.first..=p.last].fill(false);
+    }
+    Some(v)
+}
+
+/// A change block with at least one pair shown as a word diff, else `None`.
+/// Its pairs spend the read's `budget` of matcher steps.
+fn wd_block(dels: &[&str], adds: &[&str], marked: bool, budget: &mut usize) -> Option<String> {
+    let pairs = dels.len().min(adds.len());
+    let mut wd: Vec<Option<String>> = vec![None; pairs];
+    for (i, w) in wd.iter_mut().enumerate() {
+        let (a, b) = (dels[i], adds[i]);
+        let last_add = i + 1 == adds.len();
+        if !a.ends_with('\n') || !b.ends_with('\n') || (marked && last_add) {
+            continue;
+        }
+        // The word diff is quadratic in tokens or worse: a long line is shown
+        // as stored.
+        if a.len() > WD_MAX_LINE || b.len() > WD_MAX_LINE {
+            continue;
+        }
+        *w = wd_line_within(&a[1..a.len() - 1], &b[1..b.len() - 1], budget);
+    }
+    if wd.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut out = String::new();
+    for i in 0..dels.len().max(adds.len()) {
+        if let Some(Some(w)) = wd.get(i) {
+            out.push_str(w);
+            continue;
+        }
+        if let Some(a) = dels.get(i) {
+            out.push_str(a);
+        }
+        if let Some(b) = adds.get(i) {
+            out.push_str(b);
+        }
+    }
+    Some(out)
+}
+
+/// Word tokens: a run of word characters, a run of whitespace, or one other
+/// character (Python's `\w+|\s+|[^\w\s]`).
+fn tokens(s: &str) -> Vec<&str> {
+    let kind = |c: char| if c.is_alphanumeric() || c == '_' { 0 } else if c.is_whitespace() { 1 } else { 2 };
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut prev: Option<u8> = None;
+    for (i, c) in s.char_indices() {
+        let k = kind(c);
+        if prev.is_some() && (k == 2 || prev != Some(k)) {
+            out.push(&s[start..i]);
+            start = i;
+        }
+        prev = Some(k);
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+/// The matching blocks `(i, j, size)` of two token lists, as Python's
+/// `difflib.SequenceMatcher(None, a, b, autojunk=False)` finds them
+/// (Ratcliff-Obershelp: the longest match, earliest in `a` then in `b`,
+/// then the same on each side), adjacent blocks merged.
+fn matching_blocks(a: &[&str], b: &[&str]) -> Vec<(usize, usize, usize)> {
+    let mut budget = usize::MAX;
+    matching_blocks_within(a, b, &mut budget).unwrap_or_default()
+}
+
+/// [`matching_blocks`], or `None` once its matcher has taken more than
+/// `budget` steps (a pathological pair, such as two long runs of one
+/// punctuation token, approaches cubic time). The steps taken come off
+/// `budget`, which is 0 after a `None`.
+fn matching_blocks_within(a: &[&str], b: &[&str], budget: &mut usize) -> Option<Vec<(usize, usize, usize)>> {
+    let mut steps = 0usize;
+    let r = blocks_within(a, b, *budget, &mut steps);
+    *budget = budget.saturating_sub(steps);
+    r
+}
+
+/// [`matching_blocks_within`]'s matcher, counting its steps in `steps`.
+fn blocks_within(a: &[&str], b: &[&str], budget: usize, steps: &mut usize) -> Option<Vec<(usize, usize, usize)>> {
+    let mut b2j: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (j, t) in b.iter().enumerate() {
+        b2j.entry(t).or_default().push(j);
+    }
+    let mut longest = |alo: usize, ahi: usize, blo: usize, bhi: usize| -> Option<(usize, usize, usize)> {
+        let (mut bi, mut bj, mut bs) = (alo, blo, 0);
+        let mut j2len: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for (i, t) in a.iter().enumerate().take(ahi).skip(alo) {
+            *steps += 1;
+            if *steps > budget {
+                return None;
+            }
+            let mut next: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for &j in b2j.get(t).map_or(&[][..], |v| v.as_slice()) {
+                *steps += 1;
+                if *steps > budget {
+                    return None;
+                }
+                if j < blo {
+                    continue;
+                }
+                if j >= bhi {
+                    break;
+                }
+                let k = j.checked_sub(1).and_then(|p| j2len.get(&p)).copied().unwrap_or(0) + 1;
+                next.insert(j, k);
+                if k > bs {
+                    (bi, bj, bs) = (i + 1 - k, j + 1 - k, k);
+                }
+            }
+            j2len = next;
+        }
+        Some((bi, bj, bs))
+    };
+    let mut queue = vec![(0, a.len(), 0, b.len())];
+    let mut blocks = Vec::new();
+    while let Some((alo, ahi, blo, bhi)) = queue.pop() {
+        let (i, j, k) = longest(alo, ahi, blo, bhi)?;
+        if k > 0 {
+            blocks.push((i, j, k));
+            if alo < i && blo < j {
+                queue.push((alo, i, blo, j));
+            }
+            if i + k < ahi && j + k < bhi {
+                queue.push((i + k, ahi, j + k, bhi));
+            }
+        }
+    }
+    blocks.sort_unstable();
+    let mut merged: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, j, k) in blocks {
+        match merged.last_mut() {
+            Some(m) if m.0 + m.2 == i && m.1 + m.2 == j => m.2 += k,
+            _ => merged.push((i, j, k)),
+        }
+    }
+    Some(merged)
+}
+
+/// `difflib`'s ratio over word tokens: twice the matched tokens over all
+/// tokens (1 for two empty lines).
+pub fn similarity(a: &str, b: &str) -> f64 {
+    let (ta, tb) = (tokens(a), tokens(b));
+    if ta.is_empty() && tb.is_empty() {
+        return 1.0;
+    }
+    let m: usize = matching_blocks(&ta, &tb).iter().map(|x| x.2).sum();
+    2.0 * m as f64 / (ta.len() + tb.len()) as f64
+}
+
+/// Escapes text of a word diff: `\` and `~` always, and the `[` of `[-`,
+/// the `-` of `-]`, the `{` of `{+` and the `+` of `+}`.
+fn wd_escape(out: &mut String, s: &str) {
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        let next = it.peek().copied();
+        if matches!((c, next), ('\\', _) | ('~', _) | ('[', Some('-')) | ('-', Some(']')) | ('{', Some('+')) | ('+', Some('}'))) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+}
+
+/// One line for a paired edit, `~` then the old and new contents (without
+/// their `-`/`+` and newline) as common text, `[-deleted-]` and
+/// `{+added+}`, and a newline; `None` under [`WD_SIMILARITY`], or past
+/// [`WD_MAX_STEPS`]. A CR is kept as written.
+pub fn wd_line(old: &str, new: &str) -> Option<String> {
+    let mut budget = usize::MAX;
+    wd_line_within(old, new, &mut budget)
+}
+
+/// [`wd_line`], its matcher spending at most [`WD_MAX_STEPS`] of `budget`;
+/// `None` once that is spent.
+fn wd_line_within(old: &str, new: &str, budget: &mut usize) -> Option<String> {
+    // A spent budget skips the pair's tokenising and setup too.
+    if *budget == 0 {
+        return None;
+    }
+    let (ta, tb) = (tokens(old), tokens(new));
+    let limit = WD_MAX_STEPS.min(*budget);
+    let mut pair = limit;
+    let blocks = matching_blocks_within(&ta, &tb, &mut pair);
+    *budget -= limit - pair;
+    let blocks = blocks?;
+    let m: usize = blocks.iter().map(|x| x.2).sum();
+    let total = ta.len() + tb.len();
+    if total == 0 || (2 * m) as f64 / (total as f64) < WD_SIMILARITY {
+        return None;
+    }
+    let mut out = String::from("~");
+    let (mut i, mut j) = (0, 0);
+    for (bi, bj, k) in blocks.into_iter().chain(std::iter::once((ta.len(), tb.len(), 0))) {
+        if i < bi {
+            out.push_str("[-");
+            wd_escape(&mut out, &ta[i..bi].concat());
+            out.push_str("-]");
+        }
+        if j < bj {
+            out.push_str("{+");
+            wd_escape(&mut out, &tb[j..bj].concat());
+            out.push_str("+}");
+        }
+        wd_escape(&mut out, &ta[bi..bi + k].concat());
+        (i, j) = (bi + k, bj + k);
+    }
+    out.push('\n');
+    Some(out)
+}
+
+/// The old and new lines (with `-`/`+` and a newline) a [`wd_line`] stands
+/// for, or `None` when `line` is not one.
+pub fn wd_decode(line: &str) -> Option<(String, String)> {
+    let body = line.strip_prefix('~')?.strip_suffix('\n')?;
+    let (mut old, mut new) = (String::from("-"), String::from("+"));
+    let mut mode = 0u8; // 0 common, 1 deleted, 2 added
+    let mut it = body.chars().peekable();
+    while let Some(c) = it.next() {
+        let next = it.peek().copied();
+        if c == '\\' {
+            let lit = it.next()?;
+            if mode != 2 {
+                old.push(lit);
+            }
+            if mode != 1 {
+                new.push(lit);
+            }
+            continue;
+        }
+        match (mode, c, next) {
+            (0, '[', Some('-')) => {
+                it.next();
+                mode = 1;
+            }
+            (0, '{', Some('+')) => {
+                it.next();
+                mode = 2;
+            }
+            (1, '-', Some(']')) | (2, '+', Some('}')) => {
+                it.next();
+                mode = 0;
+            }
+            (0, _, _) => {
+                old.push(c);
+                new.push(c);
+            }
+            (1, _, _) => old.push(c),
+            _ => new.push(c),
+        }
+    }
+    if mode != 0 {
+        return None;
+    }
+    old.push('\n');
+    new.push('\n');
+    Some((old, new))
+}
+
+// ---- collapsing -----------------------------------------------------------
+
+/// Why a file is one row without hunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collapse {
+    /// A lock file.
+    Lock,
+    /// A generated file.
+    Generated,
+    /// Part of a vendored tree.
+    Vendored,
+    /// A deleted file: its body sits behind its handle (never from
+    /// [`collapse`]).
+    Deleted,
+}
+
+/// `.gitattributes` lines that set or unset `linguist-generated` or
+/// `linguist-vendored`: (pattern, generated, vendored), in file order.
+pub fn attributes(text: &str) -> Vec<(String, Option<bool>, Option<bool>)> {
+    let mut v = Vec::new();
+    for l in text.lines() {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let mut w = l.split_whitespace();
+        let Some(pat) = w.next() else { continue };
+        let (mut g, mut vend) = (None, None);
+        for a in w {
+            // `-attr` unsets, `attr` and `attr=true` set, `attr=false` unsets.
+            let (name, val) = match a.strip_prefix('-') {
+                Some(r) => (r, false),
+                None => match a.split_once('=') {
+                    Some((n, v)) => (n, !matches!(v, "false" | "0")),
+                    None => (a, true),
+                },
+            };
+            match name {
+                "linguist-generated" => g = Some(val),
+                "linguist-vendored" => vend = Some(val),
+                _ => {}
+            }
+        }
+        if g.is_some() || vend.is_some() {
+            v.push((pat.trim_start_matches('/').to_string(), g, vend));
+        }
+    }
+    v
+}
+
+fn attr_match(pat: &str, path: &str) -> bool {
+    let pat = pat.strip_suffix("/**").map(|p| format!("{p}/**")).unwrap_or_else(|| pat.to_string());
+    crate::glob::matches(&pat, path)
+}
+
+/// The vendored tree a path is in: the path through its vendored folder.
+fn vendor_root(path: &str) -> Option<String> {
+    let comps: Vec<&str> = path.split('/').collect();
+    let i = comps.iter().take(comps.len().saturating_sub(1)).position(|c| VENDOR_DIRS.contains(c))?;
+    Some(format!("{}/", comps[..=i].join("/")))
+}
+
+/// The first [`MARK_LINES`] lines of `path` under `toplevel` (the working
+/// tree), or empty when there is no toplevel, the path leaves it, or it is
+/// not a readable regular file. Read only for a generated marker.
+pub fn file_head(toplevel: &str, path: &str) -> String {
+    use std::io::{BufRead, Read};
+    let rel = Path::new(path);
+    if toplevel.is_empty() || path.is_empty() || !rel.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return String::new();
+    }
+    let full = Path::new(toplevel).join(rel);
+    // A regular file only: a symlink to a device or a pipe is never opened.
+    if !std::fs::metadata(&full).is_ok_and(|m| m.is_file()) {
+        return String::new();
+    }
+    let Ok(f) = std::fs::File::open(full) else { return String::new() };
+    let mut r = std::io::BufReader::new(f.take(64 * 1024));
+    let mut out = Vec::new();
+    for _ in 0..MARK_LINES {
+        match r.read_until(b'\n', &mut out) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The `linguist-generated` and `linguist-vendored` values the attributes
+/// give a path (a later line wins).
+fn attrs_for(path: &str, attrs: &[(String, Option<bool>, Option<bool>)]) -> (Option<bool>, Option<bool>) {
+    let (mut gen, mut vend) = (None, None);
+    for (p, g, v) in attrs {
+        if attr_match(p, path) {
+            gen = g.or(gen);
+            vend = v.or(vend);
+        }
+    }
+    (gen, vend)
+}
+
+/// Whether an added line among the file's first [`MARK_LINES`] lines, as
+/// the PR leaves it (new-side line numbers from each `@@` header), holds a
+/// generated marker. An added marker further down does not count.
+fn added_head_marker(part: &str) -> bool {
+    let new_start = |l: &str| -> Option<u64> {
+        let (_, rest) = l.strip_prefix("@@ -")?.split_once(" +")?;
+        rest.split_once(" @@")?.0.split(',').next()?.parse().ok()
+    };
+    // The new-side line the next body line has, inside a hunk.
+    let mut at: Option<u64> = None;
+    for l in part.lines() {
+        if l.starts_with("@@ ") {
+            at = new_start(l);
+            continue;
+        }
+        let Some(n) = at else { continue };
+        match l.as_bytes().first() {
+            Some(b'-') | Some(b'\\') => {}
+            Some(b'+') => {
+                if n <= MARK_LINES as u64 && marker(l) {
+                    return true;
+                }
+                at = Some(n + 1);
+            }
+            _ => at = Some(n + 1),
+        }
+    }
+    false
+}
+
+/// Whether the part removes a marker line among the file's first
+/// [`MARK_LINES`] lines (old-side line numbers) and adds no marker line: the
+/// PR takes the marker out, so the working tree's head is not asked.
+fn removes_head_marker(part: &str) -> bool {
+    let old_start = |l: &str| -> Option<u64> { l.strip_prefix("@@ -")?.split_once(' ')?.0.split(',').next()?.parse().ok() };
+    let (mut removed, mut added) = (false, false);
+    // The old-side line the next body line has, inside a hunk.
+    let mut at: Option<u64> = None;
+    for l in part.lines() {
+        if l.starts_with("@@ ") {
+            at = old_start(l);
+            continue;
+        }
+        let Some(n) = at else { continue };
+        match l.as_bytes().first() {
+            Some(b'+') => added |= marker(l),
+            Some(b'\\') => {}
+            c => {
+                removed |= c == Some(&b'-') && n <= MARK_LINES as u64 && marker(l);
+                at = Some(n + 1);
+            }
+        }
+    }
+    removed && !added
+}
+
+/// Which rule makes a file generated, when one does: `attribute`
+/// (`linguist-generated`), `name` ([`GENERATED_NAMES`]), `added marker` (an
+/// added line among its first lines) or `head marker` (the working tree's
+/// first lines, [`file_head`], unless the PR removes a marker there and adds
+/// none). An attribute that unsets it wins.
+pub fn generated_rule(path: &str, part: &str, attrs: &[(String, Option<bool>, Option<bool>)], head: &str) -> Option<&'static str> {
+    generated_rule_with(path, part, attrs, || head.to_string())
+}
+
+/// [`generated_rule`] with the head read only when the other rules leave it
+/// open.
+fn generated_rule_with(path: &str, part: &str, attrs: &[(String, Option<bool>, Option<bool>)], head: impl FnOnce() -> String) -> Option<&'static str> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match attrs_for(path, attrs).0 {
+        Some(true) => return Some("attribute"),
+        Some(false) => return None,
+        None => {}
+    }
+    if GENERATED_NAMES.iter().any(|g| crate::glob::matches(g, name)) {
+        return Some("name");
+    }
+    if added_head_marker(part) {
+        return Some("added marker");
+    }
+    if !removes_head_marker(part) && head().lines().take(MARK_LINES).any(marker) {
+        return Some("head marker");
+    }
+    None
+}
+
+/// Whether a file collapses, and the tree it collapses into (vendored).
+/// `head` is the file's first lines in the working tree ([`file_head`]): a
+/// generated marker there counts as one in its first added lines
+/// ([`generated_rule`]). Never [`Collapse::Deleted`]; that is [`diff`]'s, so
+/// a caller that wants only these skip kinds (the measurement's today arm)
+/// gets only them.
+pub fn collapse(path: &str, part: &str, attrs: &[(String, Option<bool>, Option<bool>)], head: &str) -> Option<(Collapse, String)> {
+    collapse_with(path, part, attrs, || head.to_string())
+}
+
+/// [`collapse`] with the head read only when every other rule leaves it
+/// open.
+fn collapse_with(path: &str, part: &str, attrs: &[(String, Option<bool>, Option<bool>)], head: impl FnOnce() -> String) -> Option<(Collapse, String)> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let (gen, vend) = attrs_for(path, attrs);
+    if LOCK_NAMES.contains(&name) && gen != Some(false) {
+        return Some((Collapse::Lock, path.to_string()));
+    }
+    if vend != Some(false) {
+        if let Some(root) = vendor_root(path) {
+            return Some((Collapse::Vendored, root));
+        }
+        if vend == Some(true) {
+            let dir = path.rsplit_once('/').map_or(String::new(), |(d, _)| format!("{d}/"));
+            return Some((Collapse::Vendored, dir));
+        }
+    }
+    generated_rule_with(path, part, attrs, head).map(|_| (Collapse::Generated, path.to_string()))
+}
+
+// ---- rounds ---------------------------------------------------------------
+//
+// The tables (`pr_rounds`, `pr_parts`, `pr_heads`) are created with the
+// handle store, in [`crate::store::HANDLES_SCHEMA`].
+
+/// One manifest row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The path (with ` (2)` for a second patch of it under `--patch`), or
+    /// empty for text between files.
+    pub path: String,
+    /// SHA-256 of the part.
+    pub exact: String,
+    /// [`norm_hash`], or the exact hash for text between files.
+    pub norm: String,
+    /// The part's handle.
+    pub handle: String,
+}
+
+/// A file's state against the earlier rounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Since {
+    /// The first round of this PR.
+    First,
+    /// The same patch since round N.
+    Unchanged(i64),
+    /// The same patch with other offsets since round N.
+    Moved(i64),
+    /// A different patch from the last round's.
+    Changed,
+    /// Not in the last round.
+    New,
+}
+
+/// A PR's handle parts, in order (tests and the exactness check).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`] from SQLite.
+pub fn manifest(conn: &Connection, pr: &str, round: i64) -> Result<Vec<Entry>> {
+    let mut st = conn.prepare("SELECT path, exact, norm, handle FROM pr_parts WHERE pr = ?1 AND round = ?2 ORDER BY seq")?;
+    let v = st
+        .query_map(params![pr, round], |r| Ok(Entry { path: r.get(0)?, exact: r.get(1)?, norm: r.get(2)?, handle: r.get(3)? }))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(v)
+}
+
+/// Records a round unless its output is the last round's, and returns it
+/// with the round before it (the one to compare with).
+fn record(conn: &Connection, pr: &str, whole_sha: &str, whole_id: &str, head: &str, rows: &[Entry]) -> Result<(i64, Option<i64>)> {
+    // The read is inside the write lock, so two hooks never take one round.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let res = (|| -> Result<(i64, Option<i64>)> {
+        // A store a newer atlas upgraded since this one opened it is not
+        // written (the refusal rolls back below).
+        crate::store::guard(conn)?;
+        let last: Option<(i64, String)> = conn
+            .query_row("SELECT round, whole FROM pr_rounds WHERE pr = ?1 ORDER BY round DESC LIMIT 1", [pr], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if let Some((n, w)) = &last {
+            if w == whole_sha {
+                let before: Option<i64> = conn.query_row("SELECT MAX(round) FROM pr_rounds WHERE pr = ?1 AND round < ?2", params![pr, n], |r| r.get(0))?;
+                return Ok((*n, before));
+            }
+        }
+        let round = last.as_ref().map_or(1, |l| l.0 + 1);
+        conn.execute(
+            "INSERT INTO pr_rounds(pr, round, whole, handle, head, created) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![pr, round, whole_sha, whole_id, head, crate::store::utc(std::time::SystemTime::now())],
+        )?;
+        for (i, e) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO pr_parts(pr, round, seq, path, exact, norm, handle) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![pr, round, i as i64, e.path, e.exact, e.norm, e.handle],
+            )?;
+        }
+        Ok((round, last.map(|l| l.0)))
+    })();
+    match res.and_then(|r| conn.execute_batch("COMMIT").map(|()| r).map_err(Into::into)) {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Each current file's state against the earlier rounds, and the files of
+/// the round before that are gone.
+fn compare(conn: &Connection, pr: &str, prior: Option<i64>, rows: &[Entry]) -> Result<(Vec<Since>, Vec<Entry>)> {
+    let Some(prior) = prior else { return Ok((rows.iter().map(|_| Since::First).collect(), Vec::new())) };
+    let mut hist: std::collections::HashMap<String, Vec<(i64, String, String)>> = std::collections::HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT round, path, exact, norm FROM pr_parts WHERE pr = ?1 AND round <= ?2 AND path != '' ORDER BY round DESC")?;
+        let it = st.query_map(params![pr, prior], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?;
+        for x in it {
+            let (round, path, exact, norm) = x?;
+            hist.entry(path).or_default().push((round, exact, norm));
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for e in rows {
+        if e.path.is_empty() {
+            out.push(Since::First);
+            continue;
+        }
+        let Some(h) = hist.get(&e.path).filter(|h| h.first().map(|x| x.0) == Some(prior)) else {
+            out.push(Since::New);
+            continue;
+        };
+        let since = |same: &dyn Fn(&(i64, String, String)) -> bool| {
+            let mut r = prior;
+            for x in h.iter() {
+                if x.0 != r || !same(x) {
+                    break;
+                }
+                r -= 1;
+            }
+            r + 1
+        };
+        out.push(if h[0].1 == e.exact {
+            Since::Unchanged(since(&|x| x.1 == e.exact))
+        } else if h[0].2 == e.norm {
+            Since::Moved(since(&|x| x.2 == e.norm))
+        } else {
+            Since::Changed
+        });
+    }
+    let now: std::collections::HashSet<&str> = rows.iter().map(|e| e.path.as_str()).collect();
+    let gone = manifest(conn, pr, prior)?.into_iter().filter(|e| !e.path.is_empty() && !now.contains(e.path.as_str())).collect();
+    Ok((out, gone))
+}
+
+// ---- hunk reuse across rounds ---------------------------------------------
+
+/// Each hunk of a file part: its key (SHA-256 with the `@@` offsets
+/// blanked, so a hunk a rebase or an earlier hunk moved is the same) and its
+/// byte range in the part.
+pub fn hunk_keys(part: &str, f: &FileDiff) -> Vec<(String, usize, usize)> {
+    let mut at = vec![0usize];
+    for l in part.split_inclusive('\n') {
+        at.push(at.last().copied().unwrap_or(0) + l.len());
+    }
+    f.hunks
+        .iter()
+        .filter(|h| h.1 < at.len())
+        .map(|&(a, b)| {
+            let body = &part[at[a - 1]..at[b]];
+            let (first, rest) = body.split_at(body.find('\n').map_or(body.len(), |i| i + 1));
+            let after = first.get(2..).and_then(|r| r.find("@@").map(|j| &r[j + 2..])).unwrap_or("");
+            (crate::sha256::hex(format!("@@{after}{rest}").as_bytes()), at[a - 1], at[b])
+        })
+        .collect()
+}
+
+/// A changed file's hunks against the earlier rounds of its path.
+struct Reuse {
+    /// The file's header and only the hunks no earlier round had.
+    fresh: String,
+    /// How many of its hunks an earlier round had.
+    seen: usize,
+    /// Hunks of the round before that this round no longer has.
+    gone: usize,
+}
+
+/// The hunks of `part` an earlier round of the same path already showed,
+/// or `None` when none did. Rounds whose handles were evicted count as
+/// having shown nothing.
+fn reuse(h: &Handles, pr: &str, prior: i64, path: &str, part: &str, f: &FileDiff) -> Result<Option<Reuse>> {
+    let ids: Vec<(i64, String)> = {
+        let mut st = h.conn().prepare("SELECT round, handle FROM pr_parts WHERE pr = ?1 AND round <= ?2 AND path = ?3")?;
+        let v = st.query_map(params![pr, prior, path], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        v
+    };
+    let (mut earlier, mut last) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    for (round, id) in ids {
+        let Ok((_, t)) = h.text(&id) else { continue };
+        for p in split_diff(&t) {
+            let Some(pf) = &p.file else { continue };
+            for (k, _, _) in hunk_keys(&t[p.start..p.end], pf) {
+                if round == prior {
+                    last.insert(k.clone());
+                }
+                earlier.insert(k);
+            }
+        }
+    }
+    let keys = hunk_keys(part, f);
+    let seen = keys.iter().filter(|k| earlier.contains(&k.0)).count();
+    if seen == 0 {
+        return Ok(None);
+    }
+    let now: std::collections::HashSet<&str> = keys.iter().map(|k| k.0.as_str()).collect();
+    let gone = last.iter().filter(|k| !now.contains(k.as_str())).count();
+    let mut fresh = part[..keys.first().map_or(part.len(), |k| k.1)].to_string();
+    for (k, a, b) in &keys {
+        if !earlier.contains(k) {
+            fresh.push_str(&part[*a..*b]);
+        }
+    }
+    Ok(Some(Reuse { fresh, seen, gone }))
+}
+
+// ---- the digests ----------------------------------------------------------
+
+/// A digested output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Digested {
+    /// What the model sees.
+    pub digest: String,
+    /// The round (diffs), else 0.
+    pub round: i64,
+    /// The whole output's handle.
+    pub whole: String,
+    /// The parts' handles in order. For a diff and a text view their texts
+    /// concatenated are the output; for `--json` they are the extracted
+    /// bodies, comments and reviews (the whole output is `whole`).
+    pub parts: Vec<String>,
+}
+
+fn clip(s: &str, n: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(n).collect();
+    t.push_str("...");
+    t
+}
+
+fn size(n: usize) -> String {
+    if n >= 10_240 {
+        format!("{} KB", n / 1024)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn part_meta(whole: &Meta, key: &str, what: &str) -> Meta {
+    Meta { kind: KIND.into(), label: format!("{key} {what}"), cmd: format!("pr {key} {what}"), cwd: whole.cwd.clone(), session: whole.session.clone(), ..Meta::default() }
+}
+
+/// The command a handle no row backs is stored under: a vendored tree, or an
+/// unchanged file that is not a plain modification ([`plain`]).
+const STORED_CMD: &str = "pr-stored ";
+
+/// [`part_meta`] for a handle whose default read keeps its header lines.
+fn stored_meta(whole: &Meta, key: &str, what: &str) -> Meta {
+    Meta { cmd: format!("{STORED_CMD}{key} {what}"), ..part_meta(whole, key, what) }
+}
+
+/// Whether a PR handle is row-backed: every digest line naming it gives back
+/// the header lines its default read leaves out ([`file_slice`]).
+pub fn row_backed(m: &Meta) -> bool {
+    !m.cmd.starts_with(STORED_CMD)
+}
+
+/// Whether a file's header lines are those of a plain modification, so an
+/// entry naming only its path gives them back.
+fn plain(f: &FileDiff) -> bool {
+    f.status == 'M' && (f.old_path.is_empty() || f.old_path == f.path)
+}
+
+/// The hunk ranges of a row: `@ 5-20 21-40`, at most [`MAX_HUNKS_SHOWN`].
+fn hunk_list(f: &FileDiff) -> String {
+    if f.hunks.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(" @");
+    for (a, b) in f.hunks.iter().take(MAX_HUNKS_SHOWN) {
+        s.push_str(&format!(" {a}-{b}"));
+    }
+    if f.hunks.len() > MAX_HUNKS_SHOWN {
+        s.push_str(&format!(" +{} more (--grep ^@@)", f.hunks.len() - MAX_HUNKS_SHOWN));
+    }
+    s
+}
+
+/// Stores a `gh pr diff` output as its parts, records the round, and
+/// returns the digest.
+///
+/// # Arguments
+///
+/// * `h` - the handle store.
+/// * `w` - the PR's key and the repository's `.gitattributes`.
+/// * `text` - the output as stored.
+/// * `whole` - the whole output's handle meta (the command's own).
+///
+/// # Errors
+///
+/// [`crate::Error::Io`] or [`crate::Error::Db`] from the store.
+pub fn diff(h: &mut Handles, w: &Where, text: &str, whole: &Meta) -> Result<Digested> {
+    let whole_row = h.put(text.as_bytes(), whole)?;
+    let parts = split_diff(text);
+    let attrs = attributes(&w.attributes);
+    let key = &w.key;
+    let mut rows: Vec<Entry> = Vec::with_capacity(parts.len());
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut head = String::new();
+    for p in &parts {
+        let t = &text[p.start..p.end];
+        let exact = crate::sha256::hex(t.as_bytes());
+        let (path, norm, what) = match &p.file {
+            Some(f) => {
+                let n = seen.entry(f.path.clone()).or_default();
+                *n += 1;
+                let path = if *n > 1 { format!("{} ({n})", f.path) } else { f.path.clone() };
+                (path.clone(), norm_hash(t, f), path)
+            }
+            None => {
+                if let Some(sha) = t.lines().rev().find_map(commit_line) {
+                    head = sha.to_string();
+                }
+                (String::new(), exact.clone(), "part".to_string())
+            }
+        };
+        let row = h.put(t.as_bytes(), &part_meta(whole, key, &what))?;
+        rows.push(Entry { path, exact, norm, handle: row.id });
+    }
+    let (round, prior) = record(h.conn(), key, &whole_row.sha, &whole_row.id, &head, &rows)?;
+    let (since, gone) = compare(h.conn(), key, prior, &rows)?;
+
+    // Collapsed files (and deleted ones, DEL), and one handle per vendored tree.
+    let lv = levers();
+    let mut trees: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut collapsed: Vec<Option<Collapse>> = vec![None; parts.len()];
+    for (i, p) in parts.iter().enumerate() {
+        let Some(f) = &p.file else { continue };
+        let deleted = || (lv.del && f.status == 'D' && !f.binary && !f.hunks.is_empty()).then(|| (Collapse::Deleted, f.path.clone()));
+        if let Some((c, root)) = collapse_with(&f.path, &text[p.start..p.end], &attrs, || file_head(&w.toplevel, &f.path)).or_else(deleted) {
+            collapsed[i] = Some(c);
+            if c == Collapse::Vendored {
+                match trees.iter_mut().find(|t| t.0 == root) {
+                    Some(t) => t.1.push(i),
+                    None => trees.push((root, vec![i])),
+                }
+            }
+        }
+    }
+
+    let files: Vec<(usize, &FileDiff)> = parts.iter().enumerate().filter_map(|(i, p)| p.file.as_ref().map(|f| (i, f))).collect();
+    let (add, del) = files.iter().fold((0, 0), |(a, d), (_, f)| (a + f.add, d + f.del));
+    let mut out = format!(
+        "{} {}: {key} round {round}, {} files +{add} -{del}, {}\n",
+        whole_row.id,
+        clip(whole.label.lines().next().unwrap_or(""), 80),
+        files.len(),
+        size(text.len())
+    );
+    if let Some(p) = prior {
+        let count = |want: fn(&Since) -> bool| files.iter().filter(|(i, _)| want(&since[*i])).count();
+        let unchanged = count(|s| matches!(s, Since::Unchanged(_) | Since::Moved(_)));
+        let moved = count(|s| matches!(s, Since::Moved(_)));
+        out.push_str(&format!(
+            "since round {p}: {} changed, {} new, {} removed, {unchanged} unchanged{}\n",
+            count(|s| *s == Since::Changed),
+            count(|s| *s == Since::New),
+            gone.len(),
+            if moved > 0 { format!(" ({moved} moved)") } else { String::new() }
+        ));
+    }
+    for (i, p) in parts.iter().enumerate() {
+        if p.file.is_none() {
+            if let Some(c) = text[p.start..p.end].lines().find_map(commit_line) {
+                let subject = text[p.start..p.end].lines().find_map(|l| l.strip_prefix("Subject: ")).unwrap_or("");
+                out.push_str(&format!("commit {} {} {}\n", &c[..7], clip(subject, QUOTE), rows[i].handle));
+            }
+        }
+    }
+    let mut shown = 0;
+    let mut unchanged: Vec<String> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for &(i, f) in &files {
+        if collapsed[i].is_some() {
+            continue;
+        }
+        let e = &rows[i];
+        if let Since::Unchanged(r) | Since::Moved(r) = &since[i] {
+            // The entry names only the path: a file whose header that does not
+            // give back is named by a handle whose read keeps it.
+            let id = if plain(f) {
+                e.handle.clone()
+            } else {
+                let p = &parts[i];
+                h.put(&text.as_bytes()[p.start..p.end], &stored_meta(whole, key, &e.path))?.id
+            };
+            let moved = if matches!(since[i], Since::Moved(_)) { "moved, " } else { "" };
+            unchanged.push(format!("{} {id} ({moved}since round {r})", e.path));
+            continue;
+        }
+        let mut tag = match &since[i] {
+            Since::Changed => "  changed".to_string(),
+            Since::New => "  new".to_string(),
+            _ => String::new(),
+        };
+        let from = if f.old_path.is_empty() || f.old_path == f.path { String::new() } else { format!(" (from {})", f.old_path) };
+        let p = &parts[i];
+        let reused = match (&since[i], prior) {
+            (Since::Changed, Some(pr)) if !f.binary && !f.hunks.is_empty() => reuse(h, key, pr, &e.path, &text[p.start..p.end], f)?,
+            _ => None,
+        };
+        if let Some(r) = reused {
+            // Only the hunks no earlier round showed, behind a handle of their own.
+            let total = f.hunks.len();
+            let fresh_n = total - r.seen;
+            let (id, list) = if fresh_n == 0 {
+                (e.handle.clone(), String::new())
+            } else {
+                let row = h.put(r.fresh.as_bytes(), &part_meta(whole, key, &format!("{} new hunks", e.path)))?;
+                let nf = split_diff(&r.fresh).into_iter().find_map(|p| p.file).unwrap_or_default();
+                (row.id, hunk_list(&nf))
+            };
+            let gone = if r.gone > 0 { format!(", {} gone", r.gone) } else { String::new() };
+            tag.push_str(&format!(", {} hunk{} seen before{gone}, whole file {}", r.seen, if r.seen == 1 { "" } else { "s" }, e.handle));
+            lines.push(format!("{} {}{from} +{} -{} {id} {fresh_n} of {total} hunks new{list}{tag}\n", f.status, e.path, f.add, f.del));
+            continue;
+        }
+        let what = if f.binary {
+            " binary".to_string()
+        } else if f.hunks.is_empty() {
+            if f.mode { " mode only".to_string() } else { " no hunks".to_string() }
+        } else {
+            format!(" {} hunk{}{}", f.hunks.len(), if f.hunks.len() == 1 { "" } else { "s" }, hunk_list(f))
+        };
+        lines.push(format!("{} {}{from} +{} -{} {}{what}{tag}\n", f.status, e.path, f.add, f.del, e.handle));
+    }
+    for l in lines {
+        if shown == MAX_ROWS {
+            break;
+        }
+        out.push_str(&l);
+        shown += 1;
+    }
+    let listed = files.iter().filter(|(i, _)| collapsed[*i].is_none()).count();
+    let rest = listed - unchanged.len() - shown;
+    if rest > 0 {
+        out.push_str(&format!("{rest} more files: atlas slice {} --grep \"^diff --git\"\n", whole_row.id));
+    }
+    if !unchanged.is_empty() {
+        let more = unchanged.len().saturating_sub(MAX_ROWS);
+        unchanged.truncate(MAX_ROWS);
+        let tail = if more > 0 { format!(", and {more} more") } else { String::new() };
+        out.push_str(&format!("unchanged: {}{tail}\n", unchanged.join(", ")));
+    }
+    for e in &gone {
+        out.push_str(&format!("removed since round {}: {} (was {})\n", prior.unwrap_or(0), e.path, e.handle));
+    }
+    for &(i, f) in &files {
+        let tag = match collapsed[i] {
+            Some(Collapse::Lock) => "lock",
+            Some(Collapse::Generated) => "generated",
+            Some(Collapse::Deleted) => "deleted",
+            _ => continue,
+        };
+        let state = match &since[i] {
+            Since::Unchanged(r) | Since::Moved(r) => format!(" unchanged since round {r}"),
+            Since::Changed => " changed".into(),
+            Since::New => " new".into(),
+            Since::First => String::new(),
+        };
+        // The old path too: a read leaves out the header lines the row stands for.
+        let from = if f.old_path.is_empty() || f.old_path == f.path { String::new() } else { format!(" (from {})", f.old_path) };
+        out.push_str(&format!("{tag} {} {}{from} +{} -{} {}{state}\n", f.status, rows[i].path, f.add, f.del, rows[i].handle));
+    }
+    for (root, idx) in &trees {
+        let mut body = String::new();
+        let (mut a, mut d) = (0, 0);
+        for &i in idx {
+            body.push_str(&text[parts[i].start..parts[i].end]);
+            if let Some(f) = &parts[i].file {
+                a += f.add;
+                d += f.del;
+            }
+        }
+        let g = h.put(body.as_bytes(), &stored_meta(whole, key, &format!("tree {root}")))?;
+        let changed = idx.iter().filter(|&&i| matches!(since[i], Since::Changed | Since::New)).count();
+        let state = if prior.is_some() { format!(", {changed} changed or new") } else { String::new() };
+        out.push_str(&format!("vendored {root} {} files +{a} -{d} {}{state}\n", idx.len(), g.id));
+    }
+    let legend = match (lv.wd, lv.c1) {
+        (true, true) => "; in a file read ~ is an edited line as [-old-]{+new+}, and = N hidden --lines A-B is context left out",
+        (true, false) => "; in a file read ~ is an edited line as [-old-]{+new+}",
+        (false, true) => "; in a file read = N hidden --lines A-B is context left out",
+        (false, false) => "",
+    };
+    out.push_str(&format!("a file: atlas slice h:F; a hunk: atlas slice h:F --lines A-B{legend}; whole output {}\n", whole_row.id));
+    let parts_ids = rows.iter().map(|e| e.handle.clone()).collect();
+    Ok(Digested { digest: out, round, whole: whole_row.id, parts: parts_ids })
+}
+
+/// A part of a `gh pr view` text output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewPart {
+    /// First byte.
+    pub start: usize,
+    /// One past the last byte.
+    pub end: usize,
+    /// `header`, `body` or `comment`.
+    pub kind: &'static str,
+}
+
+/// Splits a `gh pr view` text output (not a terminal: `key:\tvalue` fields,
+/// `--`, the body) or a `--comments` output (blocks of fields, `--`, the
+/// text, `--`) into parts that cover it exactly.
+pub fn split_view(text: &str, comments: bool) -> Vec<ViewPart> {
+    let mut parts: Vec<ViewPart> = Vec::new();
+    let mut pos = 0;
+    if !comments {
+        for raw in text.split_inclusive('\n') {
+            pos += raw.len();
+            if raw.trim_end_matches(['\n', '\r']) == "--" {
+                parts.push(ViewPart { start: 0, end: pos, kind: "header" });
+                if pos < text.len() {
+                    parts.push(ViewPart { start: pos, end: text.len(), kind: "body" });
+                }
+                return parts;
+            }
+        }
+        if !text.is_empty() {
+            parts.push(ViewPart { start: 0, end: text.len(), kind: "header" });
+        }
+        return parts;
+    }
+    let mut prev_sep = true;
+    for raw in text.split_inclusive('\n') {
+        let start = pos;
+        pos += raw.len();
+        let l = raw.trim_end_matches(['\n', '\r']);
+        match parts.last_mut() {
+            Some(p) if !(prev_sep && l.starts_with("author:\t")) => p.end = pos,
+            _ => parts.push(ViewPart { start, end: pos, kind: "comment" }),
+        }
+        prev_sep = l == "--";
+    }
+    parts
+}
+
+/// The `key:\tvalue` fields at the top of a view part, up to its `--`.
+fn fields(part: &str) -> Vec<(&str, &str)> {
+    part.lines().take_while(|l| l.trim_end() != "--").filter_map(|l| l.split_once(":\t")).collect()
+}
+
+/// The text of a comment block, between its first `--` and its last.
+fn block_text(part: &str) -> &str {
+    let Some(i) = part.find("\n--\n").or_else(|| part.find("\n--\r\n")) else { return "" };
+    let body = &part[i..];
+    let body = body.split_once('\n').map_or("", |x| x.1);
+    let body = body.split_once('\n').map_or("", |x| x.1);
+    body.strip_suffix("--\n").or_else(|| body.strip_suffix("--")).unwrap_or(body)
+}
+
+fn first_line(s: &str) -> String {
+    clip(s.lines().find(|l| !l.trim().is_empty()).unwrap_or(""), QUOTE)
+}
+
+/// Stores a `gh pr view` text output as its parts and returns the digest.
+///
+/// # Errors
+///
+/// As [`diff`].
+pub fn view_text(h: &mut Handles, w: &Where, text: &str, whole: &Meta, comments: bool) -> Result<Digested> {
+    let whole_row = h.put(text.as_bytes(), whole)?;
+    let parts = split_view(text, comments);
+    let key = &w.key;
+    let n_comments = parts.iter().filter(|p| p.kind == "comment").count();
+    let mut out = format!("{} {}: {key}, {}\n", whole_row.id, clip(whole.label.lines().next().unwrap_or(""), 80), size(text.len()));
+    let mut ids = Vec::with_capacity(parts.len());
+    let mut k = 0;
+    for p in &parts {
+        let t = &text[p.start..p.end];
+        let what = if p.kind == "comment" {
+            k += 1;
+            format!("comment {k}")
+        } else {
+            p.kind.to_string()
+        };
+        let row = h.put(t.as_bytes(), &part_meta(whole, key, &what))?;
+        match p.kind {
+            "header" => {
+                out.push_str(&format!("fields {}\n", row.id));
+                for (f, v) in fields(t) {
+                    if !v.trim().is_empty() {
+                        out.push_str(&format!("{f}: {}\n", clip(v, QUOTE)));
+                    }
+                }
+            }
+            "body" => out.push_str(&format!("body {} lines, {} {}: {}\n", t.lines().count(), size(t.len()), row.id, first_line(t))),
+            _ => {
+                let f = fields(t);
+                let get = |k: &str| f.iter().find(|x| x.0 == k).map_or("", |x| x.1.trim());
+                let body = block_text(t);
+                out.push_str(&format!(
+                    "comment {k}/{n_comments} {} ({}) {} lines, {} {}: {}\n",
+                    get("author"),
+                    get("status"),
+                    body.lines().count(),
+                    size(body.len()),
+                    row.id,
+                    first_line(body)
+                ));
+            }
+        }
+        ids.push(row.id);
+    }
+    out.push_str(&format!("a part: atlas slice h:P; whole output {}\n", whole_row.id));
+    Ok(Digested { digest: out, round: 0, whole: whole_row.id, parts: ids })
+}
+
+fn login(v: &Value) -> &str {
+    v.get("author").and_then(|a| a.get("login")).and_then(Value::as_str).unwrap_or("?")
+}
+
+/// Stores a `gh pr view --json` output and returns the digest: the short
+/// fields as they are, and each body, comment and review as a row with a
+/// handle to its text. `None` when the output is not a JSON object.
+///
+/// # Errors
+///
+/// As [`diff`].
+pub fn view_json(h: &mut Handles, w: &Where, text: &str, whole: &Meta) -> Result<Option<Digested>> {
+    let Ok(v) = crate::json::parse(text) else { return Ok(None) };
+    let Some(o) = v.as_object() else { return Ok(None) };
+    let whole_row = h.put(text.as_bytes(), whole)?;
+    let key = &w.key;
+    if let Some(head) = o.get("headRefOid").and_then(Value::as_str) {
+        if !head.is_empty() {
+            let c = h.conn();
+            crate::store::guarded(c, || {
+                c.execute(
+                    "INSERT OR IGNORE INTO pr_heads(pr, head, seen) VALUES(?1, ?2, ?3)",
+                    params![key, head, crate::store::utc(std::time::SystemTime::now())],
+                )?;
+                Ok(())
+            })?;
+        }
+    }
+    let mut out = format!("{} {}: {key}, {}\n", whole_row.id, clip(whole.label.lines().next().unwrap_or(""), 80), size(text.len()));
+    let mut ids = Vec::new();
+    for (k, val) in o.iter() {
+        match (k.as_str(), val) {
+            ("body", Value::String(b)) => {
+                let row = h.put(b.as_bytes(), &part_meta(whole, key, "body"))?;
+                out.push_str(&format!("body {} lines, {} {}: {}\n", b.lines().count(), size(b.len()), row.id, first_line(b)));
+                ids.push(row.id);
+            }
+            ("comments" | "reviews", Value::Array(items)) => {
+                let one = if k == "comments" { "comment" } else { "review" };
+                out.push_str(&format!("{k}: {}\n", items.len()));
+                for (i, it) in items.iter().enumerate() {
+                    let body = it.get("body").and_then(Value::as_str).unwrap_or("");
+                    let state = it.get("state").and_then(Value::as_str).map(|s| format!(" ({})", s.to_ascii_lowercase())).unwrap_or_default();
+                    let when = it.get("createdAt").or_else(|| it.get("submittedAt")).and_then(Value::as_str).unwrap_or("");
+                    if body.is_empty() {
+                        out.push_str(&format!("{one} {}/{} {}{state} {when} no text\n", i + 1, items.len(), login(it)));
+                        continue;
+                    }
+                    let row = h.put(body.as_bytes(), &part_meta(whole, key, &format!("{one} {}", i + 1)))?;
+                    out.push_str(&format!(
+                        "{one} {}/{} {}{state} {when} {} lines, {} {}: {}\n",
+                        i + 1,
+                        items.len(),
+                        login(it),
+                        body.lines().count(),
+                        size(body.len()),
+                        row.id,
+                        first_line(body)
+                    ));
+                    ids.push(row.id);
+                }
+            }
+            (_, Value::Array(a)) => out.push_str(&format!("{k}: {} items\n", a.len())),
+            (_, Value::Object(_)) => out.push_str(&format!("{k}: {}\n", clip(&val.to_string(), QUOTE))),
+            (_, Value::String(s)) => out.push_str(&format!("{k}: {}\n", clip(s, QUOTE))),
+            _ => out.push_str(&format!("{k}: {}\n", clip(&val.to_string(), QUOTE))),
+        }
+    }
+    out.push_str(&format!("a text: atlas slice h:T; whole output {}\n", whole_row.id));
+    Ok(Some(Digested { digest: out, round: 0, whole: whole_row.id, parts: ids }))
+}
+
+/// Digests a `gh pr` output for the PostToolUse route. `small` outputs pass
+/// whole (`None`), but a small diff is still recorded as a round.
+///
+/// # Errors
+///
+/// As [`diff`]; the caller then takes the generic route.
+pub fn route(h: &mut Handles, pc: &PrCmd, w: &Where, text: &str, whole: &Meta, small: bool) -> Result<Option<Digested>> {
+    match pc.sub {
+        // An empty or error output is never a round.
+        Sub::Diff { .. } if !split_diff(text).iter().any(|p| p.file.is_some()) => Ok(None),
+        Sub::Diff { .. } => {
+            let d = diff(h, w, text, whole)?;
+            Ok((!small).then_some(d))
+        }
+        _ if small => Ok(None),
+        Sub::View { json: true, .. } => view_json(h, w, text, whole),
+        Sub::View { comments, .. } => view_text(h, w, text, whole, comments).map(Some),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hunk_headers_parse() {
+        assert_eq!(hunk_counts("@@ -1,5 +1,7 @@ fn x()"), Some((5, 7)));
+        assert_eq!(hunk_counts("@@ -3 +3 @@"), Some((1, 1)));
+        assert_eq!(hunk_counts("@@ -0,0 +1 @@"), Some((0, 1)));
+        assert_eq!(hunk_counts("@@ -x +1 @@"), None);
+        assert_eq!(hunk_counts("@@@ -1 -1 +1 @@@"), None);
+    }
+
+    #[test]
+    fn git_lines_name_their_path() {
+        assert_eq!(git_line_path("diff --git a/src/a b.rs b/src/a b.rs"), "src/a b.rs");
+        assert_eq!(git_line_path("diff --git a/old.rs b/new.rs"), "new.rs");
+        assert_eq!(git_line_path("diff --git a/x b/x"), "x");
+        assert_eq!(git_line_path("diff --git \"a/x y\" \"b/x y\""), "x y");
+    }
+
+    /// The `@@` counts, not the next line, end a hunk: a stray line that
+    /// looks like content after the counts run out is not the file's.
+    #[test]
+    fn hunk_counts_end_a_hunk() {
+        let files = |t: &str| split_diff(t).into_iter().map(|p| (p.file.map(|f| f.hunks), p.end - p.start)).collect::<Vec<_>>();
+        let head = "diff --git a/x b/x\n--- a/x\n+++ b/x\n";
+        let minus = format!("{head}@@ -1,2 +1,1 @@\n-x\n y\n-- \n");
+        assert_eq!(files(&minus)[0].0, Some(vec![(4, 6)]));
+        assert_eq!(files(&minus).len(), 2, "the signature is its own part");
+        let plus = format!("{head}@@ -1,1 +1,2 @@\n+x\n y\n+stray\n");
+        assert_eq!(files(&plus)[0].0, Some(vec![(4, 6)]));
+        assert_eq!(files(&plus).len(), 2);
+        // A commit header right after a header-only file starts its own part.
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let mode = format!("diff --git a/r b/r\nold mode 100644\nnew mode 100755\nFrom {sha} Mon Sep 17 00:00:00 2001\n");
+        assert_eq!(files(&mode).len(), 2);
+    }
+
+    #[test]
+    fn commit_lines_need_a_full_sha() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(commit_line(&format!("From {sha} Mon Sep 17 00:00:00 2001")), Some(sha));
+        assert_eq!(commit_line("From 0123 Mon"), None);
+        assert_eq!(commit_line(&format!("From {sha}x Mon")), None);
+    }
+
+    #[test]
+    fn words_keep_quoted_spaces() {
+        assert_eq!(words("gh pr view 'a b' \"\""), Some(vec!["gh".into(), "pr".into(), "view".into(), "a b".into(), String::new()]));
+        assert_eq!(words("gh 'x"), None);
+    }
+
+    #[test]
+    fn vendor_roots_stop_at_the_vendored_folder() {
+        assert_eq!(vendor_root("vendor/github.com/x/y.go").as_deref(), Some("vendor/"));
+        assert_eq!(vendor_root("web/node_modules/a/b.js").as_deref(), Some("web/node_modules/"));
+        assert_eq!(vendor_root("src/vendor.rs"), None);
+        assert_eq!(vendor_root("vendor"), None);
+    }
+
+    #[test]
+    fn the_working_tree_head_is_read_only_when_no_other_rule_decides() {
+        let reads = std::cell::Cell::new(0);
+        let head = || {
+            reads.set(reads.get() + 1);
+            "// @generated\n".to_string()
+        };
+        let attrs = attributes("off.rs -linguist-generated\n");
+        assert_eq!(collapse_with("Cargo.lock", "", &attrs, head), Some((Collapse::Lock, "Cargo.lock".into())));
+        assert_eq!(collapse_with("vendor/a.go", "", &attrs, head), Some((Collapse::Vendored, "vendor/".into())));
+        assert_eq!(collapse_with("x.pb.go", "", &attrs, head), Some((Collapse::Generated, "x.pb.go".into())));
+        assert_eq!(collapse_with("off.rs", "", &attrs, head), None);
+        assert_eq!(collapse_with("a.rs", "@@ -0,0 +1 @@\n+// DO NOT EDIT\n", &attrs, head), Some((Collapse::Generated, "a.rs".into())));
+        assert_eq!(reads.get(), 0, "an earlier rule decided each");
+        assert_eq!(collapse_with("a.rs", "", &attrs, head), Some((Collapse::Generated, "a.rs".into())));
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn a_removed_head_marker_is_not_asked_of_the_working_tree() {
+        let gone = "--- a/m.rs\n+++ b/m.rs\n@@ -1,2 +1,1 @@\n-// @generated by tool\n fn x() {}\n";
+        assert!(removes_head_marker(gone));
+        assert_eq!(generated_rule("m.rs", gone, &[], "// @generated by tool\n"), None, "the PR takes the marker out");
+        // Old-side line 12 counts, 13 does not.
+        let at = |old: u32| format!("@@ -{old},2 +{old},1 @@\n x\n-// DO NOT EDIT\n");
+        assert!(removes_head_marker(&at(11)));
+        assert!(!removes_head_marker(&at(12)));
+        assert_eq!(generated_rule("m.rs", &at(12), &[], "// DO NOT EDIT\n"), Some("head marker"));
+        // Added back further down: still a marker the PR keeps.
+        let moved = "@@ -1,1 +1,0 @@\n-// DO NOT EDIT\n@@ -40,1 +39,2 @@\n x\n+// DO NOT EDIT\n";
+        assert!(!removes_head_marker(moved));
+        assert_eq!(generated_rule("m.rs", moved, &[], "// DO NOT EDIT\n"), Some("head marker"));
+        assert!(!removes_head_marker("@@ -1,1 +1,1 @@\n-plain\n+plain2\n"));
+    }
+
+    /// Python's `difflib.SequenceMatcher(None, a, b, autojunk=False)
+    /// .get_matching_blocks()` (without its final sentinel) on word tokens.
+    #[test]
+    fn matching_blocks_are_difflibs() {
+        for (a, b, want) in [
+            ("a b a b a", "b a b a b", vec![(0, 2, 7)]),
+            ("let a = f(x);", "let a = f(y);", vec![(0, 0, 8), (9, 9, 2)]),
+            ("x y z", "z y x", vec![(1, 1, 3)]),
+            ("a x b", "a b", vec![(0, 0, 2), (4, 2, 1)]),
+            ("q a b c d", "a b c d q", vec![(2, 0, 7)]),
+        ] {
+            assert_eq!(matching_blocks(&tokens(a), &tokens(b)), want, "{a:?} {b:?}");
+        }
+    }
+
+    /// The matcher stops once it has taken more steps than its budget, and
+    /// leaves the budget at 0; within it, the steps it took come off.
+    #[test]
+    fn the_matcher_stops_past_its_budget() {
+        let (a, b) = (tokens("a b c d"), tokens("a b c e"));
+        let mut big = 1000;
+        assert_eq!(matching_blocks_within(&a, &b, &mut big), Some(matching_blocks(&a, &b)));
+        let took = 1000 - big;
+        assert!(took > 0);
+        let mut exact = took;
+        assert!(matching_blocks_within(&a, &b, &mut exact).is_some());
+        assert_eq!(exact, 0);
+        let mut small = took - 1;
+        assert_eq!(matching_blocks_within(&a, &b, &mut small), None);
+        assert_eq!(small, 0);
+        // One token against a long run of it: one row of 100 steps, so the
+        // budget is checked within a row too, not only between rows.
+        let run = ",".repeat(100);
+        let (a, b) = (tokens(","), tokens(&run));
+        let mut small = 10;
+        assert_eq!(matching_blocks_within(&a, &b, &mut small), None);
+    }
+
+    /// A pair at a similarity of 0.6 or more is a word diff within the read's
+    /// budget, which it spends, and not paired past it.
+    #[test]
+    fn a_similar_pair_past_the_reads_budget_is_not_paired() {
+        let (old, new) = ("let a = f(x);", "let a = f(y);");
+        assert!(similarity(old, new) >= WD_SIMILARITY);
+        let mut budget = WD_READ_STEPS;
+        assert_eq!(wd_line_within(old, new, &mut budget), Some("~let a = f([-x-]{+y+});
+".to_string()));
+        let took = WD_READ_STEPS - budget;
+        assert!(took > 0);
+        let mut budget = took - 1;
+        assert_eq!(wd_line_within(old, new, &mut budget), None);
+        assert_eq!(budget, 0);
+    }
+}
+
+#[cfg(test)]
+mod storeguard_tests {
+    use super::*;
+    use crate::store::skew_support::{dump, make_index_newer};
+
+    /// A review round on a store a newer atlas upgraded since this one
+    /// opened it is refused under the lock and rolled back.
+    #[test]
+    fn a_round_checks_the_version_under_the_lock() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::store::HANDLES_SCHEMA).unwrap();
+        let rows = vec![Entry { path: "a.rs".into(), exact: "e".into(), norm: "n".into(), handle: "h:1".into() }];
+        assert_eq!(record(&c, "o/r#1", "w1", "h:w1", "head", &rows).unwrap(), (1, None));
+        make_index_newer(&c);
+        let before = dump(&c);
+        let e = record(&c, "o/r#1", "w2", "h:w2", "head", &rows).expect_err("refused");
+        assert!(e.is_store_too_new(), "{e}");
+        assert!(c.is_autocommit(), "rolled back");
+        assert_eq!(dump(&c), before);
+    }
+}

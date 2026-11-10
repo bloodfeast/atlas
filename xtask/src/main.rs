@@ -1,7 +1,7 @@
 //! `cargo xtask`: atlas's development tasks, in Rust, never shipped.
 //!
 //! ```text
-//! cargo xtask calibrate-baseline --config CONFIG --transcripts DIR --before TIME [--handoff RE] [--project NAME] [--skip TEXT ...] [--audit FILE]
+//! cargo xtask calibrate-baseline --config CONFIG --transcripts DIR --before TIME [--handoff RE] [--project NAME] [--skip TEXT ...] [--keep-duplicates] [--audit FILE]
 //! cargo xtask token-use --config CONFIG --transcripts DIR --since TIME [--handoff RE] [--replay CONFIG]
 //! cargo xtask attrib TRANSCRIPT.jsonl [TRANSCRIPT.jsonl ...]
 //! cargo xtask calibrate-recall SCORES.tsv [MIN_TERMS]
@@ -26,7 +26,7 @@
 //! * `calibrate-baseline` measures what agents spent on lookups in the
 //!   transcripts below DIR before TIME (read only), saves it to the
 //!   configuration's database for `atlas --token-report`, and prints the
-//!   measured ratio beside the upper bound (see `calibrate.rs`).
+//!   measured ratio beside the upper bound (see `atlas::calibrate`).
 //! * `token-use --config CONFIG --transcripts DIR --since TIME` breaks down
 //!   atlas's answers after TIME by tool and mode: sizes, how much of each was
 //!   used later, and episodes by the baseline's rule (see `usage.rs`);
@@ -68,9 +68,10 @@
 //! * `coverage` runs the tests with rustc's coverage instrumentation and
 //!   prints line and region coverage per module (see `coverage.rs`).
 
+mod accept;
 mod attrib;
 mod bpe;
-mod calibrate;
+use atlas::calibrate;
 mod calibrate_recall;
 mod compact_live;
 mod coverage;
@@ -88,7 +89,9 @@ mod resume_eval;
 mod public_repo;
 mod py;
 mod release;
+mod release_check;
 mod release_ci;
+mod release_ship;
 mod secret_scan;
 mod tar;
 mod ucd;
@@ -99,7 +102,7 @@ mod wiki;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --transcripts DIR --before TIME [--handoff RE] [--project NAME] [--skip TEXT ...] [--audit FILE]
+const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --transcripts DIR --before TIME [--handoff RE] [--project NAME] [--skip TEXT ...] [--keep-duplicates] [--audit FILE]
        cargo xtask token-use --config CONFIG --transcripts DIR --since TIME [--handoff RE] [--replay CONFIG]
        cargo xtask attrib TRANSCRIPT.jsonl [TRANSCRIPT.jsonl ...]
        cargo xtask calibrate-recall SCORES.tsv [MIN_TERMS]
@@ -309,6 +312,7 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
     let mut audit: Option<PathBuf> = None;
     let mut project: Option<String> = None;
     let mut skip: Vec<String> = Vec::new();
+    let mut dedup = true;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{a} needs a value\n{USAGE}"));
@@ -320,6 +324,7 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
             "--audit" if !token_use => audit = Some(PathBuf::from(val()?)),
             "--project" => project = Some(val()?),
             "--skip" if !token_use => skip.push(val()?),
+            "--keep-duplicates" if !token_use => dedup = false,
             "--replay" if token_use => replay = Some(PathBuf::from(val()?)),
             _ => return Err(USAGE.into()),
         }
@@ -360,9 +365,9 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
     let b = match &audit {
         Some(p) => {
             let mut f = std::io::BufWriter::new(std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?);
-            calibrate::measure_audited(&dir, &before, &t, &skip, Some(&mut f))
+            calibrate::measure_audited(&dir, &before, &t, &skip, dedup, Some(&mut f))
         }
-        None => calibrate::measure_audited(&dir, &before, &t, &skip, None),
+        None => calibrate::measure_audited(&dir, &before, &t, &skip, dedup, None),
     };
     let conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
     atlas::baseline::save(&conn, &b).map_err(|e| e.to_string())?;

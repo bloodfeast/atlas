@@ -158,6 +158,13 @@ pub enum Sel {
     Head(usize),
     /// The last n lines.
     Tail(usize),
+    /// A PR diff file part's default read from line k (its `next page`),
+    /// any other output's lines from k.
+    Page(usize),
+    /// No selector: a PR diff file part read diff-native and paged at hunk
+    /// boundaries ([`crate::pr_digest::file_slice`]), any other output's
+    /// first 40 lines.
+    Whole,
 }
 
 /// The handle store.
@@ -183,7 +190,7 @@ impl Handles {
         if let Some(p) = db.parent() {
             std::fs::create_dir_all(p).map_err(|e| Error::Io(format!("{}: {e}", p.display())))?;
         }
-        let conn = Connection::open(db)?;
+        let conn = crate::store::open_raw(db)?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.execute_batch(crate::store::HANDLES_SCHEMA)?;
         let dir = db.parent().unwrap_or(Path::new(".")).join("handles");
@@ -225,28 +232,28 @@ impl Handles {
         let lines = digest::line_count(&text) as u64;
         let key = crate::sha256::hex(format!("{sha}|{}|{}", m.kind, m.cmd).as_bytes());
         let t = now();
-        let mut id = String::new();
-        for n in (10..=64).step_by(2) {
-            let cand = format!("h:{}", &key[..n]);
-            let have: Option<String> = self.conn.query_row("SELECT sha FROM handles WHERE id = ?1", [&cand], |r| r.get(0)).optional()?;
-            match have {
-                None => {
-                    self.conn.execute(
-                        "INSERT INTO handles(id, sha, kind, label, cmd, cwd, session, created, last_used, bytes, lines, exit_code, ms)
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12)",
-                        params![cand, sha, m.kind, m.label, m.cmd, m.cwd, m.session, t, data.len() as i64, lines as i64, m.exit_code, m.ms],
-                    )?;
-                    id = cand;
-                    break;
+        let id = crate::store::guarded(&self.conn, || {
+            for n in (10..=64).step_by(2) {
+                let cand = format!("h:{}", &key[..n]);
+                let have: Option<String> = self.conn.query_row("SELECT sha FROM handles WHERE id = ?1", [&cand], |r| r.get(0)).optional()?;
+                match have {
+                    None => {
+                        self.conn.execute(
+                            "INSERT INTO handles(id, sha, kind, label, cmd, cwd, session, created, last_used, bytes, lines, exit_code, ms)
+                             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12)",
+                            params![cand, sha, m.kind, m.label, m.cmd, m.cwd, m.session, t, data.len() as i64, lines as i64, m.exit_code, m.ms],
+                        )?;
+                        return Ok(cand);
+                    }
+                    Some(s) if s == sha => {
+                        self.conn.execute("UPDATE handles SET last_used = ?2 WHERE id = ?1", params![cand, t])?;
+                        return Ok(cand);
+                    }
+                    Some(_) => continue,
                 }
-                Some(s) if s == sha => {
-                    self.conn.execute("UPDATE handles SET last_used = ?2 WHERE id = ?1", params![cand, t])?;
-                    id = cand;
-                    break;
-                }
-                Some(_) => continue,
             }
-        }
+            Ok(String::new())
+        })?;
         if id.is_empty() {
             return Err(Error::Db("handle id space exhausted".into()));
         }
@@ -296,7 +303,7 @@ impl Handles {
     pub fn text(&self, id: &str) -> Result<(Row, String)> {
         let row = self.row(id)?;
         let b = std::fs::read(self.blob(&row.sha)).map_err(|e| Error::NotFound(format!("handle {} file: {e}", row.id)))?;
-        self.conn.execute("UPDATE handles SET last_used = ?2 WHERE id = ?1", params![row.id, now()])?;
+        crate::store::guarded(&self.conn, || Ok(self.conn.execute("UPDATE handles SET last_used = ?2 WHERE id = ?1", params![row.id, now()])?))?;
         Ok((row, String::from_utf8_lossy(&b).into_owned()))
     }
 
@@ -324,6 +331,20 @@ impl Handles {
     /// As [`Handles::text`]; [`Error::InvalidArgument`] for a bad pattern.
     pub fn slice(&self, id: &str, sel: &Sel) -> Result<String> {
         let (row, text) = self.text(id)?;
+        if row.meta.kind == crate::pr_digest::KIND {
+            // A PR diff's file part: its stored bytes, without line numbers.
+            use crate::pr_digest::FileSel;
+            let from = match sel {
+                Sel::Whole => Some(FileSel::View(1)),
+                Sel::Page(k) => Some(FileSel::View(*k)),
+                Sel::Lines(a, b) => Some(FileSel::Raw(*a, *b)),
+                _ => None,
+            };
+            let backed = crate::pr_digest::row_backed(&row.meta);
+            if let Some(s) = from.and_then(|f| crate::pr_digest::file_slice(&row.id, &text, f, self.cfg.slice_bytes, backed)) {
+                return Ok(s);
+            }
+        }
         let lines: Vec<&str> = text.lines().collect();
         let n = lines.len();
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -337,7 +358,13 @@ impl Handles {
                 }
             }
             Sel::Head(k) => ranges.push((1, (*k).min(n))),
+            Sel::Whole => ranges.push((1, 40.min(n))),
             Sel::Tail(k) => ranges.push((n.saturating_sub(*k) + 1, n)),
+            Sel::Page(k) => {
+                if (*k).max(1) <= n {
+                    ranges.push(((*k).max(1), n));
+                }
+            }
             Sel::Grep { re, context } => {
                 let r = RegexBuilder::new(re).build().map_err(|e| Error::InvalidArgument(format!("pattern {re:?}: {e}")))?;
                 for (i, l) in lines.iter().enumerate() {
@@ -442,12 +469,24 @@ impl Handles {
                 }
             }
         }
-        for (id, sha) in &gone {
-            self.conn.execute("DELETE FROM handles WHERE id = ?1", [id])?;
-            let left: i64 = self.conn.query_row("SELECT COUNT(*) FROM handles WHERE sha = ?1", [sha], |r| r.get(0))?;
-            if left == 0 {
-                let _ = std::fs::remove_file(self.blob(sha));
+        if gone.is_empty() {
+            return Ok(0);
+        }
+        // One guarded transaction for every delete; a blob no handle still
+        // names is removed only after it commits.
+        let orphans: Vec<&str> = crate::store::guarded(&self.conn, || {
+            let mut orphans = Vec::new();
+            for (id, sha) in &gone {
+                self.conn.execute("DELETE FROM handles WHERE id = ?1", [id])?;
+                let left: i64 = self.conn.query_row("SELECT COUNT(*) FROM handles WHERE sha = ?1", [sha], |r| r.get(0))?;
+                if left == 0 && !orphans.contains(&sha.as_str()) {
+                    orphans.push(sha.as_str());
+                }
             }
+            Ok(orphans)
+        })?;
+        for sha in orphans {
+            let _ = std::fs::remove_file(self.blob(sha));
         }
         Ok(gone.len())
     }
@@ -545,18 +584,19 @@ pub fn parse_sel(words: &[String]) -> std::result::Result<Sel, String> {
             "--context" | "-C" => context = val()?.parse().map_err(|_| "--context needs a number".to_string())?,
             "--head" => sel = Some(Sel::Head(val()?.parse().map_err(|_| "--head needs a number".to_string())?)),
             "--tail" => sel = Some(Sel::Tail(val()?.parse().map_err(|_| "--tail needs a number".to_string())?)),
+            "--page" => sel = Some(Sel::Page(val()?.parse().map_err(|_| "--page needs a number".to_string())?)),
             o => return Err(format!("unknown selector {o:?}")),
         }
     }
     Ok(match sel {
         Some(Sel::Grep { re, .. }) => Sel::Grep { re, context: context.min(20) },
         Some(s) => s,
-        None => Sel::Head(40),
+        None => Sel::Whole,
     })
 }
 
 /// The usage of `atlas slice`.
-pub const SLICE_USAGE: &str = "usage: atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --digest]\n       atlas slice --list [N]";
+pub const SLICE_USAGE: &str = "usage: atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --page K | --digest]\n       atlas slice --list [N]";
 
 /// The `atlas slice` subcommand: one slice of a stored output.
 ///

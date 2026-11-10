@@ -33,7 +33,7 @@ use crate::watch::{Snapshot, Watcher};
 /// Bumped whenever the atlas tables change shape or meaning. atlas-7: a
 /// leading ISO date on a list item is markup, so dated rulings define their
 /// identifiers (the rows of an atlas-6 index are re-derived).
-const ATLAS_SCHEMA: &str = "atlas-7";
+pub(super) const ATLAS_SCHEMA: &str = "atlas-7";
 
 /// File name of the append-only JSONL mirror of the `misses` table.
 pub const MISSES_LOG: &str = "misses.jsonl";
@@ -297,6 +297,10 @@ pub(super) struct Atlas {
     /// Why this process found the derived rows wiped (`schema rebuild`,
     /// `index rules changed`), if it did; the freshness summary names it.
     pub(super) rebuilt: Option<&'static str>,
+    /// True while the derived tables are a newer crate version's (same
+    /// shape and parse rules): this process then never writes the open
+    /// stamp, so that binary does not rebuild after this one's open.
+    pub(super) keeps_newer: bool,
 }
 
 /// A path and its indexed (mtime, size, sha256).
@@ -705,6 +709,7 @@ impl Atlas {
             walked: HashMap::new(),
             known: Default::default(),
             rebuilt: None,
+            keeps_newer: false,
         }
     }
 
@@ -852,10 +857,13 @@ pub(super) fn ensure_fingerprint(tx: &Transaction<'_>, fp: &str) -> Result<Optio
     Ok(Some(why))
 }
 
-/// Stores the names set and the open stamp (see `Store::open_with`).
-pub(super) fn write_stamp(tx: &Transaction<'_>, names: &Names, stamp: &str) -> Result<()> {
+/// Stores the names set and the open stamp (see `Store::open_with`); no
+/// stamp is written when it is `None`.
+pub(super) fn write_stamp(tx: &Transaction<'_>, names: &Names, stamp: Option<&str>) -> Result<()> {
     tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('atlas_names', ?1)", [names.encode()])?;
-    tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('open_stamp', ?1)", [stamp])?;
+    if let Some(stamp) = stamp {
+        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('open_stamp', ?1)", [stamp])?;
+    }
     Ok(())
 }
 
@@ -1389,7 +1397,8 @@ impl Store {
                 if why.is_some() {
                     self.atlas.rebuilt = why;
                 }
-                write_stamp(&tx, &self.atlas.names, &format!("{}|{}|{fp}", super::SCHEMA, super::DURABLE_VERSION))?;
+                let stamp = format!("{}|{}|{fp}", super::SCHEMA, super::DURABLE_VERSION);
+                write_stamp(&tx, &self.atlas.names, (!self.atlas.keeps_newer).then_some(stamp.as_str()))?;
                 tx.commit()?;
             }
         }
@@ -1521,7 +1530,7 @@ impl Store {
         }
         let src = self.atlas.source(name).ok_or_else(|| Error::NotFound(format!("source {name:?}")))?;
         let dr = DocRules { source: &src.name, kind: "source", chunk: &src.chunk, id_keys: &src.id_keys, names_kind: src.names_kind.as_deref() };
-        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = begin(&mut self.conn)?;
         for f in &diff.stale {
             if f.state == "removed" {
                 delete_doc(&tx, name, &f.path)?;
@@ -1945,7 +1954,10 @@ impl Store {
         // Bring the summary rows up to date first (a no-op read when clean).
         let dirty: bool = self.conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM ident_dirty)")?.query_row([], |r| r.get(0))?;
         if dirty {
-            self.conn.execute_batch(&format!("BEGIN IMMEDIATE; {RECOUNT} COMMIT;"))?;
+            let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            super::guard(&tx)?;
+            tx.execute_batch(RECOUNT)?;
+            tx.commit()?;
         }
         let like = prefix.map(|p| format!("{}%", p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
         let mut st = self.conn.prepare_cached(

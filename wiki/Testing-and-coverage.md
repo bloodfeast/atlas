@@ -65,7 +65,7 @@ Development tasks are `cargo xtask <command>`, in Rust, in the `xtask` workspace
 | Command | What it does |
 |---|---|
 | `attrib` | attributes the tokens a session processed to what put them in context (see [[Token savings and method]]) |
-| `calibrate-baseline` | measures what agents spent on lookups before atlas, from transcripts, for `--token-report` |
+| `calibrate-baseline` | the calibration with explicit inputs (cutoff, folder, skips, `--keep-duplicates`) and an audit file; the shipped one is `atlas --calibrate` |
 | `token-use` | breaks down atlas's answers by tool and mode; `--replay` answers them again on another build |
 | `calibrate-recall` | derives the recall floors from `atlas --recall-scores` output |
 | `memory-eval` | scores atlas as a memory store on a fixed copy of one: recall-check misses and a question set |

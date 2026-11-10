@@ -3217,13 +3217,33 @@ fn wide_root_lines(config: Option<&Path>) -> Vec<String> {
     out
 }
 
+/// The doctor's lines for stores a newer atlas made, which this binary refuses
+/// to open (the memory store, the index store and its code index), read with
+/// read-only opens so nothing is created or changed. The paths come from
+/// `config` as the server resolves them, else the defaults: a server whose
+/// args pass `--db` (or a memory path) of its own is not checked here. A file
+/// that cannot be read (locked or corrupt) gives no line; the server reports
+/// its own error when it opens it.
+fn store_lines(config: Option<&Path>) -> Vec<String> {
+    let loaded = config.filter(|c| c.is_file()).and_then(|c| crate::config::Config::load(c).ok());
+    let db = loaded.as_ref().and_then(|c| c.db.clone()).unwrap_or_else(crate::dirs::default_db);
+    let mut out = Vec::new();
+    if let Ok(s) = crate::memory::settings::Settings::from_config(loaded.as_ref(), &db) {
+        out.extend(crate::memory::store_skew(&s.store));
+    }
+    out.extend(crate::store::index_skew(&db));
+    out.into_iter().map(|e| format!("store: {e}")).collect()
+}
+
 /// `atlas doctor`: says what it could check of the live Claude Code settings'
 /// atlas hooks against `hooks/hooks.json`, one honest line for each case: no
 /// settings file, a malformed one, no atlas hooks in it, a plugin install
 /// (whose hooks live in the plugin), or real hooks that match or differ. Also
 /// names a project root that is too wide in `config`, and a server Claude Code is
-/// holding off. Exit 1 when the hooks
-/// differ or when the settings or plugin file could not be read. Writes nothing.
+/// holding off, and a store a newer atlas made. Exit 1 when the hooks
+/// differ, when the settings or plugin file could not be read, or when a
+/// store is too new for this binary (the stores at the configured or default
+/// paths only, and only those it can read). Writes nothing.
 ///
 /// # Errors
 ///
@@ -3279,6 +3299,10 @@ pub fn doctor_cli(args: &[String], config: Option<&Path>) -> Result<ExitCode, St
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
     for line in held_off_lines(&dir, now_ms) {
         println!("{line}");
+    }
+    for line in store_lines(config) {
+        println!("{line}");
+        failed = true;
     }
     Ok(if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }

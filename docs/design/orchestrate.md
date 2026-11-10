@@ -73,8 +73,9 @@ On an Agent PreToolUse, while caps are on:
 
 Each launch gets one kind: `builder`, `reviewer`, `research` or `none` (not counted). Rules, first match wins:
 
-1. **A `Kind:` line in the brief.** It must be one of the first 40 lines, for example `Kind: reviewer`. The
-   skill makes the orchestrator write it.
+1. **A `Kind:` line in the brief.** The brief is the Agent launch prompt itself; a brief file the prompt names
+   is never read. The line must be one of the prompt's first 40 lines, for example `Kind: reviewer`. The skill
+   makes the orchestrator write it.
 2. **`orchestrate.types`**, a map from `subagent_type` to kind. The default maps `Explore`, `Plan` and
    `claude-code-guide` to research and `statusline-setup` to none. Users add their own agent types, such as a
    reviewer persona type.
@@ -82,8 +83,13 @@ Each launch gets one kind: `builder`, `reviewer`, `research` or `none` (not coun
 4. **`orchestrate.default_kind`** applies otherwise. The default is builder: an unmarked general agent is
    counted against the tightest slot that compiles.
 
-The same rules classify a running agent from its meta file (`agentType`, `description`) and its brief. The
-result is cached by agent id.
+The same rules classify a running agent from its meta file (`agentType`, `description`) and its brief (the
+first user message of its transcript, which is the launch prompt). The result is cached by agent id.
+
+A refusal at a kind's cap names the rule that decided the kind: the prompt's `Kind:` line, the `subagent_type`
+in `orchestrate.types`, `isolation: "worktree"`, or `orchestrate.default_kind`. When no `Kind:` line decided
+it, the refusal says where one goes, and the queue suffix asks a relaunch with one to add `Queue: KEY`, so the
+queued entry takes the new kind and leaves the queue when it starts.
 
 ## 3. Settings
 

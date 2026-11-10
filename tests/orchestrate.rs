@@ -120,6 +120,108 @@ fn the_agent_cap_refuses_past_each_kind_and_counts_live_agents_only() {
     assert!(launch(&mut h, &s, "t9", "general-purpose", "Build more.").deny.is_none());
 }
 
+/// A cap refusal names the rule that decided the launch's
+/// kind; only a launch no `Kind:` line classified is told where one goes.
+#[test]
+fn a_cap_refusal_names_where_the_kind_came_from() {
+    let t = Temp::new("orch-cap-source");
+    let s = Session::new(t.path());
+    let one = |k| (k, KindSpec { max: Some(1), ..Default::default() });
+    let on = OrchestrateSpec { enabled: Some(true), kinds: vec![one(Kind::Builder), one(Kind::Reviewer), one(Kind::Research)], ..Default::default() };
+    let st = settings(t.path(), &on, &[]);
+    let store_path = st.store.clone();
+    let mut h = Hooks::open(st).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nBuild it.", 1000, false);
+    s.agent("r1", "general-purpose", "t-r1", "Kind: reviewer\nReview it.", 1000, false);
+    s.agent("e1", "general-purpose", "t-e1", "Kind: research\nFind it.", 1000, false);
+    let hint = "put `Kind: builder`, `Kind: reviewer` or `Kind: research` in the prompt's first 40 lines (a brief file the prompt names is not read)";
+    let line = launch(&mut h, &s, "t1", "general-purpose", "Kind: reviewer\nRead Z:/brief.md.").deny.unwrap();
+    assert!(line.starts_with("atlas agent cap: 1 of 1 reviewer") && line.contains("This launch counts as a reviewer: its prompt's `Kind:` line says so."), "{line}");
+    assert!(!line.contains(hint) && !line.contains("add `Queue:"), "{line}");
+    let ty = launch(&mut h, &s, "t2", "Explore", "Read Z:/brief.md.").deny.unwrap();
+    assert!(
+        ty.contains("This launch counts as a research agent: ") && ty.contains("the agent-type map (orchestrate.types) gives its subagent_type `Explore` the kind research") && ty.contains(hint),
+        "{ty}"
+    );
+    let input = json!({"description": "w", "subagent_type": "general-purpose", "isolation": "worktree", "prompt": "Read Z:/brief.md."});
+    let wt = h.handle(&HookEvent { tool_name: "Agent".into(), tool_use_id: "t3".into(), transcript_path: s.tp(), tool_prompt: "Read Z:/brief.md.".into(), tool_input: input, ..ev("PreToolUse") });
+    let wt = wt.deny.unwrap();
+    assert!(wt.contains("an agent with isolation: \"worktree\" counts as a builder") && wt.contains(hint), "{wt}");
+    let d = launch(&mut h, &s, "t4", "general-purpose", "Kind: whatever\nRead Z:/brief.md.").deny.unwrap();
+    assert!(d.contains("no `Kind:` line naming a kind in its first 40 lines and no other rule classifies it, so orchestrate.default_kind (builder) applies") && d.contains(hint), "{d}");
+    // The Explore launch again as a general agent: the same description and
+    // brief find its entry, which keeps its kind (no `Queue:` line named it).
+    let key = |r: &str| r.split("queued it as ").nth(1).unwrap().split(':').take(3).collect::<Vec<_>>().join(":");
+    let k = key(&ty);
+    let again = launch(&mut h, &s, "t5", "general-purpose", "Read Z:/brief.md.").deny.unwrap();
+    assert_eq!(key(&again), k, "{again}");
+    let m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+    let w = atlas::queue::waiting(&m).unwrap();
+    assert_eq!(w.iter().find(|h| h.key == k).and_then(atlas::queue::kind_of), Some(Kind::Research));
+}
+
+/// Q-QU3 with a `Kind:` line: a launch queued under the default kind and
+/// relaunched with the advised `Kind:` and `Queue:` lines keeps its entry,
+/// which takes the new kind; a relaunch of the same kind leaves the entry
+/// as it was; either leaves the queue when it starts.
+#[test]
+fn a_relaunch_with_a_kind_line_keeps_and_rekinds_its_queue_entry() {
+    let t = Temp::new("orch-cap-requeue");
+    let s = Session::new(t.path());
+    let one = |k| (k, KindSpec { max: Some(1), ..Default::default() });
+    let on = OrchestrateSpec { enabled: Some(true), kinds: vec![one(Kind::Builder), one(Kind::Reviewer)], ..Default::default() };
+    let st = settings(t.path(), &on, &[]);
+    let store_path = st.store.clone();
+    let mut h = Hooks::open(st).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nBuild it.", 1000, false);
+    s.agent("r1", "general-purpose", "t-r1", "Kind: reviewer\nReview it.", 1000, false);
+    let r = launch(&mut h, &s, "t1", "general-purpose", "Review the parser; brief Z:/b.md.").deny.unwrap();
+    let key = "journal:queue:0001";
+    assert!(
+        r.contains(&format!("atlas queued it as {key}")) && r.contains(&format!("If you relaunch it with a `Kind:` line, add `Queue: {key}` too")),
+        "{r}"
+    );
+    let entry = |want_kind: Kind, want_body: &str| {
+        let m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+        let w = atlas::queue::waiting(&m).unwrap();
+        assert_eq!(w.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(), [key]);
+        assert_eq!(atlas::queue::kind_of(&w[0]), Some(want_kind));
+        assert_eq!(m.head(key).unwrap().unwrap().body, want_body);
+    };
+    // The relaunch as advised: refused at the reviewer cap, the same entry,
+    // now a reviewer with the new brief.
+    let again = format!("Kind: reviewer\nQueue: {key}\nReview the parser; brief Z:/b.md.");
+    let r = launch(&mut h, &s, "t2", "general-purpose", &again).deny.unwrap();
+    assert!(r.contains(&format!("has already queued it as {key}")) && !r.contains("add `Queue:"), "{r}");
+    entry(Kind::Reviewer, &again);
+    // A relaunch of the same kind by its key: the entry stays as it was.
+    let more = format!("{again}\nAlso read the tests.");
+    assert!(launch(&mut h, &s, "t3", "general-purpose", &more).deny.unwrap().contains(&format!("has already queued it as {key}")));
+    entry(Kind::Reviewer, &again);
+    // r1 finishes: the relaunch starts and the entry leaves the queue.
+    let _ = finished(&mut h, &s, "r1");
+    assert!(launch(&mut h, &s, "t4", "general-purpose", &more).deny.is_none());
+    let m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+    assert!(atlas::queue::waiting(&m).unwrap().is_empty());
+    assert_eq!(m.head(key).unwrap().unwrap().status, "retired");
+}
+
+/// A lane refusal is not caused by the kind: it gets no advice on
+/// `Kind:` lines, even for a launch no `Kind:` line classified.
+#[test]
+fn a_lane_refusal_gives_no_kind_advice() {
+    let t = Temp::new("orch-cap-no-kind-advice");
+    let s = Session::new(t.path());
+    let on = OrchestrateSpec { enabled: Some(true), ..Default::default() };
+    let mut h = Hooks::open(settings(t.path(), &on, &[])).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: parser\n\nFix the reader.", 1000, false);
+    let r = launch(&mut h, &s, "t1", "general-purpose", "Lane: parser\n\nFix the writer.").deny.unwrap();
+    assert!(r.starts_with("atlas queue") && r.contains("atlas queued it as") && !r.contains("add `Queue:") && !r.contains("Kind:"), "{r}");
+}
+
 /// ORCH-RETRO F1, the phantom pending slot (journal ATLAS-V03:0058): a
 /// launch that is finally denied never holds a slot, and a launch never
 /// counts against itself when its PreToolUse is seen twice.

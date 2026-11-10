@@ -195,6 +195,27 @@ pub struct UpdateSpec {
     pub url: Option<String>,
 }
 
+/// The self-calibration of the measured ratio (see `crate::calibrate`).
+#[derive(Debug, Clone, Default)]
+pub struct CalibrateSpec {
+    /// Calibrate in the background when the server starts and the stored
+    /// baseline is missing or stale (default true). `atlas --calibrate`
+    /// runs it by hand either way.
+    pub auto: Option<bool>,
+    /// What leaves a transcript out, matched against its session folder and
+    /// the Claude Code folder it is filed under (a replay keeps the folder of
+    /// the session it copies, so the second is the only sign of it): a
+    /// path (it has `/`, `\` or `:`) leaves out that folder and those
+    /// below it; a word leaves out a folder path that has it as a whole
+    /// word (split at every character but a letter or digit) below the
+    /// project root that holds it (the whole path when none does). Replaces the
+    /// default, `crate::calibrate::DEFAULT_SKIPS`.
+    pub skip: Option<Vec<String>>,
+    /// The handoff file-name pattern (default
+    /// `crate::calibrate::DEFAULT_HANDOFF`).
+    pub handoff: Option<String>,
+}
+
 /// One export of the memory store (see `crate::memory::export`).
 #[derive(Debug, Clone, Default)]
 pub struct ExportCfg {
@@ -452,6 +473,8 @@ pub struct Config {
     pub models: Option<ModelsSpec>,
     /// The release check at session start.
     pub update: Option<UpdateSpec>,
+    /// The self-calibration (`calibrate`).
+    pub calibrate: Option<CalibrateSpec>,
     /// The `lean` section, passed through unparsed: each package reads its
     /// own subsection (`handles`, `digests`, `routing`; `setup`, `startup`).
     pub lean: Option<Value>,
@@ -464,7 +487,7 @@ pub struct Config {
 /// The keys of the configuration file's top level that are not about
 /// projects.
 pub const TOP_KEYS: &[&str] =
-    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "orchestrate", "models", "update", "lean"];
+    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "orchestrate", "models", "update", "lean", "calibrate"];
 
 pub(crate) fn absolute(base: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -861,6 +884,16 @@ impl Config {
                 }
             }
             c.update = Some(UpdateSpec { enabled: f.boolean("enabled")?, pin, url });
+        }
+        if let Some(cv) = top.get("calibrate") {
+            let f = Fields::new("calibrate", cv, &["auto", "skip", "handoff"])?;
+            let handoff = f.string("handoff")?;
+            if let Some(h) = &handoff {
+                if crate::regex::Regex::new(h).is_err() {
+                    return Err(f.bad("handoff", "a regular expression"));
+                }
+            }
+            c.calibrate = Some(CalibrateSpec { auto: f.boolean("auto")?, skip: f.strings("skip")?, handoff });
         }
         if let Some(mv) = top.get("memory") {
             let f = Fields::new("memory", mv, &["store", "export_dir", "exports", "snapshot_hours", "snapshot_dir", "snapshot_cap_mb", "brief_reference", "tree", "transcripts", "resume_card", "ideas", "rules"])?;

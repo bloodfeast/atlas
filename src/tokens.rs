@@ -265,7 +265,7 @@ impl Ledger {
     ///
     /// [`crate::Error::Db`] if the table cannot be made.
     pub fn start(db: &Path, roots: Vec<(String, PathBuf)>) -> Result<Ledger> {
-        let conn = Connection::open(db)?;
+        let conn = crate::store::open_raw(db)?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(TOKEN_TABLE)?;
         let (tx, rx) = mpsc::channel::<Record>();
@@ -467,8 +467,10 @@ pub fn record_read(mem: &crate::memory::MemoryStore, key: &str) -> usize {
 pub fn log_brief(conn: &Connection, session: &str, agent: &str, bytes: u64) -> Result<()> {
     let time = crate::store::utc(SystemTime::now());
     let day = time.get(..10).unwrap_or("").to_string();
-    conn.prepare_cached("INSERT INTO brief_log(time, day, session, agent, bytes) VALUES(?1, ?2, ?3, ?4, ?5)")?.execute(params![time, day, session, agent, bytes as i64])?;
-    Ok(())
+    crate::store::guarded(conn, || {
+        conn.prepare_cached("INSERT INTO brief_log(time, day, session, agent, bytes) VALUES(?1, ?2, ?3, ?4, ?5)")?.execute(params![time, day, session, agent, bytes as i64])?;
+        Ok(())
+    })
 }
 
 /// The "brief without atlas" totals: subagent starts, and the tokens
@@ -517,15 +519,17 @@ pub fn log_row(conn: &Connection, tool: &str, returned: usize, cf: Option<Counte
 fn log(conn: &Connection, r: &Record, cf: Option<Counterfactual>) -> Result<()> {
     let time = crate::store::utc(SystemTime::now());
     let day = time.get(..10).unwrap_or("").to_string();
-    conn.prepare_cached("INSERT INTO token_log(time, day, tool, returned, grep, read) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![
-        time,
-        day,
-        r.tool,
-        r.returned as i64,
-        cf.map(|c| c.grep as i64),
-        cf.map(|c| c.read as i64)
-    ])?;
-    Ok(())
+    crate::store::guarded(conn, || {
+        conn.prepare_cached("INSERT INTO token_log(time, day, tool, returned, grep, read) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![
+            time,
+            day,
+            r.tool,
+            r.returned as i64,
+            cf.map(|c| c.grep as i64),
+            cf.map(|c| c.read as i64)
+        ])?;
+        Ok(())
+    })
 }
 
 /// One row of the token report.
@@ -615,8 +619,10 @@ pub fn inject_report(conn: &Connection, bytes_per_token: f64) -> Result<Option<I
 /// [`crate::Error::Db`].
 pub fn log_select(conn: &Connection, hook: &str, key: &str, how: &str, bytes: usize, full: usize) -> Result<()> {
     let time = crate::store::utc(SystemTime::now());
-    conn.prepare_cached("INSERT INTO inject_select(time, hook, key, how, bytes, full) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![time, hook, key, how, bytes as i64, full as i64])?;
-    Ok(())
+    crate::store::guarded(conn, || {
+        conn.prepare_cached("INSERT INTO inject_select(time, hook, key, how, bytes, full) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![time, hook, key, how, bytes as i64, full as i64])?;
+        Ok(())
+    })
 }
 
 /// One row of the context-selection report: an outcome, how many injected

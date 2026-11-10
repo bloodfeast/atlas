@@ -363,25 +363,81 @@ impl CodeSetup {
     }
 }
 
+/// The stored code schema, or `None` (no `meta` table yet, or no row).
+fn stored_code_schema(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT value FROM meta WHERE key = 'code_schema'", [], |r| r.get(0)).optional().unwrap_or(None)
+}
+
+/// The number of a `code-N` schema; `None` for any other shape (older
+/// schemas than the numbered ones, or garbage: both count as older).
+fn code_schema_number(s: &str) -> Option<u64> {
+    s.strip_prefix("code-")?.parse().ok()
+}
+
+/// The refusal for a code index at schema `have` when it is newer than
+/// [`CODE_SCHEMA`].
+pub(crate) fn code_schema_too_new(have: Option<&str>, path: &str) -> Option<Error> {
+    let have = have?;
+    let ours = code_schema_number(CODE_SCHEMA)?;
+    (code_schema_number(have)? > ours).then(|| Error::StoreTooNew {
+        store: "code index".into(),
+        path: path.to_string(),
+        found: have.to_string(),
+        supported: CODE_SCHEMA.to_string(),
+    })
+}
+
+/// Whether the code index in `conn` is newer than this binary reads (for
+/// `atlas doctor`; reads only). `db` names the file in the message.
+pub fn code_too_new(conn: &Connection, db: &Path) -> Option<Error> {
+    code_schema_too_new(stored_code_schema(conn).as_deref(), &db.display().to_string())
+}
+
 /// Creates the code tables: migrates them in place from `code-5` (adding
 /// `code_units`) or `code-6` (adding `code_packages`), else drops and
-/// rebuilds them when their schema changed.
+/// rebuilds them when their schema changed. A newer schema than
+/// [`CODE_SCHEMA`] is refused and left as it is.
 ///
 /// # Errors
 ///
+/// [`Error::StoreTooNew`] for a newer code index (nothing written), else
 /// [`Error::Db`] from SQLite.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
-    let have: Option<String> = conn
-        .query_row("SELECT value FROM meta WHERE key = 'code_schema'", [], |r| r.get(0))
-        .optional()
-        .unwrap_or(None);
+    let have = stored_code_schema(conn);
     if have.as_deref() == Some(CODE_SCHEMA) {
         return Ok(());
+    }
+    // A newer binary's index is refused before anything is written: dropping
+    // it here would cost that binary a full reindex, and each would drop the
+    // other's on every open.
+    if let Some(e) = code_schema_too_new(have.as_deref(), conn.path().unwrap_or("")) {
+        return Err(e);
     }
     conn.execute_batch("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
     // One write transaction, taken at its start (a deferred one that reads
     // first cannot wait for another writer).
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    make_schema(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The schema step of [`ensure_schema`], under the write lock: reads the
+/// schema again (another binary may have written it since the first read),
+/// refuses a newer one with nothing written, and migrates or rebuilds an
+/// older one. The caller commits; on an error dropping `tx` rolls back.
+///
+/// # Errors
+///
+/// [`Error::StoreTooNew`], else [`Error::Db`] from SQLite.
+fn make_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let have = stored_code_schema(tx);
+    if have.as_deref() == Some(CODE_SCHEMA) {
+        return Ok(());
+    }
+    if let Some(e) = code_schema_too_new(have.as_deref(), tx.path().unwrap_or("")) {
+        return Err(e);
+    }
     if let Some(from) = MIGRATIONS.iter().position(|(s, _)| have.as_deref() == Some(*s)) {
         tx.execute_batch(SCHEMA)?;
         for (_, sql) in &MIGRATIONS[from..] {
@@ -392,7 +448,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         tx.execute_batch(SCHEMA)?;
     }
     tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('code_schema', ?1)", [CODE_SCHEMA])?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -1888,7 +1943,8 @@ pub fn write_root(
     elapsed_ms: u64,
 ) -> Result<WriteStats> {
     ensure_schema(conn)?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // `begin` refuses a store a newer atlas upgraded since this one opened it.
+    let tx = crate::store::begin(conn)?;
     tx.execute("DELETE FROM code_occ WHERE file IN (SELECT id FROM code_files WHERE root = ?1)", [root])?;
     tx.execute("DELETE FROM code_lines WHERE file IN (SELECT id FROM code_files WHERE root = ?1)", [root])?;
     tx.execute("DELETE FROM code_files WHERE root = ?1", [root])?;
@@ -2218,22 +2274,24 @@ pub fn defined_packages(conn: &Connection, root: &str, own: bool) -> Result<Hash
 ///
 /// # Errors
 ///
-/// [`Error::Db`] from SQLite.
+/// [`Error::StoreTooNew`] (nothing marked), or [`Error::Db`] from SQLite.
 pub fn mark_package_users(conn: &Connection, root: &str, before: &HashSet<String>, after: &HashSet<String>) -> Result<usize> {
     let mut changed: Vec<&String> = before.symmetric_difference(after).collect();
     if changed.is_empty() {
         return Ok(0);
     }
     changed.sort();
-    let mut st = conn.prepare_cached(
-        "UPDATE code_roots SET fingerprint = '' WHERE root <> ?1 AND fingerprint <> ''
-         AND root IN (SELECT root FROM code_packages WHERE package = ?2 AND defines = 0)",
-    )?;
-    let mut n = 0;
-    for p in changed {
-        n += st.execute(params![root, p])?;
-    }
-    Ok(n)
+    crate::store::guarded(conn, || {
+        let mut st = conn.prepare_cached(
+            "UPDATE code_roots SET fingerprint = '' WHERE root <> ?1 AND fingerprint <> ''
+             AND root IN (SELECT root FROM code_packages WHERE package = ?2 AND defines = 0)",
+        )?;
+        let mut n = 0;
+        for p in changed {
+            n += st.execute(params![root, p])?;
+        }
+        Ok(n)
+    })
 }
 
 /// Every root's last indexing, by name.
@@ -2430,7 +2488,8 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
             scan_rows(&one, &mut rows, &mut files);
         }
     }
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // `begin` refuses a store a newer atlas upgraded since this one opened it.
+    let tx = crate::store::begin(conn)?;
     let existing: Option<i64> = file_row(&tx, &root, &rel)?.map(|x| x.0);
     let mut names: HashSet<String> = HashSet::new();
     if let Some(id) = existing {
@@ -2795,6 +2854,52 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_code_index_is_refused_and_left_as_it_is() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let newer = format!("code-{}", code_schema_number(CODE_SCHEMA).unwrap() + 1);
+        conn.execute("UPDATE meta SET value = ?1 WHERE key = 'code_schema'", [&newer]).unwrap();
+        conn.execute_batch("INSERT INTO code_files(id, root, path, lang) VALUES(1, 'app', 'src/lib.rs', 'rust'); DROP TABLE code_packages;").unwrap();
+        let e = ensure_schema(&conn).unwrap_err();
+        assert!(matches!(&e, Error::StoreTooNew { store, found, supported, .. } if store == "code index" && *found == newer && supported == CODE_SCHEMA), "{e}");
+        let schema: String = conn.query_row("SELECT value FROM meta WHERE key = 'code_schema'", [], |r| r.get(0)).unwrap();
+        assert_eq!(schema, newer, "the version is not written back");
+        let files: i64 = conn.query_row("SELECT COUNT(*) FROM code_files", [], |r| r.get(0)).unwrap();
+        assert_eq!(files, 1, "nothing is dropped");
+        let made: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'code_packages'", [], |r| r.get(0)).unwrap();
+        assert_eq!(made, 0, "no schema is run");
+        assert!(code_too_new(&conn, Path::new("x.sqlite")).is_some());
+        // Unnumbered and older schemas are not refused.
+        assert!(code_schema_too_new(Some("code-6"), "").is_none() && code_schema_too_new(Some("garbage"), "").is_none() && code_schema_too_new(None, "").is_none());
+    }
+
+    #[test]
+    fn the_schema_step_under_the_lock_refuses_an_index_upgraded_since_the_first_read() {
+        // The race: `ensure_schema` read an older schema, a newer binary then
+        // wrote its own, and this one takes the write lock. The step under
+        // the lock reads it again and refuses, with nothing written.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        let newer = format!("code-{}", code_schema_number(CODE_SCHEMA).unwrap() + 1);
+        conn.execute("UPDATE meta SET value = ?1 WHERE key = 'code_schema'", [&newer]).unwrap();
+        conn.execute_batch("DROP TABLE code_packages;").unwrap();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        let e = make_schema(&tx).unwrap_err();
+        assert!(e.is_store_too_new(), "{e}");
+        drop(tx);
+        assert!(conn.is_autocommit(), "rolled back");
+        let made: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'code_packages'", [], |r| r.get(0)).unwrap();
+        assert_eq!(made, 0, "no schema is run");
+        // An older one is migrated by the same step.
+        conn.execute("UPDATE meta SET value = 'code-6' WHERE key = 'code_schema'", []).unwrap();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        make_schema(&tx).unwrap();
+        tx.commit().unwrap();
+        let schema: String = conn.query_row("SELECT value FROM meta WHERE key = 'code_schema'", [], |r| r.get(0)).unwrap();
+        assert_eq!(schema, CODE_SCHEMA);
+    }
+
+    #[test]
     fn schema_migrates_from_code_5_and_6_and_rebuilds_from_older() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
@@ -2858,5 +2963,33 @@ mod tests {
         assert!(!relevant("target/debug/build/x.rs"));
         assert!(!relevant(".git/HEAD"));
         assert!(!relevant("README.md"));
+    }
+}
+
+#[cfg(test)]
+mod storeguard_tests {
+    use super::*;
+    use crate::store::skew_support::{dump, make_index_newer};
+
+    /// Marking the users of a changed package on a store a newer atlas
+    /// upgraded since this one opened it clears no fingerprint; at the
+    /// current version it does.
+    #[test]
+    fn marking_package_users_checks_the_version_under_the_lock() {
+        let c = Connection::open_in_memory().unwrap();
+        ensure_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO code_roots(root, fingerprint, indexed, files, defs, refs, impls, rust, elapsed_ms) VALUES('b', 'fp', 't', 0, 0, 0, 0, '', 0);
+             INSERT INTO code_packages(root, package, defines) VALUES('b', 'p', 0);",
+        )
+        .unwrap();
+        let (was, now): (HashSet<String>, HashSet<String>) = (HashSet::new(), ["p".to_string()].into());
+        make_index_newer(&c);
+        let before = dump(&c);
+        assert!(mark_package_users(&c, "a", &was, &now).expect_err("refused").is_store_too_new());
+        assert!(c.is_autocommit(), "rolled back");
+        assert_eq!(dump(&c), before, "no fingerprint cleared");
+        c.execute("DELETE FROM meta WHERE key = 'schema'", []).unwrap();
+        assert_eq!(mark_package_users(&c, "a", &was, &now).unwrap(), 1);
     }
 }

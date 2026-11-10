@@ -89,6 +89,8 @@ pub fn embed_pending(store: &MemoryStore, model: &Model, limit: usize, threads: 
         return Err(crate::Error::InvalidArgument(format!("embedded {} vectors for {} texts", vecs.len(), todo.len())));
     }
     let tx = rusqlite::Transaction::new_unchecked(store.conn(), rusqlite::TransactionBehavior::Immediate)?;
+    // A store a newer atlas upgraded since this one opened it is not written.
+    super::check_locked(&tx, store.path())?;
     {
         let mut st = tx.prepare_cached("INSERT OR REPLACE INTO rec_vec(model, sha, vec) VALUES(?1, ?2, ?3)")?;
         for ((sha, _), v) in todo.iter().zip(&vecs) {
@@ -104,13 +106,18 @@ pub fn embed_pending(store: &MemoryStore, model: &Model, limit: usize, threads: 
 ///
 /// # Errors
 ///
+/// [`crate::Error::StoreTooNew`] (nothing deleted, no table made), or
 /// [`crate::Error::Db`].
 pub fn prune(store: &MemoryStore, model: &str) -> Result<usize> {
-    ensure_schema(store)?;
-    Ok(store.conn().execute(
-        "DELETE FROM rec_vec WHERE model = ?1 AND sha NOT IN (SELECT v.sha FROM records r JOIN versions v ON v.vid = r.head)",
-        [model],
-    )?)
+    // The table is made inside the checked transaction too: a store a newer
+    // atlas upgraded is not written, its schema included.
+    super::guarded(store.conn(), store.path(), || {
+        ensure_schema(store)?;
+        Ok(store.conn().execute(
+            "DELETE FROM rec_vec WHERE model = ?1 AND sha NOT IN (SELECT v.sha FROM records r JOIN versions v ON v.vid = r.head)",
+            [model],
+        )?)
+    })
 }
 
 /// Embeds every pending record on a background thread with its own store
@@ -224,5 +231,33 @@ impl RecVecs {
         scored.truncate(k);
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         scored
+    }
+}
+
+#[cfg(test)]
+mod storeguard_tests {
+    use super::*;
+    use crate::store::skew_support::dump;
+
+    /// `prune` on a store a newer atlas upgraded since this one opened it
+    /// deletes nothing and makes no table; at the current version it prunes.
+    #[test]
+    fn prune_checks_the_version_under_the_lock() {
+        let newer = format!("PRAGMA user_version = {};", super::super::SCHEMA_VERSION + 1);
+        let store = MemoryStore::in_memory().unwrap();
+        store.conn().execute_batch(&newer).unwrap();
+        let before = dump(store.conn());
+        assert!(prune(&store, "m").expect_err("refused").is_store_too_new());
+        assert_eq!(dump(store.conn()), before, "no table made");
+        let store = MemoryStore::in_memory().unwrap();
+        ensure_schema(&store).unwrap();
+        store.conn().execute("INSERT INTO rec_vec(model, sha, vec) VALUES('m', 'gone', x'00')", []).unwrap();
+        store.conn().execute_batch(&newer).unwrap();
+        let before = dump(store.conn());
+        assert!(prune(&store, "m").expect_err("refused").is_store_too_new());
+        assert!(store.conn().is_autocommit(), "rolled back");
+        assert_eq!(dump(store.conn()), before, "the stale vector stays");
+        store.conn().execute_batch(&format!("PRAGMA user_version = {};", super::super::SCHEMA_VERSION)).unwrap();
+        assert_eq!(prune(&store, "m").unwrap(), 1);
     }
 }

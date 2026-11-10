@@ -1,5 +1,6 @@
 * text=auto eol=lf
-# The development repository's release workflow never reaches the public one.
+# The development repository's own workflows never reach the public one.
 .github/workflows/release-pr.yml export-ignore
+.github/workflows/dev-pr.yml export-ignore
 # SCIP indexes are binary protobuf.
 *.scip binary
