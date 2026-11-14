@@ -25,8 +25,9 @@ fn a_chain_key_is_off_unless_transcripts_or_compaction_is_on() {
     let card = atlas::chain::card(&p).unwrap();
     let key = atlas::chain::written_keys(&card).into_iter().next().unwrap_or_else(|| panic!("no key in {card}"));
 
-    let off = Settings::from_config(None, &tmp.path().join("state").join("index.sqlite")).unwrap();
-    assert!(!off.transcripts && !off.compact.enabled, "both are off by default");
+    let mut off = Settings::from_config(None, &tmp.path().join("state").join("index.sqlite")).unwrap();
+    assert!(!off.transcripts && off.compact.enabled, "transcripts are off by default, compaction on");
+    off.compact.enabled = false;
     let fx = Fx::new("chain-keys-server");
     let mut s = fx.server();
     s.set_memory(off.clone());

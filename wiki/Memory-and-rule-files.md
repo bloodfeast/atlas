@@ -12,7 +12,8 @@ How the store and hooks work in general is in [[Memory store and hooks]]. The ge
 | --- | --- | --- |
 | unset | the default, and `atlas settings off memory-rules` | What your configuration names by hand (`memory_dir`, `intent`) is synced and recalled as it always was. Nothing new is read. |
 | `true` | `atlas settings set memory-rules true` | The sections below apply. |
-| `false` | `atlas settings set memory-rules false`, by hand only | More than unset: even what your configuration names by hand stops. Memory folders and rule files stop syncing and leave the sources, and query recall and the prompt hook leave out rule and memory records. **The store is kept**: `recall {key}` still reads every record, and a later `true` picks up where it stopped. The store refuses deletes, so atlas never offers to remove it. |
+| `false` | `atlas settings set memory-rules false` | The same as unset: what your configuration names by hand is synced and recalled as it always was. (Before v0.5.0, `false` stopped that too; that is now `"off"`.) |
+| `"off"` | `atlas settings set memory-rules off`, by hand only | More than unset: even what your configuration names by hand stops. Memory folders and rule files stop syncing and leave the sources, and query recall and the prompt hook leave out rule and memory records. **The store is kept**: `recall {key}` still reads every record, and a later `true` picks up where it stopped. The store refuses deletes, so atlas never offers to remove it. |
 
 ## What `true` reads and writes
 

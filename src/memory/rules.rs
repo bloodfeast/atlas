@@ -39,19 +39,16 @@ pub enum Mode {
     /// on a replaced ruling answers with the live one, and hook pointers on
     /// rules and memories are headlines.
     Live,
-    /// `false`, set by hand: no sync of rule files or memory folders and no query recall of
+    /// `"off"`, set by hand: no sync of rule files or memory folders and no query recall of
     /// their records. The store is kept, and `recall {key}` still reads it.
     Off,
 }
 
 impl Mode {
-    /// The mode of a `memory.rules` value.
-    pub fn of(v: Option<bool>) -> Mode {
-        match v {
-            None => Mode::Today,
-            Some(true) => Mode::Live,
-            Some(false) => Mode::Off,
-        }
+    /// The mode of a `memory.rules` value as the configuration reads it
+    /// (`false` reads as [`Mode::Today`], the same as unset).
+    pub fn of(v: Option<Mode>) -> Mode {
+        v.unwrap_or_default()
     }
 }
 

@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS hook_inject(
     bytes INTEGER NOT NULL,
     read INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS hook_inject_session ON hook_inject(session, agent);
+CREATE INDEX IF NOT EXISTS hook_inject_agent ON hook_inject(agent);
 CREATE TABLE IF NOT EXISTS inject_select(
     id INTEGER PRIMARY KEY,
     time TEXT NOT NULL,

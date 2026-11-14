@@ -41,7 +41,8 @@ jobs:
           CARGO_BUILD_JOBS: 4
   clippy:
     # Same rule as the tests. On a pinned toolchain, so a new Rust release's
-    # lints cannot fail an unrelated release: bump it in xtask/src/release.rs too.
+    # lints cannot fail an unrelated release: bump it in xtask/src/release.rs
+    # and rust-toolchain.toml too.
     if: github.repository == 'bloodfeast/atlas'
     strategy:
       fail-fast: false

@@ -29,7 +29,7 @@ const SITES: &[(&str, usize, &str)] = &[
     ("calibrate/mod.rs", 7, "run: tables under store::guarded, each batch under store::begin_shared, the cutoff row under store::guarded"),
     ("code.rs", 31, "ensure_schema re-checks under the lock (its meta CREATE is setup DDL before it); write_root and reindex_file under store::begin; mark_package_users under store::guarded"),
     ("code_index.rs", 3, "code_roots reset under store::guarded; take_lease under store::begin; release_lease under store::guarded"),
-    ("compact.rs", 4, "log: table and row under store::guarded; totals TABLE DDL is read-path setup DDL"),
+    ("compact.rs", 6, "log and log_miss: table and row under store::guarded; totals' COMPACT_TABLE and TOKEN_TABLE DDL is read-path setup DDL; totals and repeats read compact_miss only when sqlite_master has it"),
     ("handles.rs", 5, "open: HANDLES_SCHEMA after open_raw's check (setup DDL); put, touch and evict under store::guarded"),
     ("hook_hits.rs", 2, "log_injection under store::guarded; logged TOKEN_TABLE is read-path setup DDL"),
     ("hook_rewrite.rs", 3, "TOKEN_TABLE after Handles::open (setup DDL); both miss rows under store::guarded"),

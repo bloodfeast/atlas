@@ -112,12 +112,12 @@ pub fn places(m: &Matcher, files: &[(String, Vec<u8>)]) -> Vec<Place> {
                 (r, n)
             })
             .collect();
-        for (k, t) in m.terms() {
+        for term in m.terms() {
+            let (k, t) = (&term.num, &term.text);
             let mut seen = BTreeSet::new();
             for (r, n) in &reads {
                 let mut from = 0;
-                while let Some(i) = n.text[from..].find(t.as_str()) {
-                    let p = from + i;
+                while let Some(p) = term.find(&n.text, from) {
                     let at = n.at[p];
                     let d = digest(*k, t, window(&n.text, p, p + t.len()));
                     if seen.insert((at, d.clone())) {
@@ -127,7 +127,7 @@ pub fn places(m: &Matcher, files: &[(String, Vec<u8>)]) -> Vec<Place> {
                     from = p + n.text[p..].chars().next().map_or(1, char::len_utf8);
                 }
             }
-            if name.text.contains(t.as_str()) {
+            if term.find(&name.text, 0).is_some() {
                 out.push(Place { file: rel.clone(), term: *k, at: None, digest: None });
             }
         }
@@ -156,7 +156,7 @@ impl Accepted {
             if d.len() != 64 || !d.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return Err(bad());
             }
-            if !m.terms().iter().any(|(k, _)| *k == n) {
+            if !m.terms().iter().any(|t| t.num == n) {
                 return Err(format!("the accepted-hits file, line {}: term #{n} is not a term of the denylist", i + 1));
             }
             out.insert((n, d.to_string()));
@@ -278,6 +278,16 @@ mod tests {
         assert_eq!(ps.len(), 2, "every place is listed, not only the first");
         let j = judge(&ps, &files2, &acc);
         assert_eq!((j.leaks.len(), j.accepted), (1, 1), "{j:?}");
+    }
+
+    #[test]
+    fn a_whole_word_term_lists_only_its_whole_word_places() {
+        let db = db();
+        let m = Matcher::new(&db, "#[word]\nquill\n");
+        let files = vec![("f".to_string(), elf("squill quills quill_x (quill) a-quill"))];
+        let ps = places(&m, &files);
+        assert_eq!(ps.iter().filter_map(|p| p.at.map(|a| a.0)).collect::<Vec<_>>(), vec![16 + 23, 16 + 32], "{ps:?}");
+        assert!(places(&m, &[("bin/quills".to_string(), elf("clean"))]).is_empty(), "a path inside a word");
     }
 
     #[test]

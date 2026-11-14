@@ -143,7 +143,11 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
         let r = by(*id);
         assert!(r.get("result").is_some() && r["result"]["isError"] != true, "{event}: {r}");
         let t = text(&r);
-        if !t.is_empty() {
+        if event == "PreCompact" && !t.is_empty() {
+            // Compaction is on by default: its reply is the plain summary
+            // instructions, all of which land in the summarizer's prompt.
+            assert_eq!(t, atlas::claude_settings::COMPACT_INSTRUCTIONS, "{event}");
+        } else if !t.is_empty() {
             let h = json::parse(&t).unwrap_or_else(|e| panic!("{event} answered non-JSON {t:?}: {e:?}"));
             assert_eq!(h["hookSpecificOutput"]["hookEventName"], event.as_str());
         }

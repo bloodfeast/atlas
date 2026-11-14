@@ -150,7 +150,7 @@ See [[Memory store and hooks]] and [[Memory tree]].
 | `memory.tree` | the memory index as a tree (off when absent) |
 | `memory.transcripts` | index this project's session transcripts at each compaction as an opt-in source: `recall {key: "turn:<session8>:<line>@hash"}` and `recall {query, kind: "turn"}` (visible text only, secret lines redacted, never served to another project; default false). On, `recall` also resolves a compaction card's chain keys (`turn:<session>:b<first>-b<last>@hash`, `turn:<session>:b<offset>#<k>@hash`, `compact:<session>:b<offset>@hash`), read from the transcript and not indexed, without `compact.enabled` |
 | `memory.resume_card` | at a new or cleared session (SessionStart `startup` or `clear`), inject the resume card (at most 1,160 bytes): live lanes, their open questions, running agents after a `/clear`, the work queue's head, an unmet goal and other handoffs, as keys, then a multiple-choice question about what to do first (an empty store gives none; default true) |
-| `memory.rules` | experimental, off by default: whether atlas manages the memory folder and rule files. Unset keeps what is named by hand, `true` finds them and answers with the ruling that holds, `false` also stops sync and recall of what is named by hand and keeps the store. See [[Memory and rule files]] |
+| `memory.rules` | experimental, off by default: whether atlas manages the memory folder and rule files. Unset keeps what is named by hand, `true` finds them and answers with the ruling that holds, `false` is the same as unset, and `"off"` also stops sync and recall of what is named by hand and keeps the store. See [[Memory and rule files]] |
 | `memory.ideas.enabled` | idea capture, off by default: the one switch for capture, surfaces and questions. See [[Memory store and hooks]] |
 | `memory.ideas.weights` | a weights file in place of the built-in frozen ones |
 | `memory.ideas.band_below` | how far below the threshold a score is still unsure (default 0.25) |
@@ -183,16 +183,17 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | Key | Meaning |
 |---|---|
 | `recall` | the recall gate's settings |
-| `recall.budget_tokens` | the most a recall hook injects per prompt (default 150) |
+| `recall.budget_tokens` | the most a recall hook injects per prompt (default 600; with `recall.cos_floor` 0.53, chosen by the cos_floor sweep on the off-topic set and the 303-prompt hook replay) |
 | `recall.lane_budget_tokens` | the budget of `recall {lane}` (default 2,000) |
 | `recall.fts_floor` | the FTS5 score a record must clear without the embedding model |
 | `recall.hybrid_fts_floor` | the FTS5 score a record must clear with the embedding model loaded |
 | `recall.min_terms` | the prompt words a record must contain to pass lexically (default 3) |
-| `recall.cos_floor` | the cosine a record must also clear with the model loaded |
+| `recall.cos_floor` | the cosine a record must also clear with the model loaded (default 0.53, the lowest floor that passes the cos_floor sweep at 600 tokens with 2 prompt pointers: no more off-topic records than 0.57 at 150 tokens on the 30-prompt off-topic set; set 0.57 for a stricter floor) |
 | `recall.cos_alone` | a cosine at or above this passes on meaning alone |
 | `recall.query_tokens` | the prompt tokens the cosine is taken over (default 32) |
 | `recall.inject_floor` | the cosine below which a hook injects a record not at all (records without a vector are not held to it); tuned on hit data by `atlas --hook-report --tune-floor 1` |
 | `recall.session_budget_tokens` | the tokens one session's (or one subagent's) recall injections may use in all, lanes and pointers together; past it the hooks inject nothing more, and `recall {query}` still answers. 0 (the default) is no cap. Judge it against the "brief without atlas" row of `--token-report`, which now has a `hook injections` line beside it |
+| `recall.prompt_pointers` | the most pointers one main-session prompt gets (2); the rest are counted in the `+N more` line, and a subagent's brief is not capped. 0 is no cap. On the 70 hook questions of the memory eval, 2 against no cap cost 2 informed passes and 1 strict at floor 0 for 22% fewer injected tokens |
 | `recall.pointer_anchors` | whether each `recall {query}` pointer ends with `@src:path:line`, the vault or source, file and line its record's text starts at, so a follow-up can `read_note {vault: src, path, lines}` instead of `recall {key}` (default off; see the anchors rows of `cargo xtask memory-eval`) |
 | `recall.select` | context selection of what the hooks inject (on by default): near-duplicates sent as refs, pointers and older lane entries trimmed to the clauses that match the prompt, each excerpt the record's own text. Measured by the hook rows of `cargo xtask memory-eval` (each floor with selection off, then on) and the `context selection` line of `--token-report` |
 | `recall.select.enabled` | `false` sends every pointer and lane entry whole, as before (the gate and budgets still apply) |
@@ -205,32 +206,75 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `cap.block_tokens` | the hard limit: past this every tool but `handoff` is denied. It applies to every agent kind without its own `limit`, and to the main session (default 450,000 scaled to the context window) |
 | `cap.warn_every` | the warning repeats after this many more tokens (default 25,000) |
 | `cap.main_session` | apply the cap to the main session too (default false) |
-| `orchestrate` | orchestrator mode: caps on how many agents of each kind run at once, and per-kind context limits (see the `orchestrate` skill and `docs/design/orchestrate.md`) |
+| `orchestrate` | orchestrator mode: caps on how many agents of each kind run at once, and per-kind context limits (see [[Orchestration]], the `orchestrate` skill and `docs/design/orchestrate.md`) |
 | `orchestrate.enabled` | turn the agent caps on (default false). Context limits apply without it. `atlas --setup` and `atlas settings orchestrate` ask for it and store the answers |
 | `orchestrate.window` | the context window the limits scale to (default 0: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else 200,000 when `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set, else 1,000,000) |
 | `orchestrate.stale_minutes` | an unfinished agent whose transcript has not changed for this long is not counted (default 360) |
-| `orchestrate.resources` | the work queue's shared resources and how many items may hold each at once, e.g. `{"gpu": 1, "compile": 1}` (the default); other names allow 1, and 0 never serializes |
+| `orchestrate.resources` | the work queue's shared resources and how many items may hold each at once, e.g. `{"gpu": 1, "compile": 1}` (the default). `worktree:NAME` allows 1; any other name not listed is not a limit and only warns at launch; 0 never serializes |
+| `orchestrate.resources.compile` | compile slots (default 1). On yes, setup writes max(1, hardware threads / 16), at most 4, unless you answer `--compile N` or it is set |
+| `orchestrate.resources.gpu` | gpu slots (default 1). Setup writes 1: `gpu` is a lock and atlas assigns no device, so nothing is probed |
 | `orchestrate.aging_minutes` | minutes a queued item waits before it rises one priority class (default 60; 0 turns aging off) |
+| `orchestrate.bare_gpu_words` | the bare words capture, screenshot, bench, benchmark and bake in a brief infer the gpu (default false). A project file (`atlas.project.json`) may set it for its project, and sets no other `orchestrate` key |
 | `orchestrate.reviews` | the required-reviews merge gate: a `gh pr merge` in a shell command needs a passing review of the PR's head from each role (see `docs/design/reviews.md`) |
 | `orchestrate.reviews.roles` | the review roles every PR needs, named by job, e.g. `["simplicity", "cost"]` (default none: the gate is off) |
 | `orchestrate.reviews.mode` | `enforced` denies the merge, `advisory` adds a warning, `off` does nothing (default `advisory`) |
-| `orchestrate.default_kind` | the kind of an agent no rule classifies: `builder`, `reviewer`, `research` or `none` (default `builder`). Rules, in order: a `Kind:` line in the first 40 lines of the Agent launch prompt (not a brief file it names), `orchestrate.types`, an agent with `isolation: "worktree"` is a builder |
-| `orchestrate.types` | agent type to kind, over the built-in map (`Explore`, `Plan` and `claude-code-guide` are research; `statusline-setup` is none) |
+| `orchestrate.judge` | the task judge: a model and effort pick per agent launch from a local cells file (`note` op `judge`; see `src/taskjudge.rs`) |
+| `orchestrate.judge.enabled` | at each admitted Agent launch, add one advisory line when the launch's model or its `Judge:` line differs from the pick, and log the pick to `judge-picks.jsonl` beside the memory store; never denies or rewrites a launch (default false) |
+| `orchestrate.judge.cells` | the cells file: `{"cells": [{"key": {"kind", "has_brief"}, "scope", "unk"}]}`, looked up by (kind, names a brief), then kind, then the global cell (default none: no pick) |
+| `orchestrate.judge.classifier` | the work classifier (rule C): an ordinal demand score 0-5 for a launch that names a brief, from a small head over the brief's input vector (bge-int8 encoder, model id `746bdb58bc259433-int8`) or from a kind-only table, turned into a model and effort by an editable rules map. Advisory only: one `Classifier:` context line at an admitted launch (kind source only: the head's embed is too slow for the launch hook) and a `classifier` field in the `judge_task` answer; never denies or rewrites a launch. Absent or off: no change. |
+| `orchestrate.judge.classifier.enabled` | run the classifier (default false); it runs only for a launch that names a `BRIEF*.md` file |
+| `orchestrate.judge.classifier.weights` | the head's `weights.f32` (f32 little-endian: 388 weights, then 5 thresholds; 1,572 bytes); a missing file, wrong size or wrong sha256 gives no pick and no error (default none). Not shipped; local only |
+| `orchestrate.judge.classifier.weights_sha256` | the weights file's sha256, checked when set (default none) |
+| `orchestrate.judge.classifier.source` | `"head"` (the trained head; needs `weights` and the bge-int8 `semantic.model`) or `"kind"` (the kind-only table: reviewer 0, builder 5, research 2, other 0) (default `"kind"`) |
+| `orchestrate.judge.classifier.map` | the pick per score, `{"0": "opus/medium", ..., "5": "opus/high"}`; a score left out keeps its default (scores 0-4 opus/medium, 5 opus/high) |
+| `orchestrate.judge.classifier.overrides` | per-kind overrides, each `{"enabled", "max_score", "pick"}` or null: `research` defaults to `{"enabled": false, "max_score": 1, "pick": "sonnet/medium"}`; `builder` defaults to null (set later by the builder replays). Reviewers have none |
+| `orchestrate.judge.classifier.overrides.research` | the research override, or null for none (default `{"enabled": false, "max_score": 1, "pick": "sonnet/medium"}`) |
+| `orchestrate.judge.classifier.overrides.research.enabled` | apply the research override (default false) |
+| `orchestrate.judge.classifier.overrides.research.max_score` | the highest score the research override applies to (required) |
+| `orchestrate.judge.classifier.overrides.research.pick` | the research override's `"model/effort"` (required) |
+| `orchestrate.judge.classifier.overrides.builder` | the builder override, or null for none (default null: no override) |
+| `orchestrate.judge.classifier.overrides.builder.enabled` | apply the builder override (default false) |
+| `orchestrate.judge.classifier.overrides.builder.max_score` | the highest score the builder override applies to (required) |
+| `orchestrate.judge.classifier.overrides.builder.pick` | the builder override's `"model/effort"` (required) |
+| `orchestrate.default_kind` | the kind of an agent no rule classifies: `builder`, `reviewer`, `research`, `brief-writer` or `none` (default `builder`). Rules, in order: a `Kind:` line in the first 40 lines of the Agent launch prompt (not a brief file it names), `orchestrate.types`, an agent with `isolation: "worktree"` is a builder |
+| `orchestrate.types` | agent type to kind, over the built-in map (`Explore`, `Plan`, `claude-code-guide` and `research` are research; `builder` is builder; `reviewer` is reviewer; `statusline-setup` is none; `brief-writer` is brief-writer). A kind is `builder`, `reviewer`, `research`, `brief-writer` (also `brief writer`) or `none` |
 | `orchestrate.mode` | how context limits apply to a kind that sets none: `enforced` (past the hard limit every tool but the handoff is denied, and so is a SendMessage to the agent), `advisory` (told only) or `off` (default `enforced`) |
 | `orchestrate.fresh` | when an agent that passed its handoff point finishes, the orchestrator is told to start a fresh agent from its handoff (`auto`) or to ask the user first (`ask`) (default `auto`) |
-| `orchestrate.kinds` | per-kind settings: `orchestrate.kinds.builder`, `orchestrate.kinds.reviewer` and `orchestrate.kinds.research`, each with the keys below |
-| `orchestrate.kinds.builder.max`, `orchestrate.kinds.reviewer.max`, `orchestrate.kinds.research.max` | agents of this kind at once (defaults 2, 2 and 1); clamped to Claude Code's `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (20 by default); 0 launches none |
+| `orchestrate.kinds` | per-kind settings: `orchestrate.kinds.builder`, `orchestrate.kinds.reviewer`, `orchestrate.kinds.research` and `orchestrate.kinds.brief-writer`, each with the keys below |
+| `orchestrate.kinds.builder.max`, `orchestrate.kinds.reviewer.max`, `orchestrate.kinds.research.max` | agents of this kind at once (defaults 2, 2 and 1 for an install that never ran setup); clamped to Claude Code's `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (20 by default); 0 launches none. On yes, setup writes starters for the caps not answered or set: builders = the compile slots (at least 1), reviewers = builders, research = max(1, builders / 2) |
+| `orchestrate.kinds.brief-writer` | brief writers: agents launched with `Kind: brief-writer` (or `brief writer`) or `subagent_type` `brief-writer`. Their own cap, never the builders' |
+| `orchestrate.kinds.brief-writer.max` | brief writers at once (default uncapped: only Claude Code's `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` applies); a value, 0 included, is enforced and clamped like the others. Setup writes no starter for it |
+| `orchestrate.kinds.brief-writer.window`, `orchestrate.kinds.brief-writer.limit`, `orchestrate.kinds.brief-writer.handoff`, `orchestrate.kinds.brief-writer.handoff_pct`, `orchestrate.kinds.brief-writer.mode`, `orchestrate.kinds.brief-writer.fresh` | as for the other kinds below |
 | `orchestrate.kinds.builder.window`, `orchestrate.kinds.reviewer.window`, `orchestrate.kinds.research.window` | the context window this kind's limits scale to (default `orchestrate.window`) |
 | `orchestrate.kinds.builder.limit`, `orchestrate.kinds.reviewer.limit`, `orchestrate.kinds.research.limit` | the hard limit in context tokens (default `cap.block_tokens`, else 450,000 scaled to the window) |
 | `orchestrate.kinds.builder.handoff`, `orchestrate.kinds.reviewer.handoff`, `orchestrate.kinds.research.handoff` | the handoff point in context tokens, at most the limit (default `handoff_pct` of the limit, else `cap.warn_tokens`, else 285,000 scaled to the window) |
 | `orchestrate.kinds.builder.handoff_pct`, `orchestrate.kinds.reviewer.handoff_pct`, `orchestrate.kinds.research.handoff_pct` | the handoff point as 1 to 100 percent of the limit |
 | `orchestrate.kinds.builder.mode`, `orchestrate.kinds.reviewer.mode`, `orchestrate.kinds.research.mode` | `enforced`, `advisory` or `off` (default `orchestrate.mode`) |
 | `orchestrate.kinds.builder.fresh`, `orchestrate.kinds.reviewer.fresh`, `orchestrate.kinds.research.fresh` | `auto` or `ask` (default `orchestrate.fresh`) |
-| `compact` | compaction: the checkpoint card and deferral (see `docs/design/compaction.md`). Experimental and off by default |
-| `compact.enabled` | turn on the experimental compaction features: the PreCompact checkpoint with its chain card and the instructions it returns for the summary, the SessionStart(compact) card and ref report, `atlas settings compact-md`, and `compact.defer` (default false). Off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript) and returns no text, and `recall` refuses a chain key unless `memory.transcripts` is on |
+| `compact` | compaction: the checkpoint card and deferral (see `docs/design/compaction.md`). On by default |
+| `compact.enabled` | the compaction features: the PreCompact checkpoint with its chain card and the instructions it returns for the summary, the SessionStart(compact) card and ref report, `atlas settings compact-md`, and `compact.defer` (default true; `false`, or `atlas settings off compact`, turns them off). Off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript) and returns no text, and `recall` refuses a chain key unless `memory.transcripts` is on |
 | `compact.card_tokens` | the budget of the checkpoint PreCompact writes and SessionStart(compact) injects, not counting the chain card appended to it (default 400) |
 | `compact.defer` | block a proactive automatic compaction while a tool chain is running, until the next quiet point, never past the ceiling (the window less three times the largest per-request growth, at least 40,000 tokens); a manual `/compact` is never blocked (default false, pending a live check that a blocked compaction is offered again; needs `compact.enabled`) |
 | `compact.window` | the context window `compact.defer` measures against (default 0: 1,000,000 once the session has held more than 200,000 tokens, else 200,000) |
+
+## The backlog comb (`backlog`)
+
+`atlas backlog [--all] [--as-of YYYY-MM-DDTHH:MM] [--json] [--transcript PATH]` lists placed work with no live
+brief, commit or agent: aging items, then waiting; `atlas backlog dismiss ID --because KEY` silences an ID for good. It
+proposes only and never changes the queue's order. The section is optional; every key has a default.
+
+| Key | Meaning |
+|---|---|
+| `backlog.w_ask`, `w_turn`, `w_front`, `w_ruling`, `w_placed` | rank weights: per ask date (40), turn came (15), front-of-queue ruling (15), per dated ruling past the first (5), placed (5) |
+| `backlog.age_cap_days` | age adds a point a day up to this (default 30) |
+| `backlog.live_days` | a brief or commit keeps its lane live this long (default 7) |
+| `backlog.turn_days` | an item whose written-order turn came this long ago is shown as aging (default 2) |
+| `backlog.overdue_days` | a placed item older than this is shown as aging (default 14) |
+| `backlog.stale_days` | an unplaced, never-asked ID older than this is listed as stale under `--all` (default 30) |
+| `backlog.near_duplicate` | token Jaccard at which an ask repeats an earlier one (default 0.5) |
+| `backlog.ask`, `front`, `place`, `fold`, `include`, `defer`, `close`, `done` | the cue phrases, lowercase |
+| `backlog.stop` | ID-shaped words that are never work |
+| `backlog.asker` | the name that leads a line in the user's own words (`- 2026-11-04 Name:` or `Name 2026-11-10:`); only such lines (and ideas) count as asks. Default none: no lead counts, so set it to your own name to rank asks |
 
 ## Routing, handles and records (`lean`)
 
@@ -275,6 +319,7 @@ See [[Projects and multi-repo]] for the whole shape.
 | `projects[].memory` | memory settings for this project alone |
 | `projects[].wikilinks` | `wikilinks` for this project alone |
 | `projects[].vault_id_keys` | `vault_id_keys` for this project alone |
+| `projects[].orchestrate` | `{"bare_gpu_words": true}` for this project alone; no other `orchestrate` key is allowed here (a project file takes the same) |
 | `user` | the user layer, shared by every project |
 | `user.memory` | the user layer's memory folder (with its `MEMORY.md` index) |
 | `default_project` | the project active where no project root holds the working directory |

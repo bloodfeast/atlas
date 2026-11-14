@@ -156,22 +156,61 @@ pub fn declared(brief: &str) -> Declared {
         }
         if d.uses.is_none() {
             if let Some(v) = decl(line, "uses") {
-                let mut r: Vec<String> = v
-                    .split([',', ' '])
-                    .map(|x| x.trim().trim_matches(['`', '"', '\'', '.']).to_string())
-                    .filter(|x| !x.is_empty() && !x.eq_ignore_ascii_case("none") && !x.eq_ignore_ascii_case("and"))
-                    .map(|x| x.to_ascii_lowercase())
-                    .collect();
-                r.sort();
-                r.dedup();
-                let before = r.len();
-                r.retain(|x| x != "read-only" && x != "readonly");
-                d.read_only = r.len() < before;
+                let (r, read_only) = parse_uses(v);
+                d.read_only = read_only;
                 d.uses = Some(r);
             }
         }
     }
     d
+}
+
+/// Reads a `Uses:` value: the resources, lowercased, sorted and deduped,
+/// and whether it lists `read-only`. Commas and spaces separate resources,
+/// except that a bare number joins the word before it in the same
+/// comma-separated piece: `sqlport 15126`, `sqlport: 15126` and
+/// `sqlport:15126` are all `sqlport:15126`, while `sqlport, 15126` is two
+/// resources. `none` and `and` are not resources.
+pub fn parse_uses(v: &str) -> (Vec<String>, bool) {
+    let mut r: Vec<String> = Vec::new();
+    for piece in v.split(',') {
+        // Whether the last resource of this piece can take a number.
+        let mut open = false;
+        for w in piece.split_whitespace() {
+            let w = w.trim_matches(['`', '"', '\'', '.']).to_ascii_lowercase();
+            if w.is_empty() || w == "none" || w == "and" {
+                continue;
+            }
+            let number = w.bytes().all(|b| b.is_ascii_digit());
+            match r.last_mut() {
+                Some(last) if open && number => {
+                    if !last.ends_with(':') {
+                        last.push(':');
+                    }
+                    last.push_str(&w);
+                    open = false;
+                }
+                _ => {
+                    // `sqlport:` waits for its number; `sqlport:15126` has it.
+                    open = !number && (!w.contains(':') || w.ends_with(':'));
+                    r.push(w);
+                }
+            }
+        }
+    }
+    for x in &mut r {
+        // A `name:` whose number never came is the name.
+        if x.ends_with(':') {
+            x.pop();
+        }
+    }
+    r.retain(|x| !x.is_empty());
+    r.sort();
+    r.dedup();
+    let before = r.len();
+    r.retain(|x| x != "read-only" && x != "readonly");
+    let read_only = r.len() < before;
+    (r, read_only)
 }
 
 /// Whether the words before a match on its line negate it (the last 32
@@ -183,15 +222,25 @@ fn negated(line_before: &[u8]) -> bool {
 
 const URGENT: &[&str] = &["urgent", "urgently", "blocker", "hotfix", "asap", "right away"];
 const BACKGROUND: &[&str] = &["low priority", "low-priority", "no rush", "when idle", "when you have time", "nice to have"];
-const GPU: &[&str] = &["gpu lock", "gpu-lock", "capture", "captures", "screenshot", "screenshots", "gpu timing", "gpu timings", "gpu bench", "benchmark", "benchmarks", "bake", "bakes", "render it", "quiet gpu", "gpu runs", "gpu run", "gpu time", "bench"];
+/// Phrases that mean the gpu in any project. Not `gpu` alone: on the
+/// `lanes-eval` corpus it took briefs with a spurious gpu from 23 to 31 of
+/// 60 (a brief names the gpu without needing it), against 24 for these.
+const GPU: &[&str] = &["gpu lock", "gpu-lock", "gpu timing", "gpu timings", "gpu bench", "quiet gpu", "gpu runs", "gpu run", "gpu time", "gpu capture", "gpu captures", "cuda", "vulkan", "optix", "renderdoc", "nsight", "frame capture", "frame captures"];
+/// Words that mean the gpu only where a project says so
+/// (`orchestrate.bare_gpu_words`): in a web repo a screenshot is a browser
+/// PNG and a bench is a unit benchmark (atlas-dev #150).
+const BARE_GPU: &[&str] = &["capture", "captures", "screenshot", "screenshots", "benchmark", "benchmarks", "bake", "bakes", "render it", "bench"];
 const COMPILE: &[&str] = &["cargo build", "cargo test", "cargo nextest", "cargo xtask", "cargo clippy", "heavy compile", "release build", "cargo_build_jobs", "cargo_target_dir", "build jobs"];
 const OWN_WORKTREE: &[&str] = &["your own worktree", "make a worktree", "create a worktree", "own worktree", "new worktree"];
 
+/// How many phrase groups [`scan`] looks for.
+const NGROUPS: usize = 5;
+
 /// The phrase groups [`scan`] looks for, in this order.
-const GROUPS: [&[&str]; 4] = [URGENT, BACKGROUND, GPU, COMPILE];
+const GROUPS: [&[&str]; NGROUPS] = [URGENT, BACKGROUND, GPU, COMPILE, BARE_GPU];
 
 /// How many phrases there are in all.
-const PHRASES: usize = URGENT.len() + BACKGROUND.len() + GPU.len() + COMPILE.len();
+const PHRASES: usize = URGENT.len() + BACKGROUND.len() + GPU.len() + COMPILE.len() + BARE_GPU.len();
 
 /// Every phrase with its group, in group order.
 const FLAT: [(usize, &str); PHRASES] = {
@@ -225,9 +274,9 @@ const FIRST: [u64; 256] = {
 /// lowercased brief and not negated on its line: one pass over the word
 /// starts, checking only the phrases that start with the word's first
 /// byte, with no allocation.
-fn scan(lower: &str) -> [Option<&'static str>; 4] {
+fn scan(lower: &str) -> [Option<&'static str>; NGROUPS] {
     let b = lower.as_bytes();
-    let mut hit: [Option<&'static str>; 4] = [None; 4];
+    let mut hit: [Option<&'static str>; NGROUPS] = [None; NGROUPS];
     let mut found = 0u32;
     let mut line = 0;
     let mut in_word = false;
@@ -324,10 +373,11 @@ fn named_work(brief: &str, lower: &str) -> Option<String> {
     best.map(|(_, w)| w.to_string())
 }
 
-/// The resources a brief's words say it uses, from [`scan`]'s hits.
-fn infer_uses(brief: &str, lower: &str, hit: &[Option<&'static str>; 4]) -> Vec<(String, Source)> {
+/// The resources a brief's words say it uses, from [`scan`]'s hits. The
+/// bare gpu words count only when `bare_gpu_words` is on.
+fn infer_uses(brief: &str, lower: &str, hit: &[Option<&'static str>; NGROUPS], bare_gpu_words: bool) -> Vec<(String, Source)> {
     let mut out: Vec<(String, Source)> = Vec::new();
-    if let Some(w) = hit[2] {
+    if let Some(w) = hit[2].or(hit[4].filter(|_| bare_gpu_words)) {
         out.push(("gpu".into(), Source::Inferred(w.into())));
     }
     if let Some(w) = hit[3] {
@@ -347,7 +397,7 @@ pub fn infer_priority(brief: &str) -> (Priority, Source) {
     priority_of(&scan(&brief.to_ascii_lowercase()))
 }
 
-fn priority_of(hit: &[Option<&'static str>; 4]) -> (Priority, Source) {
+fn priority_of(hit: &[Option<&'static str>; NGROUPS]) -> (Priority, Source) {
     match (hit[0], hit[1]) {
         (Some(w), _) => (Priority::Urgent, Source::Inferred(w.into())),
         (None, Some(w)) => (Priority::Background, Source::Inferred(w.into())),
@@ -357,7 +407,15 @@ fn priority_of(hit: &[Option<&'static str>; 4]) -> (Priority, Source) {
 
 /// Classifies a brief: each field declared, else inferred, else the
 /// default. `known` is the lanes the store holds (for lane inference).
+/// The bare gpu words (`capture`, `screenshot`, `bench`, ...) infer no gpu:
+/// [`classify_in`] takes the project's setting.
 pub fn classify(brief: &str, known: &[String]) -> Class {
+    classify_in(brief, known, false)
+}
+
+/// [`classify`], with the project's `orchestrate.bare_gpu_words`: when on,
+/// the bare gpu words infer gpu too.
+pub fn classify_in(brief: &str, known: &[String], bare_gpu_words: bool) -> Class {
     let d = declared(brief);
     // One lowercase copy and one scan serve every inference, made only
     // when a field is not declared.
@@ -369,14 +427,14 @@ pub fn classify(brief: &str, known: &[String]) -> Class {
             None => (None, Source::Default),
         },
     };
-    let hit = if d.priority.is_none() || d.uses.is_none() { scan(&lower) } else { [None; 4] };
+    let hit = if d.priority.is_none() || d.uses.is_none() { scan(&lower) } else { [None; NGROUPS] };
     let (priority, priority_src) = match d.priority {
         Some(p) => (p, Source::Declared),
         None => priority_of(&hit),
     };
     let uses = match d.uses {
         Some(u) => u.into_iter().map(|r| (r, Source::Declared)).collect(),
-        None => infer_uses(brief, &lower, &hit),
+        None => infer_uses(brief, &lower, &hit, bare_gpu_words),
     };
     Class { lane, lane_src, priority, priority_src, uses, read_only: d.read_only }
 }
@@ -384,24 +442,37 @@ pub fn classify(brief: &str, known: &[String]) -> Class {
 /// Resource capacities and the aging step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
-    /// Capacity by resource (or class, the part before `:`); others have 1;
-    /// 0 never serializes.
+    /// Capacity by resource (or class, the part before `:`); 0 never
+    /// serializes. gpu, compile and `worktree:*` have 1 unless listed; any
+    /// other word is not a limit and only warns (atlas-dev #150).
     pub resources: Vec<(String, usize)>,
     /// Minutes of waiting that raise an item one class (0: no aging).
     pub aging_minutes: i64,
+    /// The bare gpu words (`capture`, `screenshot`, `bench`, ...) infer gpu
+    /// (`orchestrate.bare_gpu_words`, set per project; default off).
+    pub bare_gpu_words: bool,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        Policy { resources: vec![("gpu".into(), 1), ("compile".into(), 1)], aging_minutes: 60 }
+        Policy { resources: vec![("gpu".into(), 1), ("compile".into(), 1)], aging_minutes: 60, bare_gpu_words: false }
     }
 }
 
 impl Policy {
-    /// A resource's capacity: its own entry, else its class's, else 1.
-    pub fn capacity(&self, r: &str) -> usize {
+    /// A resource's capacity when it is a limit: its own entry, else its
+    /// class's (the part before `:`), else 1 for gpu, compile and the
+    /// `worktree` class. None for a word the policy does not list: it never
+    /// denies or queues a launch, it only warns. The hook ([`conflicts`])
+    /// and the scheduler ([`propose`]) both read it.
+    pub fn limit(&self, r: &str) -> Option<usize> {
         let class = r.split(':').next().unwrap_or(r);
-        self.resources.iter().find(|(n, _)| n == r).or_else(|| self.resources.iter().find(|(n, _)| n == class)).map_or(1, |(_, c)| *c)
+        self.resources
+            .iter()
+            .find(|(n, _)| n == r)
+            .or_else(|| self.resources.iter().find(|(n, _)| n == class))
+            .map(|(_, c)| *c)
+            .or_else(|| matches!(class, "gpu" | "compile" | "worktree").then_some(1))
     }
 
     /// An item's rank: lower starts first.
@@ -423,7 +494,7 @@ pub fn held_lane(kind: Kind, class: &Class) -> Option<&String> {
 }
 
 /// Lanes compare without case (`Lane: parser` and `PARSER` are one lane).
-fn same_lane(a: &str, b: &str) -> bool {
+pub(crate) fn same_lane(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
@@ -591,7 +662,8 @@ pub fn propose(items: &[Item], running: &[Holder], free_slots: &dyn Fn(Kind) -> 
             let lane = held_lane(it.kind, &it.class).and_then(|l| lanes.iter().find(|(x, _)| same_lane(x, l))).map(|(l, who)| format!("lane {l}, after {who}"));
             let res = || {
                 it.class.resources().find_map(|r| {
-                    let cap = policy.capacity(r);
+                    // A word that is not a limit never waits (#150).
+                    let cap = policy.limit(r)?;
                     let holders: Vec<&String> = held.iter().filter(|(x, _)| x == r).map(|(_, w)| w).collect();
                     (cap > 0 && holders.len() >= cap).then(|| format!("{r} held by {}", holders.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")))
                 })
@@ -647,6 +719,9 @@ pub struct Conflict {
     /// The launch declared the field and declared holders alone fill it
     /// (Q-QL2: deny and queue); otherwise an inference is involved (warn).
     pub declared: bool,
+    /// A word the policy does not list, shared with running work: never a
+    /// limit, only a note (`db with a1`; #150). Never `declared`.
+    pub advisory: bool,
 }
 
 /// The conflicts a launch would have with what runs. Empty when none.
@@ -658,17 +733,20 @@ pub fn conflicts(kind: Kind, class: &Class, running: &[Holder], policy: &Policy)
         if !hs.is_empty() {
             let decl: Vec<&Holder> = hs.iter().copied().filter(|h| h.class.lane_src == Source::Declared).collect();
             let declared = class.lane_src == Source::Declared && !decl.is_empty();
-            out.push(Conflict { what: format!("lane {l} held by {}", names(if declared { &decl } else { &hs })), declared });
+            out.push(Conflict { what: format!("lane {l} held by {}", names(if declared { &decl } else { &hs })), declared, advisory: false });
         }
     }
     for (r, src) in &class.uses {
-        let cap = policy.capacity(r);
         let hs: Vec<(&Holder, bool)> = running.iter().filter_map(|h| h.class.uses.iter().find(|(x, _)| x == r).map(|(_, s)| (h, *s == Source::Declared))).collect();
-        if cap > 0 && hs.len() >= cap {
-            let decl: Vec<&Holder> = hs.iter().filter(|(_, d)| *d).map(|(h, _)| *h).collect();
-            let all: Vec<&Holder> = hs.iter().map(|(h, _)| *h).collect();
-            let declared = *src == Source::Declared && decl.len() >= cap;
-            out.push(Conflict { what: format!("{r} held by {}", names(if declared { &decl } else { &all })), declared });
+        let all: Vec<&Holder> = hs.iter().map(|(h, _)| *h).collect();
+        match policy.limit(r) {
+            None if !hs.is_empty() => out.push(Conflict { what: format!("{r} with {}", names(&all)), declared: false, advisory: true }),
+            Some(cap) if cap > 0 && hs.len() >= cap => {
+                let decl: Vec<&Holder> = hs.iter().filter(|(_, d)| *d).map(|(h, _)| *h).collect();
+                let declared = *src == Source::Declared && decl.len() >= cap;
+                out.push(Conflict { what: format!("{r} held by {}", names(if declared { &decl } else { &all })), declared, advisory: false });
+            }
+            _ => {}
         }
     }
     out
@@ -697,9 +775,12 @@ mod tests {
 
     #[test]
     fn missing_fields_are_inferred() {
-        let c = classify("Journal to lane PARSER-FIX.\nFix the reader, then run cargo test -j 16 and take a capture of the menu.\nWork in H:/w/repo-worktrees/parser-fix.", &[]);
+        let b = "Journal to lane PARSER-FIX.\nFix the reader, then run cargo test -j 16 and take a capture of the menu.\nWork in H:/w/repo-worktrees/parser-fix.";
+        let c = classify_in(b, &[], true);
         assert_eq!(c.lane.as_deref(), Some("PARSER-FIX"));
         assert_eq!(c.resources().collect::<Vec<_>>(), ["compile", "gpu", "worktree:parser-fix"]);
+        // Without the project's bare gpu words, `a capture` is no gpu.
+        assert_eq!(classify(b, &[]).resources().collect::<Vec<_>>(), ["compile", "worktree:parser-fix"]);
         assert_eq!(c.priority, Priority::Normal);
         assert_eq!(c.priority_src, Source::Default);
         // A negated phrase and a worktree of its own are not uses.
@@ -775,7 +856,7 @@ mod tests {
 
     #[test]
     fn declared_holders_at_capacity_deny_beside_an_inferred_one() {
-        let pol = Policy { resources: vec![("compile".into(), 2)], aging_minutes: 60 };
+        let pol = Policy { resources: vec![("compile".into(), 2)], aging_minutes: 60, bare_gpu_words: false };
         let h = |n: &str, b: &str| Holder { name: n.into(), kind: Kind::Builder, class: classify(b, &[]) };
         let running = vec![h("r1", "Lane: parser\nUses: compile"), h("r2", "Uses: compile"), h("r3", "Journal to lane PARSER. Run cargo test.")];
         let c = conflicts(Kind::Builder, &classify("Lane: PARSER\nUses: compile", &[]), &running, &pol);
@@ -902,11 +983,15 @@ Cost review of PR 114.", 1),
 
     #[test]
     fn capacities_come_from_the_name_then_the_class() {
-        let pol = Policy { resources: vec![("worktree".into(), 1), ("compile".into(), 0), ("db:x".into(), 2)], aging_minutes: 60 };
-        assert_eq!(pol.capacity("worktree:a"), 1);
-        assert_eq!(pol.capacity("db:x"), 2);
-        assert_eq!(pol.capacity("db:y"), 1);
-        assert_eq!(pol.capacity("compile"), 0);
+        let pol = Policy { resources: vec![("worktree".into(), 1), ("compile".into(), 0), ("db:x".into(), 2)], aging_minutes: 60, bare_gpu_words: false };
+        assert_eq!(pol.limit("worktree:a"), Some(1));
+        assert_eq!(pol.limit("db:x"), Some(2));
+        // An unlisted name is no limit, though its class has a sibling entry.
+        assert_eq!(pol.limit("db:y"), None);
+        assert_eq!(pol.limit("compile"), Some(0));
+        // gpu, compile and `worktree:*` are limits with no entry at all.
+        let none = Policy { resources: Vec::new(), aging_minutes: 60, bare_gpu_words: false };
+        assert_eq!((none.limit("gpu"), none.limit("compile"), none.limit("worktree:x"), none.limit("react")), (Some(1), Some(1), Some(1), None));
         let running = vec![Holder { name: "r1".into(), kind: Kind::Builder, class: classify("Lane: a\nUses: compile, worktree:w", &[]) }];
         let c = classify("Lane: a\nUses: compile, worktree:w", &[]);
         let what = |v: Vec<Conflict>| v.into_iter().map(|c| (c.what, c.declared)).collect::<Vec<_>>();
@@ -916,5 +1001,87 @@ Cost review of PR 114.", 1),
         let inferred = classify("Journal to lane A-ONE. Work in /w/x-worktrees/w.", &[]);
         let running = vec![Holder { name: "r2".into(), kind: Kind::Builder, class: classify("Lane: A-ONE\nUses: worktree:w", &[]) }];
         assert_eq!(what(conflicts(Kind::Builder, &inferred, &running, &pol)), [("lane A-ONE held by r2".to_string(), false), ("worktree:w held by r2".to_string(), false)]);
+    }
+
+    /// The two headers of atlas-dev #150.
+    const ISSUE_A: &str = "Kind: build\nLane: ES1-1663\nUses: db, contracts, api, react, sqlport 15126";
+    const ISSUE_B: &str = "Kind: build\nLane: ES1-1415\nUses: db, contracts, api, react, sqlport 15127";
+
+    /// atlas-dev #150 (journal ATLAS-USES:0002): the bare gpu words count
+    /// only where the project turns them on; explicit gpu words always do.
+    #[test]
+    fn bare_gpu_words_infer_gpu_only_when_the_project_says_so() {
+        let gpu = |b: &str, on: bool| classify_in(b, &[], on).resources().any(|r| r == "gpu");
+        let web = "Lane: WEB-1\nMockup-vs-built screenshots for the PR bodies.";
+        assert!(!gpu(web, false) && gpu(web, true));
+        for b in ["Lane: X\nTake a frame capture of the menu.", "Lane: X\nHold the GPU timing window.","Lane: X\nThe CUDA kernel.", "Lane: X\nA Vulkan pass.", "Lane: X\nTake the gpu lock first."] {
+            assert!(gpu(b, false) && gpu(b, true), "{b}");
+        }
+        for b in ["Lane: X\nRun the bench.", "Lane: X\nBake the lightmaps.", "Lane: X\nTake a capture."] {
+            assert!(!gpu(b, false) && gpu(b, true), "{b}");
+        }
+        assert!(!gpu("Lane: X\nNo GPU timing needed.", true));
+        // Naming the gpu is not using it.
+        assert!(!gpu("Lane: X\nThe gpu module's docs.", true));
+    }
+
+    #[test]
+    fn uses_joins_a_bare_number_to_the_word_before_it() {
+        let uses = |b: &str| declared(b).uses.unwrap_or_default();
+        assert_eq!(uses(ISSUE_A), ["api", "contracts", "db", "react", "sqlport:15126"]);
+        for same in ["Uses: sqlport 15126", "Uses: sqlport: 15126", "Uses: sqlport  15126", "Uses: sqlport:15126", "Uses: SQLPort 15126.", "Uses: `sqlport 15126`"] {
+            assert_eq!(uses(same), ["sqlport:15126"], "{same}");
+        }
+        // A comma separates; a word is not a value; `name:` alone is the name.
+        assert_eq!(uses("Uses: sqlport, 15126"), ["15126", "sqlport"]);
+        assert_eq!(uses("Uses: gpu compile"), ["compile", "gpu"]);
+        assert_eq!(uses("Uses: gpu and compile, gpu"), ["compile", "gpu"]);
+        assert_eq!(uses("Uses: sqlport:"), ["sqlport"]);
+        assert_eq!(uses("Uses: worktree:a 7"), ["7", "worktree:a"]);
+        assert!(uses("Uses: none").is_empty());
+        let d = declared("Uses: sqlport 15126, read-only");
+        assert_eq!((d.uses.unwrap(), d.read_only), (vec!["sqlport:15126".to_string()], true));
+    }
+
+    #[test]
+    fn an_unlisted_word_only_warns_in_the_hook_and_never_waits_in_the_batch() {
+        let pol = Policy::default();
+        let running = vec![Holder { name: "Build ES1-1663".into(), kind: Kind::Builder, class: classify(ISSUE_A, &[]) }];
+        let c = conflicts(Kind::Builder, &classify(ISSUE_B, &[]), &running, &pol);
+        let what: Vec<(&str, bool, bool)> = c.iter().map(|c| (c.what.as_str(), c.declared, c.advisory)).collect();
+        assert_eq!(what, [("api with Build ES1-1663", false, true), ("contracts with Build ES1-1663", false, true), ("db with Build ES1-1663", false, true), ("react with Build ES1-1663", false, true)]);
+        // The scheduler starts both together.
+        let items = vec![item("a", Kind::Builder, ISSUE_A, 10), item("b", Kind::Builder, ISSUE_B, 5)];
+        assert_eq!(propose(&items, &[], &|_| 5, 5, &pol).start, [0, 1]);
+        assert_eq!(propose(&items[1..], &running, &|_| 5, 5, &pol).start, [0]);
+        // An inferred unlisted word warns the same way (no inference makes
+        // one today, so the class is built by hand).
+        let mut inferred = classify("Lane: x\nUses: none", &[]);
+        inferred.uses = vec![("db".into(), Source::Inferred("db".into()))];
+        assert!(conflicts(Kind::Builder, &inferred, &running, &pol).iter().all(|c| c.advisory && !c.declared));
+    }
+
+    #[test]
+    fn listed_words_gpu_compile_and_worktrees_still_limit() {
+        let h = |b: &str| vec![Holder { name: "r1".into(), kind: Kind::Builder, class: classify(b, &[]) }];
+        let denied = |pol: &Policy, held: &str, launch: &str| conflicts(Kind::Builder, &classify(launch, &[]), &h(held), pol).iter().any(|c| c.declared);
+        let def = Policy::default();
+        for r in ["gpu", "compile", "worktree:x"] {
+            let (a, b) = (format!("Lane: a\nUses: {r}"), format!("Lane: b\nUses: {r}"));
+            assert!(denied(&def, &a, &b), "{r}");
+            assert_eq!(propose(&[item("q", Kind::Builder, &b, 0)], &h(&a), &|_| 5, 5, &def).start, Vec::<usize>::new(), "{r}");
+        }
+        assert!(!denied(&def, "Lane: a\nUses: worktree:x", "Lane: b\nUses: worktree:y"));
+        // Capacity 0 turns a word off: no deny and no note.
+        let off = Policy { resources: vec![("db".into(), 0)], aging_minutes: 60, bare_gpu_words: false };
+        assert!(conflicts(Kind::Builder, &classify("Lane: b\nUses: db", &[]), &h("Lane: a\nUses: db"), &off).is_empty());
+        // Capacity 1 makes a word a limit, in the hook and the batch.
+        let one = Policy { resources: vec![("db".into(), 1), ("sqlport".into(), 1)], aging_minutes: 60, bare_gpu_words: false };
+        assert!(denied(&one, "Lane: a\nUses: db", "Lane: b\nUses: db"));
+        assert_eq!(propose(&[item("q", Kind::Builder, "Lane: b\nUses: db", 0)], &h("Lane: a\nUses: db"), &|_| 5, 5, &one).wait, [(0, "db held by r1".to_string())]);
+        // A class entry limits each port on its own.
+        assert!(!denied(&one, "Lane: a\nUses: sqlport 15126", "Lane: b\nUses: sqlport 15127"));
+        assert!(denied(&one, "Lane: a\nUses: sqlport 15126", "Lane: b\nUses: sqlport: 15126"));
+        assert_eq!(propose(&[item("q", Kind::Builder, "Lane: b\nUses: sqlport 15127", 0)], &h("Lane: a\nUses: sqlport 15126"), &|_| 5, 5, &one).start, [0]);
     }
 }

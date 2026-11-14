@@ -158,3 +158,19 @@ fn too_little_history_gives_the_upper_bound_only() {
     assert!(text.contains("needs 30 episodes in 5 transcripts") && text.contains("runs again when the lookup rules or the configured targets change"), "{text}");
     assert!(text.contains("upper bound per answer"), "{text}");
 }
+
+#[test]
+fn the_token_report_never_creates_the_miss_table() {
+    // M1: the report is a read; a store without compact_miss reads as no
+    // misses and no repeats, and stays without it.
+    let t = Temp::new("calibrate-report-miss");
+    let (cfg, claude, db) = fixture(&t);
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let out = command(&t, &cfg, &claude, true).arg("--token-report").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(tables(&db, "compact_log"), 1, "the report did not set up the store");
+    assert_eq!(tables(&db, "compact_miss"), 0, "--token-report created compact_miss");
+    let out = command(&t, &cfg, &claude, true).args(["--token-report", "--repeats"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(tables(&db, "compact_miss"), 0, "--token-report --repeats created compact_miss");
+}

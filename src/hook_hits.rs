@@ -104,6 +104,33 @@ pub fn logged(conn: &Connection, since: &str) -> Result<Vec<Injection>> {
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// The record keys already pointed to in one scope, read back from
+/// `hook_inject` so a server restart or a command hook (a process per
+/// event) does not point to them again: a main session's prompts (`agent`
+/// empty, rows of `session` with no agent) or one subagent (`agent`, its
+/// rows in any session). Lane (`lane:`) rows are left out: a lane view's
+/// records are not logged one by one, so its key alone would hide the
+/// view and leave its records unmarked. Read only and fail open: a missing
+/// database, table or lock is an empty set.
+pub fn injected_keys(db: &Path, session: &str, agent: &str) -> HashSet<String> {
+    if session.is_empty() && agent.is_empty() {
+        return HashSet::new();
+    }
+    let read = || -> rusqlite::Result<HashSet<String>> {
+        let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        let mut st = if agent.is_empty() {
+            conn.prepare("SELECT key FROM hook_inject WHERE session = ?1 AND agent = '' AND key NOT LIKE 'lane:%'")?
+        } else {
+            conn.prepare("SELECT key FROM hook_inject WHERE agent = ?1 AND key NOT LIKE 'lane:%'")?
+        };
+        let id = if agent.is_empty() { session } else { agent };
+        let keys = st.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<HashSet<String>>>()?;
+        Ok(keys)
+    };
+    read().unwrap_or_default()
+}
+
 /// One key parsed out of an injected context, with its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedKey {
@@ -381,7 +408,9 @@ impl<'a> Judge<'a> {
             self.acts.insert(inj.transcript.clone(), acts(Path::new(&inj.transcript)));
         }
         let key = inj.key.clone();
-        if let Some(lane) = key.strip_prefix("lane:") {
+        // A lane view, or the head line an agent's report gets: either is
+        // used when the lane's records or its recall are read after it.
+        if let Some(lane) = key.strip_prefix("lane:").or_else(|| key.strip_prefix("lane-head:")) {
             let (j, h, l) = (format!("journal:{lane}:"), format!("handoff:{lane}:"), format!("\"lane\":\"{lane}\""));
             let acts = &self.acts[&inj.transcript];
             let used = acts.iter().filter(|a| a.time > inj.time && !a.tool.is_empty()).any(|a| a.text.contains(&j) || a.text.contains(&h) || (a.tool.ends_with("recall") && a.text.contains(&l)));

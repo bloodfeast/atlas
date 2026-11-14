@@ -6,29 +6,70 @@
 //!
 //! ```text
 //! atlas settings orchestrate            asks (a terminal), else lists the options
-//! atlas settings orchestrate --yes [--builders N] [--reviewers N] [--research N]
-//!     [--mode enforced|advisory|off] [--handoff TOKENS] [--limit TOKENS] [--fresh auto|ask]
+//! atlas settings orchestrate --yes [--compile N] [--gpu N] [--builders N] [--reviewers N]
+//!     [--research N] [--mode enforced|advisory|off] [--handoff TOKENS] [--limit TOKENS] [--fresh auto|ask]
 //! atlas settings orchestrate --no       records the answer; turns the caps off if on
 //! ```
 //!
-//! What is stored: `orchestrate.enabled`, the three caps
+//! What is stored: `orchestrate.enabled`, the work queue's resource slots
+//! (`orchestrate.resources.compile` and `.gpu`), the three caps
 //! (`orchestrate.kinds.<kind>.max`), `orchestrate.mode` and
-//! `orchestrate.fresh`, each the answer or, for an empty answer, the value
-//! in effect. The handoff point and the hard limit (`cap.warn_tokens`,
+//! `orchestrate.fresh`, each the answer, else the value configured, else its
+//! starter value. The handoff point and the hard limit (`cap.warn_tokens`,
 //! `cap.block_tokens`) are stored only when a number is given: their
 //! defaults scale to the model's context window, and a stored number would
 //! not.
+//!
+//! The starter values are derived here, where the answer is applied, from
+//! the machine ([`Machine`]), never in a SessionStart path:
+//! - compile slots: one per 16 hardware threads, at least 1, at most 4;
+//! - gpu slots: 1. `gpu` is a lock and atlas assigns no device, so a second
+//!   holder on a two-GPU machine would still land on device 0. Nothing is
+//!   probed, and 0 (never serialize) is never a starter;
+//! - builders: the compile slots (at least 1); reviewers: the builders;
+//!   research: half the builders, at least 1. Each is clamped to Claude
+//!   Code's own subagent limit, which is a clamp, not a source.
+//!
+//! An installation that never ran setup keeps the code defaults (gpu 1,
+//! compile 1, caps 2, 2, 1).
 
 use super::{check, edit_config_many, get_path, mark_offered, offered, Item, Io, Paths, Written};
 use crate::json::Value;
-use crate::orchestrate::{DEFAULT_HANDOFF, DEFAULT_LIMIT};
+use crate::orchestrate::{CLAUDE_CODE_DEFAULT_LIMIT, DEFAULT_HANDOFF, DEFAULT_LIMIT, LIMIT_ENV};
 use std::process::ExitCode;
 
 /// The manifest id the question is recorded under (the caps' switch).
 pub const ID: &str = "orchestrate";
 
+/// What setup reads from the machine to derive the starter values. Setup
+/// reads it ([`Machine::here`]); a test passes its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Machine {
+    /// Hardware threads (`std::thread::available_parallelism`).
+    pub cores: usize,
+    /// Claude Code's concurrent-subagent limit
+    /// (`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`, else 20).
+    pub claude_limit: usize,
+}
+
+impl Machine {
+    /// This machine and this process's environment.
+    pub fn here() -> Machine {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let claude_limit = std::env::var(LIMIT_ENV).ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(CLAUDE_CODE_DEFAULT_LIMIT);
+        Machine { cores, claude_limit }
+    }
+}
+
+/// The starter compile slots: one per 16 hardware threads, at least 1, at
+/// most 4 (a 16-thread machine gets 1, a 32-thread machine 2).
+pub fn starter_compile(cores: usize) -> usize {
+    (cores / 16).clamp(1, 4)
+}
+
 /// One option: its flag, the manifest entry that checks a value (if any),
-/// where it is stored, and its built-in default.
+/// where it is stored, and its built-in default (`None` for a starter,
+/// derived from the machine, or a limit, which scales to the window).
 struct Opt {
     flag: &'static str,
     item: Option<&'static str>,
@@ -37,18 +78,27 @@ struct Opt {
     default: Option<&'static str>,
 }
 
-const OPTS: [Opt; 7] = [
-    Opt { flag: "--builders", item: Some("agents-builders"), keys: &["orchestrate", "kinds", "builder", "max"], question: "Builders at once (agents that write and compile code)", default: Some("2") },
-    Opt { flag: "--reviewers", item: Some("agents-reviewers"), keys: &["orchestrate", "kinds", "reviewer", "max"], question: "Reviewers at once (read-only review agents)", default: Some("2") },
-    Opt { flag: "--research", item: Some("agents-research"), keys: &["orchestrate", "kinds", "research", "max"], question: "Research and design agents at once", default: Some("1") },
+const OPTS: [Opt; 9] = [
+    Opt { flag: "--compile", item: Some("resources-compile"), keys: &["orchestrate", "resources", "compile"], question: "Compile slots (heavy compiles at once; 0 never serializes)", default: None },
+    Opt { flag: "--gpu", item: Some("resources-gpu"), keys: &["orchestrate", "resources", "gpu"], question: "GPU slots (GPU runs at once; 0 never serializes)", default: None },
+    Opt { flag: "--builders", item: Some("agents-builders"), keys: &["orchestrate", "kinds", "builder", "max"], question: "Builders at once (agents that write and compile code)", default: None },
+    Opt { flag: "--reviewers", item: Some("agents-reviewers"), keys: &["orchestrate", "kinds", "reviewer", "max"], question: "Reviewers at once (read-only review agents)", default: None },
+    Opt { flag: "--research", item: Some("agents-research"), keys: &["orchestrate", "kinds", "research", "max"], question: "Research and design agents at once", default: None },
     Opt { flag: "--mode", item: Some("context-mode"), keys: &["orchestrate", "mode"], question: "Context limits: enforced, advisory or off", default: Some("enforced") },
     Opt { flag: "--handoff", item: Some("context-handoff"), keys: &["cap", "warn_tokens"], question: "Handoff point, in context tokens (an agent is told to wrap up from here)", default: None },
     Opt { flag: "--limit", item: Some("context-limit"), keys: &["cap", "block_tokens"], question: "Hard limit, in context tokens (an agent must have handed off by here)", default: None },
     Opt { flag: "--fresh", item: None, keys: &["orchestrate", "fresh"], question: "After a handoff, start the fresh agent: auto, or ask the user first", default: Some("auto") },
 ];
 
-const HANDOFF: usize = 4;
-const LIMIT: usize = 5;
+const COMPILE: usize = 0;
+const GPU: usize = 1;
+const BUILDERS: usize = 2;
+const REVIEWERS: usize = 3;
+const RESEARCH: usize = 4;
+const MODE: usize = 5;
+const HANDOFF: usize = 6;
+const LIMIT: usize = 7;
+const FRESH: usize = 8;
 
 /// What the question says the mode is, before the options.
 const ABOUT: &str = "\n[orchestrate] Orchestrated mode
@@ -58,7 +108,7 @@ const ABOUT: &str = "\n[orchestrate] Orchestrated mode
   Cost: a launch past a cap waits for a running agent to finish; an agent past its hard limit can only hand off.";
 
 /// The usage line of `atlas settings orchestrate`.
-pub const USAGE: &str = "atlas settings orchestrate [--yes [--builders N] [--reviewers N] [--research N] [--mode enforced|advisory|off] [--handoff TOKENS] [--limit TOKENS] [--fresh auto|ask] | --no]";
+pub const USAGE: &str = "atlas settings orchestrate [--yes [--compile N] [--gpu N] [--builders N] [--reviewers N] [--research N] [--mode enforced|advisory|off] [--handoff TOKENS] [--limit TOKENS] [--fresh auto|ask] | --no]";
 
 /// Abbreviations a terminal answer may use.
 fn expand(o: &Opt, raw: &str) -> String {
@@ -88,14 +138,34 @@ fn parse(items: &[Item], o: &Opt, raw: &str) -> Result<Value, String> {
     }
 }
 
-/// The value in effect for an option: configured, else its default.
-fn in_effect(atlas: &Value, o: &Opt) -> Option<Value> {
-    get_path(atlas, o.keys).cloned().or_else(|| o.default.map(|d| crate::json::parse(d).unwrap_or_else(|_| Value::String(d.to_string()))))
+/// The value in effect for an option: answered, else configured, else its
+/// default, else its starter value.
+fn effective(atlas: &Value, a: &Answers, m: Machine, i: usize) -> Option<Value> {
+    let o = &OPTS[i];
+    a[i].clone()
+        .or_else(|| get_path(atlas, o.keys).cloned())
+        .or_else(|| o.default.map(|d| crate::json::parse(d).unwrap_or_else(|_| Value::String(d.to_string()))))
+        .or_else(|| starter(atlas, a, m, i).map(Value::from))
+}
+
+/// An option's starter value (see the module documentation). The caps
+/// follow the compile slots in effect, so an answered or configured compile
+/// count moves them too.
+fn starter(atlas: &Value, a: &Answers, m: Machine, i: usize) -> Option<usize> {
+    let n = |j: usize| effective(atlas, a, m, j).and_then(|v| v.as_f64()).map(|f| f.max(0.0) as usize);
+    match i {
+        COMPILE => Some(starter_compile(m.cores)),
+        GPU => Some(1),
+        BUILDERS => Some(n(COMPILE)?.max(1).min(m.claude_limit)),
+        REVIEWERS => Some(n(BUILDERS)?.min(m.claude_limit)),
+        RESEARCH => Some((n(BUILDERS)? / 2).max(1).min(m.claude_limit)),
+        _ => None,
+    }
 }
 
 /// How the default of an option reads in a question.
-fn default_label(atlas: &Value, o: &Opt, i: usize) -> String {
-    match (in_effect(atlas, o), i) {
+fn default_label(atlas: &Value, a: &Answers, m: Machine, i: usize) -> String {
+    match (effective(atlas, a, m, i), i) {
         (Some(Value::String(s)), _) => s,
         (Some(v), _) => v.to_string(),
         (None, HANDOFF) => format!("{} on a 1M window, scaled to the window", thousands(DEFAULT_HANDOFF)),
@@ -117,14 +187,14 @@ fn thousands(n: u64) -> String {
 }
 
 /// The answers: one per option, `None` for "keep what is in effect".
-type Answers = [Option<Value>; 7];
+type Answers = [Option<Value>; 9];
 
 /// The configuration edits for a yes: the switch, then every option that
 /// has an answer or a value in effect (the limits only when answered).
-fn edits(atlas: &Value, a: &Answers) -> Vec<(&'static [&'static str], Option<Value>)> {
+fn edits(atlas: &Value, a: &Answers, m: Machine) -> Vec<(&'static [&'static str], Option<Value>)> {
     let mut out: Vec<(&'static [&'static str], Option<Value>)> = vec![(&["orchestrate", "enabled"], Some(Value::Bool(true)))];
     for (i, o) in OPTS.iter().enumerate() {
-        let v = a[i].clone().or_else(|| if o.default.is_some() { in_effect(atlas, o) } else { None });
+        let v = if i == HANDOFF || i == LIMIT { a[i].clone() } else { effective(atlas, a, m, i) };
         if let Some(v) = v {
             out.push((o.keys, Some(v)));
         }
@@ -142,15 +212,15 @@ fn check_order(atlas: &Value, a: &Answers) -> Result<(), String> {
     }
 }
 
-fn summary(atlas: &Value, a: &Answers) -> String {
-    let v = |i: usize| a[i].clone().or_else(|| in_effect(atlas, &OPTS[i])).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
-    let mut s = format!("builders {}, reviewers {}, research {}, context limits {}", v(0).unwrap_or_default(), v(1).unwrap_or_default(), v(2).unwrap_or_default(), v(3).unwrap_or_default());
+fn summary(atlas: &Value, a: &Answers, m: Machine) -> String {
+    let v = |i: usize| effective(atlas, a, m, i).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+    let mut s = format!("builders {}, reviewers {}, research {}, context limits {}", v(BUILDERS).unwrap_or_default(), v(REVIEWERS).unwrap_or_default(), v(RESEARCH).unwrap_or_default(), v(MODE).unwrap_or_default());
     for (i, name) in [(HANDOFF, "handoff"), (LIMIT, "limit")] {
         if let Some(x) = &a[i] {
             s.push_str(&format!(", {name} {x}"));
         }
     }
-    s.push_str(&format!(", fresh {}", v(6).unwrap_or_default()));
+    s.push_str(&format!(", fresh {}, compile slots {}, gpu slots {}", v(FRESH).unwrap_or_default(), v(COMPILE).unwrap_or_default(), v(GPU).unwrap_or_default()));
     s
 }
 
@@ -160,15 +230,16 @@ fn apply(p: &Paths, io: &mut Io, a: &Answers) -> Result<bool, String> {
     // The values kept and checked are those under the lock, not those asked over.
     let held = p.lock_config()?;
     let atlas = &super::atlas_value(p);
+    let m = io.machine.unwrap_or_else(Machine::here);
     check_order(atlas, a)?;
-    let e = edits(atlas, a);
-    let label = format!("orchestrate: orchestrated mode on ({})", summary(atlas, a));
+    let e = edits(atlas, a, m);
+    let label = format!("orchestrate: orchestrated mode on ({})", summary(atlas, a, m));
     let manual = format!("set {}", e.iter().map(|(k, v)| format!("{} to {}", k.join("."), v.as_ref().map_or("nothing".into(), Value::to_string))).collect::<Vec<_>>().join(", "));
     let w = edit_config_many(&held, io, &e, &label, &manual, None)?;
     drop(held);
     mark_offered(p, std::iter::once(ID));
     if !matches!(w, Written::Refused) {
-        say!(io, "[orchestrate] on: {}. `atlas settings orchestrate` asks again; `atlas settings off orchestrate` turns the caps off.", summary(atlas, a));
+        say!(io, "[orchestrate] on: {}. `atlas settings orchestrate` asks again; `atlas settings off orchestrate` turns the caps off.", summary(atlas, a, m));
     }
     Ok(!matches!(w, Written::Refused))
 }
@@ -202,8 +273,9 @@ fn read(io: &mut Io) -> Option<String> {
 pub(super) fn describe(io: &mut Io, atlas: &Value) {
     say!(io, "{ABOUT}");
     say!(io, "  Options (the value in brackets is what applies now or by default):");
+    let (m, a) = (io.machine.unwrap_or_else(Machine::here), Answers::default());
     for (i, o) in OPTS.iter().enumerate() {
-        say!(io, "    {} {} [{}]", o.flag, o.question, default_label(atlas, o, i));
+        say!(io, "    {} {} [{}]", o.flag, o.question, default_label(atlas, &a, m, i));
     }
 }
 
@@ -236,14 +308,15 @@ pub fn prompt(p: &Paths, io: &mut Io, items: &[Item], atlas: &Value) -> Result<b
         return decline(p, io);
     }
     say!(io, "  Enter keeps the value in brackets.");
+    let m = io.machine.unwrap_or_else(Machine::here);
     let mut a: Answers = Default::default();
     for (i, o) in OPTS.iter().enumerate() {
-        let off = matches!(a[3].clone().or_else(|| in_effect(atlas, &OPTS[3])), Some(Value::String(ref m)) if m == "off");
+        let off = matches!(effective(atlas, &a, m, MODE), Some(Value::String(ref s)) if s == "off");
         if off && (i == HANDOFF || i == LIMIT) {
             continue;
         }
         for attempt in 0..3 {
-            let _ = write!(io.out, "  {} [{}]: ", o.question, default_label(atlas, o, i));
+            let _ = write!(io.out, "  {} [{}]: ", o.question, default_label(atlas, &a, m, i));
             let Some(line) = read(io) else { break };
             if line.trim().is_empty() {
                 break;
@@ -259,7 +332,7 @@ pub fn prompt(p: &Paths, io: &mut Io, items: &[Item], atlas: &Value) -> Result<b
                     break;
                 }
                 Err(e) if attempt < 2 => say!(io, "  {e}"),
-                Err(e) => say!(io, "  {e}; kept [{}]", default_label(atlas, o, i)),
+                Err(e) => say!(io, "  {e}; kept [{}]", default_label(atlas, &a, m, i)),
             }
         }
     }
@@ -328,7 +401,7 @@ pub fn orchestrate_line(p: &Paths) -> Option<String> {
         return None;
     }
     Some(format!(
-        "atlas: orchestrated mode is offered (caps on how many agents of each kind run at once; context limits that hand agents off). In your first reply, whatever the task, ask the user whether to work in orchestrated mode. On yes, ask its options as multiple choice: builders, reviewers and research agents at once (default 2, 2, 1); context limits enforced (default), advisory or off; the handoff point and hard limit (default {}k and {}k on a 1M window, scaled to the window); after a handoff a fresh agent auto (default) or ask. Then run `atlas settings orchestrate --yes --builders N --reviewers N --research N --mode MODE --fresh auto|ask`, adding `--handoff N --limit N` only for numbers the user chose. On no run `atlas settings orchestrate --no`. With no answer, or no user to ask, run nothing: atlas asks again next session.",
+        "atlas: orchestrated mode is offered (per-kind agent caps and context limits). In your first reply, whatever the task, ask the user whether to work in orchestrated mode. On yes, ask as multiple choice: compile and GPU slots (default: from this machine's cores; 1); builder, reviewer and research caps (default: from the compile slots); context limits enforced (default), advisory or off; handoff point and hard limit (default {}k and {}k on a 1M window, scaled); after a handoff a fresh agent auto (default) or ask. Then run `atlas settings orchestrate --yes --mode MODE --fresh auto|ask`, adding `--compile N --gpu N --builders N --reviewers N --research N --handoff N --limit N` only for numbers chosen. On no run `atlas settings orchestrate --no`. With no answer, or no user to ask, run nothing: atlas asks again next session.",
         DEFAULT_HANDOFF / 1000,
         DEFAULT_LIMIT / 1000
     ))

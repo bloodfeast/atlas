@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH]
-//!       [--rescan | --recall-check [--phrase TEXT ...] | --token-report | --calibrate [--audit FILE]
+//!       [--rescan | --recall-check [--phrase TEXT ...] | --token-report [--repeats [--since TIME]] | --calibrate [--audit FILE]
 //!        | --hook-report [--transcripts DIR] [--since TIME] [--rows]
 //!        | --code-index [NAME ...] [--scip FILE] | --version]
 //! ```
@@ -54,6 +54,8 @@
 //!   tokens returned, the counterfactual, and their ratio (see
 //!   [`atlas::tokens`]), headed by the measured ratio and the upper bound,
 //!   with the brief-without-atlas and hook-injection lines at the end.
+//!   With `--repeats [--since TIME]` it lists instead the 20 targets looked
+//!   up again after a compaction most (see [`atlas::compact::repeats`]).
 //! * `--calibrate [--audit FILE]` measures the pre-atlas baseline the
 //!   measured ratio divides by, now, printing progress and the result (see
 //!   [`atlas::calibrate`]); the server also runs it in the background at a
@@ -87,10 +89,10 @@ mod bench;
 mod measure;
 
 #[cfg(not(feature = "dev"))]
-const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --token-report | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | settings on|off update | --version]";
+const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --token-report [--repeats [--since TIME]] | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | settings on|off update | --version]";
 /// With the `dev` feature: the measuring modes too.
 #[cfg(feature = "dev")]
-const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --bench [RUNS] [--queries FILE] [--before EXE CONFIG] | --token-report | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | --judge FILE [--modes M,M] [--runs N] | --symbol-bench FILE [--runs N] | --recall-scores FILE [--runs N] | settings on|off update | --version]";
+const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --bench [RUNS] [--queries FILE] [--before EXE CONFIG] | --token-report [--repeats [--since TIME]] | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | --judge FILE [--modes M,M] [--runs N] | --symbol-bench FILE [--runs N] | --recall-scores FILE [--runs N] | settings on|off update | --version]";
 
 /// `atlas --help`: every mode, subcommand and flag, one per line.
 const HELP: &str = "\
@@ -108,6 +110,7 @@ Modes:
   --hook                 a Claude Code command hook: the event JSON on stdin, the answer on stdout
   --recall-check [--phrase TEXT ...]   every identifier and phrase is found by lookup
   --token-report         the token ledger: what atlas answered against what reading would cost
+  --token-report --repeats [--since TIME]   the targets looked up again after a compaction most
   --calibrate [--audit FILE]   measure the pre-atlas baseline of the measured ratio now
   --misses-week [--since TIME]         lookups that found nothing, this week
   --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE]
@@ -143,6 +146,7 @@ Subcommands:
   atlas settings on|off update
   atlas rules [scan | counts | sitting 1|2 | link | answer KEY | unmark KEY]   which ruling replaces which (experimental, off by default)
   atlas queue [list | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next | add | plan]   the work queue: launches waiting to start, and the batch that can start now
+  atlas backlog [--all] [--as-of TIME] [--json] | dismiss ID --because KEY   ruled work that fell off the queue: aging and waiting items (proposed; the written order is unchanged)
   atlas ideas [list | show ID | file TEXT... | dismiss ID... | answer ID yes|no | convert ID ruling|queue | labels]   ideas caught from prompts, and the questions about them
 
 SHAPE is test, build, grep, listing, source, summary or generic. More: https://github.com/bloodfeast/atlas/wiki
@@ -155,7 +159,9 @@ enum Mode {
     Recall(Vec<String>),
     #[cfg(feature = "dev")]
     Bench(usize, bench::Opts),
-    TokenReport,
+    /// `--token-report [--repeats [--since TIME]]`: the ledger, or with
+    /// `--repeats` the targets looked up again after a compaction most.
+    TokenReport { repeats: bool, since: String },
     /// `--calibrate [--audit FILE]`.
     Calibrate(Option<PathBuf>),
     /// `--misses-week [--since TIME]`: the weekly top-10 misses pass.
@@ -545,7 +551,7 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
 
 /// The bare words recognised as `argv[1]`, or after leading
 /// [`LEADING_OPTIONS`].
-const SUBCOMMANDS: &[&str] = &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules"];
+const SUBCOMMANDS: &[&str] = &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules", "backlog"];
 
 /// The usage of a subcommand asked for its help, `None` when it was not: only
 /// the first word after it counts, so `atlas run -- cargo --help` still runs and a
@@ -567,6 +573,7 @@ fn sub_help(word: &str, rest: &[String]) -> Option<&'static str> {
         "queue" => atlas::queue::USAGE,
         "ideas" => atlas::ideas::cli::USAGE,
         "rules" => atlas::memory::rules::USAGE,
+        "backlog" => atlas::backlog::USAGE,
         _ => return None,
     })
 }
@@ -671,6 +678,14 @@ fn run() -> Result<ExitCode, String> {
     #[cfg(feature = "dev")]
     let mut runs = 20usize;
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(feature = "dev")]
+    if argv.first().is_some_and(|w| w == "taskjudge-embed") {
+        return taskjudge_embed(&argv[1..]);
+    }
+    #[cfg(feature = "dev")]
+    if argv.first().is_some_and(|w| w == "taskjudge-time") {
+        return taskjudge_time(&argv[1..]);
+    }
     // File tools that need no configuration, run before one is looked for.
     if argv.first().is_some_and(|w| w == "doctor") {
         // `config_path`, not `ensure_config`: the doctor writes nothing.
@@ -704,7 +719,11 @@ fn run() -> Result<ExitCode, String> {
             "--config" => config = Some(PathBuf::from(args.next().ok_or("--config needs a path")?)),
             "--rescan" => mode = Mode::Rescan,
             "--setup" => mode = Mode::Setup,
-            "--token-report" => mode = Mode::TokenReport,
+            "--token-report" => mode = Mode::TokenReport { repeats: false, since: String::new() },
+            "--repeats" => match &mut mode {
+                Mode::TokenReport { repeats, .. } => *repeats = true,
+                _ => return Err("--repeats goes after --token-report".into()),
+            },
             "--calibrate" => mode = Mode::Calibrate(None),
             "--audit" => match &mut mode {
                 Mode::Calibrate(a) => *a = Some(PathBuf::from(args.next().ok_or("--audit needs a file")?)),
@@ -728,8 +747,8 @@ fn run() -> Result<ExitCode, String> {
                 _ => return Err("--transcripts goes after --hook-report or --compact-report".into()),
             },
             "--since" => match &mut mode {
-                Mode::HookReport { since, .. } | Mode::MissesWeek(since) | Mode::CompactReport { since, .. } => *since = args.next().ok_or("--since needs a time")?,
-                _ => return Err("--since goes after --hook-report, --compact-report or --misses-week".into()),
+                Mode::HookReport { since, .. } | Mode::MissesWeek(since) | Mode::CompactReport { since, .. } | Mode::TokenReport { since, .. } => *since = args.next().ok_or("--since needs a time")?,
+                _ => return Err("--since goes after --hook-report, --compact-report, --misses-week or --token-report --repeats".into()),
             },
             "--rows" => match &mut mode {
                 Mode::HookReport { rows, .. } | Mode::CompactReport { rows, .. } => *rows = true,
@@ -877,7 +896,7 @@ fn run() -> Result<ExitCode, String> {
     // The user configuration and the active project, for calibration.
     let mut calib_src: Option<(Config, Option<atlas::project::Active>)> = None;
     // Only the modes that calibrate or report it build a plan: never a hook.
-    let calibrates = matches!(mode, Mode::Serve | Mode::Calibrate(_) | Mode::TokenReport);
+    let calibrates = matches!(mode, Mode::Serve | Mode::Calibrate(_) | Mode::TokenReport { repeats: false, .. });
     if let Some(cp) = &config {
         let raw = Config::load(cp).map_err(|e| e.to_string())?;
         // The active project's own configuration over the user-level one
@@ -1043,6 +1062,12 @@ fn run() -> Result<ExitCode, String> {
             "rules" => {
                 let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
                 atlas::memory::rules::cli(rest, &mut store)
+            }
+            "backlog" => {
+                let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
+                let orch = atlas::orchestrate::resolve(loaded.as_ref().and_then(|c| c.orchestrate.as_ref()), None, None, |k| std::env::var(k).ok());
+                let s = atlas::backlog::Settings::from_config(loaded.as_ref().and_then(|c| c.backlog.as_ref()))?;
+                atlas::backlog::cli(&rest, &mut store, Some(&setup.db), &s, &orch)
             }
             "ruling" | "entry" => {
                 let mut store = setup.open()?;
@@ -1293,7 +1318,22 @@ fn run() -> Result<ExitCode, String> {
             println!("upper bound per answer (grep + read counterfactual / returned): {:.1}x", side.upper());
             Ok(ExitCode::SUCCESS)
         }
-        Mode::TokenReport => {
+        Mode::TokenReport { repeats: true, since } => {
+            let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
+            conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+            let rows = atlas::compact::repeats(&conn, &since, 20).map_err(|e| e.to_string())?;
+            let when = if since.is_empty() { "ever".to_string() } else { format!("since {since}") };
+            if rows.is_empty() {
+                println!("post-compaction repeats {when}: none logged");
+            } else {
+                println!("post-compaction repeats {when}, most first (misses / changed / unstamped)");
+                for r in &rows {
+                    println!("{}\t{}\t{}\t{}", r.misses, r.changed, r.unstamped, r.sig);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Mode::TokenReport { .. } => {
             let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
             // A background calibration may be writing; its first read may add columns.
             conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
@@ -1352,8 +1392,9 @@ fn run() -> Result<ExitCode, String> {
             match atlas::compact::totals(&conn, bytes_per_token).map_err(|e| e.to_string())? {
                 Some(c) => {
                     let rate = if c.refs > 0 { c.dangling as f64 / c.refs as f64 } else { 0.0 };
+                    let pct = |n: i64| if c.window_lookups > 0 { n as f64 / c.window_lookups as f64 * 100.0 } else { 0.0 };
                     println!(
-                        "compactions\tn {}\tratio pre/summary {:.1}x\tpre/post {:.1}x\trefs {}\tdangling {} ({:.1}%)\tchanged {}\tbare keys {} (missing {})\tpost-compaction misses {}\tslowest hook {:.0} ms",
+                        "compactions\tn {}\tratio pre/summary {:.1}x\tpre/post {:.1}x\trefs {}\tdangling {} ({:.1}%)\tchanged {}\tbare keys {} (missing {})\tpost-compaction repeats (legacy, unfiltered) {}\tslowest hook {:.0} ms",
                         c.n,
                         if c.summary > 0.0 { c.pre / c.summary } else { 0.0 },
                         if c.post > 0.0 { c.pre_with_post / c.post } else { 0.0 },
@@ -1365,6 +1406,21 @@ fn run() -> Result<ExitCode, String> {
                         c.bare_missing,
                         c.misses,
                         c.max_ms
+                    );
+                    // The first figure is the replay's rule, comparable with its
+                    // offline baseline; the second drops repeats of changed targets.
+                    println!(
+                        "post-compaction lookups\twithin {} calls: repeats {} of {} ({:.1}%), misses of unchanged targets {} ({:.1}%; a folder repeat after any shell command counts as changed)\tmisses uncapped {}\tchanged targets {}\tunstamped {} (shell {})",
+                        atlas::compact::MISS_WINDOW,
+                        c.window_repeats,
+                        c.window_lookups,
+                        pct(c.window_repeats),
+                        c.window_misses,
+                        pct(c.window_misses),
+                        c.stamped_misses,
+                        c.changed_targets,
+                        c.unstamped,
+                        c.unstamped_shell
                     );
                 }
                 None => println!("compactions: none logged"),
@@ -1670,6 +1726,105 @@ fn setup_mode(config: Option<&std::path::Path>, setup: &Setup, models: &atlas::m
     }
     println!("next: add vaults and sources to the configuration, then restart Claude Code (or run /mcp and reconnect atlas) so the server reloads it");
     Ok(if failed == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+/// `atlas taskjudge-embed MODEL IN.jsonl OUT [THREADS]` (dev): the task
+/// judge's input vector for each `{"id", "text"}` line of IN, written as
+/// `OUT.f32` (little-endian rows of `dim` floats, in input order) and
+/// `OUT.json` (model id, dim, recipe, ids). Then 20 rows are embedded again
+/// one at a time with the run-time function and compared bit for bit.
+/// Needs no configuration and opens no store.
+#[cfg(feature = "dev")]
+fn taskjudge_embed(args: &[String]) -> Result<ExitCode, String> {
+    use atlas::json::{self, Value};
+    use atlas::taskjudge;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let [model, input, out, rest @ ..] = args else { return Err("usage: atlas taskjudge-embed MODEL IN.jsonl OUT [THREADS]".into()) };
+    let threads = rest.first().and_then(|t| t.parse().ok()).unwrap_or(1usize);
+    let model = atlas::embed::Model::load(std::path::Path::new(model)).map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
+    let t0 = std::time::Instant::now();
+    let step = AtomicUsize::new(0);
+    let rows = taskjudge::embed_jsonl(&model, &text, threads, &|done, total| {
+        let tenth = done * 10 / total.max(1);
+        if step.fetch_max(tenth, Ordering::Relaxed) < tenth {
+            println!("progress embed {done}/{total}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::with_capacity(rows.len() * model.dim * 4);
+    for (_, v) in &rows {
+        for x in v {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    std::fs::write(format!("{out}.f32"), &bytes).map_err(|e| e.to_string())?;
+    let ids = Value::Array(rows.iter().map(|(i, _)| Value::String(i.clone())).collect());
+    let isa = format!("{:?}", model.isa);
+    let head = json::object(256 + rows.len() * 24, |w| {
+        w.field("model", model.id.as_str())
+            .field("dim", &model.dim)
+            .field("isa", isa.as_str())
+            .field("recipe", taskjudge::RECIPE)
+            .field("n", &rows.len())
+            .field("ids", &ids);
+    });
+    std::fs::write(format!("{out}.json"), head).map_err(|e| e.to_string())?;
+    // The run-time check: 20 rows spread over the file, one at a time.
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let n = rows.len().min(20);
+    let stride = (rows.len() / n.max(1)).max(1);
+    let mut s = atlas::embed::bert::Scratch::default();
+    let mut same = 0usize;
+    for k in 0..n {
+        let at = k * stride;
+        let v = json::parse(lines[at]).map_err(|e| format!("{e:?}"))?;
+        let t = v.get("text").and_then(Value::as_str).unwrap_or_default();
+        let one = taskjudge::input_vector(&model, t, &mut s);
+        same += usize::from(one.len() == rows[at].1.len() && one.iter().zip(&rows[at].1).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+    println!(
+        "taskjudge-embed: {} rows, dim {}, model {}, isa {isa}, {:.1} s; run-time check {same}/{n} bit-identical",
+        rows.len(),
+        model.dim,
+        model.id,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(if same == n { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+/// `atlas taskjudge-time MODEL WEIGHTS BRIEF.md [RUNS]` (dev): the work
+/// classifier's latency for one brief: cold (encoder and weights load, then
+/// one embed and head) and warm (RUNS embeds and heads, default 20), as
+/// p50 and p95 in ms. Prints the score too.
+#[cfg(feature = "dev")]
+fn taskjudge_time(args: &[String]) -> Result<ExitCode, String> {
+    use atlas::taskjudge;
+    let [model, weights, brief, rest @ ..] = args else { return Err("usage: atlas taskjudge-time MODEL WEIGHTS BRIEF.md [RUNS]".into()) };
+    let runs = rest.first().and_then(|t| t.parse().ok()).unwrap_or(20usize).max(1);
+    let text = std::fs::read_to_string(brief).map_err(|e| format!("{brief}: {e}"))?;
+    let t0 = std::time::Instant::now();
+    let model = atlas::embed::Model::load(std::path::Path::new(model)).map_err(|e| e.to_string())?;
+    let head = taskjudge::Head::load(std::path::Path::new(weights), None).ok_or("weights do not load")?;
+    let mut s = atlas::embed::bert::Scratch::default();
+    let score = head.score(&taskjudge::input_vector(&model, &text, &mut s), "builder");
+    let cold = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut warm = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t = std::time::Instant::now();
+        let _ = head.score(&taskjudge::input_vector(&model, &text, &mut s), "builder");
+        warm.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    warm.sort_by(f64::total_cmp);
+    let at = |q: f64| warm[((warm.len() - 1) as f64 * q).round() as usize];
+    println!(
+        "taskjudge-time: model {}, cold {cold:.1} ms, warm p50 {:.1} ms p95 {:.1} ms over {runs} runs, score {score} (as builder)",
+        model.id,
+        at(0.5),
+        at(0.95)
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn main() -> ExitCode {

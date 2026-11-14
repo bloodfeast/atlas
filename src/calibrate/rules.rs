@@ -125,11 +125,16 @@ impl Targets {
     /// Whether a shell command reads only targets (see the module docs).
     pub fn names_target(&self, command: &str, cwd: &str) -> bool {
         let mut hit = false;
+        // Whether the previous word was `cd`: only its target may be a
+        // folder above a root.
+        let mut after_cd = false;
         for w in shell_words(&command.replace('\\', "/")) {
             for part in w.split([';', '|', '&', '<', '>', '(', ')']) {
+                // A flag (`cd -P DIR`) keeps `after_cd` for the word after it.
                 if part.is_empty() || part.starts_with('-') {
                     continue;
                 }
+                let cd_target = std::mem::replace(&mut after_cd, part.eq_ignore_ascii_case("cd"));
                 // `NAME=VALUE` (a variable set for later words): its value.
                 let part = match part.split_once('=') {
                     Some((k, v)) if !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => v,
@@ -152,7 +157,7 @@ impl Targets {
                         // An absolute path outside every target (a scratch
                         // folder, a build log), or a path through a
                         // variable (unknown): not only targets.
-                        || (path_word(&n) && !self.holds_a_root(&n))
+                        || (path_word(&n) && !(cd_target && self.holds_a_root(&n)))
                         || (n.starts_with('$') && n.contains('/')))
                 {
                     return false;
@@ -173,7 +178,8 @@ impl Targets {
     }
 
     /// Whether a normalised absolute path is a folder above a target root
-    /// (`cd R:/work && grep ... repo/docs/a.md`).
+    /// (`cd R:/work && grep ... repo/docs/a.md`); asked of a `cd` target
+    /// only, since any other word naming such a folder reads all below it.
     fn holds_a_root(&self, p: &str) -> bool {
         self.roots.iter().any(|(r, _)| r.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
     }
@@ -287,7 +293,7 @@ pub fn classify(name: &str, input: &Value, cwd: &str, t: &Targets) -> Option<Kin
             let p = if s("path").is_empty() { cwd } else { s("path") };
             // A globbed source root searched whole is a code search unless the
             // search is limited to Markdown.
-            let md_only = s("glob").contains(".md") || s("type") == "md";
+            let md_only = md_glob(s("glob")) || s("type") == "md";
             (!p.is_empty() && t.is_target(p, cwd) && (md_only || !t.is_globbed_root(p, cwd))).then_some(Kind::Search)
         }
         "Read" => (!s("file_path").is_empty() && t.is_target(s("file_path"), cwd)).then_some(Kind::Read),
@@ -304,6 +310,20 @@ pub fn classify(name: &str, input: &Value, cwd: &str, t: &Targets) -> Option<Kin
             }
         }
         _ => None,
+    }
+}
+
+/// Whether a Grep glob matches only Markdown files: every alternative of its
+/// braces (`*.{md,txt}` is `*.md` and `*.txt`) ends in `.md`, so `*.mdx` and
+/// `*.{md,rs}` do not.
+fn md_glob(glob: &str) -> bool {
+    let g = glob.to_ascii_lowercase();
+    match (g.find('{'), g.rfind('}')) {
+        (Some(a), Some(b)) if a < b => {
+            let (head, tail) = (&g[..a], &g[b + 1..]);
+            g[a + 1..b].split(',').all(|alt| md_glob(&format!("{head}{alt}{tail}")))
+        }
+        _ => !g.contains(['{', '}', ',']) && g.ends_with(".md"),
     }
 }
 
@@ -529,15 +549,25 @@ mod tests {
         // A globbed source root named as a folder says nothing; code is not a target.
         assert_eq!(c("cd /r/repo/docs && grep -rn x --include=*.rs src"), None);
         assert_eq!(c("perl -pi -e s/a/b/ RULES.md"), None);
-        // A folder above a target root is not a read of anything else.
+        // A folder above a target root, as a `cd` target, is not a read of
+        // anything else; named to grep, it is a search of all below it.
         assert_eq!(c("cd /r && grep -n x repo/.claude/RULES.md"), Some(Kind::Search));
+        assert_eq!(c("CD /r; grep -n x RULES.md"), Some(Kind::Search));
+        assert_eq!(c("cd -P /r && grep -n x RULES.md"), Some(Kind::Search));
+        assert_eq!(c("grep -rn x /r RULES.md"), None);
+        assert_eq!(c("cd /r/repo/.claude && grep -rn x /r RULES.md"), None);
         // A `/`-led sed address or grep pattern is not a path.
         assert_eq!(c("sed -n '/^## Next/,/^## /p' notes/handoff.md"), Some(Kind::Read));
         assert_eq!(c("grep -n \"/api\" docs/a.md"), Some(Kind::Search));
         let g = classify("Grep", &crate::json!({"pattern": "x", "path": "R:/repo/docs"}), "", &t);
         assert_eq!(g, None, "a globbed root searched whole");
-        let g = classify("Grep", &crate::json!({"pattern": "x", "path": "R:/repo/docs", "glob": "*.md"}), "", &t);
-        assert_eq!(g, Some(Kind::Search));
+        let grep = |glob: &str| classify("Grep", &crate::json!({"pattern": "x", "path": "R:/repo/docs", "glob": glob}), "", &t);
+        for g in ["*.md", "**/*.MD", "*.{md}", "{a,b}*.md"] {
+            assert_eq!(grep(g), Some(Kind::Search), "{g}");
+        }
+        for g in ["*.mdx", "*.{md,rs}", "*.{md,txt}", "*.md,*.rs", "*.{md"] {
+            assert_eq!(grep(g), None, "{g}");
+        }
         assert_eq!(classify("Read", &crate::json!({"file_path": "R:/repo/src/a.rs"}), "", &t), None);
     }
 

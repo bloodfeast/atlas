@@ -30,8 +30,9 @@ and the same with default targets (`cargo +1.99.0 clippy --workspace --locked --
 repository's CI runs them in its `clippy` job on every pull request, the release command refuses to merge until
 both pass, the development repository's `dev-pr` workflow runs them on its pull requests, and the local rehearsal
 (below) runs them before its tests. The toolchain is pinned so that a new Rust release's lints cannot fail an
-unrelated release; `rust-toolchain.toml` stays `stable`. To bump it, change `CLIPPY_TOOLCHAIN` in
-`xtask/src/release.rs` and every `1.99.0` in `.github/workflows/ci.yml`, and clear what the new lints find.
+unrelated release; `rust-toolchain.toml` pins the same version, so the shipped binary is built by it too. To bump
+it, change `channel` in `rust-toolchain.toml`, `CLIPPY_TOOLCHAIN` in `xtask/src/release.rs` and every `1.99.0` in
+`.github/workflows/ci.yml` and `.github/workflows/dev-pr.yml`, and clear what the new lints find.
 
 ## The release
 
@@ -71,7 +72,7 @@ only after a new `open` answer; the release branch may already be on the public 
 replaces it. The same holds once the pull request is open: when `main` has moved on since run 1, or the last
 run that was meant to update the pull request failed or never showed, ship re-exports (run 2, step 2). A pull
 request closed without a merge gives way to run 1 again once its branch is gone from the public repository, or
-holds a later export than the closed pull request's head; while the branch still holds that head, ship refuses
+holds another commit than the closed pull request's head; while the branch still holds that head, ship refuses
 and says to delete the branch by hand, then run ship again.
 
 **The pull request** (development repository, workflow `release-pr`). It checks out the commit ship sent (the
@@ -100,14 +101,17 @@ not merge it on GitHub: run 2 merges it.
    record; without it the checks below stand alone, and the command says so). If not, ship **re-exports**
    instead of merging: run 1's steps again for `HEAD`, which must be the tip of `main` (a re-export never goes
    back to an older commit), with the binary leak check unless a stamp stands, the plan naming the pull request,
-   and a new `open vX.Y.Z` whose prompt names the old commit, `HEAD` and the pull request's number. The new
+   and a new `open vX.Y.Z` whose prompt names the pull request's number, its current head and `HEAD`. The new
    `release-pr` run replaces the release branch and updates the open pull request, so its head moves; ship
    watches the run and prints the pull request. An approval of the old head does not count: review the pull
    request again, approve it on its new head, and run ship again. A run still in progress is watched, never
    dispatched again; a failed one is dispatched again only after another `open` answer. Without an answer nothing
-   changes. Otherwise the checkout guard with `HEAD` on `main`.
+   is dispatched and the pull request does not change (a `release check` run before the prompt may have left its
+   stamp). Otherwise the checkout guard with `HEAD` on `main`.
 3. The owner's latest review must be an approval of the pull request's head commit (an approval of an earlier
-   push does not count), no one may have asked for changes, and every check must have passed, these five among
+   push does not count), and no one else's latest review may ask for changes. Each reviewer's latest is read from
+   the pull request's `reviews` by time, comments aside, as GitHub counts it (gh's `latestReviews` leaves the
+   commit out, so it cannot tell which head was approved), and every check must have passed, these five among
    them: `test (ubuntu-latest)`, `test (windows-latest)`, `test (macos-latest)`, `clippy (windows-latest)`,
    `clippy (ubuntu-latest)`. Anything missing is listed, nothing changes, and the run ends; run it again later.
    The command checks this itself because the owner, as an admin, could merge past the ruleset on GitHub.
@@ -115,10 +119,13 @@ not merge it on GitHub: run 2 merges it.
    exactly what the pull request's head holds (export-ignored files and `bin/` aside), so the approval was of
    this code.
 5. `merge vX.Y.Z`, then a squash merge pinned to the approved head commit (GitHub refuses it if the branch moved),
-   with the public address as its author and the release commit's own subject and message, so GitHub's default
-   text never decides what enters the public history. Never with the admin bypass. The branch is kept.
-6. Every author and committer address of the public history, merge commit included, must be the public one or
-   GitHub's own (the address check, below); a hit stops everything.
+   with the release commit's own subject and message, so GitHub's default text never decides what enters the public
+   history. GitHub picks the squash commit's author (it refused the public address given as `--author-email`), and
+   ship checks every address after the merge. Never with the admin bypass. The branch is kept.
+6. Every author, committer and `Co-authored-by:` address of the public history, merge commit included, must be
+   the public one or GitHub's own (the address check, below); a hit stops everything and names the merge commit and
+   how many addresses were refused, never the addresses. The same check runs again whenever a later run finds the
+   pull request already merged.
 7. The release workflow's run on the merge commit is watched to its end (a run 2 that stopped after the merge
    finds it, and never merges again). A failed build stops it with the run's page: a rebuild is the owner's (delete
    the draft if one was made, then start the workflow by hand).
@@ -255,8 +262,9 @@ cargo xtask release --remote PATH/pub.git              # everything but push and
 Both this and the pull request refuse an export without `.github/workflows/ci.yml`, `.github/workflows/release.yml`,
 `.github/CODEOWNERS`, `SECURITY.md`, `LICENSE`, `NOTICE`, `README.md`, `CHANGELOG.md` and `wiki/Home.md`.
 
-**The address check.** Every author and committer address in the public history must be the public one, or
-GitHub's own on the commits a merged pull request makes (`noreply@github.com`, an app's `[bot]` address). The two
+**The address check.** Every author, committer and `Co-authored-by:` address in the public history must be the
+public one, or GitHub's own on the commits a merged pull request makes (`noreply@github.com`, an app's `[bot]`
+address). A refused address is counted in the error, never printed. The two
 v0.2.1 merges whose author address GitHub's web merge took from the merger's account are accepted by name; no
 other commit is.
 
@@ -428,6 +436,12 @@ GitHub never shows a secret's value, but the release-pr job's `linux-leak` step 
 the copy's term count and SHA-256 (carriage returns removed, one final newline); `cargo xtask release check`
 prints the same for the local file. If they differ, set the secret again. The release-pr job drops carriage
 returns, so a file with Windows line endings is fine.
+
+The file holds one term per line; blank lines and lines starting with `#` are skipped. A term matches anywhere,
+inside longer words too, unless the line right before it is exactly `#[word]`: then it matches only as a whole word,
+with no letter, digit or `_` right before or after it (`-` is not a word character, so `x-term` still matches). The
+marker is a comment to everything else that reads the list (the log masking above, idea-capture redaction), which
+still treat the term below it as a plain term, and term numbers do not change. `xtask/src/leak.rs` has the details.
 
 **5. The accepted-hits secret.** `ATLAS_LEAK_ACCEPTED` is a copy of the accepted-hits file (term numbers and
 digests only), read by the `linux-leak` job; unset means no accepted hits there. After any change to the file:

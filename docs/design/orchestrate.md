@@ -117,7 +117,7 @@ also in `atlas settings`.
 ```
 
 - **`resources`** and **`aging_minutes`** belong to the work queue's lanes: resource capacities (0 never
-  serializes) and the minutes of waiting that raise a queued item one priority class. See `queue-lanes.md`.
+  serializes; a name not listed, other than `gpu`, `compile` and `worktree:*`, is not a limit and only warns) and the minutes of waiting that raise a queued item one priority class. See `queue-lanes.md`.
 - **`reviews`** is the required-reviews merge gate: a `gh pr merge` needs a passing review of the PR's head from
   each role. No roles (the default) turns it off; the default mode is advisory. See `reviews.md`.
 
@@ -271,12 +271,18 @@ These are in the ruling but not in this cut:
   what matters; the hook's mechanical digest is a backstop for long reports only. The gate rows are
   `baseline-51fee57.rows` beside the corpus.
 
-  The backstop is wired (Q-SD3). In orchestrated mode, a report over 14,000 bytes is sent back once: at the
-  SubagentStop hook (`decision: block`, unless `stop_hook_active`), or, when the report is handed back
-  through a hand-back tool, at that tool's PreToolUse (a deny). atlas files the report whole as a journal note
-  in the agent's lane (`reports` when no lane is known), and the reason asks for the digest form, cites the
-  key, and attaches the mechanical draft (`digest(report, budget(len))`, so the draft keeps every labelled fact
-  on the corpus). A report within the bound, a second stop, the caps off, or a filing error lets it through.
+  The backstop is wired (Q-SD3, refined 11-04). In orchestrated mode, a report over 28,000 bytes (twice the
+  14,000-byte bound, `SEND_BACK_OVER`) is sent back once: at the SubagentStop hook (`decision: block`, unless
+  `stop_hook_active`), or, when the report is handed back through a hand-back tool, at that tool's PreToolUse
+  (a deny). atlas files the report whole as a journal note in the agent's lane (`reports` when no lane is
+  known), and the reason asks for the digest form within 14,000 bytes and cites the key. It no longer attaches
+  the mechanical draft. A shorter report, a second stop, the caps off, or a filing error lets it through.
+
+  `digest(report, max)` now stays within `max` with its gap marks and closing line; only a Markdown or bold
+  heading opens or closes a questions section (a short `Options:` line inside one no longer ends it); and
+  lines that carry nothing the classifier knows get a last tier, filling what room is left. The report eval
+  scores the bound (14,000 B) and also 4,000 and 8,000 B on every run; `--gate` compares each budget's rows
+  and which facts are missed, not only how many.
 - **A queue command** for what comes next. Built; section 8.1.
 - **The unmanned mode,** with questions queued for the user's return.
 - **REFS-BRIEF:** briefs written as refs. It ships only if a paired test passes. Until then the skill teaches
@@ -330,3 +336,5 @@ runs next (Q-QU2).
 - **Q-SD2.** The digest ships only if every labelled fact is kept on the whole corpus (284/284).
 - **Q-SD3.** Wire the backstop now. It fires only for reports over 14,000 bytes, blocks the stop once, and
   asks the agent to hand back its own digest form with atlas's draft attached. It must pass the report gate.
+  Refined 11-04 after the #96/#97 retro: it fires only past about 28 KB (twice the bound) and sends the
+  instruction without the draft; the eval gains rows at a fixed 4-8 KB budget and a set-of-misses gate.

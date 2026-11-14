@@ -604,6 +604,9 @@ pub struct Io<'a> {
     pub version: Option<(u32, u32, u32)>,
     /// Show what `add-project` would write, and write nothing.
     pub dry_run: bool,
+    /// The machine the orchestrated mode's starter values derive from;
+    /// `None` reads this one ([`Machine::here`]).
+    pub machine: Option<Machine>,
 }
 
 macro_rules! say {
@@ -611,7 +614,7 @@ macro_rules! say {
 }
 
 mod orchestrated;
-pub use orchestrated::orchestrate_line;
+pub use orchestrated::{orchestrate_line, starter_compile, Machine};
 
 fn show(v: Option<&Value>) -> String {
     match v {
@@ -1126,14 +1129,15 @@ fn atlas_config_value(p: &Paths) -> Value {
     p.atlas_config.as_deref().and_then(|c| load(c).ok()).map(|d| d.value).unwrap_or(Value::Object(Map::new()))
 }
 
-/// Whether the experimental compaction features are on (`compact.enabled`
-/// in atlas's configuration; default off).
+/// Whether the compaction features are on (`compact.enabled` in atlas's
+/// configuration; on unless it is false, as [`crate::memory::settings::CompactSettings`]
+/// reads it).
 pub fn compaction_on(p: &Paths) -> bool {
-    atlas_config_value(p).pointer("/compact/enabled").and_then(Value::as_bool) == Some(true)
+    atlas_config_value(p).pointer("/compact/enabled").and_then(Value::as_bool) != Some(false)
 }
 
 /// What `atlas settings compact-md` says while compaction is off.
-pub const COMPACTION_OFF: &str = "The Compact instructions go with atlas's experimental compaction features, which are off. To try them, set \"compact\": {\"enabled\": true} in atlas's configuration, then run this again. Nothing was changed.";
+pub const COMPACTION_OFF: &str = "The Compact instructions go with atlas's compaction features, which are turned off (\"compact\": {\"enabled\": false} in atlas's configuration). To turn them back on, run atlas settings set compact true or remove that key, then run this again. Nothing was changed.";
 
 /// atlas's configuration as the switches read it: the file, plus each flag
 /// switch's state under its own key (`routing: false` when routing is off).
@@ -1199,11 +1203,9 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
         "set" => {
             let s = find(&items, args.get(1))?;
             let raw = args.get(2).ok_or("set needs ID VALUE")?;
-            let v = check(s, raw)?;
-            // `false` is not off for this one: only its own word reaches it.
-            if s.id == "memory-rules" && v == Value::Bool(false) && !raw.eq_ignore_ascii_case("false") {
-                return Err(format!("{}: {raw:?} is not taken here. To go back to the default: atlas settings off {}. The value false also stops what the configuration names by hand: atlas settings set {} false", s.id, s.id, s.id));
-            }
+            // For this one the word off is its own value, "off", the full off;
+            // false and its other spellings are the same as unset.
+            let v = if s.id == "memory-rules" && raw.eq_ignore_ascii_case("off") { Value::String("off".into()) } else { check(s, raw)? };
             // By the value, so every spelling `check` accepts is warned about.
             let word = match &v {
                 Value::String(t) => t.clone(),
@@ -1562,7 +1564,7 @@ pub fn session_start_line(p: &Paths) -> Option<String> {
         let names: Vec<&str> = offer.iter().map(|s| s.short.as_str()).collect();
         let n = offer.len();
         line.push_str(&format!(
-            " {n} Claude Code setting{} {} offered ({}); ask the user, then run `atlas settings offer --yes ID` or `offer --no`; asked again next session.",
+            " {n} Claude Code setting{} {} offered ({}); ask the user, then `atlas settings offer --yes ID` or `offer --no`; asked again next session.",
             if n == 1 { "" } else { "s" },
             if n == 1 { "is" } else { "are" },
             names.join(", ")
@@ -2426,7 +2428,7 @@ pub fn offer_project_interactive(config: Option<&Path>, db: &Path, user_state: O
     let interactive = stdin.is_terminal();
     let mut input = stdin.lock();
     let mut out = std::io::stdout();
-    let mut io = Io { out: &mut out, input: &mut input, interactive, version: None, dry_run: false };
+    let mut io = Io { out: &mut out, input: &mut input, interactive, version: None, dry_run: false, machine: None };
     project_prompt(&p, &mut io, Path::new(&key))
 }
 
@@ -2976,7 +2978,7 @@ pub fn cli(args: Vec<String>, config: Option<&Path>, db: &Path, user_state: Opti
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut out = std::io::stdout();
-    run(&args, &p, &mut Io { out: &mut out, input: &mut input, interactive, version, dry_run: false })
+    run(&args, &p, &mut Io { out: &mut out, input: &mut input, interactive, version, dry_run: false, machine: None })
 }
 
 /// The interactive offer `atlas --setup` runs after its model step. Without
@@ -2997,7 +2999,7 @@ pub fn offer_interactive(config: Option<&Path>, db: &Path, user_state: Option<&P
     println!("\nClaude Code settings atlas offers (each is opt-in; `atlas settings` changes them any time):");
     // Without a terminal nothing is written, so Claude Code is not spawned.
     let version = if interactive { claude_version() } else { None };
-    run(&["offer".to_string()], &p, &mut Io { out: &mut out, input: &mut input, interactive, version, dry_run: false }).map(|_| ())
+    run(&["offer".to_string()], &p, &mut Io { out: &mut out, input: &mut input, interactive, version, dry_run: false, machine: None }).map(|_| ())
 }
 
 // ------------------------------------------------------------ hook drift
@@ -3041,9 +3043,10 @@ fn atlas_hooks(settings: &Value) -> Vec<(String, Option<std::collections::BTreeS
 /// `hooks/hooks.json`, one line per finding: an event the plugin hooks with
 /// no live atlas hook, an `mcp_tool` hook whose input fields differ (the
 /// missing and extra fields), and an atlas hook on an event the plugin does
-/// not hook. A command hook is compared by its event only. Empty when they
-/// match or the settings hold no atlas hook (the plugin's own hooks are then
-/// the ones in use).
+/// not hook. A command hook is compared by its event only, and said on
+/// UserPromptSubmit or SubagentStart, where each event starts a new process
+/// that reloads the model and record vectors. Empty when they match or the settings hold no atlas hook (the
+/// plugin's own hooks are then the ones in use).
 pub fn hook_drift(settings: &Value) -> Vec<String> {
     let live = atlas_hooks(settings);
     if live.is_empty() {
@@ -3063,6 +3066,11 @@ pub fn hook_drift(settings: &Value) -> Vec<String> {
             continue;
         }
         let Some(want) = want else { continue };
+        // A command hook is one process per event: on a recalling event it
+        // reloads the model and every record vector each time.
+        if matches!(event.as_str(), "UserPromptSubmit" | "SubagentStart") && here.iter().any(|f| f.is_none()) {
+            out.push(format!("{event}: {COMMAND_FINDING}"));
+        }
         for fields in here.into_iter().flatten() {
             let missing: Vec<&str> = want.difference(fields).map(String::as_str).collect();
             let extra: Vec<&str> = fields.difference(want).map(String::as_str).collect();
@@ -3088,6 +3096,21 @@ pub fn hook_drift(settings: &Value) -> Vec<String> {
     out
 }
 
+/// The [`hook_drift`] finding for a command hook on a recalling event.
+const COMMAND_FINDING: &str = "a command hook starts a new process per event that reloads the model and record vectors; use the mcp_tool hook";
+
+/// Whether the hook drift is told at SessionStart rather than at a
+/// session's first prompt: the live UserPromptSubmit or SubagentStart is a
+/// command hook (`atlas --hook`, a new process per prompt, which cannot tell
+/// once), and no UserPromptSubmit is an `mcp_tool` hook (a resident server
+/// tells it at the first prompt, so it is not told twice).
+pub fn drift_told_at_session_start(p: &Paths) -> bool {
+    let Ok(d) = load(&p.settings()) else { return false };
+    let live = atlas_hooks(&d.value);
+    let recalling = |e: &str| e == "UserPromptSubmit" || e == "SubagentStart";
+    live.iter().any(|(e, f)| recalling(e) && f.is_none()) && !live.iter().any(|(e, f)| e == "UserPromptSubmit" && f.is_some())
+}
+
 /// The drift of the live user settings' atlas hooks, read from `path`
 /// (a missing or unreadable file has none).
 pub fn hook_drift_at(path: &Path) -> Vec<String> {
@@ -3108,8 +3131,9 @@ fn ask_answers_missed(settings: &Value) -> bool {
     })
 }
 
-/// The warning for a session's first prompt when the live atlas hooks
-/// drifted from `hooks/hooks.json`; `None` when they match. Only idea questions
+/// The warning for a session's first prompt (or its SessionStart, see
+/// [`drift_told_at_session_start`]) when the live atlas hooks drifted from
+/// `hooks/hooks.json`; `None` when they match. Only idea questions
 /// use the Stop hook, so a settings install that lacks it hears nothing unless
 /// `asks_on` (`atlas doctor` still lists it). With `ideas_on`, an
 /// `AskUserQuestion` the PostToolUse matcher leaves out is said, or typed answers
@@ -3123,11 +3147,13 @@ pub fn hook_drift_line(p: &Paths, ideas_on: bool, asks_on: bool) -> Option<Strin
         d.push("PostToolUse: the matcher leaves out AskUserQuestion".to_string());
     }
     (!d.is_empty()).then(|| {
-        format!(
-            "atlas: the atlas hooks in {} differ from the plugin's hooks/hooks.json ({}); a hook missing a field gives atlas less to go on (a PreToolUse without tool_use_id once made the agent cap count agents twice). Tell the user; `atlas doctor` lists it.",
-            p.settings().display(),
-            d.join("; ")
-        )
+        // A command hook's finding carries its own reason; the others share
+        // this one.
+        let why = match d.iter().all(|l| l.ends_with(COMMAND_FINDING)) {
+            true => "",
+            false => "; a hook missing a field gives atlas less to go on (a PreToolUse without tool_use_id once made the agent cap count agents twice)",
+        };
+        format!("atlas: the atlas hooks in {} differ from the plugin's hooks/hooks.json ({}){why}. Tell the user; `atlas doctor` lists it.", p.settings().display(), d.join("; "))
     })
 }
 
@@ -3346,7 +3372,7 @@ mod tests {
     fn the_manifest_is_well_formed() {
         let m = manifest().unwrap();
         let ids: Vec<&str> = m.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["subagent-cache-1h", "goal-checkin-120", "routing", "update", "update-pin", "orchestrate", "memory-rules", "agents-builders", "agents-reviewers", "agents-research", "context-mode", "context-limit", "context-handoff"]);
+        assert_eq!(ids, ["subagent-cache-1h", "goal-checkin-120", "routing", "update", "update-pin", "compact", "orchestrate", "memory-rules", "agents-builders", "agents-reviewers", "agents-research", "context-mode", "context-limit", "context-handoff", "resources-compile", "resources-gpu"]);
         for s in &m {
             assert!(!s.title.is_empty() && !s.what.is_empty() && !s.cost.is_empty() && !s.basis.is_empty() && !s.short.is_empty(), "{}", s.id);
             if s.kind != Kind::Atlas {
@@ -3426,7 +3452,7 @@ mod tests {
             std::fs::write(dir.join("README.md"), "# Readme\n").unwrap();
             let mut out = Vec::new();
             let mut input = answers.as_bytes();
-            project_prompt(&p, &mut Io { out: &mut out, input: &mut input, interactive, version: None, dry_run: false }, dir).unwrap();
+            project_prompt(&p, &mut Io { out: &mut out, input: &mut input, interactive, version: None, dry_run: false, machine: None }, dir).unwrap();
             String::from_utf8(out).unwrap()
         };
         let vaults = || crate::config::Config::load(&home.join("atlas.json")).unwrap().vaults.into_iter().map(|v| v.name).collect::<Vec<_>>();

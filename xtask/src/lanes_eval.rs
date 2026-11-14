@@ -94,7 +94,9 @@ impl Scored {
 
 /// Scores one brief.
 pub fn score(label: &Label, brief: &str) -> Scored {
-    let c = atlas::lanes::classify(brief, &[]);
+    // The corpus is a game project's briefs, and that project turns the bare gpu
+    // words on (`orchestrate.bare_gpu_words` in its project file).
+    let c = atlas::lanes::classify_in(brief, &[], true);
     let inferred: Vec<String> = c.resources().filter(|r| !r.starts_with("file:")).map(str::to_string).collect();
     let evidence = c.uses.iter().map(|(r, s)| format!("{r}: {s:?}")).collect();
     Scored {

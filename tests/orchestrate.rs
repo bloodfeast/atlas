@@ -95,7 +95,10 @@ fn the_agent_cap_refuses_past_each_kind_and_counts_live_agents_only() {
 
     // One live builder (b1): a second may start; it then counts at once,
     // before Claude Code writes its meta file, so a third is refused.
-    assert_eq!(launch(&mut h, &s, "t1", "general-purpose", "Build the parser."), HookAnswer::default());
+    // Admitted, with only the reminder to declare its lane.
+    let a = launch(&mut h, &s, "t1", "general-purpose", "Build the parser.");
+    assert_eq!(a, HookAnswer { context: a.context.clone(), ..HookAnswer::default() });
+    assert!(a.context.starts_with("atlas lanes: this builder's prompt declares no lane"), "{a:?}");
     let d = launch(&mut h, &s, "t2", "general-purpose", "Build the printer.");
     let r = d.deny.clone().expect("the third builder is refused");
     assert!(
@@ -135,7 +138,7 @@ fn a_cap_refusal_names_where_the_kind_came_from() {
     s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nBuild it.", 1000, false);
     s.agent("r1", "general-purpose", "t-r1", "Kind: reviewer\nReview it.", 1000, false);
     s.agent("e1", "general-purpose", "t-e1", "Kind: research\nFind it.", 1000, false);
-    let hint = "put `Kind: builder`, `Kind: reviewer` or `Kind: research` in the prompt's first 40 lines (a brief file the prompt names is not read)";
+    let hint = "put `Kind: builder`, `Kind: reviewer`, `Kind: research` or `Kind: brief-writer` in the prompt's first 40 lines (a brief file the prompt names is not read)";
     let line = launch(&mut h, &s, "t1", "general-purpose", "Kind: reviewer\nRead Z:/brief.md.").deny.unwrap();
     assert!(line.starts_with("atlas agent cap: 1 of 1 reviewer") && line.contains("This launch counts as a reviewer: its prompt's `Kind:` line says so."), "{line}");
     assert!(!line.contains(hint) && !line.contains("add `Queue:"), "{line}");
@@ -311,7 +314,57 @@ fn the_agent_cap_is_off_by_default_and_clamped_to_claude_codes_limit() {
         tool_input: json!({"prompt": "Build."}),
         ..ev("PreToolUse")
     };
-    assert_eq!(h.handle(&none), HookAnswer::default());
+    let a = h.handle(&none);
+    assert_eq!(a, HookAnswer { context: a.context.clone(), ..HookAnswer::default() }, "only the lane reminder");
+    assert!(a.context.starts_with("atlas lanes:"), "{a:?}");
+}
+
+/// F7: a brief writer has its own cap, uncapped by default (Claude Code's
+/// own limit still applies), and never takes a builder's slot.
+#[test]
+fn a_brief_writer_has_its_own_cap_uncapped_by_default() {
+    let t = Temp::new("orch-brief-writer");
+    let s = Session::new(t.path());
+    let on = OrchestrateSpec { enabled: Some(true), ..Default::default() };
+    let mut h = Hooks::open(settings(t.path(), &on, &[(atlas::orchestrate::LIMIT_ENV, "6")])).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nBuild it.", 1000, false);
+    // Four brief writers: past the builder's 2 and research's 1, by either
+    // spelling or by subagent_type.
+    assert!(launch(&mut h, &s, "w1", "general-purpose", "Kind: brief writer\nWrite Z:/brief.md.").deny.is_none());
+    assert!(launch(&mut h, &s, "w2", "brief-writer", "Write Z:/brief2.md.").deny.is_none());
+    assert!(launch(&mut h, &s, "w3", "general-purpose", "Kind: brief-writers\nWrite Z:/brief3.md.").deny.is_none());
+    assert!(launch(&mut h, &s, "w4", "general-purpose", "- **Kind:** brief-writer\nWrite Z:/brief4.md.").deny.is_none());
+    // The builder slot b1 left free is still free: brief writers never count.
+    assert!(launch(&mut h, &s, "b2", "general-purpose", "Kind: builder\nLane: X\nBuild more.").deny.is_none());
+    // Six running: Claude Code's own limit refuses the next, not a kind cap.
+    let r = launch(&mut h, &s, "w5", "general-purpose", "Kind: brief writer\nWrite Z:/brief5.md.").deny.unwrap();
+    assert!(r.contains("6 agents are running, Claude Code's own limit of 6") && !r.contains("brief-writer slots"), "{r}");
+
+    // A configured cap is enforced, and 0 launches none.
+    for (max, running) in [(1usize, true), (0, false)] {
+        let t = Temp::new(&format!("orch-brief-writer-{max}"));
+        let s = Session::new(t.path());
+        let o = OrchestrateSpec {
+            enabled: Some(true),
+            kinds: vec![(Kind::BriefWriter, KindSpec { max: Some(max), ..Default::default() })],
+            ..Default::default()
+        };
+        let mut h = Hooks::open(settings(t.path(), &o, &[])).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if running {
+            s.agent("w0", "general-purpose", "t-w0", "Kind: brief writer\nWrite it.", 1000, false);
+        }
+        let r = launch(&mut h, &s, "w1", "brief-writer", "Write Z:/brief.md.").deny.unwrap();
+        assert!(
+            r.contains(&format!("{max} of {max} brief-writer slots"))
+                && r.contains("orchestrate.kinds.brief-writer.max")
+                && r.contains("counts as a brief writer"),
+            "{r}"
+        );
+        // The builders' cap is untouched.
+        assert!(launch(&mut h, &s, "b1", "general-purpose", "Kind: builder\nLane: X\nBuild it.").deny.is_none());
+    }
 }
 
 #[test]
@@ -555,7 +608,7 @@ fn lanes_and_resources_shape_the_batch_and_the_launch() {
     let a = launch(&mut h, &s, "t2", "general-purpose", "Kind: reviewer\nLane: parser\nUses: read-only\n\nReview the reader.");
     assert!(a.deny.is_none() && a.context.is_empty(), "{a:?}");
     // An inferred resource conflict is a warning.
-    let a = launch(&mut h, &s, "t3", "general-purpose", "Kind: builder\nLane: docs\n\nTake a capture of the menu.");
+    let a = launch(&mut h, &s, "t3", "general-purpose", "Kind: builder\nLane: docs\n\nTake a frame capture of the menu.");
     assert!(a.deny.is_none() && a.context.contains("may conflict with running work (gpu held by job b1 (b1))"), "{a:?}");
     // A queued gpu item waits while b1 holds the gpu; after b1 finishes the
     // finish line proposes both queued items together.
@@ -563,6 +616,98 @@ fn lanes_and_resources_shape_the_batch_and_the_launch() {
     assert!(r.contains("gpu held by job b1 (b1)"), "{r}");
     let n = finished(&mut h, &s, "b1");
     assert!(n.contains("start together: journal:parser:0001 (builder, lane parser, d); journal:render:0001 (builder, lane render, d)"), "{n}");
+}
+
+/// atlas-dev #150: words on a `Uses:` line that the policy does not list
+/// (repos) never deny or queue a launch, only note what it shares; gpu,
+/// compile, worktrees and configured words still deny, and a configured
+/// class limits each `name value` on its own.
+#[test]
+fn unlisted_uses_words_only_warn_through_the_hook() {
+    let t = Temp::new("orch-uses150");
+    let s = Session::new(t.path());
+    let o = OrchestrateSpec {
+        enabled: Some(true),
+        kinds: vec![(Kind::Builder, KindSpec { max: Some(6), ..Default::default() })],
+        resources: vec![("sqlport".into(), 1), ("cache".into(), 0), ("license".into(), 1)],
+        ..Default::default()
+    };
+    let st = settings(t.path(), &o, &[]);
+    let store_path = st.store.clone();
+    let mut h = Hooks::open(st).unwrap();
+    h.set_command_hook();
+    s.agent("a1", "general-purpose", "t-a1", "Kind: build\nLane: ES1-1663\nUses: db, contracts, api, react, sqlport 15126, cache, license\n\nBuild it.", 1000, false);
+    // The issue's second header: let through, with a note naming the words.
+    let a = launch(&mut h, &s, "t1", "general-purpose", "Kind: build\nLane: ES1-1415\nUses: db, contracts, api, react, sqlport 15127\n\nBuild it.");
+    assert!(a.deny.is_none(), "{a:?}");
+    assert!(a.context.contains("shares api with job a1 (a1); contracts with job a1 (a1); db with job a1 (a1); react with job a1 (a1) with running work"), "{a:?}");
+    assert!(!a.context.contains("atlas inferred it"), "{a:?}");
+    // A word at capacity 0 gives no note.
+    let a = launch(&mut h, &s, "t2", "general-purpose", "Kind: build\nLane: L2\nUses: cache\n\nBuild it.");
+    assert!(a.deny.is_none() && a.context.is_empty(), "{a:?}");
+    // A configured word and the same port are denied.
+    let r = launch(&mut h, &s, "t3", "general-purpose", "Kind: build\nLane: L3\nUses: license\n\nBuild it.").deny.expect("license has capacity 1");
+    assert!(r.contains("license held by job a1 (a1)"), "{r}");
+    let r = launch(&mut h, &s, "t4", "general-purpose", "Kind: build\nLane: L4\nUses: sqlport: 15126\n\nBuild it.").deny.expect("the same port");
+    assert!(r.contains("sqlport:15126 held by job a1 (a1)"), "{r}");
+    let m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+    let w = atlas::queue::waiting(&m).unwrap();
+    assert_eq!(w.iter().map(|h| h.scope.as_str()).collect::<Vec<_>>(), ["L3", "L4"], "the shared-word launches were not queued");
+}
+
+/// atlas-dev #150: a queued launch leaves the queue when its lane starts
+/// under a reworded brief with the same kind (the oldest, named), while a
+/// `Queue:` key still wins, another kind and a planned item stay, and an
+/// undeclared lane retires nothing.
+#[test]
+fn a_reworded_start_in_the_lane_takes_its_oldest_launch_off_the_queue() {
+    let t = Temp::new("orch-stale150");
+    let s = Session::new(t.path());
+    let o = OrchestrateSpec { enabled: Some(true), kinds: vec![(Kind::Builder, KindSpec { max: Some(6), ..Default::default() })], ..Default::default() };
+    let st = settings(t.path(), &o, &[]);
+    let store_path = st.store.clone();
+    let mut h = Hooks::open(st).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: ES1-1415\n\nHold the lane.", 1000, false);
+    for (id, what) in [("t1", "tariff pricing"), ("t2", "pricing tests"), ("t3", "pricing docs")] {
+        let r = launch(&mut h, &s, id, "general-purpose", &format!("Kind: builder\nLane: ES1-1415\nUses: sqlport 15127\n\nBuild the {what}.")).deny.expect("the lane is held");
+        assert!(r.contains("atlas queued it"), "{r}");
+    }
+    let planned = {
+        let mut m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+        let l = atlas::queue::Launch { kind: Kind::Reviewer, lane: Some("ES1-1415"), description: "review it", subagent_type: "general-purpose", prompt: "Kind: reviewer\nLane: ES1-1415\n\nReview it.", session: "s1", class_meta: "" };
+        assert_eq!(atlas::queue::add(&mut m, &l).unwrap().0, "journal:ES1-1415:0004");
+        atlas::queue::add_planned(&mut m, &atlas::queue::Planned { lane: "ES1-1415".into(), kind: "builder".into(), uses: vec!["sqlport 15128".into()], title: "planned".into(), ..Default::default() }).unwrap()
+    };
+    // A planned `uses: sqlport 15128` reads back as one resource.
+    {
+        let m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+        let ph = atlas::queue::waiting(&m).unwrap().into_iter().find(|h| h.key == planned).unwrap();
+        assert_eq!(atlas::queue::qmeta(&ph.meta).uses, Some(vec![("sqlport:15128".to_string(), true)]));
+    }
+    finished(&mut h, &s, "b1");
+    let keys = || atlas::queue::waiting(&atlas::memory::MemoryStore::open(&store_path).unwrap()).unwrap().into_iter().map(|h| h.key).collect::<Vec<_>>();
+    // No declared lane: nothing leaves.
+    let a = launch(&mut h, &s, "t5", "general-purpose", "Kind: builder\n\nJournal to lane ES1-1415. Build the pricing.");
+    assert!(a.deny.is_none() && !a.context.contains("off the queue"), "{a:?}");
+    assert_eq!(keys().len(), 5);
+    // A `Queue:` key wins over the oldest in the lane.
+    let a = launch(&mut h, &s, "t6", "general-purpose", "Queue: journal:ES1-1415:0003\nKind: builder\nLane: ES1-1415\n\nWrite the pricing docs.");
+    assert!(a.deny.is_none() && a.context.contains("took journal:ES1-1415:0003 off the queue."), "{a:?}");
+    // A reworded brief in the lane: the oldest builder launch leaves, named.
+    let a = launch(&mut h, &s, "t7", "general-purpose", "Kind: builder\nLane: es1-1415\n\nBuild ES1-1415 tariff pricing type.");
+    assert!(a.deny.is_none() && a.context.contains("took journal:ES1-1415:0001 off the queue (the oldest waiting builder launch in its lane); 1 more"), "{a:?}");
+    let a = launch(&mut h, &s, "t8", "general-purpose", "Kind: builder\nLane: ES1-1415\n\nAdd the pricing tests.");
+    assert!(a.context.contains("took journal:ES1-1415:0002 off the queue (the oldest waiting builder launch in its lane)."), "{a:?}");
+    // Only the review (another kind) and the planned item wait.
+    assert_eq!(keys(), ["journal:ES1-1415:0004".to_string(), planned.clone()]);
+    let a = launch(&mut h, &s, "t9", "general-purpose", "Kind: builder\nLane: ES1-1415\n\nMore pricing work.");
+    assert!(a.deny.is_none() && !a.context.contains("off the queue"), "{a:?}");
+    // A review shares the lane: another review starting there leaves the
+    // waiting one alone.
+    let a = launch(&mut h, &s, "t10", "general-purpose", "Kind: reviewer\nLane: ES1-1415\n\nReview PR 2.");
+    assert!(a.deny.is_none() && !a.context.contains("off the queue"), "{a:?}");
+    assert_eq!(keys().len(), 2);
 }
 
 /// Planned work: `after: KEY` waits until KEY is marked done (even when
@@ -590,9 +735,10 @@ fn planned_items_wait_on_done_keys_and_leave_by_their_key() {
     let (s, w) = start(&m);
     assert_eq!(s, std::slice::from_ref(&budget));
     assert_eq!(w, [(fire.clone(), format!("after {budget}"))]);
-    // A launch on its lane without a `Queue:` line leaves it waiting.
-    assert_eq!(started(&mut m, "other work", "Lane: GPU-BUDGET\nUses: read-only\nReview it.").unwrap(), Started::None);
-    assert_eq!(started(&mut m, "gpu budget", &format!("Queue: {budget}\nLane: GPU-BUDGET\nDo it.")).unwrap(), Started::Retired(budget.clone()));
+    // A launch on its lane without a `Queue:` line leaves it waiting, even
+    // with the same lane and kind.
+    assert_eq!(started(&mut m, "other work", "Lane: GPU-BUDGET\nUses: read-only\nReview it.", Some("GPU-BUDGET"), Kind::Builder).unwrap(), Started::None);
+    assert_eq!(started(&mut m, "gpu budget", &format!("Queue: {budget}\nLane: GPU-BUDGET\nDo it."), Some("GPU-BUDGET"), Kind::Builder).unwrap(), Started::Retired(budget.clone()));
     // Started is not done: the dependent still waits.
     assert_eq!(start(&m).1, [(fire.clone(), format!("after {budget}"))]);
     let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -678,21 +824,21 @@ fn the_queue_files_and_lists_fractional_orders() {
     assert!(at.windows(2).all(|w| w[0] < w[1]), "{list}");
 }
 
-/// A long report: one paragraph with an outcome, a number and a question,
-/// padded past the digest bound.
-fn long_report() -> String {
+/// A report of more than `over` bytes: one paragraph with an outcome, a
+/// number and a question, padded.
+fn long_report(over: usize) -> String {
     let mut r = String::from("Merged PR #12 as abc1234. Tests 40/0/1.\n\n## Questions\n\n- Q1. Ship it now? (a) yes, recommended.\n\n");
-    while r.len() <= atlas::report::WHOLE_UP_TO {
+    while r.len() <= over {
         r.push_str("The reader walked the folder and nothing in this line changes what the caller does next.\n");
     }
     r
 }
 
-/// Q-SD3: a report over the digest bound is sent back once, filed whole,
-/// with the draft attached; a short one, a second stop and the caps off
-/// pass.
+/// Q-SD3 as refined on 11-04: a report over twice the digest bound is sent
+/// back once, filed whole, without a draft; one within it, a second stop
+/// and the caps off pass.
 #[test]
-fn a_long_report_is_sent_back_once_with_its_draft() {
+fn a_long_report_is_sent_back_once_without_a_draft() {
     let t = Temp::new("orch-report");
     let o = OrchestrateSpec { enabled: Some(true), ..Default::default() };
     let st = settings(t.path(), &o, &[]);
@@ -702,10 +848,13 @@ fn a_long_report_is_sent_back_once_with_its_draft() {
         h.handle(&HookEvent { agent_id: id.into(), agent_type: "general-purpose".into(), last_message: msg.into(), stop_hook_active: active, ..ev("SubagentStop") })
     };
     assert!(stop(&mut h, "a1", "Merged PR #3. Done.", false).block.is_none(), "a short report passes");
-    let long = long_report();
+    let mid = long_report(atlas::report::WHOLE_UP_TO + 4_000);
+    assert!(mid.trim().len() <= atlas::report::SEND_BACK_OVER);
+    assert!(stop(&mut h, "a0", &mid, false).block.is_none(), "a report under twice the bound passes");
+    let long = long_report(atlas::report::SEND_BACK_OVER);
     let r = stop(&mut h, "a2", &long, false).block.expect("a long report is sent back");
     assert!(r.contains("atlas filed it whole as journal:reports:0001"), "{r}");
-    assert!(r.contains("Merged PR #12 as abc1234") && r.contains("Q1. Ship it now?"), "the draft keeps the facts: {r}");
+    assert!(!r.contains("Q1. Ship it now?") && r.len() < 1_000, "no draft: {r}");
     assert!(stop(&mut h, "a2", &long, true).block.is_none(), "a stop already blocked passes");
     assert!(stop(&mut h, "a2", &long, false).block.is_none(), "it is asked once per agent");
     {
@@ -951,4 +1100,86 @@ fn admit_at_300_metas_is_cheap() {
     let (p50, p99) = (times[50], times[99]);
     println!("admit at 300 metas: median {:.2} ms, p99 {:.2} ms", p50.as_secs_f64() * 1e3, p99.as_secs_f64() * 1e3);
     assert!(p99 < Duration::from_millis(250), "p99 {p99:?}");
+}
+
+/// Allow and remind: with orchestrate on, an
+/// admitted builder whose prompt declares no `Lane:` gets one context line
+/// naming the lines to add and the lane's `brief` entry; it is never denied.
+/// A builder with a lane, a reviewer, an Explore agent and an uncounted agent
+/// get no line, and orchestrate off says nothing.
+#[test]
+fn a_builder_with_no_lane_is_reminded_to_declare_one() {
+    let t = Temp::new("orch-nolane");
+    let s = Session::new(t.path());
+    let six = KindSpec { max: Some(6), ..Default::default() };
+    let o = OrchestrateSpec { enabled: Some(true), kinds: vec![(Kind::Builder, six.clone()), (Kind::Reviewer, six.clone()), (Kind::Research, six)], ..Default::default() };
+    let mut h = Hooks::open(settings(t.path(), &o, &[])).unwrap();
+    h.set_command_hook();
+    let remind = "declares no lane";
+    let a = launch(&mut h, &s, "t1", "general-purpose", "Kind: builder\n\nFix the reader.");
+    assert!(a.deny.is_none() && a.context.contains(remind) && a.context.contains("`Lane:`") && a.context.contains("`Uses:`") && a.context.contains("`brief` journal entry"), "{a:?}");
+    // The configured default kind (builder), with no Kind: line, is reminded too.
+    let a = launch(&mut h, &s, "t2", "general-purpose", "Fix the writer.");
+    assert!(a.deny.is_none() && a.context.contains(remind), "{a:?}");
+    for (id, ty, prompt) in [
+        ("t3", "general-purpose", "Kind: builder\nLane: FEATURE-1\nUses: none\n\nFix the parser."),
+        ("t4", "general-purpose", "Kind: reviewer\n\nReview the reader."),
+        ("t5", "Explore", "Find where the reader is defined."),
+        ("t6", "statusline-setup", "Set up the status line."),
+    ] {
+        let a = launch(&mut h, &s, id, ty, prompt);
+        assert!(a.deny.is_none() && !a.context.contains(remind), "{id}: {a:?}");
+    }
+    let t2 = Temp::new("orch-nolane-off");
+    let s2 = Session::new(t2.path());
+    let mut off = Hooks::open(settings(t2.path(), &OrchestrateSpec::default(), &[])).unwrap();
+    off.set_command_hook();
+    let a = launch(&mut off, &s2, "t1", "general-purpose", "Kind: builder\n\nFix the reader.");
+    assert!(a.deny.is_none() && !a.context.contains(remind), "{a:?}");
+}
+
+/// The skill's lane declaration example is what the queue reads: every
+/// field is classified as declared, and the kind line is read.
+#[test]
+fn the_skill_s_lane_declaration_round_trips() {
+    let skill = include_str!("../skills/orchestrate/SKILL.md");
+    let at = skill.find("**Declare a lane**").expect("the skill teaches declaring a lane");
+    let block = skill[at..].split("```text\n").nth(1).and_then(|b| b.split("```").next()).expect("an example block");
+    let c = atlas::lanes::classify(block, &[]);
+    assert_eq!(c.lane.as_deref(), Some("FEATURE-1"));
+    assert_eq!(c.lane_src, atlas::lanes::Source::Declared);
+    assert_eq!(c.priority_src, atlas::lanes::Source::Declared);
+    assert!(!c.uses.is_empty() && c.uses.iter().all(|(_, s)| *s == atlas::lanes::Source::Declared), "{c:?}");
+    assert_eq!(c.resources().collect::<Vec<_>>(), ["compile", "worktree:feature-1"]);
+    assert_eq!(atlas::orchestrate::brief_kind(block), Some(Kind::Builder));
+}
+
+/// The sentence of `doc` that states the SubagentStop backstop ("... back
+/// once ..."), with its line breaks folded to spaces.
+fn backstop_sentence(doc: &str) -> String {
+    let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+    let hits: Vec<&str> = flat.split(". ").filter(|s| s.contains("back once")).collect();
+    assert_eq!(hits.len(), 1, "one backstop sentence: {hits:?}");
+    hits[0].to_string()
+}
+
+/// The byte count after "over " and before " bytes" in a backstop sentence.
+fn backstop_bytes(sentence: &str) -> usize {
+    let (head, _) = sentence.split_once(" bytes").unwrap_or_else(|| panic!("no byte count: {sentence}"));
+    let n = head.rsplit_once("over ").unwrap_or_else(|| panic!("no 'over N bytes': {sentence}")).1;
+    n.replace(',', "").parse().unwrap_or_else(|e| panic!("{n:?}: {e}"))
+}
+
+/// The skill and the wiki state the backstop the code applies: a report over
+/// `report::SEND_BACK_OVER` bytes is sent back, with no draft attached.
+#[test]
+fn the_docs_state_the_send_back_bound_and_no_draft() {
+    for (name, doc) in [
+        ("skills/orchestrate/SKILL.md", include_str!("../skills/orchestrate/SKILL.md")),
+        ("wiki/Orchestration.md", include_str!("../wiki/Orchestration.md")),
+    ] {
+        let s = backstop_sentence(doc);
+        assert_eq!(backstop_bytes(&s), atlas::report::SEND_BACK_OVER, "{name}: {s}");
+        assert!(!s.contains("draft"), "{name} promises a draft: {s}");
+    }
 }

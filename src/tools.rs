@@ -188,6 +188,17 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef { name: "list_sources", description: "Vaults and sources: root, files, sections.", read_only: true, schema: || obj(with_fmt(json!({})), &[]) },
     ToolDef {
+        name: "judge_task",
+        description: "The task judge's model and effort pick for an agent launch prompt, as a Judge line to paste (orchestrate.judge.cells).",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({"prompt": s("The launch prompt."), "kind": e(&crate::taskjudge::KINDS), "subagent_type": s(""), "description": s("The launch's description.")}),
+                &["prompt"],
+            )
+        },
+    },
+    ToolDef {
         name: "report_miss",
         description: "Record something grep or reading found that atlas did not return.",
         read_only: false,
@@ -655,6 +666,44 @@ pub fn full_tool_list() -> Vec<Value> {
 }
 
 /// Every tool: the core list, then the handle tools and the intake tools.
+impl Server {
+    /// `judge_task`: the pick for a launch prompt from the configured cells.
+    fn judge_task(&mut self, a: &Map) -> Result<Value> {
+        let s = self.memory.as_ref().map(|m| m.settings.orchestrate.judge.clone()).unwrap_or_default();
+        let path = s.cells.ok_or_else(|| Error::NotFound("the task judge has no cells file (orchestrate.judge.cells)".into()))?;
+        let cells = crate::taskjudge::Cells::load(&path)?;
+        let prompt = arg_str(a, "prompt")?;
+        let kind = match opt_str(a, "kind")? {
+            Some(k) => crate::taskjudge::KINDS
+                .iter()
+                .copied()
+                .find(|x| *x == k)
+                .ok_or_else(|| Error::InvalidArgument(format!("kind {k:?}; use {}", crate::taskjudge::KINDS.join(", "))))?,
+            None => crate::taskjudge::launch_kind(prompt, opt_str(a, "subagent_type")?.unwrap_or(""), opt_str(a, "description")?.unwrap_or("")),
+        };
+        let p = crate::taskjudge::judge(&cells, prompt, kind);
+        let mut out = json!({
+            "line": crate::taskjudge::line(&p), "kind": kind, "scope": p.scope, "unknowns": p.unknowns,
+            "model": p.model, "effort": p.effort, "split": p.split, "source": p.source,
+        });
+        // The work classifier, when on: its score and pick ride along; off,
+        // the answer is unchanged.
+        if s.classifier.enabled {
+            let model = if s.classifier.source == crate::taskjudge::ScoreSource::Head {
+                self.memory.as_ref().and_then(|m| crate::embed::Model::load(&m.settings.model).ok())
+            } else {
+                None
+            };
+            let c = crate::taskjudge::classify(&s.classifier, prompt, kind, model.as_ref(), &mut crate::embed::bert::Scratch::default());
+            if let (Some(c), Some(o)) = (c, out.as_object_mut()) {
+                let line = crate::taskjudge::class_line(&c);
+                o.insert("classifier".into(), json!({"line": line, "score": c.score, "source": c.source, "model": c.model, "effort": c.effort}));
+            }
+        }
+        Ok(out)
+    }
+}
+
 fn all_tools() -> impl Iterator<Item = &'static ToolDef> {
     TOOLS.iter().chain(lean_tools::TOOLS).chain(intake_tools::TOOLS)
 }
@@ -1126,6 +1175,7 @@ impl Server {
             "list_notes" => self.list_notes(a),
             "read_note" => self.read_note(a),
             "find_by_frontmatter" => self.find_by_frontmatter(a),
+            "judge_task" => self.judge_task(a),
             "backlinks" | "outlinks" => self.links(a, name == "backlinks"),
             "broken_links" => self.broken_links(a),
             "write_log" => self.write_log(a),

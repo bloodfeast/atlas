@@ -13,7 +13,7 @@
 //! cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
 //! cargo xtask verify-macos
 //! cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
-//! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
+//! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--rows] [--show QID ...]
 //! cargo xtask memory-tree-check --config CONFIG [--dir DIR]
 //! cargo xtask digest-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS]
 //! cargo xtask report-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS] [--budget BYTES]
@@ -76,6 +76,7 @@ mod calibrate_recall;
 mod compact_live;
 mod coverage;
 mod digest_eval;
+mod hook_bench;
 mod langs_bench;
 mod leak;
 mod memory_eval;
@@ -114,7 +115,7 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
        cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
        cargo xtask verify-macos
        cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
-       cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--rows] [--show QID ...]
+       cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--rows] [--show QID ...]
        cargo xtask rules-eval --config CONFIG --holds FILE [--project NAME] [--cwd DIR] [--rows] [--dump DIR]
        cargo xtask memory-tree-check --config CONFIG [--dir DIR]
        cargo xtask digest-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS]
@@ -130,7 +131,8 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
            reads and writes included), so the first job always runs and a run can pass it by about one job. It is not a
            dollar guard: a smoke's guard is --only plus the orchestrator's go.
        cargo xtask hook-time LOG -- EXE ARGS...
-       cargo xtask langs-bench --lang LANG --root DIR [--scip FILE]";
+       cargo xtask langs-bench --lang LANG --root DIR [--scip FILE]
+       cargo xtask hook-bench [--records N] [--prompts N] [--model PATH.atm] [--threads N]";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -174,6 +176,7 @@ fn main() -> ExitCode {
             Err(e) => Err(e),
         },
         "langs-bench" => langs_bench::run(args),
+        "hook-bench" => hook_bench::run(args),
         "verify-macos" => match verify_macos::run() {
             Ok(0) => Ok(()),
             Ok(code) => return ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -274,7 +277,7 @@ fn rules_eval(args: Vec<String>) -> Result<(), String> {
 }
 
 fn memory_eval(args: Vec<String>) -> Result<(), String> {
-    let mut o = memory_eval::Opts { config: PathBuf::new(), questions: PathBuf::new(), fresh_from: None, floors: Vec::new(), rows: false, show: Vec::new(), project: None, cwd: None };
+    let mut o = memory_eval::Opts { config: PathBuf::new(), questions: PathBuf::new(), fresh_from: None, floors: Vec::new(), rows: false, show: Vec::new(), project: None, cwd: None, offtopic: None };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || {
@@ -292,6 +295,7 @@ fn memory_eval(args: Vec<String>) -> Result<(), String> {
             "--project" => o.project = Some(val()?),
             "--cwd" => o.cwd = Some(PathBuf::from(val()?)),
             "--floor" => o.floors.push(val()?.parse().map_err(|e| format!("--floor: {e}"))?),
+            "--offtopic" => o.offtopic = Some(PathBuf::from(val()?)),
             "--rows" => o.rows = true,
             "--show" => o.show.push(val()?),
             _ => return Err(USAGE.into()),
@@ -305,6 +309,18 @@ fn memory_eval(args: Vec<String>) -> Result<(), String> {
     } else {
         Err("memory eval: a recall-check or work-queue check failed".into())
     }
+}
+
+/// The configuration a calibration reads. One with projects needs
+/// `--project`: the working folder is the build's, not the transcripts'
+/// project, so it does not choose one.
+fn calibration_config(raw: &atlas::config::Config, project: Option<&str>) -> Result<atlas::config::Config, String> {
+    if raw.user.scoped && project.is_none() {
+        let names: Vec<&str> = raw.user.projects.iter().map(|p| p.name.as_str()).collect();
+        return Err(format!("this configuration has projects ({}): name one with --project", names.join(", ")));
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    atlas::project::resolve(raw, &cwd, project).map(|r| r.config).map_err(|e| e.to_string())
 }
 
 fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> {
@@ -333,11 +349,8 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
         (Some(c), Some(d), Some(b)) => (c, d, b),
         _ => return Err(USAGE.into()),
     };
-    // A configuration with projects resolves to one (`--project`, else the
-    // working folder's), as the server does.
     let raw = atlas::config::Config::load(&config).map_err(|e| e.to_string())?;
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let c = atlas::project::resolve(&raw, &cwd, project.as_deref()).map_err(|e| e.to_string())?.config;
+    let c = calibration_config(&raw, project.as_deref())?;
     let db = c.db.clone().ok_or("the configuration names no db")?;
     let vaults: Vec<PathBuf> = c.vaults.iter().map(|v| v.path.clone()).collect();
     let sources: Vec<(PathBuf, Vec<String>)> = c.sources.iter().map(|s| (s.root.clone(), s.include.clone())).collect();
@@ -523,5 +536,21 @@ fn report_eval(args: Vec<String>) -> Result<(), String> {
         Ok(())
     } else {
         Err("report eval: a case keeps fewer facts than in the gate's rows".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn calibration_needs_a_named_project() {
+        let dir = std::env::temp_dir();
+        let text = r#"{"projects": [{"name": "solo", "roots": ["solo"], "db": "solo.sqlite"}], "default_project": "solo", "watch": false}"#;
+        let raw = atlas::config::Config::parse(text, &dir).unwrap();
+        let e = super::calibration_config(&raw, None).unwrap_err();
+        assert!(e.contains("--project") && e.contains("solo"), "{e}");
+        let c = super::calibration_config(&raw, Some("solo")).unwrap();
+        assert!(c.db.is_some_and(|d| d.ends_with("solo.sqlite")));
+        let flat = atlas::config::Config::parse(r#"{"db": "flat.sqlite", "watch": false}"#, &dir).unwrap();
+        assert!(super::calibration_config(&flat, None).is_ok(), "a configuration without projects needs none");
     }
 }

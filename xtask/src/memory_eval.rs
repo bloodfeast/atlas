@@ -46,6 +46,16 @@
 //!   when its facts are in the injection and that follow-up, and the row
 //!   also counts those found in the injection alone.
 //!
+//! Each replay also prints a `records:` line: items injected (pointers,
+//! lane views and repository lines) per prompt, tokens per prompt, prompts
+//! with an item, and items off-topic by the lane rule of [`Label::off`],
+//! a question taking its source record's lane when that is a journal or
+//! handoff record. `--offtopic FILE` replays a second set beside it at every
+//! floor, `label<TAB>prompt` lines ([`parse_offtopic`]): `neg` prompts,
+//! for which every injected item is off-topic, and prompts labelled with
+//! their lanes, for which an item of another lane is; with `--rows`, one
+//! `offtopic row` per prompt names each item and its cosine.
+//!
 //! The question file is plain text, one block per question:
 //!
 //! ```text
@@ -62,7 +72,7 @@
 //! reported invalid and the run fails: a fact the source does not hold
 //! tests nothing.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use atlas::json::Value;
@@ -534,6 +544,216 @@ pub struct Opts {
     /// every replayed hook event carries it as its `cwd`, so the active
     /// repository is the one a session started there would have.
     pub cwd: Option<PathBuf>,
+    /// An off-topic prompt file (see [`parse_offtopic`]), replayed through
+    /// the hook beside the recall questions at every floor.
+    pub offtopic: Option<PathBuf>,
+}
+
+/// An off-topic prompt's label: `neg` (it should recall nothing) or the
+/// lanes whose records are on its topic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Label {
+    /// Every injected record is off-topic.
+    Neg,
+    /// A record of another lane is off-topic.
+    Lanes(Vec<String>),
+}
+
+impl Label {
+    fn name(&self) -> String {
+        match self {
+            Label::Neg => "neg".into(),
+            Label::Lanes(l) => l.join("|"),
+        }
+    }
+
+    /// Whether an injected item whose lanes are `lanes` (see [`item_lanes`])
+    /// is off-topic: under `neg` every item is; under lanes, an item none of
+    /// whose lanes is listed. An item with no lane is not; an item with one
+    /// lane is when that lane is not listed; an ambiguous item (two or more
+    /// lanes) is when no listed lane is among them.
+    pub fn off(&self, lanes: &[String]) -> bool {
+        match self {
+            Label::Neg => true,
+            Label::Lanes(l) => !lanes.is_empty() && !lanes.iter().any(|x| l.contains(x)),
+        }
+    }
+}
+
+/// Parses an off-topic prompt file: `label<TAB>prompt` lines (the
+/// `--recall-scores` format), `#` comments and blank lines skipped. The
+/// label is `neg` or lanes joined by `|`, each a lane of the store.
+///
+/// # Errors
+///
+/// A message naming the line, for a line without a tab or a lane the store
+/// does not hold.
+pub fn parse_offtopic(text: &str, known: &HashSet<String>) -> Result<Vec<(Label, String)>, String> {
+    let mut out = Vec::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (label, prompt) = line.split_once('\t').ok_or_else(|| format!("off-topic line {}: needs label<TAB>prompt", n + 1))?;
+        let label = if label == "neg" {
+            Label::Neg
+        } else {
+            let lanes: Vec<String> = label.split('|').map(str::to_string).collect();
+            if let Some(l) = lanes.iter().find(|l| !known.contains(*l)) {
+                return Err(format!("off-topic line {}: the store has no lane {l}", n + 1));
+            }
+            Label::Lanes(lanes)
+        };
+        out.push((label, prompt.trim().to_string()));
+    }
+    Ok(out)
+}
+
+/// The lane names a record can be labelled with: the store's lanes
+/// without the `session:` scopes.
+fn lane_names(mem: &atlas::memory::MemoryStore) -> Result<HashSet<String>, String> {
+    Ok(mem.lanes().map_err(|e| e.to_string())?.into_iter().map(|l| l.lane).filter(|l| !l.starts_with("session:")).collect())
+}
+
+/// The names in `lanes` that equal a token of one of `texts`, sorted. A
+/// token is a maximal run of `[A-Za-z0-9_-]`, matched case-sensitively, so
+/// `QUARRY-FLOW-2` is not `QUARRY-FLOW`.
+fn token_lanes(lanes: &HashSet<String>, texts: &[&str]) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for t in texts {
+        for tok in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')) {
+            if !tok.is_empty() && lanes.contains(tok) {
+                out.insert(tok.to_string());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// A record's lanes by the widened rule (fixtures/offtopic/README.md): a
+/// journal or handoff record's own lane; for an intent record (key
+/// `intent:...`, kind rule or block) or a memory record (kind memory, a
+/// bare key), the lane names that are tokens of its key or head title;
+/// any other record has none.
+fn record_lanes(lanes: &HashSet<String>, key: &str, kind: &str, scope: &str, title: &str) -> Vec<String> {
+    if kind == "journal" || kind == "handoff" {
+        return vec![scope.to_string()];
+    }
+    if is_intent_or_memory(key, kind) {
+        token_lanes(lanes, &[key, title])
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether a record is labelled by its lane tokens: an intent record (key
+/// `intent:...`, kind rule or block) or a memory record (kind memory, a
+/// bare key).
+fn is_intent_or_memory(key: &str, kind: &str) -> bool {
+    (key.starts_with("intent:") && (kind == "rule" || kind == "block")) || (kind == "memory" && !key.contains(':'))
+}
+
+/// The lanes of an injected item: `lane:X` and `lane-head:X` are lane X, a
+/// record's are [`record_lanes`], anything else (a repository line) has
+/// none.
+fn item_lanes(mem: &atlas::memory::MemoryStore, lanes: &HashSet<String>, key: &str) -> Vec<String> {
+    if let Some(l) = key.strip_prefix("lane:").or_else(|| key.strip_prefix("lane-head:")) {
+        return vec![l.to_string()];
+    }
+    match mem.head(key).ok().flatten() {
+        Some(h) => record_lanes(lanes, &h.key, &h.kind, &h.scope, &h.title),
+        None => Vec::new(),
+    }
+}
+
+/// A control question's label from its source record's lanes: one lane
+/// labels it; none or two or more leave it unlabelled, the second counted
+/// as ambiguous (the `bool`).
+fn control_label(source: &[String]) -> (Option<Label>, bool) {
+    match source.len() {
+        1 => (Some(Label::Lanes(source.to_vec())), false),
+        0 => (None, false),
+        _ => (None, true),
+    }
+}
+
+/// Injection counts over a set of hook prompts.
+#[derive(Debug, Default)]
+struct Tally {
+    prompts: usize,
+    /// Prompts with at least one injected item.
+    any: usize,
+    items: usize,
+    bytes: usize,
+    /// Prompts with a label (their items are labelled).
+    labelled: usize,
+    /// Labelled prompts with at least one off-topic item.
+    any_off: usize,
+    off: usize,
+    /// Items with two or more lanes (labelled prompts only).
+    amb: usize,
+    /// Prompts left unlabelled because their source has two or more lanes
+    /// (the control only).
+    amb_src: usize,
+}
+
+impl Tally {
+    /// Adds one prompt's injection; returns its row (items, off-topic
+    /// items, bytes, then each item as `key[lane]`, with `*` when off-topic).
+    fn add(
+        &mut self,
+        mem: &atlas::memory::MemoryStore,
+        lanes: &HashSet<String>,
+        label: Option<&Label>,
+        injected: &[atlas::hooks::Injected],
+        bytes: usize,
+    ) -> String {
+        self.prompts += 1;
+        self.any += (!injected.is_empty()) as usize;
+        self.items += injected.len();
+        self.bytes += bytes;
+        let (mut off, mut amb) = (0, 0);
+        let mut keys = Vec::new();
+        for k in injected {
+            let item = item_lanes(mem, lanes, &k.key);
+            let o = label.is_some_and(|l| l.off(&item));
+            off += o as usize;
+            amb += (item.len() > 1) as usize;
+            let cos = k.cos.map_or("-".to_string(), |c| format!("{c:.3}"));
+            let shown = if item.is_empty() { "-".to_string() } else { item.join("|") };
+            keys.push(format!("{}{}[{shown}] cos {cos}", if o { "*" } else { "" }, k.key));
+        }
+        if label.is_some() {
+            self.labelled += 1;
+            self.any_off += (off > 0) as usize;
+            self.off += off;
+            self.amb += amb;
+        }
+        format!("{}\t{off}\t{bytes}\t{}", injected.len(), keys.join("; "))
+    }
+
+    fn line(&self, name: &str, bpt: f64) -> String {
+        let n = self.prompts.max(1) as f64;
+        format!(
+            "{name}: {} prompts; items injected {} ({:.2} per prompt); tokens {:.0} ({:.1} per prompt); prompts with an item {}/{} ({:.1}%); labelled prompts {}, with an off-topic item {} ({:.1}%), off-topic items {} ({:.2} per labelled prompt); ambiguous items {}, ambiguous sources {}",
+            self.prompts,
+            self.items,
+            self.items as f64 / n,
+            self.bytes as f64 / bpt,
+            self.bytes as f64 / bpt / n,
+            self.any,
+            self.prompts,
+            100.0 * self.any as f64 / n,
+            self.labelled,
+            self.any_off,
+            100.0 * self.any_off as f64 / self.labelled.max(1) as f64,
+            self.off,
+            self.off as f64 / self.labelled.max(1) as f64,
+            self.amb,
+            self.amb_src
+        )
+    }
 }
 
 fn copy_fresh(from: &Path, to: &Path) -> Result<(), String> {
@@ -852,6 +1072,73 @@ pub fn run(o: &Opts) -> Result<bool, String> {
             println!("hook replay: embedded {n} pending record vectors first in {:.1} s", t0.elapsed().as_secs_f64());
         }
     }
+    let offtopic = match &o.offtopic {
+        Some(p) => {
+            let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let known: HashSet<String> = mem.lanes().map_err(|e| e.to_string())?.into_iter().map(|l| l.lane).collect();
+            parse_offtopic(&text, &known)?
+        }
+        None => Vec::new(),
+    };
+    // The widened lane rule's labels on this store, once per run: intent and
+    // memory records by how many lanes they name, and the recall questions'
+    // intent or memory sources the same way.
+    let lane_set = lane_names(&mem)?;
+    {
+        let count = |hs: &[atlas::memory::Head]| {
+            let mut c = [0usize; 3];
+            for h in hs {
+                c[record_lanes(&lane_set, &h.key, &h.kind, &h.scope, &h.title).len().min(2)] += 1;
+            }
+            c
+        };
+        let mut intent = Vec::new();
+        for kind in ["rule", "block"] {
+            intent.extend(
+                mem.heads(Some(kind), None).map_err(|e| e.to_string())?.into_iter().filter(|h| is_intent_or_memory(&h.key, &h.kind)),
+            );
+        }
+        let memory: Vec<_> = mem
+            .heads(Some("memory"), None)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|h| is_intent_or_memory(&h.key, &h.kind))
+            .collect();
+        let mut sources = Vec::new();
+        let mut seen = HashSet::new();
+        for q in qs.iter().filter(|q| q.tool == "recall" && q.args.get("query").is_some()) {
+            if let Some(h) = source_key(q).and_then(|k| mem.head(k).ok().flatten()) {
+                if is_intent_or_memory(&h.key, &h.kind) && seen.insert(h.key.clone()) {
+                    sources.push(h);
+                }
+            }
+        }
+        let (i, m, q) = (count(&intent), count(&memory), count(&sources));
+        let mut names: Vec<&str> = lane_set.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        println!("lane rule: {} lanes ({})", names.len(), names.join(" "));
+        println!(
+            "lane rule labels: intent records {} (no lane {}, one lane {}, two or more {}); memory records {} (no lane {}, one lane {}, two or more {}); recall question intent or memory sources {} distinct (no lane {}, one lane {}, two or more {})",
+            intent.len(),
+            i[0],
+            i[1],
+            i[2],
+            memory.len(),
+            m[0],
+            m[1],
+            m[2],
+            sources.len(),
+            q[0],
+            q[1],
+            q[2]
+        );
+        for h in intent.iter().chain(memory.iter()) {
+            let l = record_lanes(&lane_set, &h.key, &h.kind, &h.scope, &h.title);
+            if !l.is_empty() {
+                println!("    lane rule label {}[{}]", h.key, l.join("|"));
+            }
+        }
+    }
     // Each floor twice: context selection off (the pointers as before it),
     // then on (the default); the selection line says what trim and
     // collapse saved. (h) replays the lane questions the same way: their
@@ -868,12 +1155,19 @@ pub fn run(o: &Opts) -> Result<bool, String> {
             let (mut lost, mut informed_fails, mut strict_fails) = (Vec::new(), Vec::new(), Vec::new());
             // (count, bytes sent, bytes whole) per selection outcome.
             let mut how: BTreeMap<&'static str, (usize, usize, usize)> = BTreeMap::new();
+            let mut tally = Tally::default();
             for q in &recall_qs {
                 let ev = atlas::hooks::HookEvent::from_value(
                     &atlas::json!({"event": "UserPromptSubmit", "session_id": format!("eval-{}-{floor}-{select}", q.id), "prompt": q.ask.clone(), "cwd": cwd.to_string_lossy().into_owned()}),
                 );
                 let ctx = hooks.handle(&ev).context;
                 inj += ctx.len();
+                // The question's lane is its source record's, when that has
+                // one lane (see `control_label`); else its injections are not
+                // labelled.
+                let (own, amb) = control_label(&source_key(q).map(|k| item_lanes(&mem, &lane_set, k)).unwrap_or_default());
+                tally.amb_src += amb as usize;
+                tally.add(&mem, &lane_set, own.as_ref(), hooks.last_injected(), ctx.len());
                 for k in hooks.last_injected() {
                     let e = how.entry(k.how.name()).or_default();
                     e.0 += 1;
@@ -915,6 +1209,25 @@ pub fn run(o: &Opts) -> Result<bool, String> {
             println!("    source not injected: {}", lost.join(" "));
             println!("    fail informed: {}", informed_fails.join(" "));
             println!("    fail strict: {}", strict_fails.join(" "));
+            println!("    {}", tally.line("records", bpt));
+            // The off-topic set: prompts that should recall nothing (`neg`)
+            // or only their own lane's records.
+            if !offtopic.is_empty() {
+                let (mut neg, mut lanes) = (Tally::default(), Tally::default());
+                for (i, (label, prompt)) in offtopic.iter().enumerate() {
+                    let ev = atlas::hooks::HookEvent::from_value(
+                        &atlas::json!({"event": "UserPromptSubmit", "session_id": format!("eval-off-{i}-{floor}-{select}"), "prompt": prompt.clone(), "cwd": cwd.to_string_lossy().into_owned()}),
+                    );
+                    let ctx = hooks.handle(&ev).context;
+                    let t = if matches!(label, Label::Neg) { &mut neg } else { &mut lanes };
+                    let row = t.add(&mem, &lane_set, Some(label), hooks.last_injected(), ctx.len());
+                    if o.rows {
+                        println!("    offtopic row {}\t{}\t{}", i + 1, label.name(), row);
+                    }
+                }
+                println!("    {}", neg.line("off-topic neg", bpt));
+                println!("    {}", lanes.line("off-topic lane", bpt));
+            }
             if select {
                 let row = |k: &str| how.get(k).copied().unwrap_or_default();
                 let (t, c, w) = (row("trim"), row("collapse"), row("whole"));
@@ -1371,6 +1684,84 @@ mod tests {
     use super::*;
 
     const SET: &str = "# a comment\nQ001 ruling\nask: What is the frame target?\nsource: record:frame-target\ncall: recall {\"query\": \"frame target\"}\nfact: 240\nfact: 120 | one twenty\n\nQ002 id\nask: What is X-001?\nsource: file:v:Notes/X-001 A note.md\ncall: lookup {\"id\": \"X-001\"}\nfact: a note\n";
+
+    #[test]
+    fn offtopic_lines_parse_and_label_by_lane() {
+        let known: HashSet<String> = ["TRACKS", "RAGDOLL"].iter().map(|s| s.to_string()).collect();
+        let set = parse_offtopic("# c\n\nneg\tHow do tides work?\r\nTRACKS|RAGDOLL\tTrack marks behind tanks\n", &known).unwrap();
+        assert_eq!(set.len(), 2);
+        assert_eq!(set[0], (Label::Neg, "How do tides work?".to_string()));
+        assert_eq!(set[1].0, Label::Lanes(vec!["TRACKS".into(), "RAGDOLL".into()]));
+        // neg: everything is off-topic, a laneless item too.
+        assert!(Label::Neg.off(&[]) && Label::Neg.off(&["TRACKS".into()]));
+        // lanes: another lane's item is off-topic; its own and a laneless one are not.
+        assert!(set[1].0.off(&["FILL-TAIL".into()]));
+        assert!(!set[1].0.off(&["RAGDOLL".into()]) && !set[1].0.off(&[]));
+        assert!(parse_offtopic("FILL-TAIL\tx\n", &known).unwrap_err().contains("no lane FILL-TAIL"));
+        assert!(parse_offtopic("no tab here\n", &known).unwrap_err().contains("label<TAB>prompt"));
+    }
+
+    fn lane_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn widened_rule_labels_intent_and_memory_records_by_lane_tokens() {
+        let l = lane_set(&["TURF", "QUARRY-FLOW", "RIDGE-MAP", "UNIT-LIGHTS"]);
+        // One lane, from the title.
+        assert_eq!(record_lanes(&l, "intent:r00001", "rule", "intent", "2026-10-18 Brandon: TURF ruled: grass"), vec!["TURF"]);
+        // A memory record: `_` joins a token, so QUARRY-FLOW_notes is no lane; the title names one.
+        assert_eq!(record_lanes(&l, "QUARRY-FLOW_notes", "memory", "", "- [x](x.md) - y"), Vec::<String>::new());
+        assert_eq!(record_lanes(&l, "notes-on", "memory", "", "- [x](x.md) - QUARRY-FLOW rest"), vec!["QUARRY-FLOW"]);
+        // No lane.
+        assert!(record_lanes(&l, "intent:r00002", "block", "intent", "A rule about frames").is_empty());
+        // Two lanes, sorted.
+        assert_eq!(
+            record_lanes(&l, "intent:r01178", "rule", "intent", "UNIT-LIGHTS and RIDGE-MAP (both)"),
+            vec!["RIDGE-MAP", "UNIT-LIGHTS"]
+        );
+        // Case-sensitive: lowercase and title case do not match.
+        assert!(record_lanes(&l, "intent:r00003", "rule", "intent", "turf and Turf and quarry-flow").is_empty());
+        // Token boundary: QUARRY-FLOW-2 is not QUARRY-FLOW; punctuation is a boundary.
+        assert!(record_lanes(&l, "intent:r00004", "rule", "intent", "QUARRY-FLOW-2 landed").is_empty());
+        assert_eq!(record_lanes(&l, "intent:r00005", "rule", "intent", "(QUARRY-FLOW), done"), vec!["QUARRY-FLOW"]);
+        // Journal and handoff records keep their scope; other records have none.
+        assert_eq!(record_lanes(&l, "journal:TURF:0001", "journal", "TURF", "RIDGE-MAP"), vec!["TURF"]);
+        assert_eq!(record_lanes(&l, "handoff:NEW-MAP:001", "handoff", "NEW-MAP", ""), vec!["NEW-MAP"]);
+        assert!(record_lanes(&l, "restore:x", "section", "", "TURF").is_empty());
+        // A memory kind with a prefixed key, or an intent key of another kind, is not labelled.
+        assert!(record_lanes(&l, "x:TURF", "memory", "", "TURF").is_empty());
+        assert!(record_lanes(&l, "intent:r9", "note", "", "TURF").is_empty());
+    }
+
+    #[test]
+    fn widened_rule_counts_ambiguous_items_by_the_prompt_lane() {
+        let p = Label::Lanes(vec!["RIDGE-MAP".into()]);
+        let two = |a: &str, b: &str| vec![a.to_string(), b.to_string()];
+        // Two lanes, P in S: not off-topic; P not in S: off-topic.
+        assert!(!p.off(&two("RIDGE-MAP", "UNIT-LIGHTS")));
+        assert!(p.off(&two("FILM-WICK", "UNIT-LIGHTS")));
+        // One lane and no lane, unchanged.
+        assert!(p.off(&["TURF".into()]) && !p.off(&["RIDGE-MAP".into()]) && !p.off(&[]));
+        // neg: every item.
+        assert!(Label::Neg.off(&two("RIDGE-MAP", "UNIT-LIGHTS")));
+    }
+
+    #[test]
+    fn session_scopes_are_not_lanes_for_the_rule() {
+        // A `session:` scope is never a token (':' splits it), so it names
+        // no lane even if a lane set held it; lane_names drops them anyway.
+        assert!(token_lanes(&lane_set(&["session:0f3a"]), &["session:0f3a notes"]).is_empty());
+        let l = lane_set(&["TURF"]);
+        assert!(record_lanes(&l, "intent:r00006", "rule", "intent", "session:0f3a notes").is_empty());
+    }
+
+    #[test]
+    fn control_source_takes_one_lane_only() {
+        assert_eq!(control_label(&[]), (None, false));
+        assert_eq!(control_label(&["TURF".into()]), (Some(Label::Lanes(vec!["TURF".into()])), false));
+        assert_eq!(control_label(&["RIDGE-MAP".into(), "UNIT-LIGHTS".into()]), (None, true));
+    }
 
     #[test]
     fn parses_blocks_fields_and_alternatives() {

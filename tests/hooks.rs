@@ -24,7 +24,7 @@ fn settings(dir: &Path) -> Settings {
     s
 }
 
-/// [`settings`] with the experimental compaction features on, in a project
+/// [`settings`] with the compaction features on, in a project
 /// (whose store is its own, so the card lists its lanes).
 fn compaction(dir: &Path) -> Settings {
     let mut s = settings(dir);
@@ -93,11 +93,13 @@ fn a_session_budget_stops_injection_once_spent() {
     let mut h = Hooks::open(s.clone()).unwrap();
     let first = h.handle(&HookEvent { prompt: widget.into(), ..ev("UserPromptSubmit") });
     assert!(first.context.is_empty() || first.context.len() <= s.bytes_for(s.recall.budget_tokens) + 128, "{}", first.context);
+    // A session of its own: s1 already had both pointed to, and the
+    // injected set is read back across processes.
     s.recall.session_budget_tokens = 40;
     let mut h = Hooks::open(s.clone()).unwrap();
-    let first = h.handle(&HookEvent { prompt: widget.into(), ..ev("UserPromptSubmit") });
+    let first = h.handle(&HookEvent { prompt: widget.into(), session_id: "s3".into(), ..ev("UserPromptSubmit") });
     assert!(first.context.contains("widget-cache"), "{}", first.context);
-    let second = h.handle(&HookEvent { prompt: gadget.into(), ..ev("UserPromptSubmit") });
+    let second = h.handle(&HookEvent { prompt: gadget.into(), session_id: "s3".into(), ..ev("UserPromptSubmit") });
     assert!(second.context.is_empty(), "the session spent its budget: {}", second.context);
     // Another session has its own.
     let other = h.handle(&HookEvent { prompt: gadget.into(), session_id: "s2".into(), ..ev("UserPromptSubmit") });
@@ -116,7 +118,8 @@ fn a_subagent_gets_recall_from_the_parents_brief_and_its_lane() {
     let start = h.handle(&HookEvent { agent_id: "a1".into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") });
     assert!(start.context.contains("lane build-7"), "{}", start.context);
     assert!(start.context.contains("# brief") && start.context.contains("# next"), "{}", start.context);
-    assert!(start.context.contains("rules:r00001"), "{}", start.context);
+    // Its own lane's view was injected: no pointers beside it.
+    assert!(!start.context.contains("atlas recall (related"), "{}", start.context);
     // No stashed brief: the subagent's first tool call reads its own transcript.
     let dir = t.path().join("proj");
     let parent = dir.join("sess.jsonl");
@@ -133,6 +136,126 @@ fn a_subagent_gets_recall_from_the_parents_brief_and_its_lane() {
     assert!(first.context.contains("lane build-7"), "{}", first.context);
     let second = h.handle(&HookEvent { agent_id: "a2".into(), tool_name: "Bash".into(), transcript_path: parent.to_string_lossy().into_owned(), ..ev("PreToolUse") });
     assert!(second.context.is_empty());
+}
+
+/// Two more widget-cache records, so one widget prompt passes three.
+fn seed_widgets(s: &Settings) {
+    let mut store = MemoryStore::open(&s.store).unwrap();
+    let mut w = store.writer().unwrap();
+    for (key, body) in [
+        ("widget-cache-size", "\nThe widget cache holds sixty four widgets and evicts entries past that.\n"),
+        ("widget-cache-order", "\nWidget cache eviction takes the least recently used widgets past sixty four entries.\n"),
+    ] {
+        let d = Draft { title: format!("- [{key}]({key}.md) - widget cache"), body: body.into(), reason: "seeding hook tests".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+        w.create(key, "memory", "feedback", "", &d, None).unwrap();
+    }
+    drop(w.commit());
+}
+
+/// The pointer lines of an injected context.
+fn pointer_lines(ctx: &str) -> Vec<&str> {
+    ctx.lines().filter(|l| l.starts_with("- ")).collect()
+}
+
+const WIDGET: &str = "why does the widget cache evict entries past sixty four widgets";
+
+/// The injected set is read back from `hook_inject`: a new process (a
+/// server restart, or a command hook's process per event) after a
+/// compaction does not point to a key the session already had, while
+/// another session and a subagent keep their own.
+#[test]
+fn a_restart_or_compaction_keeps_the_injected_set() {
+    let t = Temp::new("hook-dedup-restart");
+    let s = settings(t.path());
+    seed(&s);
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        assert!(h.handle(&HookEvent { prompt: WIDGET.into(), ..ev("UserPromptSubmit") }).context.contains("widget-cache"));
+        let brief = "Look into the gadget exporter: it writes with temp files and renames them into place.";
+        h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: brief.into(), ..ev("PreToolUse") });
+        let start = h.handle(&HookEvent { agent_id: "a1".into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") });
+        assert!(start.context.contains("rules:r00001"), "{}", start.context);
+    }
+    // A restart: the same prompt in the same session points to nothing again.
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        let again = h.handle(&HookEvent { prompt: WIDGET.into(), ..ev("UserPromptSubmit") });
+        assert!(!again.context.contains("widget-cache"), "{}", again.context);
+    }
+    // A compaction, then a restart again.
+    let tp = t.path().join("session.jsonl");
+    compacted_transcript(&tp, "Work so far: the widget cache.");
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    h.handle(&HookEvent { source: "compact".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("SessionStart") });
+    let after = h.handle(&HookEvent { prompt: WIDGET.into(), ..ev("UserPromptSubmit") });
+    assert!(!after.context.contains("widget-cache"), "{}", after.context);
+    // The subagent's own set came back too: its brief read from its own
+    // transcript at its first tool call points to nothing it already had.
+    let dir = t.path().join("proj");
+    let parent = dir.join("sess.jsonl");
+    std::fs::create_dir_all(dir.join("sess").join("subagents")).unwrap();
+    std::fs::write(&parent, "").unwrap();
+    let brief = "Look into the gadget exporter: it writes with temp files and renames them into place.";
+    std::fs::write(dir.join("sess").join("subagents").join("agent-a1.jsonl"), format!("{}\n", json!({"type": "user", "message": {"role": "user", "content": brief}}))).unwrap();
+    assert!(h.handle(&HookEvent { agent_id: "a1".into(), ..ev("SubagentStart") }).context.is_empty());
+    let pre = h.handle(&HookEvent { agent_id: "a1".into(), tool_name: "Bash".into(), transcript_path: parent.to_string_lossy().into_owned(), ..ev("PreToolUse") });
+    assert!(!pre.context.contains("rules:r00001"), "{}", pre.context);
+    // A new subagent with the same brief gets it.
+    assert!(h.handle(&HookEvent { agent_id: "a2".into(), ..ev("SubagentStart") }).context.is_empty());
+    std::fs::write(dir.join("sess").join("subagents").join("agent-a2.jsonl"), format!("{}\n", json!({"type": "user", "message": {"role": "user", "content": brief}}))).unwrap();
+    let pre = h.handle(&HookEvent { agent_id: "a2".into(), tool_name: "Bash".into(), transcript_path: parent.to_string_lossy().into_owned(), ..ev("PreToolUse") });
+    assert!(pre.context.contains("rules:r00001"), "{}", pre.context);
+    // Another session has its own.
+    let other = h.handle(&HookEvent { prompt: WIDGET.into(), session_id: "s2".into(), ..ev("UserPromptSubmit") });
+    assert!(other.context.contains("widget-cache"), "{}", other.context);
+}
+
+/// A human prompt gets at most two pointers; the third is counted in the
+/// `+N more` line. A subagent's brief is not capped.
+#[test]
+fn a_third_pointer_in_one_prompt_is_dropped() {
+    let t = Temp::new("hook-pointer-cap");
+    let s = settings(t.path());
+    seed(&s);
+    seed_widgets(&s);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let a = h.handle(&HookEvent { prompt: WIDGET.into(), ..ev("UserPromptSubmit") });
+    assert_eq!(s.recall.prompt_pointers, 2);
+    assert_eq!(pointer_lines(&a.context).len(), s.recall.prompt_pointers, "{}", a.context);
+    assert!(a.context.contains("+1 more: recall {query}"), "{}", a.context);
+    // The dropped one was not pointed to, so the next prompt may point to it.
+    let next = h.handle(&HookEvent { prompt: WIDGET.into(), ..ev("UserPromptSubmit") });
+    assert_eq!(pointer_lines(&next.context).len(), 1, "{}", next.context);
+    // A brief naming no lane: all three.
+    h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: WIDGET.into(), ..ev("PreToolUse") });
+    let start = h.handle(&HookEvent { agent_id: "a1".into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") });
+    assert_eq!(pointer_lines(&start.context).len(), 3, "{}", start.context);
+    // `recall.prompt_pointers: 0` is no cap.
+    let mut open = s.clone();
+    open.recall.prompt_pointers = 0;
+    let mut h = Hooks::open(open).unwrap();
+    let all = h.handle(&HookEvent { prompt: WIDGET.into(), session_id: "s9".into(), ..ev("UserPromptSubmit") });
+    assert_eq!(pointer_lines(&all.context).len(), 3, "{}", all.context);
+}
+
+/// A subagent whose brief names its own lane gets that lane's view and no
+/// pointers; the same brief with no lane gets its pointers.
+#[test]
+fn a_subagent_start_with_an_own_lane_dump_gets_no_pointers() {
+    let t = Temp::new("hook-own-lane");
+    let s = settings(t.path());
+    seed(&s);
+    let mut h = Hooks::open(s).unwrap();
+    let topic = "Continue the gadget exporter: it writes with temp files and renames them into place.";
+    h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: format!("You are build-7. {topic}"), ..ev("PreToolUse") });
+    let own = h.handle(&HookEvent { agent_id: "a1".into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") });
+    assert!(own.context.contains("lane build-7"), "{}", own.context);
+    assert!(pointer_lines(&own.context).iter().all(|l| !l.contains("rules:r00001")), "{}", own.context);
+    assert!(!own.context.contains(atlas::hooks::POINTER_HEAD.trim_end()), "{}", own.context);
+    h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: topic.into(), ..ev("PreToolUse") });
+    let plain = h.handle(&HookEvent { agent_id: "a2".into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") });
+    assert!(plain.context.contains("rules:r00001"), "{}", plain.context);
 }
 
 /// A `<task-notification>` as Claude Code sends it (shapes read from real
@@ -214,6 +337,70 @@ fn the_end_of_agent_check_reads_the_agents_own_transcript() {
     // No journal calls: the brief's lane, with the start from the transcript
     // (build-7's seeded entries are newer than it, so it is quiet).
     assert_eq!(note(&mut h, "w2"), "");
+}
+
+/// An `<agent-message` prompt as Claude Code frames a hand-back (shape read
+/// from a real transcript 2026-11-11: the frame follows a line of its own).
+fn agent_message(report: &str) -> String {
+    format!("Another Claude session sent a message:\n<agent-message from=\"a0123456789abcdef\">\n[Subagent hand-back] The text below is the final report of a subagent this session delegated to. The report follows:\n  {report}\n</agent-message>\n\nThat \"other Claude session\" is an agent working inside this same session.")
+}
+
+/// 0048: a report gets one head line per lane it names (entries, newest
+/// handoff, open questions, the recall that shows the lane), no lane view
+/// and no pointers; a report naming no lane gets nothing; a task
+/// notification and an ordinary prompt are as before.
+#[test]
+fn an_agent_message_gets_one_head_line_per_lane_it_names() {
+    let t = Temp::new("hook-peer-heads");
+    let s = settings(t.path());
+    seed(&s);
+    {
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let mut add = |key: &str, kind: &str, sub: &str, scope: &str, title: &str, body: &str| {
+            let d = Draft { title: title.into(), body: body.into(), reason: "hook test".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+            w.create(key, kind, sub, scope, &d, None).unwrap();
+        };
+        add("journal:ALPHA-1:0001", "journal", "brief", "ALPHA-1", "Build the alpha widget exporter", "The gadget exporter writes with temp files.\n".repeat(20).as_str());
+        add("journal:ALPHA-1:0002", "journal", "decision", "ALPHA-1", "Temp files then rename", "The gadget exporter renames temp files into place.\n".repeat(20).as_str());
+        add("handoff:ALPHA-1:001", "handoff", "", "ALPHA-1", "First handoff", "old");
+        add("handoff:ALPHA-1:002", "handoff", "", "ALPHA-1", "Exporter pushed, waits on review of the rename path and two follow-up questions from the reviewer", "the state");
+        add("journal:GAMMA-3:0001", "journal", "question", "GAMMA-3", "Which cache bound", "Sixty four or one hundred twenty eight widgets?");
+        add("journal:GAMMA-3:0002", "journal", "question", "GAMMA-3", "Which eviction", "LRU or LFU?");
+        // A lane the frame's own words name ("session"), not the report.
+        add("journal:session:0001", "journal", "note", "session", "A session note", "");
+        w.commit().unwrap();
+    }
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let report = agent_message("Done on ALPHA-1 and build-7; GAMMA-3 is blocked. The gadget exporter writes with temp files and renames them into place; the widget cache evicts entries past sixty four widgets.");
+    let a = h.handle(&HookEvent { prompt: report.clone(), ..ev("UserPromptSubmit") });
+    let lines: Vec<&str> = a.context.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", a.context);
+    assert!(a.context.len() < 400, "{} B: {}", a.context.len(), a.context);
+    assert!(lines.contains(&"lane ALPHA-1: 4 entries, handoff 002 Exporter pushed, waits on review of the rename..., 0 open; recall lane=ALPHA-1"), "{}", a.context);
+    assert!(lines.contains(&"lane GAMMA-3: 2 entries, 2 open; recall lane=GAMMA-3"), "{}", a.context);
+    assert!(lines.contains(&"lane build-7: 2 entries, 0 open; recall lane=build-7"), "{}", a.context);
+    assert!(!a.context.contains("# brief") && !a.context.contains("==") && !a.context.contains("widget-cache"), "{}", a.context);
+    // Again in the same session: the head lines again, and still no lane view.
+    assert_eq!(h.handle(&HookEvent { prompt: report, ..ev("UserPromptSubmit") }).context, a.context);
+    // A report that names no lane: nothing, even when it matches records.
+    let none = h.handle(&HookEvent { prompt: agent_message("the widget cache evicts entries past sixty four widgets"), ..ev("UserPromptSubmit") });
+    assert_eq!(none.context, "");
+    // An ordinary prompt naming the lane still gets the lane view.
+    let user = h.handle(&HookEvent { prompt: "what is left on ALPHA-1".into(), ..ev("UserPromptSubmit") });
+    assert!(user.context.contains("lane ALPHA-1: 4 entries\n# handoff\n== handoff:ALPHA-1:002"), "{}", user.context);
+    // A prompt that only mentions the tag is an ordinary prompt.
+    let pasted = h.handle(&HookEvent { prompt: "why does an <agent-message frame skip the GAMMA-3 view".into(), ..ev("UserPromptSubmit") });
+    assert!(pasted.context.contains("lane GAMMA-3: 2 entries\n# open questions"), "{}", pasted.context);
+    // Two frames in one prompt: the lanes of both reports, logged as head lines.
+    let two = format!("{}{}", agent_message("ALPHA-1 is done."), agent_message("GAMMA-3 is blocked."));
+    let a = h.handle(&HookEvent { prompt: two, ..ev("UserPromptSubmit") });
+    assert_eq!(a.context.lines().count(), 2, "{}", a.context);
+    let mut logged: Vec<String> = h.last_injected().iter().map(|k| k.key.clone()).collect();
+    logged.sort();
+    assert_eq!(logged, vec!["lane-head:ALPHA-1".to_string(), "lane-head:GAMMA-3".to_string()]);
+    // A task notification for an unknown task: nothing, as before.
+    assert_eq!(h.handle(&HookEvent { prompt: task_note("bqu7y4h25", false), ..ev("UserPromptSubmit") }).context, "");
 }
 
 #[test]
@@ -478,20 +665,208 @@ fn the_gate_scores_meaning_with_a_model() {
     assert!(a.context.contains("atlas recall"), "nothing passed on meaning alone: {}", a.context);
 }
 
-/// R6: recall injects pointers (key and title), within 150 tokens, never a
+/// A commit between prompts (another connection's journal entry) reads no
+/// record vector again; a new record is the one vector read, and a record
+/// revised or retired is updated, so the vectors match a fresh load.
+#[test]
+fn a_commit_between_prompts_reads_only_the_changed_vectors() {
+    use atlas::memory::vectors::{self, RecVecs};
+    let t = Temp::new("hook-sem-refresh");
+    let s = settings(t.path());
+    std::fs::create_dir_all(s.model.parent().unwrap()).unwrap();
+    std::fs::write(&s.model, atlas::embed::tiny_model_bytes(true, 7)).unwrap();
+    seed(&s);
+    let m = atlas::embed::Model::load(&s.model).unwrap();
+    let mut other = MemoryStore::open(&s.store).unwrap();
+    while vectors::embed_pending(&other, &m, 2, 1).unwrap() > 0 {}
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let prompt = |h: &mut Hooks, n: usize| {
+        h.handle(&HookEvent { prompt: format!("widget cache eviction question {n}"), ..ev("UserPromptSubmit") });
+        h.vectors_read()
+    };
+    assert_eq!(prompt(&mut h, 0), 3, "the first prompt reads every vector");
+    let draft = |title: &str, body: &str| Draft { title: title.into(), body: body.into(), reason: "t".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+    for n in 1..4 {
+        let mut w = other.writer().unwrap();
+        w.create(&format!("journal:build-7:{:04}", n + 2), "journal", "build-7", "note", &draft("progress", ""), None).unwrap();
+        w.commit().unwrap();
+        assert_eq!(prompt(&mut h, n), 3, "a journal entry between prompts read the vectors again");
+    }
+    let mut v = RecVecs::load(&other, &m.id, m.dim).unwrap();
+    let mut w = other.writer().unwrap();
+    w.create("rules:r00003", "rule", "rules", "", &draft("new rule", "- the sprocket list is sorted.\n"), None).unwrap();
+    w.revise("rules:r00002", None, &draft("unrelated", "- the garden is watered on fridays.\n")).unwrap();
+    w.retire("rules:r00001", "t").unwrap();
+    w.commit().unwrap();
+    while vectors::embed_pending(&other, &m, 2, 1).unwrap() > 0 {}
+    assert_eq!(prompt(&mut h, 9), 5, "only the new and the revised record are read");
+    let fresh = RecVecs::load(&other, &m.id, m.dim).unwrap();
+    v.refresh(&other).unwrap();
+    assert_eq!(v.read, 2);
+    assert_eq!((&v.rids, &v.mat, v.missing), (&fresh.rids, &fresh.mat, fresh.missing));
+    assert_eq!(fresh.rids.len(), 3, "the retired rule is gone, the new one is in");
+}
+
+/// A seeded store with every recallable record embedded by the tiny model.
+fn embedded(tag: &str) -> (Temp, Settings, MemoryStore, atlas::embed::Model) {
+    let t = Temp::new(tag);
+    let s = settings(t.path());
+    std::fs::create_dir_all(s.model.parent().unwrap()).unwrap();
+    std::fs::write(&s.model, atlas::embed::tiny_model_bytes(true, 7)).unwrap();
+    seed(&s);
+    let m = atlas::embed::Model::load(&s.model).unwrap();
+    let store = MemoryStore::open(&s.store).unwrap();
+    while atlas::memory::vectors::embed_pending(&store, &m, 2, 1).unwrap() > 0 {}
+    (t, s, store, m)
+}
+
+/// Refreshes `v` and checks it against a fresh load (rows, vectors and the
+/// missing count); returns the rows looked up again.
+fn refreshed(v: &mut atlas::memory::vectors::RecVecs, store: &MemoryStore, m: &atlas::embed::Model) -> usize {
+    v.refresh(store).unwrap();
+    let fresh = atlas::memory::vectors::RecVecs::load(store, &m.id, m.dim).unwrap();
+    assert_eq!((&v.rids, &v.mat, v.missing), (&fresh.rids, &fresh.mat, fresh.missing));
+    v.read
+}
+
+fn draft(title: &str, body: &str) -> Draft {
+    Draft { title: title.into(), body: body.into(), reason: "t".into(), author: "t".into(), client: "t".into(), ..Draft::default() }
+}
+
+/// A record with no vector yet counts as missing and is looked up on every
+/// refresh until the embedder stores its vector; then it is read once.
+#[test]
+fn a_record_missing_its_vector_is_read_once_embedded() {
+    use atlas::memory::vectors::{self, RecVecs};
+    let (_t, _s, mut store, m) = embedded("vec-missing");
+    let mut v = RecVecs::load(&store, &m.id, m.dim).unwrap();
+    assert_eq!((v.rids.len(), v.missing), (3, 0));
+    let mut w = store.writer().unwrap();
+    w.create("rules:r00003", "rule", "rules", "", &draft("new rule", "- the sprocket list is sorted.\n"), None).unwrap();
+    w.commit().unwrap();
+    assert_eq!(refreshed(&mut v, &store, &m), 1);
+    assert_eq!(v.missing, 1);
+    assert_eq!(refreshed(&mut v, &store, &m), 1, "still no vector: looked up again");
+    while vectors::embed_pending(&store, &m, 2, 1).unwrap() > 0 {}
+    assert_eq!(refreshed(&mut v, &store, &m), 1);
+    assert_eq!((v.rids.len(), v.missing), (4, 0));
+    assert_eq!(refreshed(&mut v, &store, &m), 0, "now kept");
+}
+
+/// A retired record drops out, and reactivated it is read again.
+#[test]
+fn a_reactivated_record_is_read_again() {
+    use atlas::memory::vectors::RecVecs;
+    let (_t, _s, mut store, m) = embedded("vec-reactivate");
+    let mut v = RecVecs::load(&store, &m.id, m.dim).unwrap();
+    let mut w = store.writer().unwrap();
+    w.retire("rules:r00001", "t").unwrap();
+    w.commit().unwrap();
+    assert_eq!(refreshed(&mut v, &store, &m), 0);
+    assert_eq!(v.rids.len(), 2);
+    let mut w = store.writer().unwrap();
+    w.reactivate("rules:r00001", "t").unwrap();
+    w.commit().unwrap();
+    assert_eq!(refreshed(&mut v, &store, &m), 1);
+    assert_eq!(v.rids.len(), 3);
+}
+
+/// A superseded record drops out and its replacement is read; `prune`
+/// deletes only vectors no current version has, so no kept row goes stale.
+#[test]
+fn a_supersede_and_prune_keep_the_vectors_right() {
+    use atlas::memory::vectors::{self, RecVecs};
+    let (_t, _s, mut store, m) = embedded("vec-supersede");
+    let mut v = RecVecs::load(&store, &m.id, m.dim).unwrap();
+    let mut w = store.writer().unwrap();
+    w.supersede(&["rules:r00002".to_string()], "rules:r00003", "rule", "rules", "", &draft("garden rule", "- the garden is watered on fridays.\n"), None).unwrap();
+    w.revise("rules:r00001", None, &draft("gadget exporter rule", "- the gadget exporter writes to a temp file first.\n")).unwrap();
+    w.commit().unwrap();
+    while vectors::embed_pending(&store, &m, 2, 1).unwrap() > 0 {}
+    assert_eq!(vectors::prune(&store, &m.id).unwrap(), 1, "the revised record's old version");
+    assert_eq!(refreshed(&mut v, &store, &m), 2, "only the replacement and the revised record are read");
+    assert_eq!(v.rids.len(), 3);
+    assert_eq!(vectors::prune(&store, &m.id).unwrap(), 0);
+    assert_eq!(refreshed(&mut v, &store, &m), 0);
+}
+
+/// A record's kind is fixed in the store (a trigger refuses the update), so
+/// a kind change is a supersede by a record of the new kind: to a journal
+/// or a block, kinds the gate never injects, the record drops out and
+/// nothing is looked up.
+#[test]
+fn a_kind_change_drops_the_record() {
+    use atlas::memory::vectors::RecVecs;
+    let (_t, _s, mut store, m) = embedded("vec-kind");
+    assert!(store.conn().execute("UPDATE records SET kind = 'journal' WHERE key = 'rules:r00001'", []).is_err(), "a kind never changes in place");
+    let mut v = RecVecs::load(&store, &m.id, m.dim).unwrap();
+    for (n, (old, key, kind)) in [("rules:r00001", "journal:build-7:0003", "journal"), ("rules:r00002", "layout:b00001", "block")].into_iter().enumerate() {
+        let mut w = store.writer().unwrap();
+        w.supersede(&[old.to_string()], key, kind, "build-7", "", &draft("moved", "- now a different kind.\n"), None).unwrap();
+        w.commit().unwrap();
+        assert_eq!(refreshed(&mut v, &store, &m), 0, "{kind}");
+        assert_eq!(v.rids.len(), 2 - n, "{kind}");
+    }
+}
+
+/// `warm()` loads the record vectors, so the first prompt reads none; with
+/// no commit since, a store is not stale and no prompt reads any.
+#[test]
+fn after_warm_and_with_no_commit_a_prompt_reads_no_vector() {
+    use atlas::memory::vectors::RecVecs;
+    let (_t, s, store, m) = embedded("vec-warm");
+    let v = RecVecs::load(&store, &m.id, m.dim).unwrap();
+    assert!(!v.stale(&store).unwrap(), "an unchanged store is not stale");
+    let mut kept = RecVecs::load(&store, &m.id, m.dim).unwrap();
+    assert_eq!(refreshed(&mut kept, &store, &m), 0);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.warm();
+    assert_eq!(h.vectors_read(), 3, "the warm-up read them");
+    for n in 0..3 {
+        h.handle(&HookEvent { prompt: format!("widget cache eviction question {n}"), ..ev("UserPromptSubmit") });
+        assert_eq!(h.vectors_read(), 3, "prompt {n} read vectors again");
+    }
+}
+
+/// The shipped defaults: a 600-token recall budget, a 0.53 cosine floor, 2
+/// prompt pointers and the compaction features on. They apply with no
+/// configuration and with sections that leave the keys out; a value the user
+/// sets always wins.
+#[test]
+fn the_shipped_defaults_apply_and_an_explicit_value_wins() {
+    let t = Temp::new("hook-defaults");
+    let db = t.path().join("state").join("index.sqlite");
+    let parse = |text: &str| atlas::config::Config::parse(text, t.path()).unwrap();
+    let none = Settings::from_config(None, &db).unwrap();
+    let empty = parse(r#"{"recall": {"fts_floor": 9.72}, "compact": {"card_tokens": 400}}"#);
+    let empty = Settings::from_config(Some(&empty), &db).unwrap();
+    for (what, s) in [("no configuration", &none), ("sections without the keys", &empty)] {
+        assert_eq!(s.recall.budget_tokens, 600, "{what}");
+        assert!((s.recall.cos_floor - 0.53).abs() < 1e-6, "{what}: {}", s.recall.cos_floor);
+        assert_eq!(s.recall.prompt_pointers, 2, "{what}");
+        assert!(s.compact.enabled, "{what}: compaction is on by default");
+    }
+    let old = parse(r#"{"recall": {"budget_tokens": 150, "cos_floor": 0.57}, "compact": {"enabled": false}}"#);
+    let old = Settings::from_config(Some(&old), &db).unwrap();
+    assert_eq!(old.recall.budget_tokens, 150);
+    assert!((old.recall.cos_floor - 0.57).abs() < 1e-6, "{}", old.recall.cos_floor);
+    assert!(!old.compact.enabled, "an explicit false turns compaction off");
+}
+
+/// R6: recall injects pointers (key and title), within the default budget, never a
 /// body; and on a new store of ten records the default gate (calibrated on
 /// a large store) still recalls the related record and nothing for an
 /// unrelated prompt, because the bm25 floor follows the store's size.
 #[test]
 fn a_ten_record_store_recalls_pointers_with_the_default_gate() {
-    use atlas::memory::settings::floor_scale;
+    use atlas::memory::settings::{floor_scale, DEFAULT_BUDGET_TOKENS};
     assert!((floor_scale(1400) - 1.0).abs() < 1e-9);
     assert!((floor_scale(10) - 0.27).abs() < 0.01, "{}", floor_scale(10));
     assert_eq!(floor_scale(2), 0.0);
     let t = Temp::new("hook-ten");
     let mut s = Settings::from_config(None, &t.path().join("state").join("index.sqlite")).unwrap();
     s.snapshot_secs = 0;
-    assert_eq!(s.recall.budget_tokens, 150);
+    assert_eq!(s.recall.budget_tokens, DEFAULT_BUDGET_TOKENS);
     {
         let mut store = MemoryStore::open(&s.store).unwrap();
         let mut w = store.writer().unwrap();
@@ -519,7 +894,7 @@ fn a_ten_record_store_recalls_pointers_with_the_default_gate() {
     assert!(a.context.starts_with(atlas::hooks::POINTER_HEAD), "{:?}", a.context);
     assert!(a.context.contains("- widget-cache: Widget cache - eviction bound\n"), "{}", a.context);
     assert!(!a.context.contains("sixty four"), "a pointer, not the body: {}", a.context);
-    assert!(a.context.len() <= s.bytes_for(150), "{}", a.context.len());
+    assert!(a.context.len() <= s.bytes_for(DEFAULT_BUDGET_TOKENS), "{}", a.context.len());
     let a = h.handle(&HookEvent { prompt: "what time does the train to the coast leave".into(), ..ev("UserPromptSubmit") });
     assert_eq!(a.context, "", "unrelated: nothing");
     let a = h.handle(&HookEvent { prompt: "the gadget exporter writes temp files, then renames them into place?".into(), ..ev("UserPromptSubmit") });
@@ -643,34 +1018,218 @@ fn after_a_compaction_the_summary_refs_are_checked_and_logged() {
     assert!(!a.context.contains("atlas ref"), "{}", a.context);
 }
 
+/// The live miss rows, oldest first: (kind, sig, calls). Read after the
+/// `Hooks` is dropped (its drop joins the log thread).
+fn miss_rows(db: &Path) -> Vec<(String, String, i64)> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut st = conn.prepare("SELECT kind, sig, calls FROM compact_miss ORDER BY id").unwrap();
+    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+    rows
+}
+
+fn legacy_misses(db: &Path) -> i64 {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'compact:miss'", [], |r| r.get(0)).unwrap()
+}
+
+fn read_of(p: &Path) -> HookEvent {
+    HookEvent { tool_name: "Read".into(), tool_input: json!({"file_path": p.to_string_lossy().into_owned()}), ..ev("PreToolUse") }
+}
+
+fn pre_compact() -> HookEvent {
+    HookEvent { trigger: "auto".into(), ..ev("PreCompact") }
+}
+
+/// The normalized signature a lookup is stored under.
+fn sig_of(tool: &str, input: &Value) -> String {
+    atlas::compact::lookup_sig(tool, input).unwrap()
+}
+
 #[test]
 fn a_lookup_made_again_after_a_compaction_is_a_logged_miss() {
     let t = Temp::new("hook-compact-miss");
     let s = compaction(t.path());
     seed(&s);
+    let (a, b) = (t.path().join("src").join("a.rs"), t.path().join("src").join("b.rs"));
+    write(&a, "fn secret_body_of_a() {}\n");
+    write(&b, "fn b() {}\n");
     {
         let mut h = Hooks::open(s.clone()).unwrap();
-        let read = |p: &str| HookEvent { tool_name: "Read".into(), tool_input: json!({"file_path": p}), ..ev("PreToolUse") };
-        h.handle(&read("src/a.rs"));
-        h.handle(&read("src/a.rs"));
-        h.handle(&HookEvent { trigger: "auto".into(), ..ev("PreCompact") });
-        h.handle(&read("src/a.rs"));
-        h.handle(&read("src/b.rs"));
+        h.handle(&read_of(&a));
+        h.handle(&read_of(&a));
+        h.handle(&pre_compact());
+        h.handle(&read_of(&a));
+        h.handle(&read_of(&b));
         // A subagent's lookups are not the session's.
-        h.handle(&HookEvent { agent_id: "x".into(), ..read("src/a.rs") });
+        h.handle(&HookEvent { agent_id: "x".into(), ..read_of(&a) });
     }
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
-    let mut n = 0i64;
-    for _ in 0..200 {
-        n = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'compact:miss'", [], |r| r.get(0)).unwrap_or(0);
-        if n > 0 {
-            break;
+    // The old series is unchanged: one row per repeat.
+    assert_eq!(legacy_misses(&s.index_db), 1);
+    let rows = miss_rows(&s.index_db);
+    assert_eq!(rows, [("miss".to_string(), sig_of("Read", &read_of(&a).tool_input), 1), ("lookup".to_string(), String::new(), 2)]);
+    // The target only: never the file's contents.
+    assert!(rows.iter().all(|r| !r.1.contains("secret_body_of_a")), "{rows:?}");
+}
+
+#[test]
+fn a_repeat_of_a_changed_file_is_not_a_miss() {
+    let t = Temp::new("hook-compact-changed");
+    let s = compaction(t.path());
+    seed(&s);
+    let (a, b, gone) = (t.path().join("a.rs"), t.path().join("b.rs"), t.path().join("gone.rs"));
+    write(&a, "one\n");
+    write(&b, "two\n");
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&read_of(&a));
+        h.handle(&read_of(&b));
+        h.handle(&read_of(&gone));
+        h.handle(&pre_compact());
+        write(&a, "one, and a longer line since\n");
+        h.handle(&read_of(&a));
+        h.handle(&read_of(&b));
+        // Absent then and absent now: unchanged.
+        h.handle(&read_of(&gone));
+    }
+    let kinds: Vec<String> = miss_rows(&s.index_db).into_iter().map(|r| r.0).collect();
+    assert_eq!(kinds, ["changed", "miss", "miss"]);
+    // The legacy series counts every repeat, changed or not.
+    assert_eq!(legacy_misses(&s.index_db), 3);
+}
+
+#[test]
+fn a_repeat_after_the_window_counts_only_in_the_uncapped_figure() {
+    let t = Temp::new("hook-compact-window");
+    let s = compaction(t.path());
+    seed(&s);
+    let (a, b) = (t.path().join("a.rs"), t.path().join("b.rs"));
+    write(&a, "a\n");
+    write(&b, "b\n");
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&read_of(&a));
+        h.handle(&read_of(&b));
+        h.handle(&pre_compact());
+        h.handle(&read_of(&b));
+        for _ in 0..39 {
+            h.handle(&HookEvent { tool_name: "TodoWrite".into(), tool_input: json!({"todos": []}), ..ev("PreToolUse") });
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.handle(&read_of(&a));
     }
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    n = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'compact:miss'", [], |r| r.get(0)).unwrap_or(n);
-    assert_eq!(n, 1);
+    let rows = miss_rows(&s.index_db);
+    assert_eq!(rows.iter().map(|r| (r.0.as_str(), r.2)).collect::<Vec<_>>(), [("miss", 1), ("miss", 41)]);
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let tot = atlas::compact::totals(&conn, 4.0).unwrap().unwrap();
+    assert_eq!((tot.window_lookups, tot.window_repeats, tot.window_misses, tot.stamped_misses), (1, 1, 1, 2));
+}
+
+#[test]
+fn a_shell_repeat_is_unstamped_and_stores_no_command_text() {
+    let t = Temp::new("hook-compact-shell");
+    let s = compaction(t.path());
+    seed(&s);
+    let bash = |c: &str| HookEvent { tool_name: "Bash".into(), tool_input: json!({"command": c}), ..ev("PreToolUse") };
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&bash("gh pr view 145 --json state"));
+        h.handle(&HookEvent { tool_name: "PowerShell".into(), tool_input: json!({"command": "Get-Content notes.txt"}), ..ev("PreToolUse") });
+        h.handle(&pre_compact());
+        h.handle(&bash("gh  pr view 145   --json state"));
+        h.handle(&bash("gh pr view 146 --json state"));
+        h.handle(&HookEvent { tool_name: "PowerShell".into(), tool_input: json!({"command": "Get-Content notes.txt"}), ..ev("PreToolUse") });
+    }
+    let rows = miss_rows(&s.index_db);
+    assert_eq!(rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["unstamped", "unstamped"], "{rows:?}");
+    assert!(rows[0].1.starts_with("$ gh pr #"), "{rows:?}");
+    assert!(rows[1].1.starts_with("$ Get-Content notes.txt #"), "{rows:?}");
+    let head = rows[0].1.split_once(" #").unwrap().0;
+    assert_eq!(head, "$ gh pr", "{rows:?}");
+    // No legacy row: a shell command was never a lookup.
+    assert_eq!(legacy_misses(&s.index_db), 0);
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let tot = atlas::compact::totals(&conn, 4.0).unwrap().unwrap();
+    assert_eq!((tot.window_lookups, tot.window_repeats, tot.unstamped, tot.unstamped_shell), (0, 0, 2, 2));
+}
+
+#[test]
+fn a_subagent_lookup_never_counts() {
+    let t = Temp::new("hook-compact-sub");
+    let s = compaction(t.path());
+    seed(&s);
+    let (a, b) = (t.path().join("a.rs"), t.path().join("b.rs"));
+    write(&a, "a\n");
+    write(&b, "b\n");
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&read_of(&a));
+        h.handle(&HookEvent { agent_id: "x".into(), ..read_of(&b) });
+        h.handle(&pre_compact());
+        for _ in 0..5 {
+            h.handle(&HookEvent { agent_id: "x".into(), ..read_of(&b) });
+            h.handle(&HookEvent { agent_id: "x".into(), ..read_of(&a) });
+        }
+        h.handle(&read_of(&a));
+    }
+    // Only the main session's repeat, at its first call since the boundary.
+    assert_eq!(miss_rows(&s.index_db).iter().map(|r| (r.0.as_str(), r.2)).collect::<Vec<_>>(), [("miss", 1)]);
+}
+
+#[test]
+fn a_recall_of_a_record_that_changed_since_is_not_a_miss() {
+    let t = Temp::new("hook-compact-recall");
+    let s = compaction(t.path());
+    seed(&s);
+    let recall = |k: &str| HookEvent { tool_name: "mcp__atlas__recall".into(), tool_input: json!({"key": k}), ..ev("PreToolUse") };
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&recall("widget-cache"));
+        h.handle(&recall("rules:r00001"));
+        h.handle(&HookEvent { tool_name: "mcp__atlas__search".into(), tool_input: json!({"query": "widget"}), ..ev("PreToolUse") });
+        h.handle(&pre_compact());
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let d = Draft { title: "- [Widget cache](widget-cache.md) - bound".into(), body: "\nNinety widgets now.\n".into(), reason: "miss test".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+        w.revise("widget-cache", None, &d).unwrap();
+        w.commit().unwrap();
+        drop(store);
+        h.handle(&recall("widget-cache"));
+        h.handle(&recall("rules:r00001"));
+        // An atlas call without a key has no stamp.
+        h.handle(&HookEvent { tool_name: "mcp__atlas__search".into(), tool_input: json!({"query": "widget"}), ..ev("PreToolUse") });
+    }
+    let kinds: Vec<String> = miss_rows(&s.index_db).into_iter().map(|r| r.0).collect();
+    assert_eq!(kinds, ["changed", "miss", "unstamped"]);
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let tot = atlas::compact::totals(&conn, 4.0).unwrap().unwrap();
+    // The replay's rule counts all three; the stamped figure only the one.
+    assert_eq!((tot.window_lookups, tot.window_repeats, tot.window_misses, tot.changed_targets, tot.unstamped_shell), (3, 3, 1, 1, 0));
+}
+
+#[test]
+fn a_folder_search_repeat_is_changed_after_an_edit_or_a_shell_under_it() {
+    let t = Temp::new("hook-compact-grep");
+    let s = compaction(t.path());
+    seed(&s);
+    let (d, e) = (t.path().join("d"), t.path().join("e"));
+    write(&d.join("x.rs"), "x\n");
+    write(&e.join("y.rs"), "y\n");
+    let grep = |p: &Path| HookEvent { tool_name: "Grep".into(), tool_input: json!({"pattern": "fn", "path": p.to_string_lossy().into_owned()}), ..ev("PreToolUse") };
+    let glob = HookEvent { tool_name: "Glob".into(), tool_input: json!({"pattern": "**/*.rs"}), cwd: e.to_string_lossy().into_owned(), ..ev("PreToolUse") };
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&grep(&d));
+        h.handle(&grep(&e));
+        h.handle(&glob);
+        h.handle(&pre_compact());
+        h.handle(&HookEvent { tool_name: "Edit".into(), tool_input: json!({"file_path": d.join("x.rs").to_string_lossy().into_owned(), "old_string": "x", "new_string": "z"}), ..ev("PreToolUse") });
+        h.handle(&grep(&d));
+        h.handle(&grep(&e));
+        h.handle(&glob);
+        h.handle(&HookEvent { tool_name: "Bash".into(), tool_input: json!({"command": "cargo fmt"}), ..ev("PreToolUse") });
+        h.handle(&grep(&e));
+    }
+    let kinds: Vec<String> = miss_rows(&s.index_db).into_iter().map(|r| r.0).collect();
+    assert_eq!(kinds, ["changed", "miss", "miss", "changed"]);
 }
 
 /// A synthetic session segment: a prompt, a read with its result, an edit,
@@ -839,8 +1398,10 @@ fn with_the_transcript_source_on_precompact_indexes_turns_and_turn_refs_are_chec
 #[test]
 fn with_compaction_off_the_hooks_write_and_inject_nothing_for_it() {
     let t = Temp::new("hook-compact-off");
-    let s = settings(t.path());
-    assert!(!s.compact.enabled, "compaction is off by default");
+    let c = atlas::config::Config::parse(r#"{"compact": {"enabled": false}}"#, t.path()).unwrap();
+    let mut s = Settings::from_config(Some(&c), &t.path().join("state").join("index.sqlite")).unwrap();
+    s.snapshot_secs = 0;
+    assert!(!s.compact.enabled, "an explicit false turns compaction off");
     seed(&s);
     let tp = t.path().join("s1.jsonl");
     working_transcript(&tp, 300_000);
@@ -863,7 +1424,7 @@ fn with_compaction_off_the_hooks_write_and_inject_nothing_for_it() {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM compact_log", [], |r| r.get(0)).unwrap_or(0);
     assert_eq!(n, 0);
     // defer does nothing without the switch either.
-    let mut s2 = settings(t.path());
+    let mut s2 = s.clone();
     s2.compact.defer = true;
     let mut h2 = Hooks::open(s2).unwrap();
     assert!(h2.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") }).block.is_none());
@@ -1012,19 +1573,40 @@ fn context_selection_collapses_trims_and_keeps_lane_state_whole() {
         let m = atlas::embed::Model::load(&s.model).unwrap();
         while vectors::embed_pending(&store, &m, 8, 1).unwrap() > 0 {}
     }
+    // Every `Hooks` below asks in session ids of its own. A `Hooks` meeting
+    // a session for the first time starts from the keys already pointed to
+    // in it, read from `hook_inject` (src/hooks.rs, the `injected_keys`
+    // seed in the selection loop), and those rows are written by the other
+    // live `Hooks`' log thread at a time of its own (it is joined only on
+    // drop). A session shared between two live `Hooks` made the second
+    // answer depend on that thread: empty when the row had landed, whole
+    // when it had not.
     // Collapse by words alone (any cosine), then never (no cosine reaches 1.01).
     s.recall.select.dup_cos = -1.0;
     let mut h = Hooks::open(s.clone()).unwrap();
-    let a = h.handle(&HookEvent { prompt: "how often does the wombat ledger rotate, every ninety days?".into(), ..ev("UserPromptSubmit") });
+    let a = h.handle(&HookEvent {
+        prompt: "how often does the wombat ledger rotate, every ninety days?".into(),
+        session_id: "s-dup".into(),
+        ..ev("UserPromptSubmit")
+    });
     let lines: Vec<&str> = a.context.lines().filter(|l| l.starts_with("- ")).collect();
     assert_eq!(lines.len(), 2, "{}", a.context);
-    let first = if lines[0].starts_with("- rules:r00011:") { "rules:r00011" } else { "wombat-ledger" };
-    assert!(lines[1].ends_with(&format!(": near-duplicate of {first}")), "{}", a.context);
+    // The memory ranks above the rule, so it is sent first and the rule
+    // (whose words it holds) collapses into it.
+    assert!(lines[0].starts_with("- wombat-ledger: "), "{}", a.context);
+    assert!(lines[1].starts_with("- rules:r00011:"), "{}", a.context);
+    assert!(lines[1].ends_with(": near-duplicate of wombat-ledger"), "{}", a.context);
     let how: Vec<Sel> = h.last_injected().iter().map(|k| k.how).collect();
     assert!(how.contains(&Sel::Collapsed), "{how:?}");
     s.recall.select.dup_cos = 1.01;
     let mut h = Hooks::open(s.clone()).unwrap();
-    let a = h.handle(&HookEvent { prompt: "how often does the wombat ledger rotate, every ninety days?".into(), ..ev("UserPromptSubmit") });
+    let a = h.handle(&HookEvent {
+        prompt: "how often does the wombat ledger rotate, every ninety days?".into(),
+        session_id: "s-nodup".into(),
+        ..ev("UserPromptSubmit")
+    });
+    let lines: Vec<&str> = a.context.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(lines.len(), 2, "both sent, neither collapsed: {}", a.context);
     assert!(!a.context.contains("near-duplicate"), "{}", a.context);
     // Trim: the matching clause after the dated lead, verbatim.
     let a = h.handle(&HookEvent { prompt: "what is the zebra quota per pen?".into(), session_id: "s-trim".into(), ..ev("UserPromptSubmit") });
@@ -1033,10 +1615,18 @@ fn context_selection_collapses_trims_and_keeps_lane_state_whole() {
     let mut off = s.clone();
     off.recall.select.enabled = false;
     let mut h0 = Hooks::open(off).unwrap();
-    let a = h0.handle(&HookEvent { prompt: "what is the zebra quota per pen?".into(), session_id: "s-trim".into(), ..ev("UserPromptSubmit") });
+    let a = h0.handle(&HookEvent {
+        prompt: "what is the zebra quota per pen?".into(),
+        session_id: "s-off-trim".into(),
+        ..ev("UserPromptSubmit")
+    });
     assert!(a.context.contains("- rules:r00012: 2026-11-02 Tess: the opening line of this rule is about the barn roof. The zebra quota ...
 "), "{}", a.context);
-    let b = h0.handle(&HookEvent { prompt: "what did zoo-3 count about the zebra quota per pen?".into(), session_id: "s-lane".into(), ..ev("UserPromptSubmit") });
+    let b = h0.handle(&HookEvent {
+        prompt: "what did zoo-3 count about the zebra quota per pen?".into(),
+        session_id: "s-off-lane".into(),
+        ..ev("UserPromptSubmit")
+    });
     assert!(b.context.contains("Fence posts were repainted"), "off, the lane entry is whole: {}", b.context);
     // A lane brief: the brief whole, the measurement cut to its matching clause.
     let a = h.handle(&HookEvent { prompt: "what did zoo-3 count about the zebra quota per pen?".into(), session_id: "s-lane".into(), ..ev("UserPromptSubmit") });
@@ -1105,27 +1695,39 @@ fn precompact_replies(dir: &Path, cfg: &Path, tp: &Path, trigger: &str) -> (Stri
     (stdout, reply["result"]["content"].clone())
 }
 
-/// `compact.enabled` on: both forms and both triggers reply with the
-/// instructions and nothing around them, since all of the reply lands in the
-/// summarizer's instructions. Off: both reply with no text.
+/// `compact.enabled` on, or left out (on by default): both forms and both
+/// triggers reply with the instructions and nothing around them, since all of
+/// the reply lands in the summarizer's instructions. An explicit false: both
+/// reply with no text.
 #[test]
 fn precompact_replies_with_the_plain_instructions_only_when_compaction_is_on() {
     let t = Temp::new("hook-pre-forms");
     write(&t.path().join("vault").join("Index.md"), "# Index\n");
     let tp = t.path().join("s-pre.jsonl");
     working_transcript(&tp, 300_000);
-    let cfg = |name: &str, on: bool| {
+    // `compact` as written: Some(section) or no section at all.
+    let cfg = |name: &str, compact: Option<Value>| {
         let c = t.path().join(name);
-        write(&c, &format!("{}", json!({"db": format!("state-{on}/atlas.sqlite"), "vaults": [{"name": "notes", "path": "vault"}], "watch": false, "models": {"auto_download": false, "files": []}, "compact": {"enabled": on}})));
+        let mut v = json!({"db": format!("state-{}/atlas.sqlite", name.trim_end_matches(".json")), "vaults": [{"name": "notes", "path": "vault"}], "watch": false, "models": {"auto_download": false, "files": []}});
+        if let Some(x) = compact {
+            v.as_object_mut().unwrap().insert("compact".into(), x);
+        }
+        write(&c, &format!("{v}"));
         c
     };
     let text = atlas::claude_settings::COMPACT_INSTRUCTIONS;
     assert!(!text.contains("<!--") && !text.contains("##") && text == text.trim() && !text.starts_with('{'), "{text}");
-    let (on, off) = (cfg("on.json", true), cfg("off.json", false));
+    let on = cfg("on.json", Some(json!({"enabled": true})));
+    let off = cfg("off.json", Some(json!({"enabled": false})));
+    // On by default: no `compact` section, or one without `enabled`.
+    let absent = cfg("absent.json", None);
+    let bare = cfg("bare.json", Some(json!({"card_tokens": 400})));
     for trigger in ["manual", "auto"] {
-        let (stdout, content) = precompact_replies(t.path(), &on, &tp, trigger);
-        assert_eq!(stdout, text, "{trigger}");
-        assert_eq!(content, json!([{"type": "text", "text": text}]), "{trigger}");
+        for c in [&on, &absent, &bare] {
+            let (stdout, content) = precompact_replies(t.path(), c, &tp, trigger);
+            assert_eq!(stdout, text, "{trigger} {}", c.display());
+            assert_eq!(content, json!([{"type": "text", "text": text}]), "{trigger} {}", c.display());
+        }
         let (stdout, content) = precompact_replies(t.path(), &off, &tp, trigger);
         assert_eq!(stdout, "", "{trigger}");
         assert_eq!(content, json!([{"type": "text", "text": ""}]), "{trigger}");
@@ -1261,4 +1863,68 @@ fn a_new_or_cleared_session_gets_the_resume_card() {
     let mut h = Hooks::open(off).unwrap();
     h.set_offer_paths(None);
     assert!(!startup(&mut h, "startup").contains("resume card"));
+}
+
+#[test]
+fn the_task_judge_note_is_advisory_and_logged() {
+    let t = Temp::new("hook-judge");
+    let mut s = settings(t.path());
+    let cells = t.path().join("cells.json");
+    std::fs::write(
+        &cells,
+        r#"{"cells": [{"key": {"kind": null, "has_brief": null}, "scope": "trivial", "unk": "none"},
+            {"key": {"kind": "builder", "has_brief": true}, "scope": "large", "unk": "several"}]}"#,
+    )
+    .unwrap();
+    s.orchestrate.judge = atlas::taskjudge::JudgeSettings { enabled: true, cells: Some(cells.clone()), ..Default::default() };
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let brief = "Kind: builder\nJudge: scope small, unknowns few -> sonnet, medium\nRead Z:/work/BRIEF_GADGET.md in full.";
+    let input = json!({"prompt": brief, "description": "gadget exporter", "model": "sonnet"});
+    let pre = h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: brief.into(), tool_input: input.clone(), tool_use_id: "tu1".into(), ..ev("PreToolUse") });
+    assert!(pre.deny.is_none() && pre.updated_input.is_none(), "advisory only: {pre:?}");
+    assert!(pre.context.contains("atlas judge (advisory): the launch asks sonnet and its Judge line says sonnet, medium; the pick is opus, high"), "{}", pre.context);
+    let log = std::fs::read_to_string(s.store.parent().unwrap().join("judge-picks.jsonl")).unwrap();
+    let row = json::parse(log.lines().last().unwrap()).unwrap();
+    assert_eq!((row["tool_use_id"].as_str(), row["model"].as_str(), row["asked_model"].as_str()), (Some("tu1"), Some("opus"), Some("sonnet")));
+    // A launch that asks for the pick gets no line; a missing cells file
+    // gives none and denies nothing.
+    let agree = "Kind: builder\nRead Z:/work/BRIEF_GADGET.md in full.";
+    let pre = h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: agree.into(), tool_input: json!({"prompt": agree, "model": "opus"}), tool_use_id: "tu2".into(), ..ev("PreToolUse") });
+    assert!(!pre.context.contains("atlas judge"), "{}", pre.context);
+    std::fs::remove_file(&cells).unwrap();
+    let pre = h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: brief.into(), tool_input: input, tool_use_id: "tu3".into(), ..ev("PreToolUse") });
+    assert!(pre.deny.is_none() && !pre.context.contains("atlas judge"), "{pre:?}");
+}
+
+#[test]
+fn the_work_classifier_is_off_by_default_and_advisory_when_on() {
+    use atlas::taskjudge::{ClassifierSettings, ScoreSource};
+    let t = Temp::new("hook-classifier");
+    let s = settings(t.path());
+    let brief_file = t.path().join("BRIEF_GADGET.md");
+    std::fs::write(&brief_file, "Kind: builder\nBuild the gadget.\n").unwrap();
+    let brief = format!("Kind: builder\nRead {} in full.", brief_file.display()).replace('\\', "/");
+    let input = json!({"prompt": brief.as_str(), "description": "gadget", "model": "opus"});
+    let run = |s: &Settings, id: &str| {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: brief.clone(), tool_input: input.clone(), tool_use_id: id.into(), ..ev("PreToolUse") })
+    };
+    // Absent and present-but-off answer the same.
+    let absent = run(&s, "c1");
+    let mut off = s.clone();
+    off.orchestrate.judge.classifier = ClassifierSettings { enabled: false, source: ScoreSource::Head, ..Default::default() };
+    let present_off = run(&off, "c1");
+    assert_eq!(format!("{absent:?}"), format!("{present_off:?}"));
+    assert!(!absent.context.contains("Classifier:"), "{}", absent.context);
+    // On with the kind source: one advisory line, nothing denied or rewritten.
+    let mut on = s.clone();
+    on.orchestrate.judge.classifier = ClassifierSettings { enabled: true, source: ScoreSource::Kind, ..Default::default() };
+    let pre = run(&on, "c2");
+    assert!(pre.deny.is_none() && pre.updated_input.is_none(), "{pre:?}");
+    assert!(pre.context.contains("Classifier: demand score 5 (kind) -> opus, high"), "{}", pre.context);
+    // On with the head source and a missing weights file: no line, no error.
+    let mut bad = s.clone();
+    bad.orchestrate.judge.classifier = ClassifierSettings { enabled: true, source: ScoreSource::Head, weights: Some(t.path().join("missing.f32")), ..Default::default() };
+    let pre = run(&bad, "c3");
+    assert!(pre.deny.is_none() && !pre.context.contains("Classifier:"), "{pre:?}");
 }

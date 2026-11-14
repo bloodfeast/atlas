@@ -99,23 +99,76 @@ const ACCEPTED_MERGES: [&str; 2] = [
     "006539d2ee2f170ab9749ddcfc1990266bc661c2", // atlas v0.2.1 (#5)
 ];
 
-/// The addresses in `git log --format="%H %ae %ce"` output that may not
-/// appear in the public history, sorted and once each.
+/// The `git log` format [`log_addresses`] reads: per commit its sha, author
+/// and committer address, and the value of every `Co-authored-by:` trailer
+/// (git matches the key case aside), fields split by 0x1f, commits ended by
+/// 0x1e.
+pub const ADDRESS_LOG: &str = "--format=%H%x1f%ae%x1f%ce%x1f%(trailers:key=Co-authored-by,valueonly,separator=%x1f)%x1e";
+
+/// Each commit of `git log` output in [`ADDRESS_LOG`] format: its sha and
+/// every address it carries (author, committer, then each co-author). A
+/// trailer's address is what its `<...>` holds, or the whole value when it
+/// has none (so a malformed trailer is checked, and refused).
+pub fn log_addresses(log: &str) -> Vec<(String, Vec<String>)> {
+    log.split('\x1e')
+        .map(|c| c.trim_matches(['\n', '\r']))
+        .filter(|c| !c.is_empty())
+        .map(|c| {
+            let mut fields = c.split('\x1f');
+            let sha = fields.next().unwrap_or_default().to_string();
+            let mut addrs: Vec<String> = fields.by_ref().take(2).map(str::to_string).collect();
+            for t in fields.map(str::trim).filter(|t| !t.is_empty()) {
+                let a = t.rsplit_once('<').and_then(|(_, r)| r.strip_suffix('>')).unwrap_or(t);
+                addrs.push(a.to_string());
+            }
+            (sha, addrs)
+        })
+        .collect()
+}
+
+/// The addresses in `git log` output in [`ADDRESS_LOG`] format that may not
+/// appear in the public history, trailers included, sorted and once each.
+/// For the count in an error: an address refused here is never printed.
 pub fn other_addresses(log: &str, public_email: &str) -> Vec<String> {
     let mut other = Vec::new();
-    for line in log.lines() {
-        // A line without a sha is checked whole, so it is refused.
-        let (sha, addrs) = line.split_once(' ').unwrap_or(("", line));
-        if ACCEPTED_MERGES.contains(&sha) {
+    for (sha, addrs) in log_addresses(log) {
+        if ACCEPTED_MERGES.contains(&sha.as_str()) {
             continue;
         }
-        for a in addrs.split(' ').filter(|a| !address_allowed(a, public_email)) {
-            other.push(if a.is_empty() { "<empty>".to_string() } else { a.to_string() });
+        // A commit without both addresses is refused: the log is not what
+        // was asked for.
+        if addrs.len() < 2 || !is_full_sha(&sha) {
+            other.push("<malformed>".to_string());
+        }
+        for a in addrs.iter().filter(|a| !address_allowed(a, public_email)) {
+            other.push(if a.is_empty() { "<empty>".to_string() } else { a.clone() });
         }
     }
     other.sort();
     other.dedup();
     other
+}
+
+fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// What a refused address check says: the commit checked and how many
+/// addresses it refused, never the addresses themselves.
+pub fn refused(other: &[String]) -> String {
+    format!("{} address{}", other.len(), if other.len() == 1 { "" } else { "es" })
+}
+
+/// The addresses `release` prints for `git log` output in [`ADDRESS_LOG`]
+/// format, sorted and once each: only those [`address_allowed`] passes, so
+/// an accepted merge's refused address is never printed. The second value
+/// is how many distinct addresses were withheld.
+pub fn printed_addresses(log: &str, public_email: &str) -> (Vec<String>, usize) {
+    let mut addrs: Vec<String> = log_addresses(log).into_iter().flat_map(|(_, a)| a).collect();
+    addrs.sort();
+    addrs.dedup();
+    let (shown, withheld): (Vec<String>, Vec<String>) = addrs.into_iter().partition(|a| address_allowed(a, public_email));
+    (shown, withheld.len())
 }
 
 /// The version, from Cargo.toml and plugin.json, which must agree.
@@ -1033,9 +1086,9 @@ pub fn sign(s: &Sign) -> R<Signed> {
         }
         say("main already has this release's binaries commit (an earlier run); checking it");
     }
-    let other = other_addresses(&git_out(&public, &["log", "--format=%H %ae %ce"])?, &s.ident.email);
+    let other = other_addresses(&git_out(&public, &["log", ADDRESS_LOG])?, &s.ident.email);
     if !other.is_empty() {
-        return Err(format!("the public history carries another address: {}", other.join(" ")));
+        return Err(format!("the public history carries {} that may not be there (author, committer or Co-authored-by)", refused(&other)));
     }
 
     let bin = public.join("bin");
@@ -1417,15 +1470,85 @@ pub(crate) mod tests {
         assert!(!address_allowed("2+other@users.noreply.github.com", me));
     }
 
+    /// One commit in [`ADDRESS_LOG`] format.
+    fn entry(sha: &str, author: &str, committer: &str, trailers: &[&str]) -> String {
+        let mut e = format!("{sha}{author}{committer}");
+        e.push_str(&trailers.join(""));
+        e + "
+"
+    }
+
     #[test]
     fn only_the_accepted_merges_may_carry_another_address() {
         let me = "1+me@users.noreply.github.com";
-        let log = format!("{} a@example.com noreply@github.com\n{} a@example.com noreply@github.com\nabc123 {me} {me}\n", ACCEPTED_MERGES[0], ACCEPTED_MERGES[1]);
-        assert!(other_addresses(&log, me).is_empty());
-        let log = format!("{log}def456 b@example.com noreply@github.com\nfed789 b@example.com {me}\n");
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let bad_co = ["X <x@example.com>"];
+        let log = entry(ACCEPTED_MERGES[0], "a@example.com", "noreply@github.com", &bad_co) + &entry(ACCEPTED_MERGES[1], "a@example.com", "noreply@github.com", &[]) + &entry(&a, me, me, &[]);
+        assert!(other_addresses(&log, me).is_empty(), "an accepted merge with a bad trailer passes");
+        let log = format!("{log}{}{}", entry(&b, "b@example.com", "noreply@github.com", &[]), entry(&c, "b@example.com", me, &[]));
         assert_eq!(other_addresses(&log, me), ["b@example.com"]);
-        assert_eq!(other_addresses(&format!("abc123  {me}\n"), me), ["<empty>"]);
-        assert_eq!(other_addresses(&format!("{}\n", ACCEPTED_MERGES[0]), me), [ACCEPTED_MERGES[0]]);
+        assert_eq!(other_addresses(&entry(&a, "", me, &[]), me), ["<empty>"]);
+        assert_eq!(other_addresses(&format!("{a}"), me), ["<malformed>"], "a commit without its addresses");
+        assert_eq!(other_addresses("abc123 x@example.com
+", me), ["<malformed>"], "the old format is refused");
+        assert_eq!(refused(&["x".into()]), "1 address");
+        assert_eq!(refused(&["x".into(), "y".into()]), "2 addresses");
+    }
+
+    /// An accepted merge passes the check, but its refused addresses are
+    /// still never printed: only counted.
+    #[test]
+    fn printed_addresses_withhold_the_accepted_merges_authors() {
+        let me = "1+me@users.noreply.github.com";
+        let log = entry(ACCEPTED_MERGES[0], "a@example.com", "noreply@github.com", &["X <x@example.com>"]) + &entry(&"a".repeat(40), me, me, &[]);
+        let (addrs, withheld) = printed_addresses(&log, me);
+        assert!(!addrs.iter().any(|a| a == "a@example.com"), "the merge's author is printed");
+        assert!(!addrs.iter().any(|a| a == "x@example.com"), "the merge's co-author is printed");
+        assert!(addrs.iter().any(|a| a == me));
+        assert!(addrs.iter().any(|a| a == "noreply@github.com"));
+        assert_eq!(withheld, 2);
+    }
+
+    /// The #7 merge commit's shape passes; any co-author but the owner, the
+    /// release app and GitHub is refused, another user's noreply address
+    /// among them.
+    #[test]
+    fn co_author_trailers_are_checked_like_authors() {
+        let me = "19593371+bloodfeast@users.noreply.github.com";
+        let bot = "123+rs-atlas-releases[bot]@users.noreply.github.com";
+        let a = "a".repeat(40);
+        let merge = entry(&a, bot, "noreply@github.com", &[&format!("Brandon White <{me}>")]);
+        assert_eq!(log_addresses(&merge), [(a.clone(), vec![bot.to_string(), "noreply@github.com".into(), me.into()])]);
+        assert!(other_addresses(&merge, me).is_empty());
+        for co in ["O <o@example.com>", "O <2+other@users.noreply.github.com>", "no brackets at all", "O <>"] {
+            assert_eq!(other_addresses(&entry(&a, bot, "noreply@github.com", &[&format!("Brandon White <{me}>"), co]), me).len(), 1, "{co}");
+        }
+    }
+
+    /// git itself reads the trailers in [`ADDRESS_LOG`], the key matched
+    /// case aside, and only from the message's trailer block.
+    #[test]
+    fn the_address_log_reads_trailers_from_git() {
+        let d = tmp("address-log");
+        sh(&d, &["init", "-q", "-b", "main", "r"]);
+        let r = d.join("r");
+        let commit = |msg: &str| sh(&r, &["-c", "user.name=P", "-c", "user.email=p@example.invalid", "commit", "-q", "--allow-empty", "-m", msg]);
+        commit("one
+
+Co-Authored-By: A <a@example.invalid>
+co-authored-by: B <b@example.invalid>");
+        commit("two
+
+Co-authored-by: in the body, not a trailer <c@example.invalid>
+
+Signed-off-by: S <s@example.invalid>");
+        let log = sh(&r, &["log", ADDRESS_LOG]);
+        let got: Vec<Vec<String>> = log_addresses(&log).into_iter().map(|(sha, a)| {
+            assert!(is_full_sha(&sha), "{sha}");
+            a
+        }).collect();
+        assert_eq!(got, [vec!["p@example.invalid", "p@example.invalid"], vec!["p@example.invalid", "p@example.invalid", "a@example.invalid", "b@example.invalid"]]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

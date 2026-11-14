@@ -468,7 +468,7 @@ fn settings_cmd(p: &Paths, args: &[&str]) -> (bool, String) {
     let mut out = Vec::new();
     let mut input: &[u8] = b"";
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false });
+    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false, machine: None });
     match code {
         Ok(c) => (c == std::process::ExitCode::SUCCESS, String::from_utf8(out).unwrap()),
         Err(e) => (false, e),
@@ -788,6 +788,8 @@ fn recall_puts_the_active_repos_records_first_then_its_neighbours() {
     s.recall.fts_floor = 0.0;
     s.recall.hybrid_fts_floor = 0.0;
     s.graph = Some(Arc::new(g));
+    // All four in one answer: the order is under test, not the pointer cap.
+    s.recall.prompt_pointers = 0;
     // A tree branch can name the repo its memories are about.
     let mut tree = atlas::memory::tree::TreeSpec::new("memory");
     tree.branches.push(atlas::memory::tree::BranchSpec { name: "payments".into(), title: "Payments".into(), hook: String::new(), words: Vec::new(), types: Vec::new(), repo: Some("ledger".into()) });
@@ -1402,7 +1404,7 @@ fn settings_cmd_answering(p: &Paths, args: &[&str], answer: &str) -> (bool, Stri
     let mut out = Vec::new();
     let mut input: &[u8] = answer.as_bytes();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false });
+    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false, machine: None });
     match code {
         Ok(c) => (c == std::process::ExitCode::SUCCESS, String::from_utf8(out).unwrap()),
         Err(e) => (false, format!("{}{e}", String::from_utf8_lossy(&out))),

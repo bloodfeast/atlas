@@ -3,9 +3,10 @@
 Status: design for v0.2.0 item 7. Release gate: v0.2 ships only with the compaction ratio, the dangling-ref
 rate and post-compaction misses reported by `--token-report` and measured on replayed sessions.
 
-v0.2.0 ships these features experimental and off by default (`compact.enabled`, default false), until they are
-tested live: off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes
-the transcript), and SessionStart injects no card or ref report.
+These features are on by default (`compact.enabled`, default true, since v0.5.0; v0.2.0 shipped them experimental
+and off until they were tested live). `atlas settings off compact` or `"compact": {"enabled": false}` turns them
+off: off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes the
+transcript), and SessionStart injects no card or ref report.
 
 Goal: higher compaction ratios and more accurate references. A compacted session should carry keys and
 deltas, not restated content, and every key it carries should either resolve to the exact text it meant or
@@ -164,10 +165,28 @@ transcript, extracts every ref, resolves each, and:
   `preTokens / postTokens`, Claude Code's own measure of the context right after compaction, which
   includes the system prompt and tool definitions and so has a hard ceiling.
 - **dangling-ref rate** = dangling refs / refs (aim 0), with changed refs beside it.
-- **post-compaction misses** = lookups after a compaction for something the session had looked up before
+- **post-compaction repeats** = lookups after a compaction for something the session had looked up before
   it (same normalized target: a Read of the same file, a Grep of the same pattern and path, an atlas call
   with the same key, query or path), counted by the PreToolUse hook against the lookups since the session's
-  previous compaction. Logged as `compact:miss` token-log rows.
+  previous compaction. The PreToolUse hook writes one `compact_miss` row per main-session lookup that
+  matters: the normalized target (redacted, at most 200 characters, never contents or output), the 1-based
+  count of main-session tool calls since the boundary, and a kind. A target is stamped at every lookup (a
+  file by mtime and size, a missing file as absent; a folder, or no path, by the Edit, Write and
+  NotebookEdit calls under it and any shell command the session ran; an atlas key by its record's sha), and
+  a repeat is compared with the last stamp before the boundary: `miss` when unchanged, `changed` when not
+  (a correct re-read). Shell commands (a hash of the command plus its first two words) and MCP calls
+  without a key have no stamp and are `unstamped`; a first lookup within 40 calls is a `lookup` row with no
+  target, for the denominator. Call the two windowed figures (i) repeats over lookups and (ii) misses of
+  unchanged targets over the same lookups. MCP repeats without a stamp count in (i)'s numerator and
+  denominator and in (ii)'s denominator, never as misses, because the replay counts every MCP lookup;
+  shell rows are in neither, since a shell command is never one of the replay's lookups. Any shell command
+  marks every folder target changed wherever it ran: its targets are free text (`git -C`, absolute paths,
+  redirections), so its cwd cannot scope it, and (ii) runs low in shell-heavy sessions. Subagent calls
+  neither count nor stamp. `--token-report` shows, within 40 calls of a boundary, (i) repeats under the
+  replay's rule (stamps ignored, every repeat counted) over lookups, the one figure comparable with the
+  8.9% offline baseline; (ii) misses of unchanged targets over the same lookups; then uncapped misses, changed targets and the unstamped bucket. The older `compact:miss`
+  token-log rows (every repeat, no window, no filter) are kept as the legacy series.
+  `--token-report --repeats [--since TIME]` lists the 20 targets repeated most.
 
 ## 4. Measuring without spending Claude usage
 
@@ -191,7 +210,7 @@ every axis below, on the same sessions at the same compaction points. Any axis t
 | Ratio, pre / summary tokens | recorded `preTokens` over the recorded summary | same over the steered summary, with the card's tokens added to the denominator | plain yes; atlas needs live summaries | atlas >= plain |
 | Ratio, pre / post (`postTokens`) | recorded | live | as above | atlas >= plain |
 | Fidelity: facts from before the boundary that the session used after it | found in the summary alone | found in summary + card + one `recall` or `search` call by fixed policy | plain yes; atlas card, refs and transcript recall yes, summary live | atlas >= plain |
-| Post-compaction misses | replayed re-lookups in the 40 tool calls after the boundary | live count (`compact:miss`); offline bound: re-lookups not reachable from summary + card + refs | plain yes; atlas bound yes | atlas <= plain |
+| Post-compaction misses | replayed re-lookups in the 40 tool calls after the boundary | live count (`compact_miss`: in-window repeats over in-window lookups by the replay's rule, misses of unchanged targets beside it); offline bound: re-lookups not reachable from summary + card + refs | plain yes; atlas bound yes | atlas <= plain |
 | Dangling or changed refs | bare record keys in the summary that do not resolve | key@hash refs that dangle or changed | recorded yes; steered live | atlas <= plain |
 | Resume tokens: tool-result tokens from the boundary to the first edit, write or commit | replayed | live | plain yes | atlas <= plain |
 | Hook latency | no hooks: 0 ms | PreCompact + SessionStart(compact) wall time | yes | see below |

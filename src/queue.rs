@@ -218,33 +218,47 @@ pub enum Started {
     /// This waiting item was retired: named by `Queue:`, or the same
     /// description and brief.
     Retired(String),
+    /// The oldest waiting launch with this launch's declared lane and its
+    /// kind was retired (a reworded brief; #150); `others` more still wait.
+    SameLane {
+        /// The retired key.
+        key: String,
+        /// How many other waiting launches matched and stay queued.
+        others: usize,
+    },
     /// Its `Queue:` line names a key that is not waiting.
     NotWaiting(String),
 }
 
 /// Retires the waiting item a started launch is: the key its brief's
 /// `Queue: KEY` line names, else the waiting launch with the same
-/// description and brief. A planned item leaves only by its `Queue:` key.
+/// description and brief, else the oldest waiting launch with the same
+/// lane and kind. `lane` is the launch's declared `Lane:` (an inferred or
+/// missing lane matches nothing). A planned item leaves only by its
+/// `Queue:` key.
 ///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn started(store: &mut MemoryStore, description: &str, prompt: &str) -> Result<Started> {
+pub fn started(store: &mut MemoryStore, description: &str, prompt: &str, lane: Option<&str>, kind: Kind) -> Result<Started> {
     let all = waiting(store)?;
-    let pick = if let Some(k) = queue_line(prompt) {
+    let (key, out) = if let Some(k) = queue_line(prompt) {
         match all.iter().find(|h| h.key == k) {
-            Some(h) => h.key.clone(),
+            Some(h) => (h.key.clone(), Started::Retired(h.key.clone())),
             None => return Ok(Started::NotWaiting(k)),
         }
     } else if let Some(h) = all.iter().find(|h| same(h, description, prompt)) {
-        h.key.clone()
+        (h.key.clone(), Started::Retired(h.key.clone()))
     } else {
-        return Ok(Started::None);
+        // Oldest first, as `waiting` lists them.
+        let mut matches = all.iter().filter(|h| !is_planned(h) && lane.is_some_and(|l| crate::lanes::same_lane(l, &h.scope)) && queued_kind(store, h) == Some(kind));
+        let Some(h) = matches.next() else { return Ok(Started::None) };
+        (h.key.clone(), Started::SameLane { key: h.key.clone(), others: matches.count() })
     };
     let mut w = store.writer()?;
-    w.retire(&pick, "started")?;
+    w.retire(&key, "started")?;
     w.commit()?;
-    Ok(Started::Retired(pick))
+    Ok(out)
 }
 
 /// Whether a queued item is planned work (`planned: true`), not a refused
@@ -328,15 +342,11 @@ pub fn qmeta(meta: &str) -> QMeta {
     if let Some(v) = meta_value(meta, "uses") {
         let mut uses = Vec::new();
         for piece in split_top(v) {
-            let name = first(&piece);
-            if name.is_empty() || name == "none" {
-                continue;
-            }
-            if name == "read-only" || name == "readonly" {
-                m.read_only = true;
-                continue;
-            }
-            uses.push((name, !piece.contains("(inferred")));
+            // The words before a `(declared)` or `(inferred ...)` note, read
+            // as a `Uses:` line reads them (`sqlport 15126` is one).
+            let (names, read_only) = crate::lanes::parse_uses(piece.split('(').next().unwrap_or(""));
+            m.read_only |= read_only;
+            uses.extend(names.into_iter().map(|n| (n, !piece.contains("(inferred"))));
         }
         uses.sort();
         uses.dedup();
@@ -783,13 +793,13 @@ pub fn items(store: &MemoryStore, now: &str) -> Result<(Vec<Head>, Vec<crate::la
 /// classified, named by its description and id. `known` serves lane
 /// inference, which only warns; scheduling reads declarations alone, so
 /// a caller that only proposes passes none.
-pub fn holders(running: &[crate::orchestrate::Running], dir: &std::path::Path, known: &[String]) -> Vec<crate::lanes::Holder> {
+pub fn holders(running: &[crate::orchestrate::Running], dir: &std::path::Path, known: &[String], bare_gpu_words: bool) -> Vec<crate::lanes::Holder> {
     running
         .iter()
         .map(|r| {
             let brief = crate::orchestrate::brief_of(&dir.join(format!("agent-{}.jsonl", r.id))).unwrap_or_default();
             let name = if r.description.is_empty() { r.id.clone() } else { format!("{} ({})", r.description, r.id) };
-            crate::lanes::Holder { name, kind: r.kind, class: crate::lanes::classify(&brief, known) }
+            crate::lanes::Holder { name, kind: r.kind, class: crate::lanes::classify_in(&brief, known, bare_gpu_words) }
         })
         .collect()
 }
@@ -1002,7 +1012,7 @@ pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::
             if let Some(t) = flag(args, "--transcript") {
                 let dir = crate::orchestrate::subagents_dir(&t);
                 let r = crate::orchestrate::Agents::new(None).running(orch, &dir, std::time::SystemTime::now()).map_err(|e| format!("{}: {e}", dir.display()))?;
-                running = holders(&r, &dir, &[]);
+                running = holders(&r, &dir, &[], orch.lanes.bare_gpu_words);
             } else {
                 println!("(no --transcript: running agents are not counted)");
             }
@@ -1026,7 +1036,7 @@ pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::
             };
             let kind = if flag(args, "--kind").is_some() { kind } else { crate::orchestrate::brief_kind_or(orch, &brief) };
             let known = known_lanes(store);
-            let class = crate::lanes::classify(&brief, &known);
+            let class = crate::lanes::classify_in(&brief, &known, orch.lanes.bare_gpu_words);
             let meta = class.meta();
             let launch = Launch { kind, lane: class.lane.as_deref(), description: &description, subagent_type: "", prompt: &brief, session: "", class_meta: &meta };
             let (key, new) = add(store, &launch).map_err(s)?;

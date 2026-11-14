@@ -18,6 +18,7 @@
 - [[Memory store and hooks]]
 - [[Memory tree]]
 - [[Memory and rule files]]
+- [[Orchestration]]
 - [[Discussions]]
 - [[Generated indices]]
 - [[Cross-vault links]]
