@@ -38,6 +38,9 @@ pub struct RecallSettings {
     /// in all; past it the hooks inject nothing more and `recall {query}`
     /// still answers. 0 is no cap.
     pub session_budget_tokens: usize,
+    /// The most pointers one main-session prompt gets; the rest are counted
+    /// in the `+N more` line. A subagent's brief is not capped. 0 is no cap.
+    pub prompt_pointers: usize,
     /// Whether a `recall {query}` pointer ends with its anchor
     /// (`@src:path:line`, see [`super::recall::pointer_anchor`]).
     pub pointer_anchors: bool,
@@ -82,9 +85,9 @@ const V02_BLOCK: u64 = 500_000;
 /// Compaction settings (see [`crate::checkpoint`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactSettings {
-    /// The experimental compaction features are on (`compact.enabled`,
-    /// default false). Off, the hooks do no checkpoint, card, ref report or
-    /// deferral.
+    /// The compaction features are on (`compact.enabled`, default true; an
+    /// explicit false turns them off). Off, the hooks do no checkpoint, card,
+    /// ref report or deferral.
     pub enabled: bool,
     /// Block a proactive automatic compaction while a tool chain runs.
     pub defer: bool,
@@ -96,7 +99,7 @@ pub struct CompactSettings {
 
 impl Default for CompactSettings {
     fn default() -> Self {
-        CompactSettings { enabled: false, defer: false, window: 0, card_tokens: 400 }
+        CompactSettings { enabled: true, defer: false, window: 0, card_tokens: 400 }
     }
 }
 
@@ -193,6 +196,11 @@ pub const DEFAULT_COS_MARGIN: f32 = 0.10;
 /// eval (see `cargo xtask memory-eval`, its anchors rows).
 pub const DEFAULT_POINTER_ANCHORS: bool = false;
 
+/// The default [`RecallSettings::prompt_pointers`]. On the TOKEN-AUDIT
+/// (journal:ATLAS-V03:0050) 8.3% of the orchestrator's pointers were ever
+/// used.
+pub const DEFAULT_PROMPT_POINTERS: usize = 2;
+
 /// The default [`RecallSettings::inject_floor`], from
 /// `atlas --hook-report --tune-floor 1` ([`crate::hook_hits::tune`]): the
 /// cosine that maximises the tokens hits save less the tokens injected (see
@@ -206,10 +214,17 @@ pub const DEFAULT_MIN_TERMS: usize = 3;
 /// int8 model: 0 of 40 unrelated prompts recall anything, 69 of 80 real ones
 /// do (64 with the lexical gate). A different model or corpus recalibrates.
 pub const DEFAULT_HYBRID_FTS_FLOOR: f64 = 8.89;
-/// The default cosine a lexical match also needs (with a model). Raised
-/// from the calibrated 0.43 (Brandon, 2026-10-31): on a replay against the
-/// live store, records labelled off-topic passed at cosines up to 0.56.
-pub const DEFAULT_COS_FLOOR: f32 = 0.57;
+/// The default cosine a lexical match also needs (with a model): the floor
+/// chosen by the cos_floor sweep on the 30-prompt off-topic set and the
+/// 303-prompt hook replay (journal:ATLAS-V05-MEASURE:0010), the lowest arm
+/// that passes both parts at a 600-token budget with 2 prompt pointers. It
+/// lets no more off-topic records through than 0.57 at 150 tokens did.
+pub const DEFAULT_COS_FLOOR: f32 = 0.53;
+/// The default hook recall budget in tokens. Pointers, not bodies: a title
+/// and key is about 30 tokens. The best strict score of the four-cell hook
+/// replay (181 of 303 prompts, about 70 injected tokens per prompt, against
+/// 179 at 150 tokens).
+pub const DEFAULT_BUDGET_TOKENS: usize = 600;
 /// The default cosine at which a record passes on meaning alone: above the
 /// highest cosine of any unrelated prompt's candidate (0.70).
 pub const DEFAULT_COS_ALONE: f32 = 0.72;
@@ -257,8 +272,7 @@ impl Settings {
             snapshot_dir,
             snapshot_cap: m.snapshot_cap_mb.unwrap_or(1024) as u64 * 1024 * 1024,
             recall: RecallSettings {
-                // Pointers, not bodies: a title and key is about 30 tokens.
-                budget_tokens: r.budget_tokens.unwrap_or(150),
+                budget_tokens: r.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS),
                 lane_budget_tokens: r.lane_budget_tokens.unwrap_or(2000),
                 fts_floor: r.fts_floor.unwrap_or(DEFAULT_FTS_FLOOR),
                 min_terms: r.min_terms.unwrap_or(DEFAULT_MIN_TERMS),
@@ -269,6 +283,7 @@ impl Settings {
                 cos_margin: DEFAULT_COS_MARGIN,
                 inject_floor: r.inject_floor.map_or(DEFAULT_INJECT_FLOOR, |x| x as f32),
                 session_budget_tokens: r.session_budget_tokens.unwrap_or(0),
+                prompt_pointers: r.prompt_pointers.unwrap_or(DEFAULT_PROMPT_POINTERS),
                 pointer_anchors: r.pointer_anchors.unwrap_or(DEFAULT_POINTER_ANCHORS),
                 rules: super::rules::Mode::of(m.rules),
                 select: {

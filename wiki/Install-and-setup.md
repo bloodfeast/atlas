@@ -98,22 +98,26 @@ An older Claude Code is untested.
 
    | Question | Stored as | Default |
    |---|---|---|
-   | Builders at once | `orchestrate.kinds.builder.max` | 2 |
-   | Reviewers at once | `orchestrate.kinds.reviewer.max` | 2 |
-   | Research and design agents at once | `orchestrate.kinds.research.max` | 1 |
+   | Compile slots (heavy compiles at once) | `orchestrate.resources.compile` | max(1, hardware threads / 16), at most 4 |
+   | GPU slots (GPU runs at once) | `orchestrate.resources.gpu` | 1 |
+   | Builders at once | `orchestrate.kinds.builder.max` | the compile slots |
+   | Reviewers at once | `orchestrate.kinds.reviewer.max` | the builders |
+   | Research and design agents at once | `orchestrate.kinds.research.max` | max(1, builders / 2) |
    | Context limits: enforced, advisory or off | `orchestrate.mode` | enforced |
    | Handoff point, in context tokens | `cap.warn_tokens`, only when you type a number | 285,000 on a 1M window, scaled to the window |
    | Hard limit, in context tokens | `cap.block_tokens`, only when you type a number | 450,000 on a 1M window, scaled to the window |
    | After a handoff, start the fresh agent: auto, or ask you first | `orchestrate.fresh` | auto |
 
-   The handoff point and the hard limit are skipped when context limits are off. The answers are one
+   The defaults of the first five are starters: compile from this machine's threads, gpu 1, and the
+   caps from the compile slots; a value already in the configuration is kept, and the caps are clamped
+   to Claude Code's subagent limit. See [[Orchestration]] for the rules and for declaring lanes. The handoff point and the hard limit are skipped when context limits are off. The answers are one
    configuration change, backed up, which `atlas settings undo` reverts. The first Claude Code session asks
    the same once, through Claude, unless the configuration already sets `orchestrate.enabled`. To answer
    again at any time:
 
    ```sh
    atlas settings orchestrate                       # asks in a terminal; without one, lists the options
-   atlas settings orchestrate --yes --builders 3 --mode advisory   # answers without a terminal
+   atlas settings orchestrate --yes --compile 2 --builders 3 --mode advisory   # answers without a terminal
    atlas settings orchestrate --no                  # declines (and turns the caps off if they are on)
    ```
 
@@ -136,7 +140,7 @@ An older Claude Code is untested.
    ```
 
    (`atlas settings on update` turns them back on), or pin a version in `atlas.json` with
-   `"update": {"pin": "0.4.0"}`. A binary you build from source never updates itself.
+   `"update": {"pin": "0.5.0"}`. A binary you build from source never updates itself.
 
 5. Point atlas at your notes: edit `atlas.json` (see [[Configuration reference]]) to add vaults (folders atlas may add
    to) and read-only sources (folders it only indexes), then run `/mcp` and reconnect atlas, or restart

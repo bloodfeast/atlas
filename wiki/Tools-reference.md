@@ -6,7 +6,7 @@ of the surface sits behind four tools with an `op` argument:
 
 | Listed tool | `op` | Runs |
 |---|---|---|
-| `note` (reads) | `read` (default), `list`, `find`, `backlinks`, `outlinks`, `broken`, `link`, `log`, `vaults`, `sources`, `help` | `read_note`, `list_notes`, `find_by_frontmatter`, `backlinks`, `outlinks`, `broken_links`, `make_link`, `write_log`, `list_vaults`, `list_sources`, the help text |
+| `note` (reads) | `read` (default), `list`, `find`, `backlinks`, `outlinks`, `broken`, `link`, `log`, `vaults`, `sources`, `judge`, `help` | `read_note`, `list_notes`, `find_by_frontmatter`, `backlinks`, `outlinks`, `broken_links`, `make_link`, `write_log`, `list_vaults`, `list_sources`, `judge_task`, the help text |
 | `edit` (writes) | `create`, `append`, `history`, `frontmatter`, `section`, `link`, `next_id`, `index`, `refresh`, `refresh_all` | `create_note`, `append_to_note`, `append_history`, `set_frontmatter`, `replace_section`, `link_notes` (`vault` and `path` name the note written into), `next_id`, `build_index`, `refresh_index`, `refresh_all_indices` |
 | `discuss` | `open`, `post`, `read`, `status`, `awaiting`, `list`, `queue`, `conclude`, `unresolved`, `decide` | `open_discussion`, `post`, `read_discussion`, `discussion_status`, `awaiting`, `list_discussions`, `decision_queue`, `conclude_discussion`, `mark_unresolved`, `record_decision` |
 | `miss` | `list` (default), `report`, `resolve` | `misses`, `report_miss`, `resolve_miss` |
@@ -91,7 +91,12 @@ checkpoint card's size and coverage, the hooks' latency, and with `--sweep` the 
 (a plain and an atlas-assisted arm at each threshold on the same sessions, each atlas row judged against plain at the
 same threshold: compactions, raw and cache-weighted tokens, re-reads; plain at Claude Code's default point is a
 labelled reference row only). `--token-report` ends with the compaction line: the ratio of context
-before a compaction to its summary, refs and their dangling rate, and post-compaction misses.
+before a compaction to its summary, refs and their dangling rate, and the lookups made again after one:
+within 40 tool calls of the boundary, repeats over lookups (comparable with the offline replay) and misses of
+targets unchanged since (a file's mtime and size, a folder by the edits under it and any shell command, a record's sha), then the uncapped misses, the repeats of
+changed targets and the unstamped ones (shell commands, MCP calls without a key). `atlas --token-report
+--repeats [--since TIME]` lists the 20 targets repeated most since TIME (paths, patterns, keys, and a shell
+command's first two words with a hash), misses, changed and unstamped apart.
 
 `atlas --misses-week [--since TIME]` is the weekly misses pass: the ten open misses (`report_miss`) seen most
 since TIME (default seven days ago), by tool and query, then the ten injected keys that cost the most tokens in
@@ -125,6 +130,7 @@ episodes from 5 transcripts it gives the upper bound alone and says why. The rul
 | `lookup` | | an identifier's definitions (strongest first, each with the defining text) then mentions (newest first), source, path, heading path and line for each, plus `freshness`; `text_hits` when nothing is registered |
 | `ids` | | registered identifiers in natural order: kind, definition and occurrence counts, newest date; filters `prefix`, `pattern`, `kind`, `source` |
 | `list_sources` | | vaults and sources: root, globs, files and sections, last scan and index times, stale files |
+| `judge_task` | | the task judge's pick for an agent launch prompt (`prompt`; `kind`, else read from the prompt, `subagent_type` and `description`): scope, unknowns, model, effort, split, and a `Judge:` line to paste. Needs `orchestrate.judge.cells` |
 | `report_miss` | misses log | records what grep found and atlas did not: tool, query, what atlas returned, where it was found, reason |
 | `misses` | | the misses log, newest first: `open` (default), `resolved` or `all` |
 | `resolve_miss` | misses log | marks a miss resolved; the reason is the note. Misses are never deleted |

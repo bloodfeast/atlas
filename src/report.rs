@@ -27,16 +27,18 @@ pub enum Carries {
     Heading,
 }
 
-/// Reports up to this many bytes are never digested: on the report-eval
-/// corpus (30 real reports, 284 labelled facts) every budget below it drops
-/// a fact, and Q-SD2 ships a digest only when every fact is kept.
+/// The digest bound: reports up to this many bytes are never digested. On
+/// the report-eval corpus (30 real reports, 284 labelled facts) every budget
+/// below it drops a fact, and Q-SD2 ships a digest only when every fact is
+/// kept.
 pub const WHOLE_UP_TO: usize = 14_000;
 
-/// The budget for a report of `len` bytes: [`WHOLE_UP_TO`], or an eighth of
-/// a longer report when that is more.
-pub fn budget(len: usize) -> usize {
-    WHOLE_UP_TO.max(len / 8)
-}
+/// The SubagentStop backstop sends a report back only past this many bytes,
+/// twice the digest bound (the 11-04 refinement of Q-SD3).
+pub const SEND_BACK_OVER: usize = 2 * WHOLE_UP_TO;
+
+/// The mark between two kept pieces that were not adjacent.
+const GAP: &str = "...\n";
 
 fn has_word(lower: &str, words: &[&str]) -> bool {
     words.iter().any(|w| {
@@ -144,25 +146,32 @@ fn asks(heading: &str) -> bool {
     ["question", "decision", "decide", "for the user", "forks", "open item", "needs you"].iter().any(|w| l.contains(w))
 }
 
-/// Whether a piece is a heading: a Markdown heading, a bold line, or a short
-/// line ending in a colon.
-fn is_heading(t: &str) -> bool {
-    t.starts_with('#') || (t.starts_with("**") && t.ends_with("**")) || (t.ends_with(':') && t.len() <= 60)
+/// Whether a piece is a section heading: a Markdown heading or a bold line.
+/// Only these open or close a section of questions.
+fn is_section(t: &str) -> bool {
+    t.starts_with('#') || (t.len() > 4 && t.starts_with("**") && t.ends_with("**"))
 }
 
-/// The digest of a report, at most `max` bytes plus a closing line naming
-/// what was left out. A report within the budget is returned whole.
+/// Whether a piece is a heading: a section heading, or a short line ending
+/// in a colon (which labels a list inside a section).
+fn is_heading(t: &str) -> bool {
+    is_section(t) || (t.ends_with(':') && t.len() <= 60)
+}
+
+/// The digest of a report, at most `max` bytes, its gap marks and the
+/// closing line naming what was left out included. A report within the
+/// budget is returned whole.
 ///
 /// Pieces are kept by tier, then in report order: the opening paragraph,
 /// the questions (and every piece of a section whose heading asks for a
-/// decision), then outcomes, risks, numbers and headings.
+/// decision), then outcomes, risks, numbers, headings and the rest.
 pub fn digest(report: &str, max: usize) -> String {
     let report = report.trim();
     if report.len() <= max {
         return report.to_string();
     }
-    // Every piece, with its tier (`None`: never kept) and where it is.
-    let mut all: Vec<(usize, &str, Option<u8>)> = Vec::new();
+    // Every piece, with its tier and where it is.
+    let mut all: Vec<(usize, &str, u8)> = Vec::new();
     // The opening: its first three sentences that are not headings.
     let mut lead = 3u8;
     let mut asking = false;
@@ -175,8 +184,9 @@ pub fn digest(report: &str, max: usize) -> String {
         }
         for p in pieces(line) {
             let c = classify(p);
-            let heading = is_heading(p.trim());
-            if heading {
+            let t = p.trim();
+            let heading = is_heading(t);
+            if is_section(t) {
                 asking = asks(p);
             }
             let opening = lead > 0 && !heading;
@@ -184,28 +194,32 @@ pub fn digest(report: &str, max: usize) -> String {
                 lead -= 1;
             }
             let tier = if opening || asking || c == Some(Carries::Question) {
-                Some(0)
+                0
             } else {
-                c.map(|c| match c {
-                    Carries::Outcome => 1,
-                    Carries::Risk => 2,
-                    Carries::Number => 3,
-                    Carries::Question => 0,
-                    Carries::Heading => 4,
-                })
+                match c {
+                    Some(Carries::Outcome) => 1,
+                    Some(Carries::Risk) => 2,
+                    Some(Carries::Number) => 3,
+                    Some(Carries::Heading) => 4,
+                    // A question is tier 0 above.
+                    Some(Carries::Question) | None => 5,
+                }
             };
             all.push((all.len(), p, tier));
         }
     }
     // Picked by tier, then in order; a piece that does not fit is skipped
-    // and a smaller one may still fit.
-    let mut order: Vec<usize> = (0..all.len()).filter(|&i| all[i].2.is_some()).collect();
+    // and a smaller one may still fit. Room is kept for the closing line,
+    // and each piece is charged a gap mark, so the digest stays within `max`.
+    let closing = |dropped: usize| format!("({dropped} of {} sentences left out; the full report is one recall away)\n", all.len());
+    let room = max.saturating_sub(closing(all.len()).len());
+    let mut order: Vec<usize> = (0..all.len()).collect();
     order.sort_by_key(|&i| (all[i].2, i));
     let mut keep = vec![false; all.len()];
     let mut used = 0;
     for i in order {
-        let n = all[i].1.len() + 1;
-        if used + n <= max {
+        let n = all[i].1.len() + 1 + GAP.len();
+        if used + n <= room {
             keep[i] = true;
             used += n;
         }
@@ -215,7 +229,7 @@ pub fn digest(report: &str, max: usize) -> String {
     for (i, p, _) in &all {
         if keep[*i] {
             if gap && !out.is_empty() {
-                out.push_str("...\n");
+                out.push_str(GAP);
             }
             out.push_str(p);
             out.push('\n');
@@ -224,8 +238,7 @@ pub fn digest(report: &str, max: usize) -> String {
             gap = true;
         }
     }
-    let dropped = keep.iter().filter(|k| !**k).count();
-    out.push_str(&format!("({dropped} of {} sentences left out; the full report is one recall away)\n", all.len()));
+    out.push_str(&closing(keep.iter().filter(|k| !**k).count()));
     out
 }
 
@@ -249,8 +262,8 @@ mod tests {
         assert_eq!(digest("Done. PR #1.", 700), "Done. PR #1.");
         let filler = "I looked at the surrounding code to understand it and nothing here matters for the next step. ".repeat(30);
         let report = format!("## Summary\n{filler}\nPR #95 merged as 1bc6def.\n{filler}\nTests: 760/0/18.\nQ-QU1: who files it?\nThe kill was denied.\n");
-        let d = digest(&report, 400);
-        assert!(d.len() < 520, "{}", d.len());
+        let d = digest(&report, 600);
+        assert!(d.len() <= 600, "{}", d.len());
         let at = |s: &str| d.find(s).unwrap_or_else(|| panic!("{s}: {d}"));
         assert!(at("PR #95") < at("760/0/18") && at("760/0/18") < at("Q-QU1") && at("Q-QU1") < at("denied"));
         assert!(d.contains("left out; the full report is one recall away"));
@@ -267,15 +280,40 @@ PR #7 merged as 1bc6def.
 ## Questions for the user
 - Keep the old flag (a) or drop it (b)
 ");
-        let d = digest(&report, 110);
+        let d = digest(&report, 190);
         assert!(d.contains("Done: the lexer is rewritten.") && d.contains("Keep the old flag"), "{d}");
         assert!(!d.contains("PR #7"), "{d}");
     }
 
+    /// A long report for the tests below: `head`, filler, then `tail`.
+    fn padded(head: &str, tail: &str) -> String {
+        let filler = "Some context that the orchestrator does not need at all, repeated over and over. ".repeat(40);
+        format!("{head}\n\n{filler}\n\n{tail}")
+    }
+
     #[test]
-    fn budgets_scale_within_bounds() {
-        assert_eq!(budget(300), WHOLE_UP_TO);
-        assert_eq!(budget(30_000), WHOLE_UP_TO);
-        assert_eq!(budget(200_000), 25_000);
+    fn only_a_section_heading_ends_a_questions_section() {
+        let after = "a line under the next heading that is long enough not to fit in the room the digest still has, padded out.";
+        let report = padded("Done.", &format!("## Questions\n- Q1 the flag. Options:\n- keep the old flag\n- drop it outright\n\n## Notes\n{after}"));
+        let d = digest(&report, 300);
+        assert!(d.contains("keep the old flag") && d.contains("drop it outright"), "the options survive a colon line: {d}");
+        assert!(!d.contains(after), "a new section ends it: {d}");
+    }
+
+    #[test]
+    fn untiered_lines_fill_what_room_is_left() {
+        let report = padded("Done.\n\nthe lexer reads tabs now", "PR #7 merged.");
+        let d = digest(&report, 300);
+        assert!(d.contains("the lexer reads tabs now") && d.contains("PR #7"), "{d}");
+    }
+
+    #[test]
+    fn a_digest_keeps_within_its_bound() {
+        let tail: String = (0..40).map(|i| format!("PR #{i} merged.\nfiller line {i} that says nothing at all\n")).collect();
+        let report = padded("Done.", &tail);
+        for max in [200, 400, 1_000, 3_000, report.len() - 1] {
+            let d = digest(&report, max);
+            assert!(d.len() <= max, "{max}: {} bytes\n{d}", d.len());
+        }
     }
 }

@@ -166,7 +166,7 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
 
     let (_, items) = crate::queue::items(store, now)?;
     if !items.is_empty() {
-        let p = crate::queue::propose(orch, &items, &crate::queue::holders(&running, &dir, &[]));
+        let p = crate::queue::propose(orch, &items, &crate::queue::holders(&running, &dir, &[], orch.lanes.bare_gpu_words));
         let mut q = format!("- work queue: {} waiting", items.len());
         if !p.start.is_empty() {
             let keys: Vec<&str> = p.start.iter().take(MAX_START).map(|&i| items[i].key.as_str()).collect();
@@ -489,7 +489,9 @@ mod tests {
     #[test]
     fn only_a_cleared_session_lists_the_previous_agents() {
         let (d, mut s) = store_in("agents");
-        add(&mut s, "journal:L:0001", "journal", "decision", "L", NOW, "t");
+        // At the wall clock: the card below reads at `now()`, and a record at
+        // the fixed NOW left the live window a week after it.
+        add(&mut s, "journal:L:0001", "journal", "decision", "L", &crate::memory::now(), "t");
         let sub = d.join("sessions").join("old").join("subagents");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(d.join("sessions").join("old.jsonl"), "{}
@@ -497,7 +499,7 @@ mod tests {
         std::fs::write(sub.join("agent-aaaa1111.meta.json"), r#"{"description":"the exporter","finished":false}"#).unwrap();
         std::fs::write(sub.join("agent-bbbb2222.meta.json"), r#"{"description":"done already","finished":true}"#).unwrap();
         let new = d.join("sessions").join("new.jsonl");
-        let at = |cleared: bool| card(&s, &OrchSettings::default(), &new.to_string_lossy(), &crate::memory::now(), cleared).unwrap().unwrap();
+        let at = |cleared: bool| card(&s, &OrchSettings::default(), &new.to_string_lossy(), NOW, cleared).unwrap().unwrap();
         // The card reads agents at the record time `now`, not the wall clock.
         assert_eq!(crate::queue::system_time("1970-01-01T00:01:00Z"), Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60)));
         let c = at(true);

@@ -22,6 +22,7 @@
 // scan).
 #![deny(unsafe_code)]
 
+pub mod backlog;
 pub mod baseline;
 pub mod calibrate;
 pub mod chain;
@@ -82,6 +83,7 @@ pub mod semantic;
 pub mod sha256;
 pub mod sources;
 pub mod store;
+pub mod taskjudge;
 pub mod text;
 pub mod tokens;
 pub mod update;

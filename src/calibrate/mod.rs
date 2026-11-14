@@ -111,12 +111,12 @@ pub use rules::{call_line, classify, episodes, is_atlas_tool, kept_input, result
 
 /// The lookup rules' version, stamped on every baseline: a store whose
 /// baseline has another recalibrates at its next start.
-pub const RULES_VERSION: u32 = 2;
+pub const RULES_VERSION: u32 = 3;
 
 /// Every rules version with the hash of the rules' code (see the module
 /// docs). A changed hash needs a new last row and [`RULES_VERSION`] set to
 /// it; the test says which.
-pub const RULES_HISTORY: &[(u32, &str)] = &[(1, "d6a3e8272a01199b02db2b05c648f1dbb8d6be36d8a95b1a584974bee4eafe93"), (2, "1331cc237a545c205cf9bc0618a7c3861070929460f5377aa5d359cabf6c9591")];
+pub const RULES_HISTORY: &[(u32, &str)] = &[(1, "d6a3e8272a01199b02db2b05c648f1dbb8d6be36d8a95b1a584974bee4eafe93"), (2, "1331cc237a545c205cf9bc0618a7c3861070929460f5377aa5d359cabf6c9591"), (3, "a62b06f78ea5068f3f18faebaad8c8bffb503e2223c51445741f98d003fffaee")];
 
 /// Fewer episodes than this give no measured ratio: below about 30 the
 /// median of a long-tailed size distribution moves by more than a factor

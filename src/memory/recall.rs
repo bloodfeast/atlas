@@ -402,6 +402,58 @@ pub struct LaneView {
 /// whole: the handoff, the brief, open questions and the next step.
 const LANE_STATE: &[&str] = &["handoff", "brief", "open questions", "next"];
 
+/// A lane's open questions, by the store's one test
+/// (`memory::OPEN_QUESTION_SQL`), as the resume card and `lanes()` count them.
+fn open_in(store: &MemoryStore, lane: &str) -> Result<HashSet<String>> {
+    Ok(store.open_questions()?.into_iter().filter(|(l, _, _)| l == lane).map(|(_, k, _)| k).collect())
+}
+
+/// The newest handoff by time (an active one before a superseded one), not
+/// the last inserted: an import can insert out of order.
+fn newest_handoff(all: &[Head]) -> Option<&Head> {
+    all.iter().filter(|h| h.kind == "handoff").max_by(|a, b| (a.status == "active", &a.time).cmp(&(b.status == "active", &b.time)))
+}
+
+/// The most of a handoff title a [`lane_head`] line shows, in characters.
+const HEAD_TITLE_CHARS: usize = 48;
+
+/// One line for a lane, read from what [`lane_with`] reads: its entry
+/// count, its newest handoff (number and title, the title cut to
+/// [`HEAD_TITLE_CHARS`]) and its open questions, with the recall that shows
+/// the whole view. `None` for a lane with no entries.
+///
+/// `lane X: 12 entries, handoff 003 Title, 1 open; recall lane=X`
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn lane_head(store: &MemoryStore, lane: &str) -> Result<Option<String>> {
+    let all = store.lane(lane)?;
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let mut out = format!("lane {lane}: {} entries", all.len());
+    if let Some(h) = newest_handoff(&all) {
+        let n = h.key.rsplit(':').next().unwrap_or(&h.key);
+        let t = h.title.trim();
+        let title = match t.char_indices().nth(HEAD_TITLE_CHARS) {
+            // Cut at the last word boundary inside the limit.
+            Some((at, c)) => {
+                let cut = if c.is_whitespace() { &t[..at] } else { t[..at].rsplit_once(char::is_whitespace).map_or(&t[..at], |(a, _)| a) };
+                format!("{}...", cut.trim_end().trim_end_matches([',', ';', ':']))
+            }
+            None => t.to_string(),
+        };
+        out.push_str(&format!(", handoff {n}"));
+        if !title.is_empty() {
+            out.push(' ');
+            out.push_str(&title);
+        }
+    }
+    out.push_str(&format!(", {} open; recall lane={lane}\n", open_in(store, lane)?.len()));
+    Ok(Some(out))
+}
+
 /// [`lane`], and with `trim` (the prompt, the excerpt length) the hook's
 /// lane brief: the state sections whole, and each older entry (decisions,
 /// measurements, commits, notes) as its header and title with its body cut
@@ -418,14 +470,10 @@ pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&
     if all.is_empty() {
         return Ok(LaneView::default());
     }
-    // Open by the store's one test (`memory::OPEN_QUESTION_SQL`), as the
-    // resume card and `lanes()` count them.
-    let open: HashSet<String> = store.open_questions()?.into_iter().filter(|(l, _, _)| l == lane).map(|(_, k, _)| k).collect();
+    let open = open_in(store, lane)?;
     let sub = |s: &str| -> Vec<&Head> { all.iter().rev().filter(|h| h.kind == "journal" && h.sub == s).collect() };
     let order: Vec<(&str, Vec<&Head>)> = vec![
-        // The newest handoff by time (an active one before a superseded one),
-        // not the last inserted: an import can insert out of order.
-        ("handoff", all.iter().filter(|h| h.kind == "handoff").max_by(|a, b| (a.status == "active", &a.time).cmp(&(b.status == "active", &b.time))).into_iter().collect()),
+        ("handoff", newest_handoff(&all).into_iter().collect()),
         ("brief", sub("brief").into_iter().take(1).collect()),
         ("open questions", sub("question").into_iter().filter(|h| open.contains(&h.key)).collect()),
         ("next", sub("next").into_iter().take(1).collect()),

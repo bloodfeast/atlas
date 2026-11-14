@@ -104,14 +104,17 @@ recall. Use the `mcp_tool` hooks for subagent recall.
 
 - **Recall** (`UserPromptSubmit` in the main session; `SubagentStart` for subagents, whose brief is taken from the
   parent's `Agent` tool call): a lane the text names gets its journal first; then the gated records, whole, in
-  fused order (reciprocal rank over FTS5 and the vectors), within `recall.budget_tokens` (150). A record passes
+  fused order (reciprocal rank over FTS5 and the vectors), within `recall.budget_tokens` (600; with the 0.53 floor below, chosen by the cos_floor sweep on the off-topic set and the hook replay). A record passes
   lexically when its FTS5 score clears the floor and it contains `recall.min_terms` (3) of the prompt's words; with
   the embedding model (`semantic.model`) loaded the floor is `recall.hybrid_fts_floor` and the record's cosine with
-  the prompt's first `recall.query_tokens` (32) tokens must also clear `recall.cos_floor`, and a cosine at or above
+  the prompt's first `recall.query_tokens` (32) tokens must also clear `recall.cos_floor` (0.53), and a cosine at or above
   `recall.cos_alone` passes on meaning alone. Without the model the floor is `recall.fts_floor`. Records are
   embedded once per version on a background thread (cached in the store's `rec_vec` table); until a record has a
   vector it is judged lexically. Nothing clears the gate: nothing is injected. A record is injected once per
-  session. The floors are set by `cargo xtask calibrate-recall` from `--recall-scores` output, never by hand.
+  session (or per subagent), across server restarts and compactions: a session's earlier injections are read
+  back from the `hook_inject` log, so a command hook's process per event does not repeat them either (a lane's
+  journal can come again after a restart). A main-session prompt gets at most `recall.prompt_pointers` (2) pointers, the rest counted in
+  a `+N more` line; a subagent whose brief names its own lane gets that lane's journal and no pointers. The floors are set by `cargo xtask calibrate-recall` from `--recall-scores` output, never by hand.
 - **Context selection** (`recall.select`, on by default): what clears the gate is cut to what the prompt needs.
   A record whose words the record injected before it holds (`dup_overlap`, 0.90, one way) at a cosine of
   `dup_cos` (0.82) or more is sent as `- KEY: near-duplicate of OTHER`, so the rule kept in INTENT, a memory
@@ -133,7 +136,7 @@ recall. Use the `mcp_tool` hooks for subagent recall.
   advisory or off.
 - **Agent caps** (`PreToolUse` on `Agent`, with `orchestrate.enabled`): the session's running agents are read
   from Claude Code's `subagents/agent-<id>.meta.json` files and counted by kind; a launch past its kind's cap
-  (2 builders, 2 reviewers, 1 research agent by default) or past Claude Code's own limit is denied with a reason
+  (2 builders, 2 reviewers, 1 research agent without setup; setup derives them from the machine, see [[Orchestration]]) or past Claude Code's own limit is denied with a reason
   to queue it. The hook files the refused launch as a `queued` journal entry in the lane its brief names (else
   lane `queue`), with the brief as its body, and the reason names the key; a retry is not filed twice. A
   finished agent's notification lists the oldest waiting launches, and launching one again with the same
@@ -155,8 +158,8 @@ recall. Use the `mcp_tool` hooks for subagent recall.
   store gives no card, and a store error drops only the card. Two limits: the previous session is the newest
   other transcript in the folder, so a second session open in the same project counts as the previous one; and
   a headless `claude -p` run starts with `startup` too, so it gets the card (turn it off in that run's config).
-- **Compaction (experimental, off by default):** everything in this item and the next three, except the
-  transcript source, runs only with `"compact": {"enabled": true}` in atlas's configuration. Off, PreCompact only
+- **Compaction (on by default):** everything in this item and the next three, except the transcript
+  source, runs unless `"compact": {"enabled": false}` is in atlas's configuration. Off, PreCompact only
   forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript); SessionStart
   injects no card or ref report.
 - **Idea capture (`memory.ideas`, off by default):** a person's standalone statements that propose, decide or

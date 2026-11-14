@@ -17,6 +17,19 @@ them: lane journals, handoffs and recall. No agent has to carry another agent's 
   `recall lane=<id>`, so nothing is lost when an agent ends.
 - **Never resume an agent past its handoff.** Start a fresh one from the handoff. A short reply to an agent
   that is mid-task and below its handoff point is fine.
+- **Declare a lane** before its first launch: a `brief` journal entry in the lane with Kind, Lane, Priority and
+  Uses lines, the same lines the launch prompt carries (see the brief, step 2). For example:
+
+  ```text
+  Kind: builder
+  Lane: FEATURE-1
+  Priority: normal
+  Uses: compile, worktree:feature-1
+  ```
+
+  Kind stays a property of each launch: the same lane later runs reviewers with `Kind: reviewer` and
+  `Uses: read-only`. A builder launched with no `Lane:` line is let through, and atlas reminds you to declare
+  its lane.
 
 ## Kinds and caps
 
@@ -26,8 +39,10 @@ Every agent has a kind:
 - **reviewer** reads and reviews, and does not build;
 - **research** researches or designs, and does not build.
 
-With agent caps on (`atlas settings orchestrate` asks for them), atlas denies a launch past its kind's cap. The defaults
-are 2 builders, 2 reviewers and 1 research agent. When a launch is denied, do not retry it: atlas queues it (the
+With agent caps on (`atlas settings orchestrate` asks for them), atlas denies a launch past its kind's cap. Setup
+derives the caps from the machine unless you answer them: compile slots of one per 16 hardware threads (at least
+1, at most 4) and 1 gpu slot, then builders equal to the compile slots, as many reviewers, and half as many
+research agents (at least 1). A configured value always wins. When a launch is denied, do not retry it: atlas queues it (the
 reason names its key), and a task-notification lists what waits when an agent finishes. Then launch the next one
 whose kind has a free slot, with the same description and brief (`recall KEY` reads it); that removes it from
 the queue. `atlas queue` lists the queue, and `atlas queue drop KEY` removes a launch you no longer want.
@@ -43,8 +58,11 @@ Keep it lean. A brief is a work order, not a copy of the rulebook.
 1. **Who and what:** the lane id, the goal in one or two sentences, and the deliverable (a branch, a PR, or a
    report).
 2. **`Kind: builder`** (or `reviewer`, or `research`), and the work queue's lines: `Lane: <id>`, `Priority: urgent`,
-   `normal` or `background`, and `Uses:` with the shared resources it needs (`gpu`, `compile`, `blender`,
-   `worktree:<name>`) or `read-only` for an agent that shares its lane. atlas schedules on declared lines;
+   `normal` or `background`, and `Uses:` with the exclusive resources it needs (`gpu`, `compile`,
+   `worktree:<name>`, one port or database such as `sqlport 15126`) or `read-only` for an agent that shares its
+   lane. Never list repositories: each agent works in its own worktree. Only `gpu`, `compile`, `worktree:*` and
+   the resources the configuration lists can hold a launch back; any other word (`blender`, unless it is
+   configured) only adds a note when a running agent uses it too. atlas schedules on declared lines;
    it only warns on what it infers. A planned item's brief adds `Queue: <key>` so its launch takes it off the queue.
 3. **The rulings that apply,** named by their recall key, a heading or a line hint, never pasted whole. "Read
    the whole rulebook" costs tens of thousands of tokens before any work starts. The agent pulls exactly what it
@@ -57,8 +75,8 @@ Keep it lean. A brief is a work order, not a copy of the rulebook.
    first lines, then the numbers, every open question under a `## Questions` heading, and every risk (a denied
    action, an unverified claim, a failure left open). File anything longer (the full notes, tables, logs) as a
    journal entry and cite its key. The report stays in the orchestrator's context for every later turn, so a
-   line that changes nothing it does is a cost. A report over 14,000 bytes is sent back once: atlas files it
-   whole and asks for the digest form, with a draft.
+   line that changes nothing it does is a cost. A report over 28,000 bytes is sent back once: atlas files it
+   whole and asks for the digest form.
 
 ## Context limits
 

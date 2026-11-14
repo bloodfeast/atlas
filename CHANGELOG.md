@@ -10,6 +10,131 @@ wiki's Changelog page. A section has these parts, in this order, and leaves out 
 
 `cargo xtask release` refuses to release a version whose section is missing, empty or has no highlights.
 
+## v0.5.0
+
+### Highlights
+
+- **`atlas backlog` combs the backlog for ruled work that fell out of the queue.** It reads the queue, its marks,
+  briefs, commits, rulings and the user's own words from the memory store, and lists the placed items that are not
+  live (no brief or commit within 7 days, no running agent) and not done: aging items (asked again, their
+  written-order turn came, or placed over 14 days ago, shown with their days), then waiting items, each with its reason
+  and the ruling keys behind it. It only proposes: the written order is never changed. `--as-of TIME` replays any
+  past day, `--json` prints rows, `--all` adds ruled IDs never placed, and `atlas backlog dismiss ID --because KEY`
+  silences a false flag for good.
+- **The prompt hook points to less, and never to the same record twice in a session.** A record pointed to once
+  is not pointed to again in that session, now also after a server restart or a compaction and under a command
+  hook (one process per event): the session's earlier injections are read back from the `hook_inject` log. A
+  main-session prompt gets at most 2 pointers (`recall.prompt_pointers`), the rest counted on the `+N more` line,
+  and a subagent whose brief names its own lane gets that lane's journal and no pointers beside it. On the memory
+  eval's 70 hook questions the injected tokens fall 22% at floor 0 (6,369 to 4,958) and 17% at 0.663 (5,654 to
+  4,693), for 2 informed passes and 1 strict pass fewer at floor 0 (61 and 52 of 70) and 1 informed fewer at 0.663;
+  recall through the tool is unchanged (100/100, facts 176/176). `"recall": {"prompt_pointers": 0}` removes the cap.
+
+### Upgrade notes
+
+- **A fresh install now recalls within 600 tokens at a 0.53 cosine floor.** A configuration with no
+  `recall.budget_tokens` or `recall.cos_floor` now gets 600 tokens and 0.53 (was 150 and 0.57), the lowest floor
+  that passes the cos_floor sweep on the off-topic set and the 303-prompt hook replay (same frozen store), both
+  arms with `recall.prompt_pointers` at 2, the shipped cap. On the replay that is 1 more strict pass (179 against
+  178), 1 more informed (200 against 199) and 50.3 injected tokens per prompt against 49.9; recall through the tool
+  is unchanged. On the 30 off-topic prompts, 2 of 30 (6.7%) get a record, 3 records in all, the same as 0.57 at
+  150 tokens, and lane off-topic is 0.03 per prompt on both. Off-topic passing is measured only on that 30-prompt
+  set. `"recall": {"budget_tokens": 150, "cos_floor": 0.57}` keeps the old behaviour.
+- **The compaction features are on by default** (`compact.enabled` was false). Before Claude Code compacts, the
+  PreCompact hook checkpoints the segment and returns instructions for the summary (cite atlas keys, write
+  deltas), which steers every compaction summary; after it, SessionStart injects a card of about 400 tokens naming
+  the segment's parts by key, and `recall` accepts the card's chain keys. Nothing is written into your project's
+  files (the `CLAUDE.md` block stays an explicit `atlas settings compact-md`). Measured on a 117 MB recorded session:
+  PreCompact 179 ms and the card 56 ms median per compaction (15 ms each with compaction off), and about 8 KB of
+  store per checkpoint (16 checkpoints on a fresh store). It also records which lookups are repeated after a
+  compaction (`compact_miss`, redacted targets and shell signatures), at one `stat` per Read, Grep and Glob in
+  PreToolUse: a median of about 40 us per call in-process (p95 under 65 us), against under 1 us with it off.
+  What a user with no `CLAUDE.md` block and a bare `/compact` gets from the steering has not been measured live. `atlas settings off compact`, or `"compact": {"enabled": false}`, turns it off.
+- **Building from source needs Rust 1.99.0** (was the latest stable). `rust-toolchain.toml` pins it, and rustup
+  installs it on the first `cargo` call.
+- **`memory.rules: false` is now the same as unset.** Before, `false` also stopped the sync and query recall of the
+  memory folders and rule files your configuration names by hand (`memory_dir`, `intent`); now they keep syncing and
+  are recalled as with the key unset. To keep the old behaviour, set `"memory": {"rules": "off"}` (or run
+  `atlas settings set memory-rules off`): the store is kept either way. `atlas settings off memory-rules` still
+  removes the key.
+
+### Features
+
+- **A task judge for agent launches (experimental, off by default; #156, #161).** The `judge_task` tool (note op
+  `judge`) gives the model and effort pick for a launch prompt from a cells file, as a `Judge:` line to paste. With
+  `orchestrate.judge.enabled` the PreToolUse hook adds the same pick as one advisory context line at an admitted
+  Agent launch, and `orchestrate.judge.classifier.enabled` adds a work classifier's pick. It is advisory only: it
+  never denies or rewrites a launch. Both switches default to false; every key is under `orchestrate.judge.*` (see
+  the wiki's Configuration reference).
+- **A new orchestrated install declares starter resources and agent caps** (#148). On yes, setup (`atlas --setup`,
+  `atlas settings orchestrate`, `--yes`) writes the keys you did not answer and the configuration does not set,
+  derived from the machine: `orchestrate.resources.compile` max(1, hardware threads / 16), at most 4;
+  `orchestrate.resources.gpu` 1 (a lock, no device is assigned or probed); builders the compile slots (at least 1),
+  reviewers the builders, research max(1, builders / 2), each clamped to Claude Code's own limit
+  (`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`, 20 by default). New `--compile` and `--gpu` flags and settings items
+  `resources-compile` and `resources-gpu` (0 never serializes) are asked first, so the caps follow them. The
+  handoff point and hard limit are not written. An install that never ran setup keeps the code defaults (gpu 1,
+  compile 1, caps 2, 2 and 1). With orchestrated mode on, a builder launched with no `Lane:` line is let through
+  with one context line asking to declare its lane. See the wiki's Orchestration page.
+- **A brief writer is its own kind with its own cap, uncapped by default.** `Kind: brief-writer` (or `brief writer`)
+  and the agent type `brief-writer` now classify a launch, so writing briefs no longer falls back to a builder and
+  takes a builder slot. `orchestrate.kinds.brief-writer.max` caps it; with none set only Claude Code's own limit
+  applies, and setup writes no starter for it.
+
+### Fixes
+
+- **Only real limits on a `Uses:` line hold a launch back** (#150). Before, every word on the line was a
+  one-holder lock, so builders that named the same repositories ran one at a time, each in its own worktree.
+  Now only `gpu`, `compile`, `worktree:NAME` and the resources your configuration lists can deny or queue a
+  launch; any other word lets it through with a note naming what it shares. `sqlport 15126` is read as one
+  resource, `sqlport:15126`, so a `sqlport` entry in the configuration limits each port on its own.
+- **A queued launch leaves the queue when its lane starts under a reworded brief** (#150). A launch with the same
+  `Lane:` and kind takes the oldest such waiting launch off the queue and names it, so `atlas queue next` stops
+  proposing work that already runs.
+- **A brief that mentions screenshots no longer claims the gpu** (#150). The bare words capture, screenshot,
+  bench, benchmark and bake now infer gpu only in a project whose `atlas.project.json` sets
+  `"orchestrate": {"bare_gpu_words": true}`. Phrases that always mean the gpu (a GPU lock or timing, a frame
+  capture, CUDA, Vulkan) still count everywhere.
+- **A prompt after a store write no longer reloads every record vector.** Any commit (a journal entry from another
+  agent, the background embedder) made the next prompt re-read all record vectors; now only records whose current
+  version changed, or that have no vector yet, are read. No record vector is re-read after a commit that changes no
+  record: on a 1,604-record store, a prompt after a journal entry reads none of the 1,604 (`cargo xtask hook-bench`).
+- **Every atlas server now loads the record vectors at start.** The background warm-up, which loaded the model, now
+  also reads every record vector, so the first prompt does not. Every server pays it, one that never gets a hook
+  included: the CPU time of one full vector read, and dim x 4 x N bytes resident (2,463,744 bytes for 1,604 records
+  at 384 dimensions).
+- **A command hook on a recalling event is said once a session.** `atlas doctor` says when UserPromptSubmit or
+  SubagentStart is a command hook (`atlas --hook`): each prompt then starts a new process that reloads the model and
+  record vectors. A session hears it once: at its first prompt when UserPromptSubmit is the mcp_tool hook, otherwise
+  at SessionStart (a new or cleared session), since with a command hook every prompt is a new process.
+- **A subagent's report no longer pulls in whole lane views.** A prompt carrying an `<agent-message` frame (a
+  hand-back or another session's message) was recalled like a question you typed: every lane it named got its full
+  view, with the handoff, decisions and measurements, plus recall pointers. Now each lane the report itself names (not
+  the harness's frame around it) gets one line, `lane X: N entries, handoff NNN <title>, K open; recall lane=X`, and
+  a report that names no lane gets nothing; a task notification is unchanged. On a real hand-back that named one
+  lane, the hook's added context fell from 10,496 bytes to 122.
+- **The report backstop sends back only reports over 28,000 bytes, and without a draft** (0045). It fired past
+  14,000 bytes and attached atlas's mechanical draft, which the agent then had in its context as well as its own
+  report. Now a report up to twice the 14,000-byte bound passes, and the one sent back gets the rewrite
+  instruction alone (the report is still filed whole first).
+- **The report digest keeps a section's options and stays within its budget** (0045). A short line ending in a
+  colon (`Options:`) inside a `## Questions` section ended the section, so the options under it could be dropped;
+  now only a Markdown or bold heading does. Lines the classifier does not recognise were never kept; they now fill
+  whatever room is left. The gap marks and closing line now count toward the budget.
+- **Calibration counts fewer non-lookups** (0045). A folder above a project root counts as harmless only as a `cd`
+  target; `grep -r x R:/work notes.md` no longer counts as a lookup. A Grep glob counts as Markdown-only when every
+  alternative of its braces ends in `.md` (`*.{md}` yes; `*.mdx` and `*.{md,rs}` no). `cargo xtask
+  calibrate-baseline` needs `--project` for a configuration with projects, instead of choosing by the folder it is
+  run from. The lookup rules are now version 3, so atlas recalibrates itself once on the new rules.
+- **An agent of type `builder`, `reviewer` or `research` counts as that kind.** A launch with one of these
+  subagent_types and no `Kind:` line fell to the worktree rule or `orchestrate.default_kind` (builder); the built-in
+  agent-type map now gives each its kind. A `Kind:` line and your own `orchestrate.types` still win.
+
+### Known limits
+
+- The aging marker is shown with its days only; it is not a call to pull work forward (only 2 of 21 (10%) read
+  as overdue; 18 read as waiting behind a written order or ruling).
+
 ## v0.4.0
 
 ### Highlights

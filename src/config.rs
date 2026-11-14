@@ -284,8 +284,9 @@ pub struct MemorySpec {
     /// `crate::resume`).
     pub resume_card: Option<bool>,
     /// Experimental, off by default: whether atlas manages the memory folder and rule files (see
-    /// `crate::memory::rules::Mode`): unset keeps what is configured by hand.
-    pub rules: Option<bool>,
+    /// `crate::memory::rules::Mode`): unset or `false` keeps what is configured by
+    /// hand, `true` is `Live`, `"off"` is `Off`.
+    pub rules: Option<crate::memory::rules::Mode>,
     /// Idea capture and its surfaces (`memory.ideas`; see `crate::ideas`).
     pub ideas: Option<crate::ideas::IdeaSettings>,
     /// The memory index as a tree (see `crate::memory::tree`); `None` keeps
@@ -370,6 +371,8 @@ pub struct RecallSpec {
     pub hybrid_fts_floor: Option<f64>,
     /// The tokens one session's recall injections may use in all (0: no cap).
     pub session_budget_tokens: Option<usize>,
+    /// The most pointers one main-session prompt gets (0: no cap).
+    pub prompt_pointers: Option<usize>,
     /// The cosine below which a hook injects nothing (tuned on hit data).
     pub inject_floor: Option<f64>,
     /// Whether `recall {query}` pointers carry their source anchor.
@@ -409,9 +412,9 @@ pub struct CapSpec {
 /// The compaction settings (`docs/design/compaction.md`).
 #[derive(Debug, Clone, Default)]
 pub struct CompactSpec {
-    /// Turn on the experimental compaction features: the PreCompact
-    /// checkpoint, the SessionStart(compact) card and ref report, `atlas
-    /// settings compact-md` and `defer` (default false).
+    /// The compaction features: the PreCompact checkpoint, the
+    /// SessionStart(compact) card and ref report, `atlas settings
+    /// compact-md` and `defer` (default true; false turns them off).
     pub enabled: Option<bool>,
     /// Block a proactive automatic compaction while a tool chain is running,
     /// up to a hard ceiling (default false).
@@ -478,6 +481,9 @@ pub struct Config {
     /// The `lean` section, passed through unparsed: each package reads its
     /// own subsection (`handles`, `digests`, `routing`; `setup`, `startup`).
     pub lean: Option<Value>,
+    /// The `backlog` section, passed through unparsed: `atlas backlog`
+    /// reads its weights and cue lists (see [`crate::backlog::Settings`]).
+    pub backlog: Option<Value>,
     /// The projects, the user-level layer and the checkout map (see
     /// [`crate::project`]). Empty in a configuration without `projects`:
     /// the whole file is then one implicit project, as before projects.
@@ -487,7 +493,7 @@ pub struct Config {
 /// The keys of the configuration file's top level that are not about
 /// projects.
 pub const TOP_KEYS: &[&str] =
-    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "orchestrate", "models", "update", "lean", "calibrate"];
+    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "orchestrate", "models", "update", "lean", "calibrate", "backlog"];
 
 pub(crate) fn absolute(base: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -569,6 +575,64 @@ impl<'a> Fields<'a> {
     }
 }
 
+/// Reads `orchestrate.judge.classifier` (see [`crate::taskjudge::ClassifierSettings`]).
+fn parse_classifier(v: &Value) -> Result<crate::taskjudge::ClassifierSettings> {
+    use crate::taskjudge::{parse_pick, ClassifierSettings, Override, ScoreSource, SCORES};
+    const PICK: &str = "a \"model/effort\" string (haiku, sonnet, opus or fable; low, medium, high, xhigh or max)";
+    let f = Fields::new("orchestrate.judge.classifier", v, &["enabled", "weights", "weights_sha256", "source", "map", "overrides"])?;
+    let mut c = ClassifierSettings {
+        enabled: f.boolean("enabled")?.unwrap_or(false),
+        weights: f.string("weights")?.map(PathBuf::from),
+        weights_sha256: f.string("weights_sha256")?,
+        ..ClassifierSettings::default()
+    };
+    c.source = match f.string("source")?.as_deref() {
+        None | Some("kind") => ScoreSource::Kind,
+        Some("head") => ScoreSource::Head,
+        Some(_) => return Err(f.bad("source", "\"head\" or \"kind\"")),
+    };
+    if let Some(mv) = f.get("map") {
+        let keys: Vec<String> = (0..SCORES).map(|s| s.to_string()).collect();
+        let known: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let m = Fields::new("orchestrate.judge.classifier.map", mv, &known)?;
+        for (s, k) in keys.iter().enumerate() {
+            if let Some(p) = m.string(k)? {
+                c.map.base[s] = parse_pick(&p).ok_or_else(|| m.bad(k, PICK))?;
+            }
+        }
+    }
+    if let Some(ov) = f.get("overrides") {
+        let g = Fields::new("orchestrate.judge.classifier.overrides", ov, &["research", "builder"])?;
+        let one = |h: Fields<'_>| -> Result<Override> {
+            let pick = h.string("pick")?.ok_or_else(|| h.bad("pick", PICK))?;
+            Ok(Override {
+                enabled: h.boolean("enabled")?.unwrap_or(false),
+                max_score: h.uint("max_score")?.ok_or_else(|| h.bad("max_score", "a score 0 to 5"))?.min(SCORES - 1),
+                pick: parse_pick(&pick).ok_or_else(|| h.bad("pick", PICK))?,
+            })
+        };
+        if g.map.contains_key("research") {
+            c.map.research = match g.get("research") {
+                None => None,
+                Some(x) => {
+                    let h = Fields::new("orchestrate.judge.classifier.overrides.research", x, &["enabled", "max_score", "pick"])?;
+                    Some(one(h)?)
+                }
+            };
+        }
+        if g.map.contains_key("builder") {
+            c.map.builder = match g.get("builder") {
+                None => None,
+                Some(x) => {
+                    let h = Fields::new("orchestrate.judge.classifier.overrides.builder", x, &["enabled", "max_score", "pick"])?;
+                    Some(one(h)?)
+                }
+            };
+        }
+    }
+    Ok(c)
+}
+
 /// Reads the `orchestrate` section; an unknown kind, mode or choice is an
 /// error, so the hook never meets one.
 fn parse_orchestrate(v: &Value) -> Result<crate::orchestrate::OrchestrateSpec> {
@@ -579,10 +643,10 @@ fn parse_orchestrate(v: &Value) -> Result<crate::orchestrate::OrchestrateSpec> {
             Some(s) => parse(&s).map(Some).ok_or_else(|| f.bad(k, what)),
         }
     }
-    const KINDS: &str = "builder, reviewer, research or none";
+    const KINDS: &str = "builder, reviewer, research, brief-writer or none";
     const MODES: &str = "enforced, advisory or off";
     const FRESH: &str = "auto or ask";
-    let f = Fields::new("orchestrate", v, &["enabled", "window", "stale_minutes", "default_kind", "mode", "fresh", "types", "kinds", "resources", "aging_minutes", "reviews"])?;
+    let f = Fields::new("orchestrate", v, &["enabled", "window", "stale_minutes", "default_kind", "mode", "fresh", "types", "kinds", "resources", "aging_minutes", "bare_gpu_words", "reviews", "judge"])?;
     let mut o = OrchestrateSpec {
         enabled: f.boolean("enabled")?,
         window: f.uint("window")?,
@@ -591,6 +655,7 @@ fn parse_orchestrate(v: &Value) -> Result<crate::orchestrate::OrchestrateSpec> {
         mode: named(&f, "mode", Mode::parse, MODES)?,
         fresh: named(&f, "fresh", Fresh::parse, FRESH)?,
         aging_minutes: f.uint("aging_minutes")?,
+        bare_gpu_words: f.boolean("bare_gpu_words")?,
         ..OrchestrateSpec::default()
     };
     if let Some(rv) = f.get("resources") {
@@ -598,6 +663,14 @@ fn parse_orchestrate(v: &Value) -> Result<crate::orchestrate::OrchestrateSpec> {
         for (n, c) in m.iter() {
             let c = c.as_u64().ok_or_else(|| Error::InvalidArgument(format!("orchestrate.resources.{n} must be a whole number (0: never serialize)")))?;
             o.resources.push((n.to_ascii_lowercase(), c as usize));
+        }
+    }
+    if let Some(jv) = f.get("judge") {
+        let g = Fields::new("orchestrate.judge", jv, &["enabled", "cells", "classifier"])?;
+        o.judge_enabled = g.boolean("enabled")?;
+        o.judge_cells = g.string("cells")?.map(PathBuf::from);
+        if let Some(cv) = g.get("classifier") {
+            o.judge_classifier = parse_classifier(cv)?;
         }
     }
     if let Some(rv) = f.get("reviews") {
@@ -613,13 +686,18 @@ fn parse_orchestrate(v: &Value) -> Result<crate::orchestrate::OrchestrateSpec> {
         }
     }
     if let Some(kv) = f.get("kinds") {
-        let kf = Fields::new("orchestrate.kinds", kv, &["builder", "reviewer", "research"])?;
-        for kind in [Kind::Builder, Kind::Reviewer, Kind::Research] {
+        let kf = Fields::new("orchestrate.kinds", kv, &["builder", "reviewer", "research", "brief-writer"])?;
+        for kind in [Kind::Builder, Kind::Reviewer, Kind::Research, Kind::BriefWriter] {
             let Some(x) = kf.get(kind.name()) else { continue };
             // Each label is written out, so the docs test reads every key.
             let g = match kind {
                 Kind::Builder => Fields::new("orchestrate.kinds.builder", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
                 Kind::Reviewer => Fields::new("orchestrate.kinds.reviewer", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
+                Kind::BriefWriter => Fields::new(
+                    "orchestrate.kinds.brief-writer",
+                    x,
+                    &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"],
+                )?,
                 _ => Fields::new("orchestrate.kinds.research", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
             };
             let pct = g.uint("handoff_pct")?;
@@ -906,7 +984,13 @@ impl Config {
                 brief_reference: f.string("brief_reference")?.map(|p| absolute(base, Path::new(&p))),
                 transcripts: f.boolean("transcripts")?,
                 resume_card: f.boolean("resume_card")?,
-                rules: f.boolean("rules")?,
+                rules: match f.get("rules") {
+                    None => None,
+                    Some(Value::Bool(true)) => Some(crate::memory::rules::Mode::Live),
+                    Some(Value::Bool(false)) => Some(crate::memory::rules::Mode::Today),
+                    Some(Value::String(s)) if s == "off" => Some(crate::memory::rules::Mode::Off),
+                    Some(_) => return Err(f.bad("rules", "true, false or \"off\"")),
+                },
                 ..MemorySpec::default()
             };
             if let Some(iv) = mv.get("ideas") {
@@ -964,7 +1048,7 @@ impl Config {
             c.memory = Some(m);
         }
         if let Some(rv) = top.get("recall") {
-            let f = Fields::new("recall", rv, &["budget_tokens", "lane_budget_tokens", "fts_floor", "min_terms", "cos_floor", "cos_alone", "query_tokens", "hybrid_fts_floor", "inject_floor", "session_budget_tokens", "pointer_anchors", "select"])?;
+            let f = Fields::new("recall", rv, &["budget_tokens", "lane_budget_tokens", "fts_floor", "min_terms", "cos_floor", "cos_alone", "query_tokens", "hybrid_fts_floor", "inject_floor", "session_budget_tokens", "prompt_pointers", "pointer_anchors", "select"])?;
             let num = |k: &str| -> Result<Option<f64>> {
                 match f.get(k) {
                     None => Ok(None),
@@ -982,6 +1066,7 @@ impl Config {
                 hybrid_fts_floor: num("hybrid_fts_floor")?,
                 inject_floor: num("inject_floor")?,
                 session_budget_tokens: f.uint("session_budget_tokens")?,
+                prompt_pointers: f.uint("prompt_pointers")?,
                 pointer_anchors: f.boolean("pointer_anchors")?,
                 select: match f.get("select") {
                     None => None,
@@ -1019,6 +1104,10 @@ impl Config {
                 return Err(top.bad("lean", "an object"));
             }
             c.lean = Some(lv.clone());
+        }
+        if let Some(bv) = top.get("backlog") {
+            crate::backlog::Settings::from_config(Some(bv)).map_err(Error::InvalidArgument)?;
+            c.backlog = Some(bv.clone());
         }
         let mut names: Vec<&str> = c
             .vaults
@@ -1115,6 +1204,19 @@ mod tests {
         assert_eq!(o.types, vec![("critic".to_string(), Kind::Reviewer)]);
         assert_eq!(o.kinds[0].0, Kind::Builder);
         assert_eq!((o.kinds[0].1.max, o.kinds[0].1.handoff_pct, o.kinds[0].1.fresh), (Some(3), Some(60), Some(Fresh::Ask)));
+    }
+
+    #[test]
+    fn a_brief_writer_cap_is_its_own_kind() {
+        use crate::orchestrate::{Kind, Mode};
+        let c = Config::parse(r#"{"orchestrate": {"default_kind": "brief-writer", "types": {"scribe": "brief writer"}, "kinds": {"brief-writer": {"max": 0, "mode": "off"}, "research": {"max": 4}}}}"#, Path::new(".")).unwrap();
+        let o = c.orchestrate.unwrap();
+        assert_eq!(o.default_kind, Some(Kind::BriefWriter));
+        assert_eq!(o.types, vec![("scribe".to_string(), Kind::BriefWriter)]);
+        let of = |k: Kind| o.kinds.iter().find(|(x, _)| *x == k).map(|(_, s)| s.clone()).unwrap();
+        assert_eq!((of(Kind::BriefWriter).max, of(Kind::BriefWriter).mode), (Some(0), Some(Mode::Off)));
+        assert_eq!(of(Kind::Research).max, Some(4));
+        assert!(Config::parse(r#"{"orchestrate": {"kinds": {"brief-writer": {"cap": 1}}}}"#, Path::new(".")).is_err());
     }
 
     #[test]

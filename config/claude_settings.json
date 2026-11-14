@@ -71,6 +71,19 @@
       "default_note": "atlas default: no pin (latest release)"
     },
     {
+      "id": "compact",
+      "kind": "atlas",
+      "key": "compact.enabled",
+      "type": "bool",
+      "value": true,
+      "short": "compaction card",
+      "title": "Checkpoint before a compaction and inject a card after it",
+      "what": "Before Claude Code compacts a conversation, the PreCompact hook checkpoints the segment and returns instructions for the summary (cite atlas keys, write deltas). After the compaction, SessionStart injects a card of about 400 tokens naming every part of the segment by a key one recall returns. Nothing is written into your project's files; the CLAUDE.md block stays an explicit atlas settings compact-md.",
+      "cost": "Every compaction summary is steered by the instructions. On a 117 MB recorded session, PreCompact took a median 179 ms and the card 56 ms per compaction (15 ms each with compaction off), and each compaction adds a row and a checkpoint to atlas's store. It also records which lookups are repeated after a compaction (redacted targets and shell signatures), at one stat per Read, Grep and Glob.",
+      "basis": "Measured with xtask hook-time on a recorded session (machine not quiet); what a user with no CLAUDE.md block and a bare /compact gets is not separately measured.",
+      "default_note": "atlas default: on"
+    },
+    {
       "id": "orchestrate",
       "kind": "atlas",
       "key": "orchestrate.enabled",
@@ -89,11 +102,11 @@
       "type": "bool",
       "short": "memory and rules",
       "title": "Experimental, off by default: manage the memory folder and rule files",
-      "what": "atlas finds the project's Claude Code memory folder and root CLAUDE.md and keeps them in its store. A query that hits a replaced ruling answers with the live one, tagged with what it replaces, and hook pointers on rules and memories are one-line headlines. Never asked: turn it on with atlas settings set memory-rules true. atlas settings off memory-rules removes the key, back to unset. Setting false is not the same as unset: it also stops sync and query recall of the memory and rule files the configuration names by hand, and keeps the store. See https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files.",
+      "what": "atlas finds the project's Claude Code memory folder and root CLAUDE.md and keeps them in its store. A query that hits a replaced ruling answers with the live one, tagged with what it replaces, and hook pointers on rules and memories are one-line headlines. Never asked: turn it on with atlas settings set memory-rules true. atlas settings off memory-rules removes the key, back to unset; false is the same as unset. Setting off (atlas settings set memory-rules off, written as \"off\") also stops sync and query recall of the memory and rule files the configuration names by hand, and keeps the store. See https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files.",
       "cost": "Nothing in your files is rewritten. A headline holds less of a ruling, so an agent may need one more recall to read it. On a test set, not a promise: the 1.5x token bar was missed (hook 1.027x, query 0.921x, so a query costs more), memory-eval strict pass fell from 98 to 82 and tokens per question rose 13%.",
       "basis": "A 1,582-item rules file: a reversal word finds most reversals, and only about 1 in 12 names the record it reverses, so the rest are asked (atlas rules sitting).",
-      "default_note": "atlas default: unset, what the configuration names by hand stays as it is",
-      "warn": {"true": "experimental: known limits are listed at https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files.", "false": "false is not unset: it also stops sync and query recall of the memory and rule files the configuration names by hand. atlas settings off memory-rules returns to unset."}
+      "default_note": "atlas default: unset (false reads the same), what the configuration names by hand stays as it is",
+      "warn": {"true": "experimental: known limits are listed at https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files.", "false": "false is the same as unset: what the configuration names by hand is still synced and recalled. To stop that too: atlas settings set memory-rules off.", "off": "off is not unset: it also stops sync and query recall of the memory and rule files the configuration names by hand, and keeps the store. atlas settings off memory-rules returns to unset."}
     },
     {
       "id": "agents-builders",
@@ -104,8 +117,8 @@
       "title": "Builders at once",
       "what": "How many agents that write and compile code may run at once while agent caps are on. Clamped to Claude Code's own limit (CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS, 20 by default). 0 launches none.",
       "cost": "Higher runs more compiles at once: faster queues, a busier machine.",
-      "basis": "Two builders left the machine quiet often enough for clean measurements.",
-      "default_note": "atlas default: 2"
+      "basis": "Setup's starter is the compile slots (at least 1), clamped to Claude Code's limit: builders are what compile. An install that never ran setup gets 2.",
+      "default_note": "atlas default: 2; setup writes the compile slots"
     },
     {
       "id": "agents-reviewers",
@@ -116,8 +129,8 @@
       "title": "Reviewers at once",
       "what": "How many read-only review agents may run at once while agent caps are on. Clamped to Claude Code's own limit. 0 launches none.",
       "cost": "Higher spends more tokens at once on reviews.",
-      "basis": "The same practice as the builder cap: two reviewers and one research agent beside two builders.",
-      "default_note": "atlas default: 2"
+      "basis": "Setup's starter is the builder cap: one review beside each build. An install that never ran setup gets 2.",
+      "default_note": "atlas default: 2; setup writes the builder cap"
     },
     {
       "id": "agents-research",
@@ -128,8 +141,8 @@
       "title": "Research and design agents at once",
       "what": "How many research or design agents may run at once while agent caps are on (Claude Code's Explore and Plan agents count here). Clamped to Claude Code's own limit. 0 launches none.",
       "cost": "Higher allows wider fan-outs of searches.",
-      "basis": "The same practice as the builder cap: two reviewers and one research agent beside two builders.",
-      "default_note": "atlas default: 1"
+      "basis": "Setup's starter is half the builder cap, at least 1. An install that never ran setup gets 1.",
+      "default_note": "atlas default: 1; setup writes max(1, builders / 2)"
     },
     {
       "id": "context-mode",
@@ -166,6 +179,30 @@
       "cost": "Lower hands off sooner: more fresh agents, each cheaper per turn.",
       "basis": "Agents told to wrap up from about 285k on a 1M window handed off with room left to finish their current step.",
       "default_note": "atlas default: 285,000 scaled to the context window"
+    },
+    {
+      "id": "resources-compile",
+      "kind": "atlas",
+      "key": "orchestrate.resources.compile",
+      "range": {"min": 0, "max": 64, "integer": true},
+      "short": "compile slots",
+      "title": "Heavy compiles at once",
+      "what": "How many queued launches that declare Uses: compile may hold the compile resource at once while agent caps are on. 0 never serializes compiles. Setup's builder cap follows it.",
+      "cost": "Higher runs more compiles at once: a busier machine, and on a small one memory pressure and resets.",
+      "basis": "Setup's starter is one slot per 16 hardware threads, at least 1, at most 4: a 16-thread machine gets 1, a 32-thread machine 2. An install that never ran setup gets 1.",
+      "default_note": "atlas default: 1; setup writes max(1, threads / 16), at most 4"
+    },
+    {
+      "id": "resources-gpu",
+      "kind": "atlas",
+      "key": "orchestrate.resources.gpu",
+      "range": {"min": 0, "max": 64, "integer": true},
+      "short": "gpu slots",
+      "title": "GPU runs at once",
+      "what": "How many queued launches that declare Uses: gpu may hold the gpu resource at once while agent caps are on. 0 never serializes GPU runs.",
+      "cost": "Higher lets GPU runs overlap, so their timings disturb each other.",
+      "basis": "gpu is a lock and atlas assigns no device, so a second holder on a two-GPU machine would still land on device 0. Setup writes 1 and probes nothing.",
+      "default_note": "atlas default: 1"
     }
   ]
 }

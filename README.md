@@ -72,7 +72,7 @@ update` turns them off). Building from source, uninstalling and the data folders
 
 3. Open a session in your project. Claude asks you about atlas: *create a vault for this project at
    `<path>`? yes / other folder / no*, and, unless `atlas --setup` asked already, whether to work in orchestrated mode (caps on how many
-   agents run at once; no is fine). It may also offer Claude Code settings. Say yes to the first: its Markdown becomes a searchable source, a folder holding code becomes
+   agents run at once; no is fine; on yes the caps and compile slots start from this machine's cores, see the wiki's Orchestration page). It may also offer Claude Code settings. Say yes to the first: its Markdown becomes a searchable source, a folder holding code becomes
    a code root, and a new vault (an Obsidian-compatible folder) holds the project's notes and discussion threads.
    `atlas settings undo` reverts it all; it never deletes a note. A question you do not answer comes back at your
    next new session, until you answer it, and Claude may not always put it. A session with no user (`claude -p`, the
@@ -82,12 +82,13 @@ update` turns them off). Building from source, uninstalling and the data folders
    needs with `atlas slice h:ID --item NAME` or `--failures`. Grep and Read results name the enclosing item and
    its line range.
 5. Ask Claude to remember a decision (`remember`), and start the next session: relevant records are recalled
-   on each prompt, within a 150-token budget (`recall.budget_tokens`).
+   on each prompt, within a 600-token budget (`recall.budget_tokens`). The recall defaults (600 tokens, a 0.53
+   `recall.cos_floor`) were chosen by a sweep that measured off-topic records as well as on-topic recall.
 6. Optionally, `atlas settings offer` proposes the Claude Code settings that cut cost (the 1-hour subagent
    cache, fewer goal check-ins). Nothing is written without a yes, and `atlas settings undo` reverts (it shows the change and asks first;
    `--yes` without a terminal).
-   With the experimental compaction features on (`"compact": {"enabled": true}`, off by default),
-   `atlas settings compact-md` offers a Compact instructions block for a project's `CLAUDE.md` the same way.
+   With the compaction features on (the default; `"compact": {"enabled": false}` or `atlas settings off compact`
+   turns them off), `atlas settings compact-md` offers a Compact instructions block for a project's `CLAUDE.md` the same way.
 
 ## Projects
 
@@ -179,6 +180,7 @@ The wiki is the full manual:
 - [Memory store and hooks](https://github.com/bloodfeast/atlas/wiki/Memory-store-and-hooks): the store, exports, sync and the hooks
 - [Memory tree](https://github.com/bloodfeast/atlas/wiki/Memory-tree): the memory index as a tree
 - [Memory and rule files](https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files): experimental, off by default: what atlas does with your rules and memories once you turn it on, and how to turn it off
+- [Orchestration](https://github.com/bloodfeast/atlas/wiki/Orchestration): orchestrated mode: lanes, kinds and caps, starter resources
 - [Discussions](https://github.com/bloodfeast/atlas/wiki/Discussions): reviewer threads and the decision queue
 - [Generated indices](https://github.com/bloodfeast/atlas/wiki/Generated-indices): indices between markers
 - [Cross-vault links](https://github.com/bloodfeast/atlas/wiki/Cross-vault-links): links between vaults

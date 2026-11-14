@@ -528,8 +528,12 @@ fn the_answer_decides_what_a_project_syncs() {
     let (exports, sources) = names(r#""rules": true"#);
     assert_eq!(exports, ["claude-md", "intent", "memory"]);
     assert!(sources.iter().any(|s| s == "claude-md"));
-    // No: none of them, source or export.
+    // False: the same as unset.
     let (exports, sources) = names(r#""rules": false"#);
+    assert_eq!(exports, ["intent", "memory"]);
+    assert!(!sources.iter().any(|s| s == "claude-md"), "{sources:?}");
+    // Off: none of them, source or export.
+    let (exports, sources) = names(r#""rules": "off""#);
     assert!(exports.is_empty(), "{exports:?}");
     assert!(!sources.iter().any(|s| matches!(s.as_str(), "memory" | "intent" | "claude-md")), "{sources:?}");
 }
@@ -630,7 +634,7 @@ fn a_kept_ruling_survives_a_small_budget() {
     assert!(a.contains("rules:r00002"), "{a}");
 }
 
-/// `memory.rules: false` hides rules and memories from a query. They must not hold
+/// `memory.rules: "off"` hides rules and memories from a query. They must not hold
 /// the limit first, or the journal or decision ranked after them reads as no match.
 #[test]
 fn with_rules_off_what_is_hidden_does_not_use_up_the_limit() {
@@ -742,6 +746,63 @@ fn sync_under(root: &std::path::Path, rules: &str) -> Settings {
     s
 }
 
+/// `false` is the old unset: the rule file and memory folder named by hand keep
+/// syncing and are recalled. `"off"` is the old `false`: neither is synced or
+/// recalled, and the store keeps what it holds.
+#[test]
+fn false_keeps_what_is_named_by_hand_and_off_stops_it() {
+    let t = Temp::new("rules-false-off");
+    let root = t.path();
+    config_with(root, "");
+    let intent = root.join("repo").join("INTENT.md");
+    write(&intent, "- 2026-01-02 Alex: the wombat ledger rotates weekly.\n");
+    write(&root.join("mem").join("quokka-rule.md"), "---\nname: quokka-rule\nmetadata:\n  type: feedback\n  modified: 2026-01-07T10:00:00.000Z\n---\n\nThe quokka archive is pruned nightly.\n");
+    let hits = |s: &Settings, q: &str| query(s, root, atlas::json!({"query": q}));
+    // False: synced and recalled, as unset.
+    let s = sync_under(root, r#""rules": false"#);
+    assert_eq!(s.recall.rules, rules::Mode::Today);
+    assert_eq!(status(&MemoryStore::open(&s.store).unwrap(), "intent:r00001"), "active");
+    let a = hits(&s, "wombat ledger rotates");
+    assert!(a.contains("intent:r00001"), "{a}");
+    let a = hits(&s, "quokka archive pruned");
+    assert!(a.contains("quokka"), "{a}");
+    // A new line under false is synced too.
+    write(&intent, "- 2026-01-02 Alex: the wombat ledger rotates weekly.\n- 2026-01-03 Alex: the numbat queue drains daily.\n");
+    let s = sync_under(root, r#""rules": false"#);
+    let a = hits(&s, "numbat queue drains");
+    assert!(a.contains("intent:r00002"), "{a}");
+    // Off: no sync, no query recall, and the store is kept.
+    write(&intent, "- 2026-01-02 Alex: the wombat ledger rotates weekly.\n- 2026-01-03 Alex: the numbat queue drains daily.\n- 2026-01-04 Alex: the bilby cache is cold.\n");
+    let s = sync_under(root, r#""rules": "off""#);
+    assert_eq!(s.recall.rules, rules::Mode::Off);
+    let store = MemoryStore::open(&s.store).unwrap();
+    assert!(store.head("intent:r00003").unwrap().is_none());
+    assert_eq!(status(&store, "intent:r00001"), "active");
+    drop(store);
+    for q in ["wombat ledger rotates", "quokka archive pruned", "numbat queue drains"] {
+        let a = hits(&s, q);
+        assert!(!a.contains("intent:r0") && !a.contains("quokka"), "{q}: {a}");
+    }
+    let by_key = query(&s, root, atlas::json!({"key": "intent:r00001"}));
+    assert!(by_key.contains("wombat ledger"), "off keeps the store: {by_key}");
+    // Unset again: the sync resumes.
+    let s = sync_under(root, "");
+    assert_eq!(s.recall.rules, rules::Mode::Today);
+    assert_eq!(status(&MemoryStore::open(&s.store).unwrap(), "intent:r00003"), "active");
+}
+
+/// `memory.rules` takes true, false or "off", nothing else.
+#[test]
+fn memory_rules_takes_true_false_or_off() {
+    let t = Temp::new("rules-values");
+    let cfg = t.path().join("atlas.json");
+    for bad in [r#""rules": "on""#, r#""rules": "OFF""#, r#""rules": 0"#] {
+        write(&cfg, &format!(r#"{{"memory": {{{bad}}}, "watch": false}}"#));
+        let e = atlas::config::Config::load(&cfg).unwrap_err().to_string();
+        assert!(e.contains("memory.rules") && e.contains("\"off\""), "{bad}: {e}");
+    }
+}
+
 const THREE_RULES: &str = "- 2026-01-02 Alex: the widget cache is bounded.\n- 2026-01-03 Alex: the widget cache grows freely.\n- 2026-01-04 Alex: the gamma queue drains oldest first.\n";
 
 #[test]
@@ -776,8 +837,15 @@ fn the_setting_can_be_left_and_come_back_with_nothing_lost() {
     assert_eq!(status_of(&s, "intent:r00001"), "active");
     let a = query(&s, root, atlas::json!({"query": "gamma queue drains"}));
     assert!(a.contains("claude-md:r00003"), "{a}");
-    // False: nothing retires there either, and recall leaves the kind out.
+    // False: the same as unset; the stale record is still recalled.
     let s = sync_under(root, r#""rules": false"#);
+    assert_eq!(s.recall.rules, rules::Mode::Today);
+    assert_eq!(status_of(&s, "claude-md:r00003"), "active");
+    let a = query(&s, root, atlas::json!({"query": "gamma queue drains"}));
+    assert!(a.contains("claude-md:r00003"), "{a}");
+    // Off: nothing retires there either, and recall leaves the kind out.
+    let s = sync_under(root, r#""rules": "off""#);
+    assert_eq!(s.recall.rules, rules::Mode::Off);
     assert_eq!(status_of(&s, "claude-md:r00003"), "active");
     assert_eq!(status_of(&s, "intent:r00001"), "active");
     let a = query(&s, root, atlas::json!({"query": "gamma queue drains"}));

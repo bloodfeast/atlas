@@ -279,7 +279,7 @@ fn undo_refuses_when_a_newer_change_came_after_the_question() {
     let before_undo = {
         let mut out = Vec::new();
         let mut input = Answer(&h, false);
-        let code = run(&["undo".to_string()], &p, &mut Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false }).unwrap();
+        let code = run(&["undo".to_string()], &p, &mut Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false, machine: None }).unwrap();
         (code, String::from_utf8(out).unwrap())
     };
     assert_eq!(before_undo.0, std::process::ExitCode::FAILURE, "{}", before_undo.1);

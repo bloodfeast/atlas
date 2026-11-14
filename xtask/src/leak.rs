@@ -28,6 +28,25 @@
 //!    optional `+ . .. & ~`, an optional space and a quote are dropped, so
 //!    `"quill" + "feather"` reads `"quillfeather"`.
 //!
+//! # Whole-word terms
+//!
+//! A term matches anywhere, inside longer words too, unless the line right
+//! before it is exactly `#[word]` (white space around it trimmed): then it
+//! matches only where the characters on both sides of it, in the
+//! normalised text, are not word characters (or are the start or end).
+//! Word characters are letters and digits (Unicode) and `_`; `-` is not
+//! one, so a whole-word term is still caught in `x-term`, but not in
+//! `terms` or `x_term`. A term's own first and last characters may be
+//! anything: a whole-word term ending in `-` matches before a space or a
+//! quote, not before a letter.
+//!
+//! The marker is a comment line, so it can never be a term, every other
+//! reader of the list (the CI log masking, `src/redact.rs`, an older
+//! release) still reads the term below it as a plain term, and term numbers
+//! do not change. It applies to the very next line only: a blank or
+//! comment line after it spends it, leaving the term plain (the side that
+//! catches more), and `#[word] term` on one line is a comment.
+//!
 //! A hit is reported as `path:line:column (byte N): denylist term #K`, the
 //! line, column (in characters) and byte offset in the original file, or
 //! `path (path): denylist term #K` for a path; the term itself is never
@@ -126,21 +145,63 @@ pub struct Norm {
     pub at: Vec<usize>,
 }
 
+/// The line that marks the next line's term whole-word (see the module
+/// docs). A comment to every other reader of the denylist.
+pub const WHOLE_WORD: &str = "#[word]";
+
+/// A denylist term, normalised.
+pub struct Term {
+    /// Its number: the count of terms up to it, from 1.
+    pub num: usize,
+    /// The normalised term.
+    pub text: String,
+    /// Matches only between non-word characters ([`is_word`]).
+    pub whole_word: bool,
+}
+
+impl Term {
+    /// The first place of the term in normalised text at or after byte
+    /// `from` (a character boundary): any place for a plain term, the first
+    /// with a non-word character (or an end) on both sides for a
+    /// whole-word one.
+    pub fn find(&self, hay: &str, mut from: usize) -> Option<usize> {
+        while let Some(i) = hay[from..].find(self.text.as_str()) {
+            let p = from + i;
+            let end = p + self.text.len();
+            if !self.whole_word || (!hay[..p].chars().next_back().is_some_and(is_word) && !hay[end..].chars().next().is_some_and(is_word)) {
+                return Some(p);
+            }
+            from = p + hay[p..].chars().next().map_or(1, char::len_utf8);
+        }
+        None
+    }
+}
+
+/// A word character, for whole-word terms: a letter or digit (Unicode,
+/// after normalisation) or `_`. `-` is not one, so a whole-word term is
+/// still caught in a hyphenated compound (`x-term`), but not in an
+/// identifier (`x_term`) or a longer word.
+pub fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// The matcher: the Unicode tables and the normalised terms.
 pub struct Matcher<'a> {
     db: &'a Db,
-    /// (term number, normalised term).
-    terms: Vec<(usize, String)>,
+    terms: Vec<Term>,
 }
 
 impl<'a> Matcher<'a> {
     /// The matcher for a denylist's text: one term per line, trimmed;
-    /// blank lines and lines starting with `#` skipped. A term that
-    /// normalises to nothing keeps its number but matches nothing.
+    /// blank lines and lines starting with `#` skipped, and a [`WHOLE_WORD`]
+    /// line makes the term on the line right after it whole-word. A term
+    /// that normalises to nothing keeps its number but matches nothing.
     pub fn new(db: &'a Db, list: &str) -> Matcher<'a> {
         let mut m = Matcher { db, terms: Vec::new() };
         let mut n = 0;
+        let mut whole_word = false;
         for l in list.lines().map(|l| l.trim_matches(|c: char| c.is_whitespace())) {
+            let marked = std::mem::replace(&mut whole_word, l == WHOLE_WORD);
             if l.is_empty() || l.starts_with('#') {
                 continue;
             }
@@ -148,7 +209,7 @@ impl<'a> Matcher<'a> {
             let chars: Vec<(usize, char)> = l.char_indices().collect();
             let t = m.normalise(&chars).text.trim().to_string();
             if !t.is_empty() {
-                m.terms.push((n, t));
+                m.terms.push(Term { num: n, text: t, whole_word: marked });
             }
         }
         m.terms.shrink_to_fit();
@@ -160,11 +221,10 @@ impl<'a> Matcher<'a> {
         self.terms.len()
     }
 
-    /// The terms that can match: (term number, normalised term). For the
-    /// accepted-hits digests (`accept.rs`), which hash a term and never
-    /// print it.
+    /// The terms that can match. For the accepted-hits digests
+    /// (`accept.rs`), which hash a term and never print it.
     #[allow(dead_code, reason = "tests/leak_check.rs includes this file and does not use it")]
-    pub fn terms(&self) -> &[(usize, String)] {
+    pub fn terms(&self) -> &[Term] {
         &self.terms
     }
 
@@ -228,12 +288,13 @@ impl<'a> Matcher<'a> {
                     (r, n)
                 })
                 .collect();
-            for (k, t) in &self.terms {
-                let first = reads.iter().filter_map(|(r, n)| n.text.find(t.as_str()).map(|p| (n.at[p], r))).min_by_key(|(at, _)| *at);
+            for t in &self.terms {
+                let k = t.num;
+                let first = reads.iter().filter_map(|(r, n)| t.find(&n.text, 0).map(|p| (n.at[p], r))).min_by_key(|(at, _)| *at);
                 if let Some((at, r)) = first {
                     let (line, col) = line_col(r, at);
                     out.push(format!("{rel}:{line}:{col} (byte {at}): denylist term #{k}"));
-                } else if name.text.contains(t.as_str()) {
+                } else if t.find(&name.text, 0).is_some() {
                     out.push(format!("{rel} (path): denylist term #{k}"));
                 }
             }

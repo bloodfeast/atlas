@@ -20,17 +20,21 @@
 //!         prompt, from the tip of main only; release-pr replaces the
 //!         branch, so the open pull request's head moves and needs a new
 //!         approval. A run still going is watched, never dispatched again.
-//!     run 2 (the pull request open): refuses unless HEAD is on main and is
-//!         the commit run 1 dispatched (the state file, when there is one),
-//!         the pull request is the release app's, from release/vX.Y.Z into
-//!         main, titled `atlas vX.Y.Z`, approved by the owner on its head
-//!         commit with every check green, and HEAD holds what that head
-//!         holds (`same_code`); asks `merge vX.Y.Z`; squash-merges with the
-//!         head pinned and the public address; checks the addresses of the
-//!         public history; watches the release workflow; then checks the
-//!         draft (it must target the merge commit) and runs `release sign`,
-//!         whose one prompt `publish vX.Y.Z` covers the signature, the
-//!         upload, the push of main and the wiki, and the publish.
+//!     run 2 (the pull request open, and HEAD's export by the state file,
+//!         when there is one; else the re-export above): refuses unless
+//!         HEAD is on main, the pull request is the release app's, from
+//!         release/vX.Y.Z into main, titled `atlas vX.Y.Z`, the owner's
+//!         latest review approves its head commit (read from `reviews`), no
+//!         one's latest asks for changes, every check is green, and HEAD
+//!         holds what that head holds (`same_code`); asks `merge vX.Y.Z`;
+//!         squash-merges with the head pinned (GitHub picks the author);
+//!         checks every address of the public history up to the merge
+//!         commit, co-authors included (here, and on any later run that
+//!         finds the pull request merged); watches the release workflow;
+//!         then checks the draft (it must target the merge commit) and runs
+//!         `release sign`, whose one prompt `publish vX.Y.Z` covers the
+//!         signature, the upload, the push of main and the wiki, and the
+//!         publish.
 //! ```
 //!
 //! Every state is read again on each run, so a run that stopped anywhere is
@@ -65,7 +69,7 @@ use atlas::json::Value;
 
 use crate::release::{env, mkdir, output, read_text, say, status, write};
 use crate::release_check::Confirm;
-use crate::release_ci::{checkout_guard, clone, git_out, other_addresses, same_code, short, sign, version_of, Draft, Ident, OnMain, Releases, Sign};
+use crate::release_ci::{checkout_guard, clone, git_out, other_addresses, refused, same_code, short, sign, version_of, Draft, Ident, OnMain, Releases, Sign, ADDRESS_LOG};
 
 type R<T = ()> = Result<T, String>;
 
@@ -298,15 +302,19 @@ pub struct Run {
     pub url: String,
 }
 
-/// A review as `gh pr view --json latestReviews` shows it.
+/// A review as `gh pr view --json reviews` shows it. (`latestReviews`
+/// comes back with an empty commit oid, so it cannot say which commit an
+/// approval was given on.)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Review {
     /// Its author's login.
     pub author: String,
-    /// APPROVED, CHANGES_REQUESTED, COMMENTED, ...
+    /// APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING.
     pub state: String,
     /// The commit it was given on.
     pub commit: String,
+    /// When it was submitted (ISO 8601, UTC, so it sorts as text).
+    pub submitted_at: String,
 }
 
 /// A check as `statusCheckRollup` shows it (a status context's state is
@@ -346,7 +354,7 @@ pub struct PrInfo {
     pub author_bot: bool,
     /// The merge commit, once merged.
     pub merge_commit: Option<String>,
-    /// The latest review of each reviewer.
+    /// Every review, as gh lists them; [`latest_reviews`] reduces them.
     pub reviews: Vec<Review>,
     /// Every check on its head.
     pub checks: Vec<CheckRow>,
@@ -362,22 +370,22 @@ pub struct Merge {
     /// The head commit the approval was given on: GitHub refuses the merge
     /// if the branch moved.
     pub head: String,
-    /// The public address, as the squash commit's author.
-    pub email: String,
     /// The squash commit's subject.
     pub subject: String,
     /// The squash commit's body: the release commit's own message.
     pub body_file: PathBuf,
 }
 
-/// `gh pr merge`'s arguments: squash, pinned to the approved head, under
-/// the public address, with the message given; never `--admin` (the ruleset
-/// decides), `--auto` or `--delete-branch` (the branch is the record until
-/// the release is signed).
+/// `gh pr merge`'s arguments: squash, pinned to the approved head, with the
+/// message given; never `--admin` (the ruleset decides), `--auto` or
+/// `--delete-branch` (the branch is the record until the release is
+/// signed). No `--author-email`: GitHub refused the public address there
+/// ("Invalid email address"), so GitHub picks the squash commit's author,
+/// and [`merge_addresses`] checks every address after the merge.
 pub fn merge_argv(m: &Merge) -> Vec<String> {
     let mut v: Vec<String> = ["pr", "merge"].iter().map(|s| s.to_string()).collect();
     v.push(m.number.to_string());
-    for (k, val) in [("--repo", m.repo.as_str()), ("--match-head-commit", &m.head), ("--author-email", &m.email), ("--subject", &m.subject)] {
+    for (k, val) in [("--repo", m.repo.as_str()), ("--match-head-commit", &m.head), ("--subject", &m.subject)] {
         v.push(k.into());
         v.push(val.into());
     }
@@ -443,7 +451,7 @@ impl Hub for GhHub {
             "--repo",
             &self.repo,
             "--json",
-            "number,state,url,title,baseRefName,headRefName,headRefOid,isCrossRepository,author,mergeCommit,latestReviews,statusCheckRollup",
+            "number,state,url,title,baseRefName,headRefName,headRefOid,isCrossRepository,author,mergeCommit,reviews,statusCheckRollup",
         ])?;
         parse_pr(&body).map(Some)
     }
@@ -523,7 +531,7 @@ pub fn parse_runs(body: &str) -> R<Vec<Run>> {
 pub fn parse_pr(body: &str) -> R<PrInfo> {
     let v = atlas::json::parse(body).map_err(|e| format!("gh pr view: not JSON ({e})"))?;
     let author = v.get("author");
-    let reviews = v.get("latestReviews").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let reviews = v.get("reviews").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     let checks = v.get("statusCheckRollup").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     Ok(PrInfo {
         number: v.get("number").and_then(Value::as_u64).ok_or("gh pr view: no number")?,
@@ -539,7 +547,12 @@ pub fn parse_pr(body: &str) -> R<PrInfo> {
         merge_commit: v.get("mergeCommit").filter(|m| !m.is_null()).map(|m| s_of(m, "oid")).filter(|s| !s.is_empty()),
         reviews: reviews
             .iter()
-            .map(|r| Review { author: r.get("author").map(|a| s_of(a, "login")).unwrap_or_default(), state: s_of(r, "state"), commit: r.get("commit").map(|c| s_of(c, "oid")).unwrap_or_default() })
+            .map(|r| Review {
+                author: r.get("author").map(|a| s_of(a, "login")).unwrap_or_default(),
+                state: s_of(r, "state"),
+                commit: r.get("commit").map(|c| s_of(c, "oid")).unwrap_or_default(),
+                submitted_at: s_of(r, "submittedAt"),
+            })
             .collect(),
         checks: checks
             .iter()
@@ -584,18 +597,36 @@ pub fn not_the_release(p: &PrInfo, tag: &str) -> Vec<String> {
     v
 }
 
-/// What the pull request still lacks before the merge: the owner's
-/// approval on its head commit, no request for changes, and every check
-/// run and passed, the required ones among them.
+/// Each reviewer's latest review, as GitHub counts review state: the
+/// latest by `submittedAt` (the later in the list on a tie), COMMENTED and
+/// PENDING reviews left out, so a comment never undoes an approval or a
+/// request for changes. In the order each reviewer first shows.
+pub fn latest_reviews(reviews: &[Review]) -> Vec<&Review> {
+    let mut latest: Vec<&Review> = Vec::new();
+    for r in reviews.iter().filter(|r| r.state != "COMMENTED" && r.state != "PENDING") {
+        match latest.iter_mut().find(|l| l.author.eq_ignore_ascii_case(&r.author)) {
+            Some(l) if r.submitted_at >= l.submitted_at => *l = r,
+            Some(_) => {}
+            None => latest.push(r),
+        }
+    }
+    latest
+}
+
+/// What the pull request still lacks before the merge: the owner's latest
+/// review an approval of its head commit, no other reviewer's latest a
+/// request for changes, and every check run and passed, the required ones
+/// among them.
 pub fn not_ready(p: &PrInfo, owner: &str) -> Vec<String> {
     let mut v = Vec::new();
-    match p.reviews.iter().find(|r| r.author.eq_ignore_ascii_case(owner)) {
+    let latest = latest_reviews(&p.reviews);
+    match latest.iter().find(|r| r.author.eq_ignore_ascii_case(owner)) {
         None => v.push(format!("no review from {owner}")),
         Some(r) if r.state != "APPROVED" => v.push(format!("{owner}'s latest review is {}", r.state)),
         Some(r) if r.commit != p.head_oid => v.push(format!("{owner} approved {}, not the head {}: approve the head", short(&r.commit), short(&p.head_oid))),
         Some(_) => {}
     }
-    for r in p.reviews.iter().filter(|r| r.state == "CHANGES_REQUESTED" && !r.author.eq_ignore_ascii_case(owner)) {
+    for r in latest.iter().filter(|r| r.state == "CHANGES_REQUESTED" && !r.author.eq_ignore_ascii_case(owner)) {
         v.push(format!("{} requested changes", r.author));
     }
     for n in REQUIRED_CHECKS {
@@ -758,6 +789,8 @@ pub fn ship(s: &Ship) -> R<Done> {
             if !wrong.is_empty() {
                 return Err(format!("{} is not the release pull request: {}", p.url, wrong.join("; ")));
             }
+            let commit = p.merge_commit.clone().filter(|c| is_sha(c)).ok_or(format!("{} is merged, but GitHub names no merge commit", p.url))?;
+            merge_addresses(s, &commit)?;
             after_merge(s, &p, draft)
         }
         Some(p) if draft.is_some() => Err(draft_before_merge(s, &p.url)),
@@ -828,7 +861,7 @@ fn stale_export(s: &Ship) -> R<Option<String>> {
     };
     let head = git_out(&s.root, &["rev-parse", "HEAD"])?;
     if st.commit != head {
-        return Ok(Some(format!("it is the export of {}, which run 1 dispatched, but HEAD is {}", short(&st.commit), short(&head))));
+        return Ok(Some(format!("run 1 last dispatched {}, but HEAD is {}", short(&st.commit), short(&head))));
     }
     let name = format!("release-pr {} {}", s.tag, st.nonce);
     Ok(match s.hub.release_pr_runs()?.into_iter().find(|r| r.title == name) {
@@ -876,9 +909,8 @@ fn open(s: &Ship, reexport: Option<&PrInfo>) -> R<Done> {
     if let Some(st) = moved {
         say(&format!("  HEAD moved since the last dispatch, of {}: this one is from {}", short(&st.commit), short(&head)));
     }
-    let old = last.as_ref().map_or(head.as_str(), |st| st.commit.as_str());
     if let Some(p) = reexport {
-        say(&format!("  re-export: pull request #{} ({}) is open on the export of {}; it stays open, and its head moves", p.number, p.url, short(old)));
+        say(&format!("  re-export: pull request #{} ({}) is open at its head {}, an earlier export; it stays open, and its head moves", p.number, p.url, short(&p.head_oid)));
     }
     if stamped {
         say("  the binary leak check passed already for this commit, denylist and accepted-hits file");
@@ -893,11 +925,11 @@ fn open(s: &Ship, reexport: Option<&PrInfo>) -> R<Done> {
     }
     let prompt = match reexport {
         Some(p) => format!(
-            "dispatch release-pr for {tag} at {}: the export becomes PUBLIC on {} and replaces branch release/{tag}, so pull request #{}, now the export of {}, moves to the export of {}",
+            "dispatch release-pr for {tag} at {}: the export becomes PUBLIC on {} and replaces branch release/{tag}, so pull request #{}, now at its head {}, moves to the export of {}",
             short(&head),
             s.repo,
             p.number,
-            short(old),
+            short(&p.head_oid),
             short(&head)
         ),
         None => format!("dispatch release-pr for {tag} at {}: the export becomes PUBLIC on {} as branch release/{tag}", short(&head), s.repo),
@@ -974,9 +1006,9 @@ fn merge_step(s: &Ship, p: &PrInfo) -> R<Done> {
     let body = message.split_once('\n').map_or("", |(_, b)| b).trim_start_matches('\n');
     let body_file = work.join("merge-body.txt");
     write(&body_file, format!("{}\n", body.trim_end()))?;
-    let m = Merge { repo: s.repo.clone(), number: p.number, head: p.head_oid.clone(), email: s.ident.email.clone(), subject: format!("atlas {tag} (#{})", p.number), body_file };
+    let m = Merge { repo: s.repo.clone(), number: p.number, head: p.head_oid.clone(), subject: format!("atlas {tag} (#{})", p.number), body_file };
     s.confirm.confirm(
-        &format!("squash-merge {} into main of {} at {}, as {}: the release's code reaches the PUBLIC main", p.url, s.repo, short(&p.head_oid), s.ident.email),
+        &format!("squash-merge {} into main of {} at its head {}: the release's code reaches the PUBLIC main", p.url, s.repo, short(&p.head_oid)),
         &format!("merge {tag}"),
     )?;
     s.hub.merge(&m)?;
@@ -986,13 +1018,34 @@ fn merge_step(s: &Ship, p: &PrInfo) -> R<Done> {
         .find("the merge", || Ok(s.hub.pull(&branch)?.filter(|q| q.number == p.number && q.state == "MERGED" && q.merge_commit.is_some())))?
         .ok_or(format!("{} does not show as merged: run ship again", p.url))?;
     let commit = merged.merge_commit.clone().unwrap_or_default();
-    clone(&s.remote, &public)?;
-    let other = other_addresses(&git_out(&public, &["log", "--format=%H %ae %ce", &commit])?, &s.ident.email);
-    if !other.is_empty() {
-        return Err(format!("the merge commit {} put another address in the public history: {}. Stop: nothing more is done", short(&commit), other.join(" ")));
-    }
-    say(&format!("merge commit {}: every address in the public history is allowed", short(&commit)));
+    merge_addresses(s, &commit)?;
     after_merge(s, &merged, None)
+}
+
+/// The one address check of a merge, in both merge paths (just after the
+/// merge, and the MERGED arm of a later run): a fresh clone of the public
+/// repository, and every commit up to `commit`, the merge commit: its
+/// author, committer and every `Co-authored-by:` trailer, each one
+/// [`crate::release_ci::address_allowed`] (the accepted merges aside). With
+/// no `--author-email` on the merge, GitHub picks the author, so this is the
+/// only guard. A refused address is counted, never printed.
+fn merge_addresses(s: &Ship, commit: &str) -> R {
+    let public = s.stage.join("ship").join("public");
+    clone(&s.remote, &public)?;
+    if git_out(&public, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_err() {
+        return Err(format!("the merge commit {} is not in {}: run ship again once it is", short(commit), s.remote));
+    }
+    let other = other_addresses(&git_out(&public, &["log", ADDRESS_LOG, commit])?, &s.ident.email);
+    if !other.is_empty() {
+        return Err(format!(
+            "the merge commit {} left {} in the public history that may not be there (author, committer or Co-authored-by, in {} or before it). Stop: nothing more is done, and nothing is built or signed on it",
+            short(commit),
+            refused(&other),
+            commit
+        ));
+    }
+    say(&format!("merge commit {}: every address in the public history is allowed, co-authors included", short(commit)));
+    Ok(())
 }
 
 /// Run 2's second half: the release workflow, the draft, the sign step.
@@ -1270,7 +1323,7 @@ mod tests {
             author: "app/atlas-release".into(),
             author_bot: true,
             merge_commit: None,
-            reviews: vec![Review { author: "acme".into(), state: "APPROVED".into(), commit: head.into() }],
+            reviews: vec![Review { author: "acme".into(), state: "APPROVED".into(), commit: head.into(), submitted_at: "2026-11-10T10:00:00Z".into() }],
             checks: REQUIRED_CHECKS.iter().map(|n| CheckRow { name: n.to_string(), status: "COMPLETED".into(), conclusion: "SUCCESS".into() }).collect(),
         }
     }
@@ -1494,12 +1547,12 @@ mod tests {
         assert!(not_ready(&ready(&head), "acme").is_empty());
         assert!(not_ready(&ready(&head), "ACME").is_empty(), "the owner's login, case aside");
         let mut p = ready(&head);
-        p.reviews = vec![Review { author: "helper".into(), state: "APPROVED".into(), commit: head.clone() }];
+        p.reviews = vec![Review { author: "helper".into(), state: "APPROVED".into(), commit: head.clone(), ..Review::default() }];
         assert_eq!(not_ready(&p, "acme"), ["no review from acme"]);
-        p.reviews.push(Review { author: "acme".into(), state: "COMMENTED".into(), commit: head.clone() });
-        assert_eq!(not_ready(&p, "acme"), ["acme's latest review is COMMENTED"]);
+        p.reviews.push(Review { author: "acme".into(), state: "COMMENTED".into(), commit: head.clone(), ..Review::default() });
+        assert_eq!(not_ready(&p, "acme"), ["no review from acme"], "a comment is not a review state");
         let mut p = ready(&head);
-        p.reviews.push(Review { author: "helper".into(), state: "CHANGES_REQUESTED".into(), commit: head.clone() });
+        p.reviews.push(Review { author: "helper".into(), state: "CHANGES_REQUESTED".into(), commit: head.clone(), ..Review::default() });
         assert_eq!(not_ready(&p, "acme"), ["helper requested changes"]);
         let mut p = ready(&head);
         p.checks.remove(4);
@@ -1567,7 +1620,8 @@ mod tests {
         assert!(e.contains("is not on origin/main"), "{e}");
         assert_eq!(w.hub.count("merge"), 0);
         sh(&w.dev, &["reset", "-q", "--hard", "origin/main"]);
-        // A head authored under another address: merged, then stopped.
+        // A head authored under another address: merged, then stopped,
+        // without the address printed.
         let x = w.fx.d.join("other-author");
         sh(&w.fx.d, &["clone", "-q", &w.fx.bare.to_string_lossy(), x.to_str().unwrap()]);
         sh(&x, &["-c", "user.name=P", "-c", "user.email=pub@example.invalid", "commit", "-q", "--allow-empty", "--author", "O <o@other.invalid>", "-m", "atlas v1.2.3"]);
@@ -1576,7 +1630,26 @@ mod tests {
         *w.hub.pr.borrow_mut() = Some(ready(&head));
         w.hub.rel_runs.borrow_mut().push(run_of("in_progress", ""));
         let e = w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err();
-        assert!(e.contains("put another address in the public history: ") && e.contains("o@other.invalid"), "{e}");
+        assert!(e.contains(&format!("merge commit {}", short(&head))) && e.contains(" 1 address ") && !e.contains("o@other.invalid"), "{e}");
+        assert_eq!((w.hub.count("merge"), w.hub.count("release-runs")), (1, 0));
+        w.done();
+    }
+
+    /// A co-author the public history may not hold stops run 2 after the
+    /// merge, as an author does.
+    #[test]
+    fn row_7_a_co_author_trailer_is_checked_after_the_merge() {
+        let w = world("ship-r7-trailer");
+        w.hide_draft_until_built();
+        let x = w.fx.d.join("co-author");
+        sh(&w.fx.d, &["clone", "-q", &w.fx.bare.to_string_lossy(), x.to_str().unwrap()]);
+        sh(&x, &["-c", "user.name=P", "-c", "user.email=pub@example.invalid", "commit", "-q", "--allow-empty", "-m", "atlas v1.2.3\n\nCo-authored-by: O <o@other.invalid>"]);
+        sh(&x, &["push", "-q", "origin", "HEAD:refs/heads/release/v1.2.3"]);
+        let head = sh(&x, &["rev-parse", "HEAD"]);
+        *w.hub.pr.borrow_mut() = Some(ready(&head));
+        w.hub.rel_runs.borrow_mut().push(run_of("in_progress", ""));
+        let e = w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err();
+        assert!(e.contains(&format!("merge commit {}", short(&head))) && e.contains(" 1 address ") && !e.contains("o@other.invalid"), "{e}");
         assert_eq!((w.hub.count("merge"), w.hub.count("release-runs")), (1, 0));
         w.done();
     }
@@ -1651,7 +1724,8 @@ mod tests {
     fn row_11_a_draft_not_on_the_merge_commit_is_refused_before_any_download() {
         let w = world("ship-r11");
         // The public main is the draft's commit, so only the merge commit tells.
-        *w.hub.pr.borrow_mut() = Some(merged(&w.fx.target, &"b".repeat(40)));
+        let other = public_commit(&w, "other", "pub@example.invalid", "pub@example.invalid", "atlas v1.2.3 (#5)");
+        *w.hub.pr.borrow_mut() = Some(merged(&w.fx.target, &other));
         let e = w.ship(&Typed::new(&["publish v1.2.3"]), None).unwrap_err();
         assert!(e.contains("a stale or foreign draft"), "{e}");
         assert!(!w.stage().join("sign").exists());
@@ -1721,7 +1795,8 @@ mod tests {
         assert_eq!(w.ship(&t, None).unwrap(), Done::Opened("https://github.com/acme/tool/pull/5".into()));
         assert_eq!(*t.asked.borrow(), ["open v1.2.3"]);
         let prompt = t.prompts.borrow()[0].clone();
-        assert!(prompt.contains("#5") && prompt.contains(short(&old)) && prompt.contains(short(&head)), "{prompt}");
+        assert!(prompt.contains(&format!("#5, now at its head {}, moves to the export of {}", short(&w.fx.target), short(&head))), "{prompt}");
+        assert!(!prompt.contains(short(&old)), "the state's commit is not what the pull request holds: {prompt}");
         let now = w.state().unwrap();
         assert_eq!((now.commit.as_str(), now.run), (head.as_str(), 7));
         assert_ne!(now.nonce, "n");
@@ -1787,8 +1862,13 @@ mod tests {
         assert_eq!((w.hub.count("dispatch"), w.hub.count("merge")), (0, 0));
         assert_eq!(w.state().unwrap(), st);
         *w.hub.opens.borrow_mut() = Some(PrInfo { head_oid: "e".repeat(40), ..ready(&w.fx.target) });
-        assert!(matches!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap(), Done::Opened(_)));
+        let t = Typed::new(&["open v1.2.3"]);
+        assert!(matches!(w.ship(&t, None).unwrap(), Done::Opened(_)));
         assert_eq!(w.hub.count("dispatch"), 1);
+        // The prompt names the pull request's real head, not HEAD twice
+        // (state.json already named HEAD after the failed run).
+        let prompt = t.prompts.borrow()[0].clone();
+        assert!(prompt.contains(&format!("now at its head {}, moves to the export of {}", short(&w.fx.target), short(&w.head()))), "{prompt}");
         // No run named by state.json's nonce: the same.
         State { nonce: "gone".into(), ..st }.write(&w.stage().join("ship/state.json")).unwrap();
         let e = w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err();
@@ -1868,13 +1948,15 @@ mod tests {
 
     #[test]
     fn the_merge_is_pinned_squashed_and_never_admin() {
-        let m = Merge { repo: "bloodfeast/atlas".into(), number: 9, head: "a".repeat(40), email: "1+me@users.noreply.github.com".into(), subject: "atlas v1.2.3 (#9)".into(), body_file: PathBuf::from("b.txt") };
+        let m = Merge { repo: "bloodfeast/atlas".into(), number: 9, head: "a".repeat(40), subject: "atlas v1.2.3 (#9)".into(), body_file: PathBuf::from("b.txt") };
         let v = merge_argv(&m);
         let after = |k: &str| v.iter().position(|a| a == k).map(|i| v[i + 1].clone());
         assert_eq!(&v[..3], ["pr", "merge", "9"]);
         assert_eq!(after("--repo").unwrap(), "bloodfeast/atlas");
         assert_eq!(after("--match-head-commit").unwrap(), m.head);
-        assert_eq!(after("--author-email").unwrap(), m.email);
+        // GitHub refused the flag ("Invalid email address"): it picks the
+        // author, and ship checks every address after the merge.
+        assert!(!v.iter().any(|a| a == "--author-email"), "{v:?}");
         assert_eq!(after("--subject").unwrap(), m.subject);
         assert_eq!(after("--body-file").unwrap(), "b.txt");
         assert!(v.iter().any(|a| a == "--squash"));
@@ -1892,7 +1974,7 @@ mod tests {
         let body = format!(
             r#"{{"number": 5, "state": "OPEN", "url": "https://github.com/acme/tool/pull/5", "title": "atlas v1.2.3", "baseRefName": "main", "headRefName": "release/v1.2.3", "headRefOid": "{head}", "isCrossRepository": false,
             "author": {{"login": "app/atlas-release", "is_bot": true}}, "mergeCommit": null,
-            "latestReviews": [{{"author": {{"login": "acme"}}, "state": "APPROVED", "commit": {{"oid": "{head}"}}}}],
+            "reviews": [{{"author": {{"login": "acme"}}, "state": "APPROVED", "submittedAt": "2026-11-10T21:19:57Z", "commit": {{"oid": "{head}"}}}}],
             "statusCheckRollup": [{}, {{"__typename": "StatusContext", "context": "legacy", "state": "PENDING"}}]}}"#,
             checks.join(", ")
         );
@@ -1902,6 +1984,104 @@ mod tests {
         assert_eq!(not_ready(&p, "acme"), ["check legacy is pending"]);
         let merged = parse_pr(&body.replace(r#""mergeCommit": null"#, &format!(r#""mergeCommit": {{"oid": "{}"}}"#, "b".repeat(40)))).unwrap();
         assert_eq!(merged.merge_commit, Some("b".repeat(40)));
+    }
+
+    /// bloodfeast/atlas#7's head, and its reviews as gh gave them on
+    /// 2026-11-10 (`gh pr view 7 --json reviews,latestReviews,headRefOid`),
+    /// trimmed to the fields `parse_pr` reads: logins only. gh leaves the
+    /// commit oid of `latestReviews` empty, so only `reviews` names the
+    /// commit an approval was given on.
+    const PR7_HEAD: &str = "a0ca74d0500930debb1b18dd5f953a02a7452475";
+    const PR7_REVIEWS: &str = r#""latestReviews": [{"author": {"login": "bloodfeast"}, "state": "APPROVED", "submittedAt": "2026-11-10T22:21:08Z", "commit": {"oid": ""}}],
+        "reviews": [
+            {"author": {"login": "bloodfeast"}, "state": "DISMISSED", "submittedAt": "2026-11-10T15:36:29Z", "commit": {"oid": "72fda945d45936f014f4b119fb38e656b9c03edb"}},
+            {"author": {"login": "bloodfeast"}, "state": "APPROVED", "submittedAt": "2026-11-10T21:19:57Z", "commit": {"oid": "a0ca74d0500930debb1b18dd5f953a02a7452475"}},
+            {"author": {"login": "bloodfeast"}, "state": "APPROVED", "submittedAt": "2026-11-10T22:21:08Z", "commit": {"oid": "a0ca74d0500930debb1b18dd5f953a02a7452475"}}
+        ]"#;
+
+    /// `gh pr view` of a release pull request at `head` with every check
+    /// green and the review fields given.
+    fn pr_json(head: &str, review_fields: &str) -> String {
+        let checks: Vec<String> = REQUIRED_CHECKS.iter().map(|n| format!(r#"{{"__typename": "CheckRun", "name": "{n}", "status": "COMPLETED", "conclusion": "SUCCESS"}}"#)).collect();
+        format!(
+            r#"{{"number": 7, "state": "OPEN", "url": "https://github.com/bloodfeast/atlas/pull/7", "title": "atlas v0.4.0", "baseRefName": "main", "headRefName": "release/v0.4.0", "headRefOid": "{head}", "isCrossRepository": false,
+            "author": {{"login": "app/rs-atlas-releases", "is_bot": true}}, "mergeCommit": null, {review_fields},
+            "statusCheckRollup": [{}]}}"#,
+            checks.join(", ")
+        )
+    }
+
+    /// One review as gh's `reviews` field shows it.
+    fn review_json(login: &str, state: &str, at: &str, oid: &str) -> String {
+        format!(r#"{{"author": {{"login": "{login}"}}, "state": "{state}", "submittedAt": "2026-11-10T{at}Z", "commit": {{"oid": "{oid}"}}}}"#)
+    }
+
+    #[test]
+    fn the_approval_is_read_from_reviews_not_latest_reviews() {
+        // #7 as gh gave it: approved on its head, so ready.
+        let p = parse_pr(&pr_json(PR7_HEAD, PR7_REVIEWS)).unwrap();
+        assert_eq!(not_ready(&p, "bloodfeast"), Vec::<String>::new());
+        assert!(not_ready(&p, "BloodFeast").is_empty(), "the owner's login, case aside");
+        // The approval was on the head before last: approve the head.
+        let p = parse_pr(&pr_json(&"c".repeat(40), PR7_REVIEWS)).unwrap();
+        assert_eq!(not_ready(&p, "bloodfeast"), [format!("bloodfeast approved a0ca74d05009, not the head {}: approve the head", short(&"c".repeat(40)))]);
+    }
+
+    #[test]
+    fn each_reviewers_latest_review_decides() {
+        let head = "a".repeat(40);
+        let ready_with = |reviews: &[String]| not_ready(&parse_pr(&pr_json(&head, &format!(r#""reviews": [{}]"#, reviews.join(", ")))).unwrap(), "acme");
+        let ok = review_json("acme", "APPROVED", "10:00:00", &head);
+        assert!(ready_with(std::slice::from_ref(&ok)).is_empty());
+        // The owner's approval, then the owner's request for changes.
+        assert_eq!(ready_with(&[ok.clone(), review_json("acme", "CHANGES_REQUESTED", "11:00:00", &head)]), ["acme's latest review is CHANGES_REQUESTED"]);
+        // The same, listed out of order: the time decides, not the place.
+        assert_eq!(ready_with(&[review_json("acme", "CHANGES_REQUESTED", "11:00:00", &head), ok.clone()]), ["acme's latest review is CHANGES_REQUESTED"]);
+        // The owner's approval, then dismissed.
+        assert_eq!(ready_with(&[ok.clone(), review_json("acme", "DISMISSED", "11:00:00", &head)]), ["acme's latest review is DISMISSED"]);
+        // A comment after the approval changes nothing; a comment alone is no review.
+        assert!(ready_with(&[ok.clone(), review_json("acme", "COMMENTED", "11:00:00", &head)]).is_empty());
+        assert_eq!(ready_with(&[review_json("acme", "COMMENTED", "11:00:00", &head)]), ["no review from acme"]);
+        // Another reviewer's request for changes, then their approval: ready.
+        assert!(ready_with(&[review_json("helper", "CHANGES_REQUESTED", "09:00:00", &head), ok.clone(), review_json("helper", "APPROVED", "12:00:00", &head)]).is_empty());
+        // Their approval, then their request for changes: not ready.
+        assert_eq!(ready_with(&[review_json("helper", "APPROVED", "09:00:00", &head), ok, review_json("helper", "CHANGES_REQUESTED", "12:00:00", &head)]), ["helper requested changes"]);
+    }
+
+    /// A commit on its own branch `branch` of the public repository, off its
+    /// main, with the author, committer and message given: a merge commit as
+    /// GitHub makes one.
+    fn public_commit(w: &World, branch: &str, author: &str, committer: &str, message: &str) -> String {
+        let x = w.fx.d.join(format!("side-{branch}"));
+        sh(&w.fx.d, &["clone", "-q", &w.fx.bare.to_string_lossy(), x.to_str().unwrap()]);
+        sh(&x, &["-c", "user.name=C", "-c", &format!("user.email={committer}"), "commit", "-q", "--allow-empty", "--author", &format!("A <{author}>"), "-m", message]);
+        sh(&x, &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+        sh(&x, &["rev-parse", "HEAD"])
+    }
+
+    const BOT: &str = "123+rs-atlas-releases[bot]@users.noreply.github.com";
+
+    /// The MERGED arm checks the merge commit's author, committer and every
+    /// co-author before anything else, and never prints a refused address.
+    #[test]
+    fn a_merged_pull_requests_addresses_are_checked_trailers_included() {
+        let w = world("ship-merged-addr");
+        w.no_draft();
+        // The 117f4dcc shape: the release bot, GitHub's committer, the owner as co-author.
+        let good = public_commit(&w, "good", BOT, "noreply@github.com", "atlas v1.2.3 (#5)\n\nCo-authored-by: P <pub@example.invalid>");
+        *w.hub.pr.borrow_mut() = Some(merged(&w.fx.target, &good));
+        let e = w.ship(&No, None).unwrap_err();
+        assert!(e.starts_with("no release workflow run on the merge commit"), "{e}");
+        for (name, co) in [("a non-noreply co-author", "o@other.invalid"), ("another user's noreply co-author", "2+other@users.noreply.github.com")] {
+            let bad = public_commit(&w, &format!("bad-{}", co.len()), BOT, "noreply@github.com", &format!("atlas v1.2.3 (#5)\n\nCo-authored-by: O <{co}>"));
+            *w.hub.pr.borrow_mut() = Some(merged(&w.fx.target, &bad));
+            let runs = w.hub.count("release-runs");
+            let e = w.ship(&No, None).unwrap_err();
+            assert!(e.contains(&format!("merge commit {}", short(&bad))) && e.contains(" 1 address "), "{name}: {e}");
+            assert!(!e.contains(co), "{name}: the refused address is printed: {e}");
+            assert_eq!(w.hub.count("release-runs"), runs, "{name}: nothing after the check");
+        }
+        w.done();
     }
 
     #[test]

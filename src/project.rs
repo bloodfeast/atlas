@@ -50,10 +50,10 @@ pub const USER_KEYS: &[&str] = &["projects", "user", "default_project", "checkou
 
 /// The keys of one `projects` entry: its own, then the configuration keys a
 /// project may set for itself.
-const ENTRY_KEYS: &[&str] = &["name", "roots", "repos", "file", "memory_dir", "intent", "db", "vaults", "sources", "ids", "code", "memory", "wikilinks", "vault_id_keys"];
+const ENTRY_KEYS: &[&str] = &["name", "roots", "repos", "file", "memory_dir", "intent", "db", "vaults", "sources", "ids", "code", "memory", "wikilinks", "vault_id_keys", "orchestrate"];
 
 /// The keys of a project file: nothing machine-specific.
-const FILE_KEYS: &[&str] = &["name", "repos", "memory_dir", "intent", "vaults", "sources", "ids"];
+const FILE_KEYS: &[&str] = &["name", "repos", "memory_dir", "intent", "vaults", "sources", "ids", "orchestrate"];
 
 /// The export (and source) name of the user layer.
 pub const USER_EXPORT: &str = "user";
@@ -96,7 +96,8 @@ pub struct ProjectSpec {
     /// The project's rules file (an `INTENT.md` of dated items).
     pub intent: Option<PathBuf>,
     /// The configuration keys the project sets for itself: `db`, `vaults`,
-    /// `sources`, `ids`, `code`, `memory`, `wikilinks`, `vault_id_keys`.
+    /// `sources`, `ids`, `code`, `memory`, `wikilinks`, `vault_id_keys`, and
+    /// `orchestrate` with only `bare_gpu_words`.
     pub body: Box<Config>,
 }
 
@@ -207,6 +208,12 @@ pub fn repo_name(path: Option<&Path>, remote: Option<&str>) -> String {
 /// Parses one project object (a `projects` entry or a project file).
 fn parse_project(v: &Value, base: &Path, at: &str, keys: &[&str]) -> Result<ProjectSpec> {
     let body = Config::parse_object(v, base, at, keys)?;
+    // A project sets only how its briefs are read; the caps stay the user's.
+    if let Some(o) = &body.orchestrate {
+        if *o != (crate::orchestrate::OrchestrateSpec { bare_gpu_words: o.bare_gpu_words, ..Default::default() }) {
+            return Err(Error::InvalidArgument(format!("{at}.orchestrate: a project sets only bare_gpu_words")));
+        }
+    }
     let f = Fields::new(at, v, keys)?;
     let name = f.req_string("name")?;
     check_name(&f, &name)?;
@@ -283,6 +290,9 @@ fn merge(entry: &ProjectSpec, file: ProjectSpec) -> ProjectSpec {
     body.vaults.extend(out.body.vaults.iter().cloned());
     body.sources.extend(out.body.sources.iter().cloned());
     body.ids.extend(out.body.ids.iter().cloned());
+    if let Some(g) = out.body.orchestrate.as_ref().and_then(|o| o.bare_gpu_words) {
+        body.orchestrate.get_or_insert_with(Default::default).bare_gpu_words.get_or_insert(g);
+    }
     out.body = Box::new(body);
     out
 }
@@ -810,6 +820,9 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
         if b.vault_id_keys.is_some() {
             e.vault_id_keys = b.vault_id_keys.clone();
         }
+        if let Some(g) = b.orchestrate.as_ref().and_then(|o| o.bare_gpu_words) {
+            e.orchestrate.get_or_insert_with(Default::default).bare_gpu_words = Some(g);
+        }
         if let Some(pc) = &b.code {
             let mut code = e.code.clone().unwrap_or_default();
             let roots = std::mem::take(&mut code.roots);
@@ -893,7 +906,7 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
         memory.user_scope_from = other_memory_dirs(c, active.as_ref().map(|a| a.spec.name.as_str()));
         memory.user_memory = Some(dir.clone());
     }
-    // A yes or no at the top level holds in every project a project's own
+    // A yes, no or off at the top level holds in every project a project's own
     // `memory` block does not answer for.
     memory.rules = memory.rules.or(c.memory.as_ref().and_then(|m| m.rules));
     let found_in: Vec<PathBuf> = std::iter::once(cwd.to_path_buf()).chain(active.iter().flat_map(|a| project_roots(&a.spec, &c.user.checkouts))).collect();
@@ -1009,7 +1022,7 @@ fn claude_dir() -> Option<PathBuf> {
 
 /// What `memory.rules` does to a configuration; unset does nothing.
 ///
-/// A no drops every memory folder and rule file from sync, with its source:
+/// An off drops every memory folder and rule file from sync, with its source:
 /// the store keeps what it holds. A yes adds what the user did not name: Claude
 /// Code's memory folder for the first of `folders` that has one, and the first
 /// root `CLAUDE.md` among them. Sync only reads a rule file. A memory folder's
@@ -1527,6 +1540,26 @@ mod tests {
         let m = migrate_value(&v, &t.join(base), "alpha", Path::new("unused.sqlite"), None, Some(home)).unwrap();
         let p = &m.get("projects").unwrap().as_array().unwrap()[0];
         p.get("roots").and_then(Value::as_array).map(|a| a.iter().map(|r| PathBuf::from(r.as_str().unwrap())).collect()).unwrap_or_default()
+    }
+
+    /// atlas-dev #150: a project file turns the bare gpu words on for its
+    /// project, and sets no other `orchestrate` key.
+    #[test]
+    fn a_project_file_sets_bare_gpu_words_and_nothing_else_of_orchestrate() {
+        let t = std::env::temp_dir().join(format!("atlas-baregpu-{}", std::process::id()));
+        let dir = t.join("game");
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Config::parse(r#"{"projects": [], "orchestrate": {"enabled": true}}"#, &t).unwrap();
+        let file = dir.join(PROJECT_FILE);
+        std::fs::write(&file, r#"{"name": "game", "orchestrate": {"bare_gpu_words": true}}"#).unwrap();
+        clear_cache();
+        let o = resolve(&c, &dir, None).unwrap().config.orchestrate.unwrap();
+        assert_eq!((o.enabled, o.bare_gpu_words), (Some(true), Some(true)));
+        assert!(crate::orchestrate::resolve(Some(&o), None, None, |_| None).lanes.bare_gpu_words);
+        std::fs::write(&file, r#"{"name": "game", "orchestrate": {"enabled": false}}"#).unwrap();
+        let e = load_project_file(&file).unwrap_err().to_string();
+        assert!(e.contains("a project sets only bare_gpu_words"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]

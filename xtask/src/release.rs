@@ -1023,16 +1023,18 @@ pub fn run(args: Vec<String>) -> R {
     let mut c = pubc(&["tag", "-a", "--cleanup=verbatim", &tag, "-F", &msg]);
     ident(&mut c, false);
     output(&mut c)?;
-    let log = output(&mut pubc(&["log", "--format=%H %ae %ce"]))?;
-    let mut addrs: Vec<&str> = log.lines().flat_map(|l| l.split(' ').skip(1)).collect();
-    addrs.sort();
-    addrs.dedup();
-    let addresses = addrs.join(" ");
+    let log = output(&mut pubc(&["log", crate::release_ci::ADDRESS_LOG]))?;
     // GitHub's own addresses come with releases merged through a pull
-    // request (see release_ci.rs); any other is refused.
+    // request (see release_ci.rs); any other is refused, co-authors
+    // included, and never printed.
     let other = crate::release_ci::other_addresses(&log, &public_email);
     if !other.is_empty() {
-        return Err(format!("the public history carries another address: {}", other.join(" ")));
+        return Err(format!("the public history carries {} that may not be there (author, committer or Co-authored-by)", crate::release_ci::refused(&other)));
+    }
+    let (addrs, withheld) = crate::release_ci::printed_addresses(&log, &public_email);
+    let mut addresses = addrs.join(" ");
+    if withheld > 0 {
+        addresses.push_str(&format!("; {withheld} withheld (accepted merges)"));
     }
     let tagger = output(&mut pubc(&["for-each-ref", "--format=%(taggeremail)", &format!("refs/tags/{tag}")]))?;
     if tagger.trim() != format!("<{public_email}>") {

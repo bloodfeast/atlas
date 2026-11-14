@@ -47,21 +47,26 @@ pub enum Kind {
     Reviewer,
     /// Researches or designs; does not build.
     Research,
+    /// Writes briefs for other agents; does not build. Its own cap,
+    /// uncapped by default (Claude Code's own limit still applies).
+    BriefWriter,
     /// Not counted against any cap.
     None,
 }
 
 impl Kind {
     /// The kinds that have a cap.
-    pub const COUNTED: [Kind; 3] = [Kind::Builder, Kind::Reviewer, Kind::Research];
+    pub const COUNTED: [Kind; 4] = [Kind::Builder, Kind::Reviewer, Kind::Research, Kind::BriefWriter];
 
-    /// A kind by name (`builder`, `reviewer`, `research`, `none`; case is
-    /// ignored, and a plural or `review` / `build` is accepted).
+    /// A kind by name (`builder`, `reviewer`, `research`, `brief-writer`,
+    /// `none`; case is ignored, and a plural, `review` / `build` or
+    /// `brief writer` is accepted).
     pub fn parse(s: &str) -> Option<Kind> {
         match s.trim().to_ascii_lowercase().as_str() {
             "builder" | "builders" | "build" => Some(Kind::Builder),
             "reviewer" | "reviewers" | "review" => Some(Kind::Reviewer),
             "research" | "researcher" | "design" => Some(Kind::Research),
+            "brief-writer" | "brief-writers" | "brief writer" | "brief writers" => Some(Kind::BriefWriter),
             "none" => Some(Kind::None),
             _ => None,
         }
@@ -73,6 +78,7 @@ impl Kind {
             Kind::Builder => "builder",
             Kind::Reviewer => "reviewer",
             Kind::Research => "research",
+            Kind::BriefWriter => "brief-writer",
             Kind::None => "none",
         }
     }
@@ -165,10 +171,19 @@ pub struct OrchestrateSpec {
     pub resources: Vec<(String, usize)>,
     /// Minutes of waiting that raise a queued item one priority class.
     pub aging_minutes: Option<usize>,
+    /// The bare gpu words (`capture`, `screenshot`, `bench`, ...) infer gpu
+    /// (`orchestrate.bare_gpu_words`; a project file may set it; default off).
+    pub bare_gpu_words: Option<bool>,
     /// The review roles every PR needs before it merges (`orchestrate.reviews.roles`).
     pub review_roles: Vec<String>,
     /// How the merge gate applies (`orchestrate.reviews.mode`, default advisory).
     pub review_mode: Option<Mode>,
+    /// The task judge's advisory line at launches (`orchestrate.judge.enabled`, default off).
+    pub judge_enabled: Option<bool>,
+    /// The task judge's cells file (`orchestrate.judge.cells`).
+    pub judge_cells: Option<std::path::PathBuf>,
+    /// The work classifier (`orchestrate.judge.classifier`).
+    pub judge_classifier: crate::taskjudge::ClassifierSettings,
 }
 
 /// One kind's resolved settings.
@@ -207,12 +222,16 @@ pub struct OrchSettings {
     pub reviewer: KindLimits,
     /// Research and design agents.
     pub research: KindLimits,
+    /// Brief writers.
+    pub brief_writer: KindLimits,
     /// Uncounted agents and the main session (the `cap` values).
     pub other: KindLimits,
     /// The work queue's resource capacities and aging.
     pub lanes: crate::lanes::Policy,
     /// The required-reviews merge gate.
     pub reviews: crate::reviews::ReviewSettings,
+    /// The task judge (see [`crate::taskjudge`]).
+    pub judge: crate::taskjudge::JudgeSettings,
 }
 
 impl Default for OrchSettings {
@@ -228,14 +247,23 @@ impl OrchSettings {
             Kind::Builder => &self.builder,
             Kind::Reviewer => &self.reviewer,
             Kind::Research => &self.research,
+            Kind::BriefWriter => &self.brief_writer,
             Kind::None => &self.other,
         }
     }
 }
 
 /// The built-in `subagent_type` map (Claude Code's own agent types).
-const BUILT_IN_TYPES: &[(&str, Kind)] =
-    &[("Explore", Kind::Research), ("Plan", Kind::Research), ("claude-code-guide", Kind::Research), ("statusline-setup", Kind::None)];
+const BUILT_IN_TYPES: &[(&str, Kind)] = &[
+    ("Explore", Kind::Research),
+    ("Plan", Kind::Research),
+    ("claude-code-guide", Kind::Research),
+    ("statusline-setup", Kind::None),
+    ("builder", Kind::Builder),
+    ("reviewer", Kind::Reviewer),
+    ("research", Kind::Research),
+    ("brief-writer", Kind::BriefWriter),
+];
 
 /// The window inferred from Claude Code's environment: the auto-compact
 /// window, else 200k when the 1M context is turned off, else 1M.
@@ -302,6 +330,8 @@ pub fn resolve(
         builder: resolve_kind(Kind::Builder, 2),
         reviewer: resolve_kind(Kind::Reviewer, 2),
         research: resolve_kind(Kind::Research, 1),
+        // Uncapped by default: only Claude Code's own limit applies.
+        brief_writer: resolve_kind(Kind::BriefWriter, claude_limit),
         other: resolve_kind(Kind::None, claude_limit),
         lanes: {
             let mut p = crate::lanes::Policy::default();
@@ -314,11 +344,17 @@ pub fn resolve(
             if let Some(a) = o.aging_minutes {
                 p.aging_minutes = a as i64;
             }
+            p.bare_gpu_words = o.bare_gpu_words.unwrap_or(false);
             p
         },
         reviews: crate::reviews::ReviewSettings {
             roles: o.review_roles.iter().map(|r| r.trim().to_ascii_lowercase()).filter(|r| !r.is_empty()).collect(),
             mode: o.review_mode.unwrap_or(Mode::Advisory),
+        },
+        judge: crate::taskjudge::JudgeSettings {
+            enabled: o.judge_enabled.unwrap_or(false),
+            cells: o.judge_cells.clone(),
+            classifier: o.judge_classifier.clone(),
         },
     }
 }
@@ -334,8 +370,12 @@ pub fn brief_kind(brief: &str) -> Option<Kind> {
         if !head.eq_ignore_ascii_case("kind:") {
             continue;
         }
-        let word: String = l[5..].trim().trim_matches(['`', '"', '\'']).chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-        if let Some(k) = Kind::parse(&word) {
+        let rest = l[5..].trim().trim_matches(['`', '"', '\'']);
+        let word = |s: &str| -> String { s.chars().take_while(|c| c.is_ascii_alphabetic()).collect() };
+        let first = word(rest);
+        // A two-word kind (`brief writer`, `brief-writer`) is tried first.
+        let second = rest[first.len()..].strip_prefix([' ', '-']).map(|t| word(t.trim_start())).filter(|w| !w.is_empty());
+        if let Some(k) = second.and_then(|w| Kind::parse(&format!("{first} {w}"))).or_else(|| Kind::parse(&first)) {
             return Some(k);
         }
     }
@@ -393,7 +433,7 @@ pub fn kind_reason(kind: Kind, source: KindSource, subagent_type: &str) -> Strin
         KindSource::Default => format!("{none} and no other rule classifies it, so orchestrate.default_kind ({}) applies", kind.name()),
     };
     format!(
-        "This launch counts as a {}: {why}. If the work is of another kind, put `Kind: builder`, `Kind: reviewer` or `Kind: research` in the prompt's first {KIND_LINES} lines (a brief file the prompt names is not read).",
+        "This launch counts as a {}: {why}. If the work is of another kind, put `Kind: builder`, `Kind: reviewer`, `Kind: research` or `Kind: brief-writer` in the prompt's first {KIND_LINES} lines (a brief file the prompt names is not read).",
         noun(kind)
     )
 }
@@ -402,6 +442,7 @@ pub fn kind_reason(kind: Kind, source: KindSource, subagent_type: &str) -> Strin
 fn noun(kind: Kind) -> &'static str {
     match kind {
         Kind::Research => "research agent",
+        Kind::BriefWriter => "brief writer",
         Kind::None => "uncounted agent",
         k => k.name(),
     }
@@ -871,6 +912,78 @@ mod tests {
         assert_eq!(classify_source(&s, "x", "", ""), (Kind::Research, KindSource::Default));
     }
 
+    /// The built-in map gives agent type `t` the kind `k`; a `Kind:` line still wins.
+    fn kind_named_type_maps(t: &str, k: Kind) {
+        let s = resolve(None, None, None, env(&[]));
+        // With no `Kind:` line, the subagent_type decides, over the worktree rule.
+        assert_eq!(classify_source(&s, "x", t, ""), (k, KindSource::Type), "{t}");
+        assert_eq!(classify_source(&s, "x", t, "worktree"), (k, KindSource::Type), "{t}");
+        // A `Kind:` line naming the same kind decides it.
+        assert_eq!(classify_source(&s, &format!("Kind: {}", k.name()), t, ""), (k, KindSource::Line), "{t}");
+        // A `Kind:` line wins even when it disagrees.
+        assert_eq!(classify_source(&s, "Kind: none", t, "worktree"), (Kind::None, KindSource::Line), "{t}");
+    }
+
+    #[test]
+    fn the_builder_agent_type_is_a_builder() {
+        kind_named_type_maps("builder", Kind::Builder);
+    }
+
+    #[test]
+    fn the_reviewer_agent_type_is_a_reviewer() {
+        kind_named_type_maps("reviewer", Kind::Reviewer);
+    }
+
+    #[test]
+    fn the_research_agent_type_is_research() {
+        kind_named_type_maps("research", Kind::Research);
+    }
+
+    #[test]
+    fn a_configured_type_overrides_the_kind_named_ones() {
+        let o = OrchestrateSpec { types: vec![("Reviewer".into(), Kind::Research), ("research".into(), Kind::None)], ..Default::default() };
+        let s = resolve(Some(&o), None, None, env(&[]));
+        assert_eq!(classify_source(&s, "x", "reviewer", ""), (Kind::Research, KindSource::Type));
+        assert_eq!(classify_source(&s, "x", "research", ""), (Kind::None, KindSource::Type));
+        assert_eq!(classify_source(&s, "Kind: builder", "reviewer", ""), (Kind::Builder, KindSource::Line));
+    }
+
+    #[test]
+    fn a_brief_writer_parses_maps_and_is_uncapped_by_default() {
+        for n in ["brief writer", "brief-writer", "brief-writers", "Brief Writers", " BRIEF-WRITER "] {
+            assert_eq!(Kind::parse(n), Some(Kind::BriefWriter), "{n}");
+        }
+        assert_eq!(Kind::parse("brief"), None);
+        assert_eq!(Kind::BriefWriter.name(), "brief-writer");
+        assert!(Kind::COUNTED.contains(&Kind::BriefWriter));
+        // A `Kind:` line in either spelling, with words after it.
+        for b in [
+            "Kind: brief writer",
+            "Kind: brief-writer",
+            "- **Kind:** `brief-writers`",
+            "Kind: Brief writer (no build)",
+            "kind: brief writer, uncapped",
+        ] {
+            assert_eq!(brief_kind(b), Some(Kind::BriefWriter), "{b}");
+        }
+        // A one-word kind followed by more words still reads.
+        assert_eq!(brief_kind("Kind: builder writes code"), Some(Kind::Builder));
+        assert_eq!(brief_kind("Kind: reviewer-only"), Some(Kind::Reviewer));
+        assert_eq!(brief_kind("Kind: brief"), None);
+        let s = resolve(None, None, None, env(&[]));
+        assert_eq!(classify_source(&s, "x", "brief-writer", ""), (Kind::BriefWriter, KindSource::Type));
+        assert_eq!(classify(&s, "x", "Brief-Writer", "worktree"), Kind::BriefWriter);
+        // Uncapped by default: Claude Code's own limit, whatever it is.
+        assert_eq!(s.brief_writer.max, CLAUDE_CODE_DEFAULT_LIMIT);
+        assert_eq!(resolve(None, None, None, env(&[(LIMIT_ENV, "7")])).brief_writer.max, 7);
+        assert_eq!(s.limits(Kind::BriefWriter), &s.brief_writer);
+        // A configured cap, 0 included, is its own and never the builder's.
+        let o = OrchestrateSpec { kinds: vec![(Kind::BriefWriter, KindSpec { max: Some(0), ..Default::default() })], ..Default::default() };
+        let c = resolve(Some(&o), None, None, env(&[]));
+        assert_eq!((c.brief_writer.max, c.builder.max, c.research.max), (0, 2, 1));
+        assert_eq!(noun(Kind::BriefWriter), "brief writer");
+    }
+
     #[test]
     fn the_kind_reason_names_its_rule() {
         let line = kind_reason(Kind::Reviewer, KindSource::Line, "");
@@ -886,7 +999,7 @@ mod tests {
         let d = kind_reason(Kind::Research, KindSource::Default, "");
         assert!(d.starts_with("This launch counts as a research agent: ") && d.contains("so orchestrate.default_kind (research) applies"), "{d}");
         for r in [&ty, &wt, &d] {
-            assert!(r.contains("put `Kind: builder`, `Kind: reviewer` or `Kind: research` in the prompt's first 40 lines (a brief file the prompt names is not read)"), "{r}");
+            assert!(r.contains("put `Kind: builder`, `Kind: reviewer`, `Kind: research` or `Kind: brief-writer` in the prompt's first 40 lines (a brief file the prompt names is not read)"), "{r}");
         }
     }
 

@@ -191,6 +191,10 @@ impl HookAnswer {
     }
 }
 
+/// The line an admitted builder launch with no `Lane:` line gets in
+/// orchestrated mode (the lane declaration the orchestrate skill teaches).
+const NO_LANE: &str = "atlas lanes: this builder's prompt declares no lane, so the queue cannot keep its work apart from other work. Declare it: `Kind:`, `Lane:`, `Priority:` and `Uses:` lines in the launch prompt's first 40 lines, and a `brief` journal entry in that lane with the same lines before its first launch.";
+
 /// The hook events whose `additionalContext` reaches the session's own model
 /// (SubagentStart's goes to the subagent; PreCompact's plain text is summary
 /// instructions).
@@ -327,6 +331,33 @@ fn is_handback_tool(name: &str) -> bool {
 /// The atlas tools that write to a lane journal.
 fn is_journal_tool(name: &str) -> bool {
     is_handoff_tool(name) || name == "journal" || name.ends_with("__journal")
+}
+
+/// The reports in a prompt's `<agent-message` frames, as Claude Code frames
+/// them (read from real transcripts 2026-11-11): the opening tag at the
+/// start of a line (after "Another Claude session sent a message:"), the
+/// report indented, the closing tag at the start of its own line, and a note
+/// after it. Each report is the text inside the frame after "The report
+/// follows:" (when the frame says it), so the frame's own words ("session",
+/// "subagent") name no lane. `None` when the prompt has no such frame: a
+/// prompt that only mentions the tag is an ordinary prompt.
+fn agent_reports(prompt: &str) -> Option<Vec<&str>> {
+    const OPEN: &str = "<agent-message";
+    const CLOSE: &str = "\n</agent-message>";
+    let mut out = Vec::new();
+    let mut rest = prompt;
+    while let Some(i) = rest.find(OPEN) {
+        let line_start = i == 0 || rest[..i].ends_with('\n');
+        let after = &rest[i + OPEN.len()..];
+        let Some(close) = after.find(CLOSE) else { break };
+        if line_start {
+            let inner = &after[..close];
+            let inner = inner.split_once('>').map_or("", |(_, r)| r);
+            out.push(inner.split_once("The report follows:").map_or(inner, |(_, r)| r));
+        }
+        rest = &after[close + CLOSE.len()..];
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Whether a `<task-notification>` is an interim stop: the agent ended its
@@ -537,6 +568,9 @@ struct LogRow {
     /// A subagent start: (session, agent), logged as a "brief without
     /// atlas" row beside the answer's own.
     brief: Option<(String, String)>,
+    /// A live post-compaction lookup row for `compact_miss`. A row with an
+    /// empty `tool` carries only this.
+    miss: Option<crate::compact::MissRow>,
 }
 
 /// The semantic side of the recall gate: the model, the record vectors,
@@ -552,6 +586,8 @@ struct Sem {
 pub struct Hooks {
     sem: Option<Sem>,
     model_tried: bool,
+    /// Record vectors read from the store over this state's life.
+    vectors_read: usize,
     settings: Settings,
     store: MemoryStore,
     briefs: HashMap<String, VecDeque<String>>,
@@ -601,6 +637,9 @@ pub struct Hooks {
     misses: crate::compact::MissTracker,
     /// Sessions already told about hook drift (at their first prompt).
     drift_told: HashSet<String>,
+    /// A command hook's state (one process per event): `drift_told` would
+    /// be empty on every prompt, so the drift is told at SessionStart.
+    command_hook: bool,
     /// The records the last answer injected, for the memory eval.
     last: Vec<Injected>,
     /// The vaults and sources, by name, that lines refs resolve against.
@@ -644,6 +683,13 @@ impl Hooks {
         self.sem.as_ref().is_some_and(|s| s.embedding.is_some())
     }
 
+    /// Record vectors read from the store so far (for the test that a
+    /// commit touching no record's vector reads none again).
+    #[doc(hidden)]
+    pub fn vectors_read(&self) -> usize {
+        self.vectors_read
+    }
+
     /// Opens the hook state: its own store connection, and a token-log
     /// thread writing to the index database.
     ///
@@ -659,6 +705,7 @@ impl Hooks {
         Ok(Hooks {
             sem: None,
             model_tried: false,
+            vectors_read: 0,
             settings,
             store,
             briefs: HashMap::new(),
@@ -687,6 +734,7 @@ impl Hooks {
             cwd: std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(),
             misses: crate::compact::MissTracker::default(),
             drift_told: HashSet::new(),
+            command_hook: false,
             last: Vec::new(),
             roots: Vec::new(),
             orch: crate::orchestrate::Agents::default(),
@@ -703,9 +751,11 @@ impl Hooks {
 
     /// Marks this state as a command hook's (one process per event): an
     /// unfinished agent is then not excluded for being older than the
-    /// process, only for being stale.
+    /// process, only for being stale. A prompt adds no hook drift line
+    /// (every prompt would): SessionStart tells it once instead.
     pub fn set_command_hook(&mut self) {
         self.orch.set_started(None);
+        self.command_hook = true;
     }
 
     /// Gives the hook state the index store's opener, so an edited note or
@@ -818,12 +868,21 @@ impl Hooks {
         self.offer = p;
     }
 
-    /// Loads what the first recall would (the term frequencies), so the
-    /// first hook answers warm.
+    /// The hook drift warning, when the live atlas hooks differ from
+    /// hooks/hooks.json (see [`crate::claude_settings::hook_drift_line`]).
+    fn drift_line(&self) -> Option<String> {
+        let (ideas_on, asks_on) = (self.ideas.is_some(), self.ideas.as_ref().is_some_and(crate::ideas::Live::asks));
+        self.offer.as_ref().and_then(|p| crate::claude_settings::hook_drift_line(p, ideas_on, asks_on))
+    }
+
+    /// Loads what the first recall would (the term frequencies, the model
+    /// and the record vectors), so the first hook answers warm.
     pub fn warm(&mut self) {
         let _ = self.store.rarest(&[], 0);
         let _ = self.store.lanes();
-        self.load_model();
+        if let Err(e) = self.refresh_vectors() {
+            eprintln!("atlas recall vectors: {e}");
+        }
     }
 
     /// Loads the embedding model, if the file exists, and starts embedding
@@ -862,7 +921,16 @@ impl Hooks {
             Some(v) => v.stale(&self.store)?,
         };
         if stale {
-            sem.vecs = Some(RecVecs::load(&self.store, &sem.model.id, sem.model.dim)?);
+            // Kept rows are not read again: most commits (a journal entry, a
+            // token log line) touch no record's vector.
+            let v = match sem.vecs.as_mut() {
+                Some(v) => {
+                    v.refresh(&self.store)?;
+                    v
+                }
+                None => sem.vecs.insert(RecVecs::load(&self.store, &sem.model.id, sem.model.dim)?),
+            };
+            self.vectors_read += v.read;
         }
         // Only on a change: an embedder that failed is not restarted on every prompt.
         let idle = sem.embedding.as_ref().is_none_or(|d| d.load(Ordering::Acquire));
@@ -905,6 +973,14 @@ impl Hooks {
             "UserPromptSubmit" => {
                 if ev.prompt.starts_with("<task-notification>") {
                     a.context = self.notification(&ev.prompt, &ev.transcript_path)?;
+                } else if let Some(reports) = agent_reports(&ev.prompt) {
+                    // Another session's report: a head line per lane it
+                    // names, no lane view and no pointers.
+                    let heads = self.peer_heads(&reports);
+                    if let Some(i) = self.ideas.as_mut() {
+                        i.on_prompt(&mut self.store, &ev.session_id, &ev.prompt, &ev.transcript_path);
+                    }
+                    (a.context, keys) = heads?;
                 } else {
                     // After recall, so it cannot recall itself, and whatever
                     // recall answered: an error or a spent budget files all the same.
@@ -918,9 +994,10 @@ impl Hooks {
                 }
                 // A session's first prompt: live atlas hooks that drifted from
                 // hooks/hooks.json (a hook every setup has, unlike SessionStart).
-                if self.drift_told.insert(ev.session_id.clone()) {
-                    let (ideas_on, asks_on) = (self.ideas.is_some(), self.ideas.as_ref().is_some_and(crate::ideas::Live::asks));
-                    if let Some(line) = self.offer.as_ref().and_then(|p| crate::claude_settings::hook_drift_line(p, ideas_on, asks_on)) {
+                // A command hook is a new process per prompt, so it would tell
+                // every prompt: SessionStart tells that setup instead.
+                if !self.command_hook && self.drift_told.insert(ev.session_id.clone()) {
+                    if let Some(line) = self.drift_line() {
                         if !a.context.is_empty() {
                             a.context.push('\n');
                         }
@@ -950,15 +1027,10 @@ impl Hooks {
             "PreToolUse" => {
                 let sub = !ev.agent_id.is_empty();
                 // A main-session lookup made before the last compaction and
-                // again after it is a post-compaction miss.
-                if !sub {
-                    if let Some(sig) = crate::compact::lookup_sig(&ev.tool_name, &ev.tool_input) {
-                        if self.misses.lookup(&ev.session_id, sig) {
-                            if let Some(l) = &self.log {
-                                let _ = l.send(LogRow { tool: "compact:miss".into(), returned: 0, keys: Vec::new(), brief: None, session: ev.session_id.clone(), agent: String::new(), transcript: String::new() });
-                            }
-                        }
-                    }
+                // again after it is a post-compaction repeat; a miss when its
+                // target is unchanged. Subagent calls neither count nor stamp.
+                if !sub && self.settings.compact.enabled {
+                    self.note_lookup(ev);
                 }
                 if sub || self.settings.cap.main_session {
                     let path = if sub { subagent_transcript(&ev.transcript_path, &ev.agent_id) } else { PathBuf::from(&ev.transcript_path) };
@@ -973,6 +1045,12 @@ impl Hooks {
                     self.queue_launch(ev, brief, kind_refused, &mut a);
                     if admitted && a.deny.is_some() {
                         self.orch.release_last();
+                    }
+                    if a.deny.is_none() && self.settings.orchestrate.judge.enabled {
+                        self.judge_launch(ev, brief, &mut a);
+                    }
+                    if a.deny.is_none() && self.settings.orchestrate.judge.classifier.enabled {
+                        self.classify_launch(ev, brief, &mut a);
                     }
                 }
                 if a.deny.is_none() && ev.tool_name == "SendMessage" {
@@ -1122,11 +1200,23 @@ impl Hooks {
                     }
                     a.context.push_str(&line);
                 }
+                let fresh = ev.source == "startup" || ev.source == "clear";
+                // Hook drift, once a session, when no prompt will tell it: a
+                // recalling event routed to a command hook, and no mcp_tool
+                // UserPromptSubmit (a resident server tells it at the first
+                // prompt). A line of its own, outside the questions' budget.
+                if fresh && self.offer.as_ref().is_some_and(crate::claude_settings::drift_told_at_session_start) {
+                    if let Some(line) = self.drift_line() {
+                        if !a.context.is_empty() {
+                            a.context.push('\n');
+                        }
+                        a.context.push_str(&line);
+                    }
+                }
                 // A new or cleared session: where the work stands
                 // (`memory.resume_card`). Compaction has its own card. The
                 // card is advisory: a store error loses it, not the lines
                 // above.
-                let fresh = ev.source == "startup" || ev.source == "clear";
                 let mut ideas_line = if fresh { self.ideas.as_ref().and_then(|i| i.resume_line(&self.store)) } else { None };
                 if fresh && self.settings.resume_card {
                     match crate::resume::card_with(&self.store, &self.settings.orchestrate, &ev.transcript_path, &crate::memory::now(), ev.source == "clear", ideas_line.as_deref()) {
@@ -1176,8 +1266,8 @@ impl Hooks {
                 if self.settings.transcripts && !ev.transcript_path.is_empty() {
                     self.transcripts.push(PathBuf::from(&ev.transcript_path));
                 }
-                // The rest is the experimental compaction work, off unless
-                // `compact.enabled` is set.
+                // The rest is the compaction work, on unless `compact.enabled`
+                // is false.
                 if !self.settings.compact.enabled {
                     return Ok(a);
                 }
@@ -1199,7 +1289,7 @@ impl Hooks {
                     let w = crate::checkpoint::window(self.settings.compact.window, &t);
                     if let Some(reason) = crate::checkpoint::defer(&ev.trigger, &t, w) {
                         if let Some(l) = &self.log {
-                            let _ = l.send(LogRow { tool: "compact:defer".into(), returned: 0, keys: Vec::new(), brief: None, session: ev.session_id.clone(), agent: String::new(), transcript: String::new() });
+                            let _ = l.send(LogRow { tool: "compact:defer".into(), returned: 0, keys: Vec::new(), brief: None, session: ev.session_id.clone(), agent: String::new(), transcript: String::new(), miss: None });
                         }
                         a.block = Some(reason);
                         return Ok(a);
@@ -1279,10 +1369,45 @@ impl Hooks {
                     session: ev.session_id.clone(),
                     agent: ev.agent_id.clone(),
                     transcript,
+                    miss: None,
                 });
             }
         }
         Ok(a)
+    }
+
+    /// Counts one main-session PreToolUse for the live miss figures: the
+    /// call, the files it writes (or a shell command, which may write
+    /// anything), and a lookup's row in `compact_miss` with, for a repeat
+    /// of a lookup, the legacy `compact:miss` token-log row.
+    fn note_lookup(&mut self, ev: &HookEvent) {
+        let (s, m) = (&ev.session_id, &mut self.misses);
+        m.call(s);
+        match ev.tool_name.as_str() {
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+                let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
+                let p = if f("file_path").is_empty() { f("notebook_path") } else { f("file_path") };
+                if !p.is_empty() {
+                    m.wrote(s, crate::compact::norm_path(p, &ev.cwd));
+                }
+            }
+            "Bash" | "PowerShell" => m.shell(s),
+            _ => {}
+        }
+        let sig = match crate::compact::lookup_sig(&ev.tool_name, &ev.tool_input) {
+            Some(sig) => (sig, false),
+            None => match crate::compact::shell_sig(&ev.tool_name, &ev.tool_input) {
+                Some(sig) => (sig, true),
+                None => return,
+            },
+        };
+        let stamp = m.stamp(s, &ev.tool_name, &ev.tool_input, &ev.cwd, &self.store);
+        let Some(row) = m.lookup(s, &sig.0, stamp, sig.1) else { return };
+        if let Some(l) = &self.log {
+            // An empty tool writes no token-log row: only the legacy repeat has one.
+            let tool = if row.legacy { "compact:miss" } else { "" };
+            let _ = l.send(LogRow { tool: tool.into(), returned: 0, keys: Vec::new(), brief: None, session: s.clone(), agent: String::new(), transcript: String::new(), miss: Some(row) });
+        }
     }
 
     /// The records the last answer injected, with what context selection
@@ -1310,6 +1435,26 @@ impl Hooks {
         recall::candidates(&self.store, text, &gate, sem.as_ref())
     }
 
+    /// The reports of an `<agent-message` prompt (another session's report
+    /// or a subagent's hand-back): one [`recall::lane_head`] line for each
+    /// lane a report names, found as [`Self::recall`] finds them; reports
+    /// that name none get nothing. The lane view stays one `recall lane=`
+    /// away. Logged as `lane-head:X`, not `lane:X`: the line is not the lane.
+    fn peer_heads(&mut self, reports: &[&str]) -> Result<(String, Vec<Injected>)> {
+        let mut out = String::new();
+        let mut keys = Vec::new();
+        for l in self.store.lanes()? {
+            if l.lane.starts_with("session:") || !reports.iter().any(|r| crate::memory::contains_word(r, &l.lane)) {
+                continue;
+            }
+            if let Some(line) = recall::lane_head(&self.store, &l.lane)? {
+                keys.push(Injected { key: format!("lane-head:{}", l.lane), fts: None, cos: None, bytes: line.len(), how: Sel::Whole, full: line.len() });
+                out.push_str(&line);
+            }
+        }
+        Ok((out, keys))
+    }
+
     fn recall(&mut self, scope: &str, text: &str) -> Result<(String, Vec<Injected>)> {
         let r = self.settings.recall.clone();
         let mut out = String::new();
@@ -1322,6 +1467,20 @@ impl Hooks {
         if left == 0 {
             return Ok((out, keys));
         }
+        // The scope is the session for a human prompt, else a subagent.
+        let human = scope == self.session;
+        // A scope this process has not seen yet starts from what was
+        // pointed to in it before (a server restart, a command hook's
+        // process per event): each key is pointed to once per session.
+        if !self.injected.contains_key(scope) {
+            let (session, agent) = if human { (scope, "") } else { (self.session.as_str(), scope) };
+            let logged = crate::hook_hits::injected_keys(&self.settings.index_db, session, agent);
+            self.injected.insert(scope.to_string(), logged);
+        }
+        // A subagent whose own lane's view is injected gets no pointers:
+        // its brief and lane already say what it needs.
+        let own_lane = if human { None } else { self.agent_lane.get(scope).and_then(|r| r.lane.clone()) };
+        let mut own_dump = false;
         // A lane the text names gets its journal first.
         for l in self.store.lanes()? {
             if l.lane.starts_with("session:") || !crate::memory::contains_word(text, &l.lane) {
@@ -1336,6 +1495,7 @@ impl Hooks {
             let trim = (r.select.enabled && r.select.lane_chars > 0).then_some((text, r.select.lane_chars));
             let v = recall::lane_with(&self.store, &l.lane, self.settings.bytes_for(r.lane_budget_tokens), trim)?;
             out.push_str(&v.text);
+            own_dump |= !v.text.is_empty() && own_lane.as_deref() == Some(l.lane.as_str());
             // A record the lane view shows whole or trimmed is not pointed to
             // again below (send once).
             if r.select.enabled {
@@ -1360,6 +1520,10 @@ impl Hooks {
                     keys.push(Injected { key: format!("repo:{}", r.name), fts: None, cos: None, bytes, how: Sel::Whole, full: bytes });
                 }
             }
+        }
+        if own_dump {
+            *self.spent.entry(scope.to_string()).or_default() += out.len();
+            return Ok((out, keys));
         }
         let skip = self.injected.get(scope).cloned().unwrap_or_default();
         self.refresh_vectors()?;
@@ -1421,6 +1585,10 @@ impl Hooks {
         let mut sent: Vec<(i64, String, String)> = Vec::new();
         let headlines = r.rules == crate::memory::rules::Mode::Live;
         for cand in passed {
+            if human && r.prompt_pointers > 0 && chosen.len() >= r.prompt_pointers {
+                more += 1;
+                continue;
+            }
             let whole = pointer(&cand.head);
             // A ruling's headline stands in for a fragment of it; a tag says
             // what it replaces or amends.
@@ -1575,7 +1743,7 @@ impl Hooks {
             None => self.orch.running(&self.settings.orchestrate, &dir, std::time::SystemTime::now()),
         };
         match running {
-            Ok(r) => crate::queue::holders(&r, &dir, known),
+            Ok(r) => crate::queue::holders(&r, &dir, known, self.settings.orchestrate.lanes.bare_gpu_words),
             Err(e) => {
                 eprintln!("atlas queue: {}: {e}", dir.display());
                 Vec::new()
@@ -1588,6 +1756,72 @@ impl Hooks {
     /// was waiting leaves the queue. Errors file nothing and change no
     /// decision.
     /// `kind_refused`: the deny in `a`, if any, is the kind cap's.
+    /// The task judge at an admitted launch: one advisory context line when
+    /// the launch's model or its `Judge:` line differs from the pick, and a
+    /// line in the pick log. Never denies and never changes the input; with
+    /// no readable cells file it does nothing.
+    fn judge_launch(&mut self, ev: &HookEvent, brief: &str, a: &mut HookAnswer) {
+        let Some(path) = self.settings.orchestrate.judge.cells.as_deref() else { return };
+        let cells = match crate::taskjudge::Cells::load(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("atlas judge: {e}");
+                return;
+            }
+        };
+        let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
+        let kind = crate::taskjudge::launch_kind(brief, f("subagent_type"), f("description"));
+        let pick = crate::taskjudge::judge(&cells, brief, kind);
+        if let Some(line) = crate::taskjudge::note(&pick, f("model"), brief) {
+            if !a.context.is_empty() {
+                a.context.push('\n');
+            }
+            a.context.push_str(&line);
+        }
+        let stated = crate::taskjudge::stated(brief).map(|(m, e)| format!("{m}, {e}")).unwrap_or_default();
+        let row = crate::json::object(256, |w| {
+            w.field("time", crate::memory::now().as_str())
+                .field("tool_use_id", ev.tool_use_id.as_str())
+                .field("description", f("description"))
+                .field("kind", kind)
+                .field("scope", pick.scope)
+                .field("unknowns", pick.unknowns)
+                .field("model", pick.model)
+                .field("effort", pick.effort)
+                .field("split", &pick.split)
+                .field("source", pick.source)
+                .field("asked_model", f("model"))
+                .field("judge_line", stated.as_str());
+        });
+        if let Some(dir) = self.settings.store.parent() {
+            let log = dir.join("judge-picks.jsonl");
+            let r = std::fs::OpenOptions::new().create(true).append(true).open(&log).and_then(|mut fh| std::io::Write::write_all(&mut fh, format!("{row}\n").as_bytes()));
+            if let Err(e) = r {
+                eprintln!("atlas judge log {}: {e}", log.display());
+            }
+        }
+    }
+
+    /// The work classifier at an admitted launch that names a brief: one
+    /// advisory context line with the demand score and the rules map's pick.
+    /// Never denies and never changes the input. With the head source the
+    /// hook adds nothing: a warm embed of one brief measured far over the
+    /// 500 ms launch budget, so only `judge_task` runs the head.
+    fn classify_launch(&mut self, ev: &HookEvent, brief: &str, a: &mut HookAnswer) {
+        let s = &self.settings.orchestrate.judge.classifier;
+        if s.source == crate::taskjudge::ScoreSource::Head {
+            return;
+        }
+        let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
+        let kind = crate::taskjudge::launch_kind(brief, f("subagent_type"), f("description"));
+        if let Some(p) = crate::taskjudge::classify(s, brief, kind, None, &mut crate::embed::bert::Scratch::default()) {
+            if !a.context.is_empty() {
+                a.context.push('\n');
+            }
+            a.context.push_str(&crate::taskjudge::class_line(&p));
+        }
+    }
+
     fn queue_launch(&mut self, ev: &HookEvent, brief: &str, kind_refused: bool, a: &mut HookAnswer) {
         if !self.settings.orchestrate.enabled {
             return;
@@ -1596,23 +1830,34 @@ impl Hooks {
         let description = f("description");
         let (kind, source) = crate::orchestrate::classify_source(&self.settings.orchestrate, brief, f("subagent_type"), f("isolation"));
         let known = self.known_lanes();
-        let class = crate::lanes::classify(brief, &known);
+        let class = crate::lanes::classify_in(brief, &known, self.settings.orchestrate.lanes.bare_gpu_words);
         if a.deny.is_none() {
             // Q-QL2: a conflict declared on both sides is denied and
             // queued; one that rests on an inference is let through with a
             // warning.
             let running = self.holders(&ev.transcript_path, &known);
             let c = crate::lanes::conflicts(kind, &class, &running, &self.settings.orchestrate.lanes);
-            let (hard, soft): (Vec<_>, Vec<_>) = c.into_iter().partition(|c| c.declared);
+            let (hard, rest): (Vec<_>, Vec<_>) = c.into_iter().partition(|c| c.declared);
+            // A word the policy does not list never denies: a note (#150).
+            let (shared, soft): (Vec<_>, Vec<_>) = rest.into_iter().partition(|c| c.advisory);
             if !hard.is_empty() {
                 a.deny = Some(format!(
                     "atlas queue: this launch conflicts with running work ({}), declared on both sides. Do not retry now; start it when that work finishes.",
                     hard.iter().map(|c| c.what.as_str()).collect::<Vec<_>>().join("; ")
                 ));
             } else {
-                let line = match crate::queue::started(&mut self.store, description, brief) {
+                // Only a launch that holds its declared lane replaces a waiting
+                // one there: reviews and read-only launches share the lane.
+                let lane = crate::lanes::held_lane(kind, &class).map(String::as_str).filter(|_| class.lane_src == crate::lanes::Source::Declared);
+                let line = match crate::queue::started(&mut self.store, description, brief, lane, kind) {
                     Ok(crate::queue::Started::NotWaiting(k)) => format!("atlas queue: the prompt's `Queue: {k}` names no waiting item (`atlas queue` lists them)."),
-                    Ok(_) => String::new(),
+                    Ok(crate::queue::Started::Retired(k)) => format!("atlas queue: this launch took {k} off the queue."),
+                    Ok(crate::queue::Started::SameLane { key, others }) => format!(
+                        "atlas queue: this launch took {key} off the queue (the oldest waiting {} launch in its lane){}.",
+                        kind.name(),
+                        if others > 0 { format!("; {others} more in the lane still wait, so drop any this launch replaces (`atlas queue drop KEY`)") } else { String::new() }
+                    ),
+                    Ok(crate::queue::Started::None) => String::new(),
                     Err(e) => {
                         eprintln!("atlas queue: {e}");
                         String::new()
@@ -1624,6 +1869,15 @@ impl Hooks {
                     }
                     a.context.push_str(&line);
                 }
+                if !shared.is_empty() {
+                    if !a.context.is_empty() {
+                        a.context.push('\n');
+                    }
+                    a.context.push_str(&format!(
+                        "atlas queue: this launch shares {} with running work; no limit is set for these words, so it was let through. `Uses:` limits only gpu, compile, worktree:NAME and the resources the configuration lists.",
+                        shared.iter().map(|c| c.what.as_str()).collect::<Vec<_>>().join("; ")
+                    ));
+                }
                 if !soft.is_empty() {
                     if !a.context.is_empty() {
                         a.context.push('\n');
@@ -1632,6 +1886,14 @@ impl Hooks {
                         "atlas queue: this launch may conflict with running work ({}); atlas inferred it, so it was let through. If the conflict is real, stop it and start it when that work finishes; a `Lane:` or `Uses:` line in the prompt corrects a wrong inference.",
                         soft.iter().map(|c| c.what.as_str()).collect::<Vec<_>>().join("; ")
                     ));
+                }
+                // A builder with no declared lane is let through and the orchestrator
+                // reminded; never a deny.
+                if kind == crate::orchestrate::Kind::Builder && class.lane_src != crate::lanes::Source::Declared {
+                    if !a.context.is_empty() {
+                        a.context.push('\n');
+                    }
+                    a.context.push_str(NO_LANE);
                 }
                 return;
             }
@@ -1657,14 +1919,14 @@ impl Hooks {
         }
     }
 
-    /// The SubagentStop backstop (Q-SD3): a report over
-    /// [`crate::report::WHOLE_UP_TO`] bytes is sent back once, in orchestrated
-    /// mode. atlas files it whole in the agent's lane and asks for the
-    /// digest form, with its mechanical draft attached. A report within the
-    /// bound, a second stop, or a filing error lets the stop through.
+    /// The SubagentStop backstop (Q-SD3, refined 11-04): a report over
+    /// [`crate::report::SEND_BACK_OVER`] bytes is sent back once, in
+    /// orchestrated mode. atlas files it whole in the agent's lane and asks
+    /// for the digest form, without a draft. A shorter report, a second
+    /// stop, or a filing error lets the stop through.
     fn report_backstop(&mut self, agent_id: &str, report: &str, already_blocked: bool) -> Option<String> {
         let report = report.trim();
-        if !self.settings.orchestrate.enabled || already_blocked || report.len() <= crate::report::WHOLE_UP_TO || self.report_sent_back.contains(agent_id) {
+        if !self.settings.orchestrate.enabled || already_blocked || report.len() <= crate::report::SEND_BACK_OVER || self.report_sent_back.contains(agent_id) {
             return None;
         }
         let lane = match self.lane_of(agent_id) {
@@ -1699,14 +1961,10 @@ bytes: {}", report.len()),
             }
         };
         self.report_sent_back.insert(agent_id.to_string());
-        let draft = crate::report::digest(report, crate::report::budget(report.len()));
         Some(format!(
-            "atlas report backstop: this report is {} bytes, over the {}-byte digest bound, and stays in the orchestrator's context for every later turn. atlas filed it whole as {key}. Hand back the digest form instead: the outcome first (PR, branch, merge, verdict), then the numbers, every open question under a `## Questions` heading, and every risk (a denied action, an unverified claim, a failure left open); cite {key} for the rest. Keep every fact the orchestrator acts on. This is asked once. atlas's mechanical draft ({} bytes) follows; correct and shorten it:
-
-{draft}",
+            "atlas report backstop: this report is {} bytes; atlas filed it whole as {key}. Hand back the digest form within {} bytes: the outcome first (PR, branch, merge, verdict), then the numbers, every open question under `## Questions`, and every risk (a denied action, an unverified claim, an open failure); cite {key} for the rest. Asked once.",
             report.len(),
-            crate::report::WHOLE_UP_TO,
-            draft.len()
+            crate::report::WHOLE_UP_TO
         ))
     }
 
@@ -1957,6 +2215,12 @@ fn start_log(s: &Settings) -> Option<(mpsc::Sender<LogRow>, std::thread::JoinHan
             }
             let Ok(mem) = MemoryStore::open(&store) else { return };
             for r in std::iter::once(first).chain(rx) {
+                if let Some(m) = &r.miss {
+                    let _ = crate::compact::log_miss(&conn, m);
+                }
+                if r.tool.is_empty() {
+                    continue;
+                }
                 let reads: Vec<usize> = r.keys.iter().map(|k| crate::tokens::record_read(&mem, &k.key)).collect();
                 let cf = (!r.keys.is_empty()).then_some(crate::tokens::Counterfactual { grep: 0, read: reads.iter().sum() });
                 let _ = crate::tokens::log_row(&conn, &r.tool, r.returned, cf);

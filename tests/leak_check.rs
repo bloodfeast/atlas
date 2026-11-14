@@ -3,7 +3,9 @@
 //! The denylist lives outside the repository, in the file named by the
 //! `ATLAS_LEAK_DENYLIST` environment variable: one term per line, matched
 //! anywhere in every tracked file (file contents and paths). Blank lines and
-//! lines starting with `#` are ignored. Without the variable the test is
+//! lines starting with `#` are ignored, except that a `#[word]` line makes
+//! the term on the next line match as a whole word only (the matcher's
+//! module docs, "Whole-word terms"). Without the variable the test is
 //! skipped with a notice, so the public repository never has to carry the
 //! list it guards against.
 //!
@@ -155,4 +157,60 @@ fn the_matcher_normalises_and_reports_original_places() {
     assert!(caught_bytes(b"\xFF\xC0quillfeather\x80"));
     // A path with a look-alike; a term numbered past a comment.
     assert_eq!(hits(&[("docs/m\u{430}rrow vale.md".into(), b"clean".to_vec())]), vec!["docs/m\u{430}rrow vale.md (path): denylist term #2".to_string()]);
+}
+
+/// A whole-word term: `#[word]` on the line before it. `_` and letters or
+/// digits are word characters, `-` is not; a term's own edges may be
+/// anything (a term ending in `-` still needs a non-word character after).
+const WORD_LIST: &str = "#[word]\nquill\n#[word]\nmarrow-\nfeather\n";
+
+fn word_hits(list: &str, body: &str) -> Vec<String> {
+    Matcher::new(db(), list).hits(&[("notes.md".into(), body.as_bytes().to_vec())])
+}
+
+#[test]
+fn a_whole_word_term_matches_only_between_non_word_characters() {
+    let m = Matcher::new(db(), WORD_LIST);
+    assert_eq!(m.len(), 3, "the marker is a comment line: term numbers are unchanged");
+    let term = |body: &str, k: usize| word_hits(WORD_LIST, body).iter().any(|h| h.ends_with(&format!("denylist term #{k}")));
+    for body in ["quill", "a quill pen", "(Quill).", "\"quill\"", "a-quill-b", "quill\nx", "x QUILL"] {
+        assert!(term(body, 1), "whole word in {body:?}");
+    }
+    for body in ["quills", "squill", "quill_pen", "my_quill", "quill2", "2quill", "quill\u{e9}"] {
+        assert!(!term(body, 1), "inside a word in {body:?}");
+    }
+    // `-` is not a word character, so a hyphenated compound still names
+    // the word; `_` is, so an identifier does not.
+    assert!(term("pre-quill", 1) && !term("pre_quill", 1));
+    // A term ending in `-`: the character after it counts too.
+    for body in ["marrow-", "\"marrow-\"", "the marrow- x", "marrow-."] {
+        assert!(term(body, 2), "whole word in {body:?}");
+    }
+    for body in ["marrow-vale", "`marrow-x`", "marrow-_", "omarrow- x"] {
+        assert!(!term(body, 2), "inside a word in {body:?}");
+    }
+    // A later whole-word place is found past earlier embedded ones, and
+    // reported at its own place.
+    assert_eq!(word_hits(WORD_LIST, "squill quills quill"), vec!["notes.md:1:15 (byte 14): denylist term #1".to_string()]);
+    // Paths too.
+    let path = |p: &str| Matcher::new(db(), WORD_LIST).hits(&[(p.into(), b"clean".to_vec())]);
+    assert_eq!(path("docs/quill/x.md"), vec!["docs/quill/x.md (path): denylist term #1".to_string()]);
+    assert!(path("docs/quills/x.md").is_empty() && path("docs/my_quill.md").is_empty());
+}
+
+#[test]
+fn the_whole_word_marker_touches_only_the_next_line_and_plain_terms_are_unchanged() {
+    // Unmarked terms stay substrings.
+    assert!(!word_hits(WORD_LIST, "featherweight").is_empty(), "a plain term after a marked one");
+    assert!(!word_hits("quill\n", "squills").is_empty(), "a plain term matches inside words");
+    // A marker followed by a blank or a comment line is spent: the term
+    // after it is plain (the safe side: a plain term catches more).
+    assert!(!word_hits("#[word]\n\nquill\n", "squills").is_empty());
+    assert!(!word_hits("#[word]\n# c\nquill\n", "squills").is_empty());
+    // Padding around the marker is fine; another spelling is a comment.
+    assert!(word_hits("  #[word]  \nquill\n", "squills").is_empty());
+    assert!(!word_hits("#[Word]\nquill\n", "squills").is_empty());
+    // The marker stands alone on its line: with a term after it, the line
+    // is a comment like any other.
+    assert!(Matcher::new(db(), "#[word] quill\n").is_empty());
 }

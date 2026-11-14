@@ -66,15 +66,19 @@ impl Home {
 fn refused(p: &Paths, args: &[&str]) -> bool {
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let (mut out, mut input) = (Vec::new(), &b""[..]);
-    cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false }).is_err()
+    cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false, machine: None }).is_err()
 }
+
+/// The machine scripted answers run on: 32 hardware threads, Claude Code's
+/// default subagent limit (compile 2, caps 2, 2, 1).
+const MACHINE: cs::Machine = cs::Machine { cores: 32, claude_limit: 20 };
 
 /// The library entry with scripted answers and a given Claude Code version.
 fn scripted(p: &Paths, args: &[&str], answers: &str, version: Option<(u32, u32, u32)>) -> (bool, String) {
     let mut out = Vec::new();
     let mut input = answers.as_bytes();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: true, version, dry_run: false }).unwrap();
+    let code = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: true, version, dry_run: false, machine: Some(MACHINE) }).unwrap();
     (code == std::process::ExitCode::SUCCESS, String::from_utf8(out).unwrap())
 }
 
@@ -302,7 +306,7 @@ fn the_interactive_offer_asks_skips_old_versions_and_writes_the_yeses() {
     // Without a terminal the offer only describes.
     let mut o = Vec::new();
     let mut i: &[u8] = b"y\n";
-    cs::run(&["offer".to_string()], &p, &mut Io { out: &mut o, input: &mut i, interactive: false, version: None, dry_run: false }).unwrap();
+    cs::run(&["offer".to_string()], &p, &mut Io { out: &mut o, input: &mut i, interactive: false, version: None, dry_run: false, machine: None }).unwrap();
     let o = String::from_utf8(o).unwrap();
     assert!(o.contains("Nothing went wrong") && o.contains("no terminal here to answer in"), "{o}");
     assert_eq!(h.read(&h.settings()), before);
@@ -314,7 +318,7 @@ fn the_session_start_line_returns_until_answered_and_is_short() {
     let p = h.paths();
     let line = cs::session_start_line(&p).unwrap();
     assert!(line.contains("2 Claude Code settings are offered (1h subagent cache, goal check-ins)"), "{line}");
-    assert!(line.contains("On by default: routing, update"), "{line}");
+    assert!(line.contains("On by default: routing, update, compact"), "{line}");
     // At most 60 tokens at the ledger's 4 bytes a token.
     assert!(line.len() <= 240, "{} bytes: {line}", line.len());
     // The question stays until answered; the notice was shown and is done.
@@ -479,7 +483,7 @@ fn a_terminal_yes_that_did_not_land_leaves_the_question() {
     let mut out = Vec::new();
     let mut input = &b"y\nn\nn\nn\nn\nn\n"[..];
     let args = vec!["offer".to_string()];
-    let r = cs::run(&args, &p, &mut cs::Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false });
+    let r = cs::run(&args, &p, &mut cs::Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false, machine: None });
     assert!(r.is_err() || r.unwrap() != std::process::ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
     #[allow(clippy::permissions_set_readonly_false)] // Windows only; the temp folder must be removable.
     perm.set_readonly(false);
@@ -874,13 +878,24 @@ fn compact_md_is_written_on_yes_and_undone() {
     let md = proj.join("CLAUDE.md");
     std::fs::write(&md, "# Project\n\nKeep tests green.\n").unwrap();
     let dir = proj.to_string_lossy().to_string();
-    // Compaction is experimental and off by default: nothing is asked or
-    // written.
+    // Compaction is on by default: no configuration, no `compact` section, or
+    // one without `enabled`. Only an explicit false turns it off, and then
+    // nothing is asked or written.
+    assert!(cs::compaction_on(&p), "no configuration");
+    std::fs::create_dir_all(h.atlas()).unwrap();
+    for text in [r#"{"vaults": []}"#, r#"{"vaults": [], "compact": {"card_tokens": 400}}"#, r#"{"vaults": [], "compact": {"enabled": true}}"#] {
+        std::fs::write(h.config(), text).unwrap();
+        assert!(cs::compaction_on(&p), "{text}");
+    }
+    // `atlas settings off compact` writes the false (removing the key would
+    // leave it on).
+    let (ok, out) = scripted(&p, &["off", "compact"], "", None);
+    assert!(ok && out.contains("[compact] turned off"), "{out}");
+    assert!(h.read(&h.config()).contains("\"enabled\": false"), "{}", h.read(&h.config()));
+    assert!(!cs::compaction_on(&p));
     let (ok, out) = scripted(&p, &["compact-md", &dir, "--yes"], "", None);
     assert!(!ok && out.contains("compact") && out.contains("enabled") && out.contains("Nothing was changed"), "{out}");
     assert_eq!(h.read(&md), "# Project\n\nKeep tests green.\n");
-    assert!(!cs::compaction_on(&p));
-    std::fs::create_dir_all(h.atlas()).unwrap();
     std::fs::write(h.config(), r#"{"vaults": [], "compact": {"enabled": true}}"#).unwrap();
     assert!(cs::compaction_on(&p));
     // No: nothing written.
@@ -917,7 +932,7 @@ fn an_offer_without_a_terminal_marks_nothing_offered() {
     let p = h.paths();
     let mut o = Vec::new();
     let mut i: &[u8] = b"";
-    cs::run(&["offer".to_string()], &p, &mut Io { out: &mut o, input: &mut i, interactive: false, version: None, dry_run: false }).unwrap();
+    cs::run(&["offer".to_string()], &p, &mut Io { out: &mut o, input: &mut i, interactive: false, version: None, dry_run: false, machine: None }).unwrap();
     let state = p.state.as_ref().and_then(|s| std::fs::read_to_string(s).ok()).unwrap_or_default();
     let offered = json::parse(&state).ok().and_then(|v| v.get("offered").and_then(|a| a.as_array().map(Vec::len))).unwrap_or(0);
     assert_eq!(offered, 0, "{state}");
@@ -962,7 +977,7 @@ fn a_source_build_does_not_call_updates_on() {
     let p = h.paths();
     let mut o = Vec::new();
     let mut i: &[u8] = b"";
-    cs::run(&["offer".to_string()], &p, &mut Io { out: &mut o, input: &mut i, interactive: false, version: None, dry_run: false }).unwrap();
+    cs::run(&["offer".to_string()], &p, &mut Io { out: &mut o, input: &mut i, interactive: false, version: None, dry_run: false, machine: None }).unwrap();
     let o = String::from_utf8(o).unwrap();
     let line = o.lines().find(|l| l.starts_with("[update]")).unwrap_or_else(|| panic!("{o}"));
     assert!(atlas::update::release_build() || line.contains("off here: a build from source never updates itself"), "{line}");
@@ -991,15 +1006,20 @@ fn orchestrated_mode_is_asked_and_the_answers_are_stored() {
     assert_eq!(h.read(&h.config()), template);
     assert_eq!(cs::orchestrate_line(&p), None, "a no is recorded as asked");
     // Yes, with a bad cap asked again, an abbreviation, a number with commas.
-    let (ok, out) = scripted(&p, &["orchestrate"], "y\n500\n3\n\n0\na\n300,000\n500000\nk\n", None);
+    // The compile and gpu slots come first, so the caps follow them.
+    let (ok, out) = scripted(&p, &["orchestrate"], "y\n\n\n500\n3\n\n0\na\n300,000\n500000\nk\n", None);
     assert!(ok, "{out}");
+    assert!(out.contains("Compile slots (heavy compiles at once; 0 never serializes) [2]: ") && out.contains("GPU slots (GPU runs at once; 0 never serializes) [1]: "), "{out}");
     assert!(out.contains("Builders at once (agents that write and compile code) [2]: ") && out.contains("--builders: needs 0 to 100"), "{out}");
+    assert!(out.contains("Reviewers at once (read-only review agents) [3]: "), "the reviewers follow the builders answered: {out}");
     assert!(out.contains("[285,000 on a 1M window, scaled to the window]"), "{out}");
-    assert!(out.contains("[orchestrate] on: builders 3, reviewers 2, research 0, context limits advisory, handoff 300000, limit 500000, fresh ask"), "{out}");
+    assert!(out.contains("[orchestrate] on: builders 3, reviewers 3, research 0, context limits advisory, handoff 300000, limit 500000, fresh ask, compile slots 2, gpu slots 1"), "{out}");
     for (k, v) in [
         ("orchestrate.enabled", "true"),
+        ("orchestrate.resources.compile", "2"),
+        ("orchestrate.resources.gpu", "1"),
         ("orchestrate.kinds.builder.max", "3"),
-        ("orchestrate.kinds.reviewer.max", "2"),
+        ("orchestrate.kinds.reviewer.max", "3"),
         ("orchestrate.kinds.research.max", "0"),
         ("orchestrate.mode", "\"advisory\""),
         ("orchestrate.fresh", "\"ask\""),
@@ -1014,11 +1034,11 @@ fn orchestrated_mode_is_asked_and_the_answers_are_stored() {
     // Asked again: the brackets show the stored values, Enter keeps them,
     // a handoff above the limit is refused, and off skips both limits.
     let before = h.read(&h.config());
-    let (ok, out) = scripted(&p, &["orchestrate"], "\n\n\n\n\n600000\n\n\n\n", None);
+    let (ok, out) = scripted(&p, &["orchestrate"], "\n\n\n\n\n\n\n600000\n\n\n\n", None);
     assert!(ok && out.contains("[Y/n]") && out.contains("[3]: ") && out.contains("[advisory]: "), "{out}");
     assert!(out.contains("is above the hard limit"), "{out}");
     assert_eq!(h.read(&h.config()), before, "every answer kept: {out}");
-    let (ok, out) = scripted(&p, &["orchestrate"], "y\n\n\n\noff\n\n", None);
+    let (ok, out) = scripted(&p, &["orchestrate"], "y\n\n\n\n\n\noff\n\n", None);
     assert!(ok && !out.contains("Handoff point") && config_at(&h, "orchestrate.mode").unwrap() == "off", "{out}");
     // No while on turns the caps off; one undo per change brings the template back.
     let (ok, out) = scripted(&p, &["orchestrate"], "n\n", None);
@@ -1050,10 +1070,13 @@ fn orchestrated_mode_answers_apply_without_a_terminal() {
         assert!(!ok, "{bad:?}: {out}");
     }
     assert_eq!(h.read(&h.config()), template);
-    let (ok, out) = h.run(&["orchestrate", "--yes", "--builders", "3", "--limit", "500000"]);
+    let (ok, out) = h.run(&["set", "agents-research", "1"]);
+    assert!(ok, "{out}");
+    let (ok, out) = on_machine(&h.paths(), MACHINE, &["orchestrate", "--yes", "--builders", "3", "--limit", "500000"]);
     assert!(ok, "{out}");
     assert_eq!(config_at(&h, "orchestrate.kinds.builder.max").unwrap(), 3.0);
     assert_eq!(config_at(&h, "orchestrate.kinds.research.max").unwrap(), 1.0, "an unnamed option stores the value in effect");
+    assert_eq!(config_at(&h, "orchestrate.resources.compile").unwrap(), 2.0, "a starter from the machine passed in (32 threads)");
     assert_eq!(config_at(&h, "orchestrate.mode").unwrap(), "enforced");
     assert_eq!(config_at(&h, "cap.block_tokens").unwrap(), 500000.0);
     assert!(config_at(&h, "cap.warn_tokens").is_none(), "the handoff point keeps scaling");
@@ -1093,6 +1116,80 @@ fn a_headless_session_neither_asks_nor_counts_as_asked() {
     assert!(c.contains("is not indexed") && c.contains("orchestrated mode"), "{c}");
 }
 
+/// `atlas settings orchestrate ARGS` on a given machine, without a terminal.
+fn on_machine(p: &Paths, m: cs::Machine, args: &[&str]) -> (bool, String) {
+    let mut out = Vec::new();
+    let mut input = &b""[..];
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let r = cs::run(&args, p, &mut Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false, machine: Some(m) });
+    let text = String::from_utf8(out).unwrap();
+    match r {
+        Ok(code) => (code == std::process::ExitCode::SUCCESS, text),
+        Err(e) => (false, format!("{text}{e}")),
+    }
+}
+
+/// The numbers a yes stored: compile and gpu slots, then the three caps.
+fn starters(h: &Home) -> [Option<f64>; 5] {
+    ["orchestrate.resources.compile", "orchestrate.resources.gpu", "orchestrate.kinds.builder.max", "orchestrate.kinds.reviewer.max", "orchestrate.kinds.research.max"].map(|k| config_at(h, k).and_then(|v| v.as_f64()))
+}
+
+/// A new orchestrated install ends with declared starter resources and
+/// kinds, derived from the machine passed in (compile = max(1, cores / 16)
+/// at most 4; gpu 1; builders = compile, reviewers = builders, research =
+/// max(1, builders / 2), each clamped to Claude Code's limit). A configured
+/// value and a flag win, `--no` writes none, and no limit or handoff is
+/// written without a flag.
+#[test]
+fn a_new_orchestrated_install_declares_starter_resources_and_kinds() {
+    let m = |cores: usize, claude_limit: usize| cs::Machine { cores, claude_limit };
+    for (tag, machine, want) in [
+        ("cs-start-2", m(2, 20), [1.0, 1.0, 1.0, 1.0, 1.0]),
+        ("cs-start-16", m(16, 20), [1.0, 1.0, 1.0, 1.0, 1.0]),
+        ("cs-start-32", m(32, 20), [2.0, 1.0, 2.0, 2.0, 1.0]),
+        ("cs-start-64", m(64, 20), [4.0, 1.0, 4.0, 4.0, 2.0]),
+        ("cs-start-256", m(256, 3), [4.0, 1.0, 3.0, 3.0, 1.0]),
+    ] {
+        let h = Home::new(tag);
+        let (ok, _) = h.run(&["list"]);
+        assert!(ok);
+        let (ok, out) = on_machine(&h.paths(), machine, &["orchestrate", "--yes"]);
+        assert!(ok, "{tag}: {out}");
+        assert_eq!(starters(&h), want.map(Some), "{tag}: {out}");
+        for k in ["cap.warn_tokens", "cap.block_tokens", "orchestrate.kinds.builder.limit", "orchestrate.kinds.builder.handoff", "orchestrate.kinds.reviewer.limit", "orchestrate.kinds.research.handoff"] {
+            assert!(config_at(&h, k).is_none(), "{tag}: {k} is not written without a flag");
+        }
+        assert_eq!(cs::starter_compile(machine.cores) as f64, want[0], "{tag}");
+    }
+    // A configured value is kept, and the caps follow a configured compile count.
+    let h = Home::new("cs-start-kept");
+    for args in [&["set", "agents-builders", "6"][..], &["set", "resources-compile", "3"]] {
+        let (ok, out) = h.run(args);
+        assert!(ok, "{args:?}: {out}");
+    }
+    let (ok, out) = on_machine(&h.paths(), m(64, 20), &["orchestrate", "--yes"]);
+    assert!(ok, "{out}");
+    assert_eq!(starters(&h), [Some(3.0), Some(1.0), Some(6.0), Some(6.0), Some(3.0)], "{out}");
+    // Flags win over the starters, and the caps follow an answered compile count.
+    let h = Home::new("cs-start-flags");
+    let (ok, _) = h.run(&["list"]);
+    assert!(ok);
+    let (ok, out) = on_machine(&h.paths(), m(2, 20), &["orchestrate", "--yes", "--compile", "3", "--gpu", "0", "--research", "4"]);
+    assert!(ok, "{out}");
+    assert_eq!(starters(&h), [Some(3.0), Some(0.0), Some(3.0), Some(3.0), Some(4.0)], "{out}");
+    let (ok, out) = on_machine(&h.paths(), m(2, 20), &["orchestrate", "--yes", "--compile", "65"]);
+    assert!(!ok && out.contains("needs 0 to 64"), "{out}");
+    // `--no` on a new install writes no resources or kinds.
+    let h = Home::new("cs-start-no");
+    let (ok, _) = h.run(&["list"]);
+    assert!(ok);
+    let template = h.read(&h.config());
+    let (ok, out) = on_machine(&h.paths(), m(64, 20), &["orchestrate", "--no"]);
+    assert!(ok, "{out}");
+    assert_eq!(h.read(&h.config()), template);
+    assert_eq!(starters(&h), [None; 5]);
+}
+
 /// The first session asks through Claude once, naming every option and
 /// both answers; never when the switch is already set.
 #[test]
@@ -1102,9 +1199,10 @@ fn the_first_session_offers_orchestrated_mode_once() {
     assert!(ok);
     let p = h.paths();
     let line = cs::orchestrate_line(&p).unwrap();
-    for w in ["In your first reply, whatever the task, ask the user whether to work in orchestrated mode", "--builders N --reviewers N --research N --mode MODE --fresh auto|ask", "--handoff N --limit N", "285k and 450k", "atlas settings orchestrate --no", "or no user to ask, run nothing"] {
+    for w in ["In your first reply, whatever the task, ask the user whether to work in orchestrated mode", "--yes --mode MODE --fresh auto|ask", "--compile N --gpu N --builders N --reviewers N --research N", "from this machine's cores", "--handoff N --limit N", "285k and 450k", "atlas settings orchestrate --no", "or no user to ask, run nothing"] {
         assert!(line.contains(w), "{w}: {line}");
     }
+    assert!(!line.contains("2, 2, 1"), "the line names the rule, not numbers: {line}");
     assert!(cs::orchestrate_line(&p).is_some(), "still unanswered, so it returns");
     let (ok, out) = h.run(&["orchestrate", "--no"]);
     assert!(ok, "{out}");
@@ -1161,6 +1259,26 @@ fn live_atlas_hooks_are_checked_against_hooks_json() {
         h.insert("Notification".into(), stop);
     }
     assert_eq!(cs::hook_drift(&odd), ["Notification: an atlas hook on an event hooks/hooks.json does not hook"]);
+    // A legacy setup routing a recalling event to `atlas --hook` reloads the
+    // model per prompt; a command hook on another event is not said.
+    let mut legacy = json::parse(&same).unwrap();
+    let command = legacy["hooks"]["SessionStart"].clone();
+    if let Some(h) = legacy["hooks"].as_object_mut() {
+        h.insert("UserPromptSubmit".into(), command.clone());
+        h.insert("PreCompact".into(), command.clone());
+    }
+    let finding = "a command hook starts a new process per event that reloads the model and record vectors; use the mcp_tool hook";
+    assert_eq!(cs::hook_drift(&legacy), [format!("UserPromptSubmit: {finding}")]);
+    // SubagentStart recalls too: said on its own, and beside UserPromptSubmit.
+    let mut sub = json::parse(&same).unwrap();
+    if let Some(h) = sub["hooks"].as_object_mut() {
+        h.insert("SubagentStart".into(), command.clone());
+    }
+    assert_eq!(cs::hook_drift(&sub), [format!("SubagentStart: {finding}")]);
+    if let Some(h) = legacy["hooks"].as_object_mut() {
+        h.insert("SubagentStart".into(), command);
+    }
+    assert_eq!(cs::hook_drift(&legacy), [format!("UserPromptSubmit: {finding}"), format!("SubagentStart: {finding}")]);
 
     let h = Home::new("cs-drift");
     let doctor = || {
@@ -1186,6 +1304,65 @@ fn live_atlas_hooks_are_checked_against_hooks_json() {
     assert!(prompt(&mut hooks, "s2").contains("hooks/hooks.json"));
     std::fs::write(h.settings(), &same).unwrap();
     assert!(!prompt(&mut hooks, "s3").contains("hooks/hooks.json"));
+}
+
+/// A legacy setup that routes every atlas hook to `atlas --hook` starts a
+/// new process per prompt, so a prompt cannot tell the drift once: no prompt
+/// tells it, and a new or cleared session's SessionStart tells it once. A
+/// resident setup (an mcp_tool UserPromptSubmit) still hears it at the first
+/// prompt only, and not at SessionStart as well.
+#[test]
+fn a_command_hook_setup_hears_the_drift_once_at_session_start() {
+    use atlas::hooks::{HookEvent, Hooks};
+    let h = Home::new("cs-drift-command");
+    let same = cs::PLUGIN_HOOKS.replace("plugin:atlas:atlas", "atlas").replace(r#""\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook""#, r#""\"/opt/atlas/bin/atlas\" --hook""#);
+    let mut legacy = json::parse(&same).unwrap();
+    let command = legacy["hooks"]["SessionStart"].clone();
+    if let Some(hooks) = legacy["hooks"].as_object_mut() {
+        let events: Vec<String> = hooks.keys().cloned().collect();
+        for e in events {
+            hooks.insert(e, command.clone());
+        }
+    }
+    std::fs::write(h.settings(), legacy.to_string()).unwrap();
+    let s = atlas::memory::settings::Settings::from_config(None, &h.atlas().join("state").join("index.sqlite")).unwrap();
+    // Each `atlas --hook` run is a fresh state.
+    let run = |event: &str, source: &str, command: bool| {
+        let mut hooks = Hooks::open(s.clone()).unwrap();
+        if command {
+            hooks.set_command_hook();
+        }
+        hooks.set_offer_paths(Some(h.paths()));
+        hooks.handle(&HookEvent { event: event.into(), session_id: "s1".into(), source: source.into(), prompt: "what next?".into(), ..HookEvent::default() }).context
+    };
+    let told = |ctx: &str| ctx.matches("differ from the plugin's hooks/hooks.json").count();
+    for _ in 0..2 {
+        let ctx = run("UserPromptSubmit", "", true);
+        assert_eq!(told(&ctx), 0, "a prompt in a new process: {ctx}");
+    }
+    let start = run("SessionStart", "startup", true);
+    assert_eq!(told(&start), 1, "{start}");
+    assert!(start.contains("UserPromptSubmit: a command hook starts a new process per event that reloads the model and record vectors"), "{start}");
+    assert!(!start.contains("tool_use_id"), "the command finding has its own reason: {start}");
+    assert_eq!(told(&run("SessionStart", "clear", true)), 1);
+    for source in ["resume", "compact"] {
+        let ctx = run("SessionStart", source, true);
+        assert_eq!(told(&ctx), 0, "{source}: the same session: {ctx}");
+    }
+    // Resident: the plugin's hooks with SubagentStart as a command hook.
+    let mut resident = json::parse(&same).unwrap();
+    if let Some(hooks) = resident["hooks"].as_object_mut() {
+        hooks.insert("SubagentStart".into(), command);
+    }
+    std::fs::write(h.settings(), resident.to_string()).unwrap();
+    assert_eq!(told(&run("SessionStart", "startup", true)), 0, "the first prompt tells it");
+    let mut hooks = Hooks::open(s.clone()).unwrap();
+    hooks.set_offer_paths(Some(h.paths()));
+    let mut prompt = || hooks.handle(&HookEvent { event: "UserPromptSubmit".into(), session_id: "s1".into(), prompt: "what next?".into(), ..HookEvent::default() }).context;
+    let first = prompt();
+    assert_eq!(told(&first), 1, "{first}");
+    assert!(first.contains("SubagentStart: a command hook"), "{first}");
+    assert_eq!(told(&prompt()), 0);
 }
 
 /// `atlas doctor` says what it checked: "match" only for real hooks that match,
@@ -1324,7 +1501,7 @@ fn memory_rules_is_never_asked() {
     let before = h.read(&cfg);
     let mut out = Vec::new();
     let mut input: &[u8] = b"n\nn\nn\nleft alone\n";
-    let code = cs::run(&["offer".to_string()], &h.paths(), &mut Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false }).unwrap();
+    let code = cs::run(&["offer".to_string()], &h.paths(), &mut Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false, machine: None }).unwrap();
     let out = String::from_utf8(out).unwrap();
     assert!(code == std::process::ExitCode::SUCCESS && !out.contains("Should atlas manage") && !out.contains("memory-rules"), "{out}");
     assert_eq!(input, b"left alone\n", "{out}");
@@ -1364,31 +1541,27 @@ fn off_returns_memory_rules_to_unset() {
     assert_eq!(unset(), before, "{out}");
     let (ok, out) = h.run(&["list"]);
     assert!(ok && out.contains("atlas default: unset"), "{out}");
-    // False is reachable only by name, says what it does beyond unset, and
-    // off leaves it too.
-    let (ok, out) = h.run(&["set", "memory-rules", "false"]);
-    assert!(ok && out.contains("false is not unset") && out.contains("names by hand"), "{out}");
-    assert!(h.read(&cfg).contains("\"rules\": false"));
-    let (ok, out) = h.run(&["list"]);
-    assert!(ok && out.contains("also stops sync and query recall"), "{out}");
-    let (ok, out) = h.run(&["off", "memory-rules"]);
-    assert!(ok && out.contains("removed"), "{out}");
-    assert_eq!(unset(), before, "{out}");
-    // The other spellings of false are refused and point at off; nothing lands.
-    let (ok, out) = h.run(&["set", "memory-rules", "true"]);
-    assert!(ok, "{out}");
-    let on = h.read(&cfg);
-    for word in ["off", "no", "0", "OFF"] {
+    // False is the same as unset, says so, and off removes it.
+    for word in ["false", "FALSE", "no", "0"] {
         let (ok, out) = h.run(&["set", "memory-rules", word]);
-        assert!(!ok && out.contains("atlas settings off memory-rules"), "{word}: {out}");
-        assert_eq!(h.read(&cfg), on, "{word}: {out}");
+        assert!(ok && out.contains("false is the same as unset"), "{word}: {out}");
+        assert!(h.read(&cfg).contains("\"rules\": false"), "{word}: {out}");
+        let (ok, out) = h.run(&["off", "memory-rules"]);
+        assert!(ok && out.contains("removed"), "{word}: {out}");
+        assert_eq!(unset(), before, "{word}: {out}");
     }
-    let (ok, out) = h.run(&["off", "memory-rules"]);
-    assert!(ok, "{out}");
-    // Any case of the word itself warns, and so does a spelling of true.
-    let (ok, out) = h.run(&["set", "memory-rules", "FALSE"]);
-    assert!(ok && out.contains("false is not unset"), "{out}");
-    assert!(h.read(&cfg).contains("\"rules\": false"));
+    // The word off, in any case, is the full off: it writes "off", says what it
+    // stops beyond unset, and off removes it too.
+    for word in ["off", "OFF"] {
+        let (ok, out) = h.run(&["set", "memory-rules", word]);
+        assert!(ok && out.contains("also stops") && out.contains("names by hand"), "{word}: {out}");
+        assert!(h.read(&cfg).contains("\"rules\": \"off\""), "{word}: {out}");
+        let (ok, out) = h.run(&["list"]);
+        assert!(ok && out.contains("also stops sync and query recall"), "{out}");
+        let (ok, out) = h.run(&["off", "memory-rules"]);
+        assert!(ok && out.contains("removed"), "{word}: {out}");
+        assert_eq!(unset(), before, "{word}: {out}");
+    }
     let (ok, out) = h.run(&["set", "memory-rules", "on"]);
     assert!(ok && out.contains("warning: experimental"), "{out}");
     // Another setting's warning still reads by its value.

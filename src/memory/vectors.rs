@@ -8,6 +8,11 @@
 //! * The cache table, `rec_vec(model, sha, vec)`, is derived data: a record
 //!   revised gets a new version SHA and so a new vector; the old row stays
 //!   until [`prune`].
+//! * A (model, sha) row is immutable; a changed encoder must change the
+//!   model id. A row is written once and never rewritten ([`embed_pending`]
+//!   inserts with `OR IGNORE`), and [`RecVecs::refresh`] keeps a row it
+//!   holds for as long as the record's version SHA is unchanged, so a
+//!   rewritten row would not be seen until the process restarts.
 //! * Embedding a cold store (about 1,500 records) runs on a background
 //!   thread ([`spawn_embedder`]); until a record has a vector, the gate
 //!   judges it lexically alone.
@@ -24,7 +29,8 @@ use crate::error::Result;
 
 use super::MemoryStore;
 
-/// The cache table.
+/// The cache table. A (model, sha) row is immutable; a changed encoder must
+/// change the model id (see the module doc).
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS rec_vec(model TEXT NOT NULL, sha TEXT NOT NULL, vec BLOB NOT NULL, PRIMARY KEY(model, sha)) WITHOUT ROWID;";
 
 /// True for the kinds the relevance gate may inject.
@@ -79,6 +85,13 @@ pub fn embed_pending(store: &MemoryStore, model: &Model, limit: usize, threads: 
     if todo.is_empty() {
         return Ok(0);
     }
+    store_vectors(store, model, &todo, threads)
+}
+
+/// Embeds `todo` (as [`pending`] returns it) and stores the vectors. A row
+/// another embedder stored since `todo` was read is left as it is: a
+/// (model, sha) row is never rewritten.
+fn store_vectors(store: &MemoryStore, model: &Model, todo: &[(String, String)], threads: usize) -> Result<usize> {
     let texts: Vec<String> = todo.iter().map(|t| t.1.clone()).collect();
     let vecs = model.embed_many(&texts, threads);
     // `embed_many` returns one vector per text today. A short batch would
@@ -92,7 +105,7 @@ pub fn embed_pending(store: &MemoryStore, model: &Model, limit: usize, threads: 
     // A store a newer atlas upgraded since this one opened it is not written.
     super::check_locked(&tx, store.path())?;
     {
-        let mut st = tx.prepare_cached("INSERT OR REPLACE INTO rec_vec(model, sha, vec) VALUES(?1, ?2, ?3)")?;
+        let mut st = tx.prepare_cached("INSERT OR IGNORE INTO rec_vec(model, sha, vec) VALUES(?1, ?2, ?3)")?;
         for ((sha, _), v) in todo.iter().zip(&vecs) {
             let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
             st.execute(params![model.id, sha, blob])?;
@@ -166,7 +179,14 @@ pub struct RecVecs {
     pub dim: usize,
     /// Recallable active records with no vector yet.
     pub missing: usize,
+    /// Rows looked up again (records with a new version or no vector) by
+    /// the last [`RecVecs::load`] or [`RecVecs::refresh`]; a row kept from
+    /// before is not looked up.
+    pub read: usize,
     row: HashMap<i64, usize>,
+    /// The version SHA each row's vector is for.
+    shas: Vec<String>,
+    model: String,
     stamp: (i64, u64),
 }
 
@@ -177,25 +197,64 @@ impl RecVecs {
     ///
     /// [`crate::Error::Db`].
     pub fn load(store: &MemoryStore, model: &str, dim: usize) -> Result<RecVecs> {
+        let mut v = RecVecs { dim, model: model.to_string(), ..RecVecs::default() };
+        v.refresh(store)?;
+        Ok(v)
+    }
+
+    /// Brings the vectors up to the store's current state. Only the records
+    /// whose current version changed, or that had no vector, are read again:
+    /// a vector is keyed by its version's SHA, and a (model, sha) row is
+    /// never rewritten (see the module doc), so a kept row is still right.
+    /// After a commit that touched no recallable record (a journal entry, a
+    /// token log line) this is one pass over the record heads, no vector read.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Db`].
+    pub fn refresh(&mut self, store: &MemoryStore) -> Result<()> {
+        // A `RecVecs::default()` has no width, so every record would count
+        // as missing: build one with `load`.
+        debug_assert!(self.dim > 0, "RecVecs::refresh needs a width: build it with RecVecs::load");
         ensure_schema(store)?;
-        let mut v = RecVecs { dim, stamp: store.stamp()?, ..RecVecs::default() };
-        let mut st = store.conn().prepare_cached(
-            "SELECT r.rid, x.vec FROM records r JOIN versions v ON v.vid = r.head LEFT JOIN rec_vec x ON x.model = ?1 AND x.sha = v.sha
+        let dim = self.dim;
+        // Taken first: a commit during the pass leaves these stale, so the
+        // next refresh looks again.
+        let mut next = RecVecs { dim, stamp: store.stamp()?, ..RecVecs::default() };
+        let model = self.model.clone();
+        let mut heads = store.conn().prepare_cached(
+            "SELECT r.rid, v.sha FROM records r JOIN versions v ON v.vid = r.head
              WHERE r.status = 'active' AND r.kind NOT IN ('block', 'journal') ORDER BY r.rid",
         )?;
-        let mut rows = st.query([model])?;
+        let mut get = store.conn().prepare_cached("SELECT vec FROM rec_vec WHERE model = ?1 AND sha = ?2")?;
+        let mut rows = heads.query([])?;
         while let Some(r) = rows.next()? {
             let rid: i64 = r.get(0)?;
-            match r.get_ref(1)? {
-                rusqlite::types::ValueRef::Blob(b) if b.len() == dim * 4 => {
-                    v.row.insert(rid, v.rids.len());
-                    v.rids.push(rid);
-                    v.mat.extend(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
+            let sha: String = r.get(1)?;
+            if let Some(&i) = self.row.get(&rid).filter(|&&i| self.shas[i] == sha) {
+                next.push(rid, sha, |mat| mat.extend_from_slice(&self.mat[i * dim..(i + 1) * dim]));
+                continue;
+            }
+            next.read += 1;
+            let mut vecs = get.query(params![model, sha])?;
+            match vecs.next()?.map(|x| x.get_ref(0)).transpose()? {
+                Some(rusqlite::types::ValueRef::Blob(b)) if b.len() == dim * 4 => {
+                    let floats = b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c));
+                    next.push(rid, sha, |mat| mat.extend(floats));
                 }
-                _ => v.missing += 1,
+                _ => next.missing += 1,
             }
         }
-        Ok(v)
+        next.model = model;
+        *self = next;
+        Ok(())
+    }
+
+    fn push(&mut self, rid: i64, sha: String, vector: impl FnOnce(&mut Vec<f32>)) {
+        self.row.insert(rid, self.rids.len());
+        self.rids.push(rid);
+        self.shas.push(sha);
+        vector(&mut self.mat);
     }
 
     /// True when the store changed since these vectors were loaded.
@@ -231,6 +290,46 @@ impl RecVecs {
         scored.truncate(k);
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         scored
+    }
+}
+
+#[cfg(test)]
+mod immutable_tests {
+    use super::*;
+
+    /// A second embedder that read the same pending set stores nothing over
+    /// the row the first one wrote: a (model, sha) row is never rewritten.
+    #[test]
+    fn a_stored_vector_is_never_rewritten() {
+        let mut store = MemoryStore::in_memory().unwrap();
+        let mut w = store.writer().unwrap();
+        let d = super::super::Draft {
+            title: "widget cache".into(),
+            body: "the cat sat on the mat.\n".into(),
+            reason: "t".into(),
+            author: "t".into(),
+            client: "t".into(),
+            ..Default::default()
+        };
+        w.create("widget-cache", "memory", "", "feedback", &d, None).unwrap();
+        w.commit().unwrap();
+        let first = Model::parse(&crate::embed::tiny_model_bytes(false, 7), gemm::Isa::detect()).unwrap();
+        // Another encoder under the same id: what a rewrite would store.
+        let mut second = Model::parse(&crate::embed::tiny_model_bytes(false, 8), gemm::Isa::detect()).unwrap();
+        second.id = first.id.clone();
+        let todo = pending(&store, &first.id, 10).unwrap();
+        assert_eq!(todo.len(), 1);
+        let row = |s: &MemoryStore| -> Vec<u8> {
+            s.conn().query_row("SELECT vec FROM rec_vec WHERE model = ?1", [&first.id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(store_vectors(&store, &first, &todo, 1).unwrap(), 1);
+        let before = row(&store);
+        let other: Vec<u8> = second.embed_many(&[todo[0].1.clone()], 1)[0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_ne!(other, before, "the two encoders differ");
+        store_vectors(&store, &second, &todo, 1).unwrap();
+        assert_eq!(row(&store), before, "the stored row was rewritten");
+        assert_eq!(embed_pending(&store, &second, 10, 1).unwrap(), 0, "nothing is pending");
+        assert_eq!(row(&store), before);
     }
 }
 

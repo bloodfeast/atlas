@@ -859,13 +859,31 @@ pub struct Totals {
     pub bare: i64,
     /// Bare keys no record has.
     pub bare_missing: i64,
-    /// Post-compaction misses (`compact:miss` token-log rows).
+    /// Post-compaction repeats (`compact:miss` token-log rows): the legacy
+    /// series, every repeat of a lookup until the next compaction.
     pub misses: i64,
+    /// From `compact_miss`, within [`MISS_WINDOW`] calls of a boundary:
+    /// lookups (the denominator; shell commands are not lookups).
+    pub window_lookups: i64,
+    /// Repeats among them under the replay's rule (stamps ignored).
+    pub window_repeats: i64,
+    /// Misses among them: repeats of an unchanged target.
+    pub window_misses: i64,
+    /// Misses of an unchanged target at any distance from the boundary.
+    pub stamped_misses: i64,
+    /// Repeats of a target that changed since: correct re-reads, not misses.
+    pub changed_targets: i64,
+    /// Repeats with no stamp (shell commands, MCP calls without a key).
+    pub unstamped: i64,
+    /// The shell commands among them.
+    pub unstamped_shell: i64,
     /// The slowest hook time.
     pub max_ms: f64,
 }
 
-/// The compaction totals, or `None` when none are logged.
+/// The compaction totals, or `None` when none are logged. A store without
+/// the miss table ([`MISS_TABLE`]) reads as none of its figures: the report
+/// never creates it.
 ///
 /// # Errors
 ///
@@ -891,13 +909,69 @@ pub fn totals(conn: &Connection, bytes_per_token: f64) -> Result<Option<Totals>>
                 dangling: r.get(7)?,
                 bare: r.get(8)?,
                 bare_missing: r.get(9)?,
-                misses: 0,
                 max_ms: r.get(10)?,
+                ..Totals::default()
             })
         },
     )?;
     t.misses = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'compact:miss'", [], |r| r.get(0))?;
-    Ok((t.n > 0 || t.misses > 0).then_some(t))
+    if !has_miss_table(conn)? {
+        return Ok((t.n > 0 || t.misses > 0).then_some(t));
+    }
+    // A shell target starts `$ `; it is never one of the replay's lookups.
+    let w = MISS_WINDOW as i64;
+    (t.window_lookups, t.window_repeats, t.window_misses, t.stamped_misses, t.changed_targets, t.unstamped, t.unstamped_shell) = conn.query_row(
+        "SELECT ifnull(SUM(calls <= ?1 AND substr(sig, 1, 2) <> '$ '), 0),
+                ifnull(SUM(calls <= ?1 AND kind <> 'lookup' AND substr(sig, 1, 2) <> '$ '), 0),
+                ifnull(SUM(calls <= ?1 AND kind = 'miss'), 0),
+                ifnull(SUM(kind = 'miss'), 0),
+                ifnull(SUM(kind = 'changed'), 0),
+                ifnull(SUM(kind = 'unstamped'), 0),
+                ifnull(SUM(kind = 'unstamped' AND substr(sig, 1, 2) = '$ '), 0)
+         FROM compact_miss",
+        [w],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+    )?;
+    Ok((t.n > 0 || t.misses > 0 || t.window_lookups > 0 || t.stamped_misses + t.changed_targets + t.unstamped > 0).then_some(t))
+}
+
+/// Whether the store has the miss table ([`MISS_TABLE`]): a read, never DDL.
+fn has_miss_table(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compact_miss')", [], |r| r.get(0))?)
+}
+
+/// One repeated target for `--token-report --repeats`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repeat {
+    /// The stored target ([`MISS_TABLE`]).
+    pub sig: String,
+    /// Repeats of it unchanged.
+    pub misses: i64,
+    /// Repeats after it changed.
+    pub changed: i64,
+    /// Repeats with no stamp.
+    pub unstamped: i64,
+}
+
+/// The `limit` targets repeated most after a compaction since `since`
+/// (every time when empty), most first. A store without the miss table
+/// reads as none: the report never creates it.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn repeats(conn: &Connection, since: &str, limit: usize) -> Result<Vec<Repeat>> {
+    if !has_miss_table(conn)? {
+        return Ok(Vec::new());
+    }
+    let mut st = conn.prepare(
+        "SELECT sig, SUM(kind = 'miss'), SUM(kind = 'changed'), SUM(kind = 'unstamped') FROM compact_miss
+         WHERE kind <> 'lookup' AND time >= ?1 GROUP BY sig ORDER BY COUNT(*) DESC, sig LIMIT ?2",
+    )?;
+    let rows = st
+        .query_map(params![since, limit as i64], |r| Ok(Repeat { sig: r.get(0)?, misses: r.get(1)?, changed: r.get(2)?, unstamped: r.get(3)? }))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// The newest compaction recorded in a transcript: its metadata and
@@ -949,34 +1023,270 @@ pub fn report_lines(c: &RefCheck) -> String {
     out
 }
 
-/// Lookup targets per session, for counting post-compaction misses live:
-/// the PreToolUse hook notes each lookup, PreCompact moves the set aside,
-/// and a lookup after it that the moved set holds is a miss.
-#[derive(Debug, Default)]
-pub struct MissTracker {
-    seen: HashMap<String, HashSet<String>>,
-    before: HashMap<String, HashSet<String>>,
+/// The live miss table, in the index database beside the token log: one row
+/// per main-session lookup that bears on the post-compaction figures.
+///
+/// `sig` is the lookup's normalized target, redacted and capped at
+/// [`SIG_CAP`] characters (empty on a `lookup` row); `calls` is the 1-based
+/// count of main-session tool calls since the session's last compaction,
+/// the lookup's own included; `kind` is a [`MissKind`] name.
+pub const MISS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS compact_miss(
+    id INTEGER PRIMARY KEY,
+    time TEXT NOT NULL,
+    session TEXT NOT NULL,
+    sig TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    calls INTEGER NOT NULL
+);
+";
+
+/// The most characters of a target a `compact_miss` row stores.
+pub const SIG_CAP: usize = 200;
+
+/// What a lookup after a compaction was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissKind {
+    /// A lookup within [`MISS_WINDOW`] calls of the boundary that is no
+    /// repeat: the denominator.
+    Lookup,
+    /// A repeat of a target unchanged since its last lookup before the
+    /// boundary.
+    Miss,
+    /// A repeat of a target that changed since: a correct re-read.
+    Changed,
+    /// A repeat with no stamp to tell (a shell command, an MCP call
+    /// without a key).
+    Unstamped,
 }
 
-/// The most lookups remembered per session.
+impl MissKind {
+    /// The name stored in `compact_miss.kind`.
+    pub fn name(self) -> &'static str {
+        match self {
+            MissKind::Lookup => "lookup",
+            MissKind::Miss => "miss",
+            MissKind::Changed => "changed",
+            MissKind::Unstamped => "unstamped",
+        }
+    }
+}
+
+/// One `compact_miss` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissRow {
+    /// The session.
+    pub session: String,
+    /// The stored target ([`MISS_TABLE`]).
+    pub sig: String,
+    /// What it was.
+    pub kind: MissKind,
+    /// Main-session tool calls since the boundary, this one included.
+    pub calls: usize,
+    /// A repeat of a [`lookup_sig`] lookup: the legacy `compact:miss`
+    /// token-log row is written beside it.
+    pub legacy: bool,
+}
+
+/// Logs one live miss row.
+///
+/// # Errors
+///
+/// [`crate::Error::StoreTooNew`] (nothing written, no table made), or
+/// [`crate::Error::Db`].
+pub fn log_miss(conn: &Connection, r: &MissRow) -> Result<()> {
+    crate::store::guarded(conn, || {
+        conn.execute_batch(MISS_TABLE)?;
+        conn.execute(
+            "INSERT INTO compact_miss(time, session, sig, kind, calls) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![crate::memory::now(), r.session, r.sig, r.kind.name(), r.calls as i64],
+        )?;
+        Ok(())
+    })
+}
+
+/// The live-only target of a shell command (Bash, PowerShell): `$ `, its
+/// first two words and a hash of the whole command with its whitespace
+/// collapsed. No other command text is kept. `None` for any other tool.
+///
+/// [`lookup_sig`] stays `None` for these, so the offline replay is unchanged.
+pub fn shell_sig(tool: &str, input: &Value) -> Option<String> {
+    if !matches!(tool, "Bash" | "PowerShell") {
+        return None;
+    }
+    let words: Vec<&str> = input.get("command").and_then(Value::as_str)?.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+    let h = crate::sha256::hex(format!("{tool}\n{}", words.join(" ")).as_bytes());
+    let two = crate::redact::redact(&words[..words.len().min(2)].join(" "));
+    Some(format!("$ {two} #{}", &h[..HASH_LEN]))
+}
+
+/// What a lookup's target was when it was looked up, from the raw tool
+/// input (never the lowercased signature).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stamp {
+    /// A file: its modification time (ns since the epoch) and size.
+    File(u128, u64),
+    /// Nothing at the path (or a record key no record has).
+    Absent,
+    /// A folder, or no path: the session's writes under it so far, every
+    /// shell command counted as one under every folder.
+    Writes(u64),
+    /// A memory record's sha.
+    Record(String),
+    /// No stamp.
+    None,
+}
+
+/// A path as the tracker compares it: resolved against `cwd` when relative,
+/// `\` read as `/`, lowercase, no trailing `/`. An empty path is `cwd`.
+pub fn norm_path(path: &str, cwd: &str) -> String {
+    let p = Path::new(path);
+    let full = if path.is_empty() {
+        PathBuf::from(cwd)
+    } else if p.is_relative() && !cwd.is_empty() {
+        Path::new(cwd).join(p)
+    } else {
+        p.to_path_buf()
+    };
+    full.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+/// The file stamp of `path`, [`Stamp::Absent`] when nothing is there.
+fn file_stamp(path: &Path) -> Stamp {
+    match std::fs::metadata(path) {
+        Ok(m) => Stamp::File(m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos()), m.len()),
+        Err(_) => Stamp::Absent,
+    }
+}
+
+/// An atlas MCP tool: `mcp__atlas__*` or a plugin's `mcp__plugin_*_atlas__*`.
+fn is_atlas_tool(tool: &str) -> bool {
+    tool.strip_prefix("mcp__").and_then(|t| t.split("__").next()).is_some_and(|server| server == "atlas" || server.ends_with("_atlas"))
+}
+
+/// One session's lookups, for counting post-compaction misses live.
+#[derive(Debug, Default)]
+struct Lookups {
+    /// Main-session tool calls since the last compaction.
+    calls: usize,
+    /// Since the last compaction: each target's latest stamp.
+    seen: HashMap<String, Stamp>,
+    /// Before it: what the session had, with each target's last stamp.
+    /// `None` until the session's first compaction.
+    before: Option<HashMap<String, Stamp>>,
+    /// The files the session edited or wrote, normalized ([`norm_path`]).
+    writes: Vec<String>,
+    /// Writes past [`MAX_SEEN`] and shell commands: changes under every folder.
+    everywhere: u64,
+}
+
+/// Lookup targets per session, for counting post-compaction misses live:
+/// the PreToolUse hook counts each main-session call and notes each lookup
+/// with its stamp, PreCompact moves the targets aside, and a lookup after it
+/// that the moved set holds is a repeat, a miss when its target is
+/// unchanged.
+#[derive(Debug, Default)]
+pub struct MissTracker {
+    sessions: HashMap<String, Lookups>,
+}
+
+/// The most lookups (and written files) remembered per session.
 const MAX_SEEN: usize = 8192;
 
 impl MissTracker {
-    /// Notes a lookup; true when it is a post-compaction miss.
-    pub fn lookup(&mut self, session: &str, sig: String) -> bool {
-        let miss = self.before.get(session).is_some_and(|b| b.contains(&sig));
-        let s = self.seen.entry(session.to_string()).or_default();
-        if s.len() < MAX_SEEN {
-            s.insert(sig);
-        }
-        miss
+    /// Counts one main-session tool call (any tool); returns the calls since
+    /// the session's last compaction, this one included.
+    pub fn call(&mut self, session: &str) -> usize {
+        let l = self.sessions.entry(session.to_string()).or_default();
+        l.calls += 1;
+        l.calls
     }
 
-    /// A compaction: what was looked up so far is what the session had.
-    pub fn compact(&mut self, session: &str) {
-        let s = self.seen.remove(session).unwrap_or_default();
-        self.before.insert(session.to_string(), s);
+    /// Notes a file the session edits or writes ([`norm_path`] form).
+    pub fn wrote(&mut self, session: &str, path: String) {
+        let l = self.sessions.entry(session.to_string()).or_default();
+        if l.writes.len() < MAX_SEEN {
+            l.writes.push(path);
+        } else {
+            l.everywhere += 1;
+        }
     }
+
+    /// Notes a shell command: it may have changed anything.
+    pub fn shell(&mut self, session: &str) {
+        self.sessions.entry(session.to_string()).or_default().everywhere += 1;
+    }
+
+    /// The session's changes under a folder ([`norm_path`] form) so far.
+    fn writes_under(&self, session: &str, dir: &str) -> u64 {
+        let Some(l) = self.sessions.get(session) else { return 0 };
+        let under = l.writes.iter().filter(|w| dir.is_empty() || w.as_str() == dir || w.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))).count();
+        l.everywhere + under as u64
+    }
+
+    /// The stamp of a lookup's target, from the raw tool input: a Read's
+    /// file; a Grep's or Glob's file, else the writes under its folder (or
+    /// under `cwd` with no path); an atlas call's record by its `key`.
+    /// Anything else has none.
+    pub fn stamp(&self, session: &str, tool: &str, input: &Value, cwd: &str, store: &MemoryStore) -> Stamp {
+        let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+        let resolve = |p: &str| if Path::new(p).is_relative() && !cwd.is_empty() { Path::new(cwd).join(p) } else { PathBuf::from(p) };
+        match tool {
+            "Read" => file_stamp(&resolve(f("file_path"))),
+            "Grep" | "Glob" => {
+                let p = if f("path").is_empty() { PathBuf::from(cwd) } else { resolve(f("path")) };
+                match std::fs::metadata(&p) {
+                    Ok(m) if m.is_file() => file_stamp(&p),
+                    _ => Stamp::Writes(self.writes_under(session, &norm_path(f("path"), cwd))),
+                }
+            }
+            t if is_atlas_tool(t) && !f("key").trim().is_empty() => match store.head(f("key").trim()) {
+                Ok(Some(h)) => Stamp::Record(h.sha),
+                Ok(None) => Stamp::Absent,
+                Err(_) => Stamp::None,
+            },
+            _ => Stamp::None,
+        }
+    }
+
+    /// Notes a lookup (`shell` for a [`shell_sig`]) at the session's current
+    /// call; the row it adds to `compact_miss`, if any. Before the session's
+    /// first compaction nothing is a row.
+    pub fn lookup(&mut self, session: &str, sig: &str, stamp: Stamp, shell: bool) -> Option<MissRow> {
+        let l = self.sessions.entry(session.to_string()).or_default();
+        let row = l.before.as_ref().and_then(|b| {
+            let (kind, sig) = match b.get(sig) {
+                Some(old) if *old == Stamp::None || stamp == Stamp::None => (MissKind::Unstamped, stored_sig(sig)),
+                Some(old) if *old == stamp => (MissKind::Miss, stored_sig(sig)),
+                Some(_) => (MissKind::Changed, stored_sig(sig)),
+                None if !shell && l.calls <= MISS_WINDOW => (MissKind::Lookup, String::new()),
+                None => return None,
+            };
+            Some(MissRow { session: session.to_string(), sig, kind, calls: l.calls, legacy: !shell && kind != MissKind::Lookup })
+        });
+        if l.seen.len() < MAX_SEEN || l.seen.contains_key(sig) {
+            l.seen.insert(sig.to_string(), stamp);
+        }
+        row
+    }
+
+    /// A compaction: what was looked up so far is what the session had, and
+    /// the call count starts again.
+    pub fn compact(&mut self, session: &str) {
+        let l = self.sessions.entry(session.to_string()).or_default();
+        l.before = Some(std::mem::take(&mut l.seen));
+        l.calls = 0;
+    }
+}
+
+/// A target as `compact_miss` stores it: redacted, at most [`SIG_CAP`]
+/// characters. A shell target's words are redacted already.
+fn stored_sig(sig: &str) -> String {
+    let s = if sig.starts_with("$ ") { sig.to_string() } else { crate::redact::redact(sig) };
+    s.chars().take(SIG_CAP).collect()
 }
 
 #[cfg(test)]
@@ -1060,12 +1370,39 @@ mod tests {
     #[test]
     fn misses_count_only_after_a_compaction() {
         let mut m = MissTracker::default();
-        assert!(!m.lookup("s", "read a".into()));
-        assert!(!m.lookup("s", "read a".into()));
+        let look = |m: &mut MissTracker, s: &str, sig: &str| {
+            m.call(s);
+            m.lookup(s, sig, Stamp::Absent, false).map(|r| (r.kind, r.calls))
+        };
+        assert_eq!(look(&mut m, "s", "read a"), None);
+        assert_eq!(look(&mut m, "s", "read a"), None);
         m.compact("s");
-        assert!(m.lookup("s", "read a".into()));
-        assert!(!m.lookup("s", "read b".into()));
-        assert!(!m.lookup("t", "read a".into()));
+        assert_eq!(look(&mut m, "s", "read a"), Some((MissKind::Miss, 1)));
+        assert_eq!(look(&mut m, "s", "read b"), Some((MissKind::Lookup, 2)));
+        assert_eq!(look(&mut m, "t", "read a"), None);
+    }
+
+    #[test]
+    fn a_shell_command_is_no_replay_lookup_and_keeps_two_words_and_a_hash() {
+        let v = crate::json::parse(r#"{"command": "gh pr view 145 --json state"}"#).unwrap();
+        // The offline replay is unchanged: a shell command is not one of its lookups.
+        assert_eq!(lookup_sig("Bash", &v), None);
+        assert_eq!(lookup_sig("PowerShell", &v), None);
+        let s = shell_sig("Bash", &v).unwrap();
+        assert!(s.starts_with("$ gh pr #") && s.len() == "$ gh pr #".len() + HASH_LEN, "{s}");
+        let spaced = crate::json::parse(r#"{"command": "  gh pr\tview 145  --json state "}"#).unwrap();
+        assert_eq!(shell_sig("Bash", &spaced), Some(s.clone()));
+        assert_ne!(shell_sig("PowerShell", &v), Some(s));
+        assert_eq!(shell_sig("Read", &v), None);
+        assert_eq!(shell_sig("Bash", &crate::json::parse(r#"{"command": "  "}"#).unwrap()), None);
+    }
+
+    #[test]
+    fn a_stored_target_is_capped() {
+        let long = format!("read {}", "a/".repeat(300));
+        assert_eq!(stored_sig(&long).chars().count(), SIG_CAP);
+        assert!(is_atlas_tool("mcp__atlas__recall") && is_atlas_tool("mcp__plugin_atlas_atlas__recall"));
+        assert!(!is_atlas_tool("mcp__claude_ai_Gmail__search_threads") && !is_atlas_tool("Read"));
     }
 
     /// Review finding 3: the canonical target of a lines ref is checked, as
@@ -1108,6 +1445,19 @@ mod storeguard_tests {
         make_index_newer(&c);
         let before = dump(&c);
         let e = log(&c, &Logged::default()).expect_err("refused");
+        assert!(e.is_store_too_new(), "{e}");
+        assert!(c.is_autocommit(), "rolled back");
+        assert_eq!(dump(&c), before, "no table made, no row");
+    }
+
+    /// The same for a live miss row.
+    #[test]
+    fn a_miss_row_checks_the_version_under_the_lock() {
+        let c = Connection::open_in_memory().unwrap();
+        make_index_newer(&c);
+        let before = dump(&c);
+        let row = MissRow { session: "s".into(), sig: "read a".into(), kind: MissKind::Miss, calls: 1, legacy: true };
+        let e = log_miss(&c, &row).expect_err("refused");
         assert!(e.is_store_too_new(), "{e}");
         assert!(c.is_autocommit(), "rolled back");
         assert_eq!(dump(&c), before, "no table made, no row");

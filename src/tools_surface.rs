@@ -42,6 +42,7 @@ const OPS: &[Op] = &[
     op("note", "log", "write_log"),
     op("note", "vaults", "list_vaults"),
     op("note", "sources", "list_sources"),
+    op("note", "judge", "judge_task"),
     op("edit", "create", "create_note"),
     op("edit", "append", "append_to_note"),
     op("edit", "history", "append_history"),

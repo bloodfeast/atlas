@@ -50,9 +50,10 @@ Uses: gpu, compile, worktree:parser-fix
 
 - `Lane:` takes one lane id.
 - `Priority:` takes `urgent`, `normal` or `background`.
-- `Uses:` takes a comma-separated list of resource names, or `none`. A name is free-form; atlas knows `gpu`
-  and `compile` by default (section 3.2), and a name with a `:` (`worktree:NAME`, `file:PATH`) is an
-  instance of a class. The word `read-only` in the list is not a resource: it says the item does not hold
+- `Uses:` takes a list of resource names, or `none`. Only a limit can hold a launch back: `gpu`, `compile`,
+  `worktree:NAME` and the names the configuration lists (section 3.2); any other word only adds a note at
+  launch. A name with a `:` (`worktree:NAME`, `sqlport:15126`) is an instance of a class, and `sqlport 15126`
+  reads as `sqlport:15126` (the parsing rule is in section 3.2). The word `read-only` in the list is not a resource: it says the item does not hold
   its lane (section 3.1).
 
 Each field is declared or inferred on its own: a brief that declares only `Priority:` still has its lane and
@@ -68,10 +69,23 @@ resource lets two items run together that should not, a spurious one only costs 
 |---|---|---|
 | Lane | The rules the hooks already use to file an agent's journal (`brief_lane`): a lane named after "journal", "under", "your" or "own", else the one lane the brief names | No lane: the item conflicts with nothing on lanes |
 | Priority | Words that say so: "urgent", "blocker", "blocking", "hotfix", "right away" (urgent); "low priority", "no rush", "when idle", "background" (background) | `normal` |
-| `gpu` | The brief asks for GPU work: a capture, a render, a GPU benchmark or timing, a bake, training, a GPU lock | Not used |
+| `gpu` | A phrase that means the gpu in any project: a GPU lock, GPU timing, GPU bench, GPU run or capture, quiet GPU, a frame capture, CUDA, Vulkan, OptiX, RenderDoc, Nsight. The bare words capture, screenshot, bench, benchmark, bake and "render it" count only where the project turns them on (below) | Not used |
 | `compile` | The brief runs a heavy build or test: `cargo build`, `cargo test`, `cargo nextest`, `cargo xtask`, a release build, or the words "heavy compile" | Not used |
 | `worktree:NAME` | The brief points the agent at an existing worktree by path (a path under a folder named `worktrees`), unless it tells the agent to make its own | Not used |
 | `file:PATH` | Not inferred in the first cut; declared only (section 9, Q-QL3) | Not used |
+
+**Bare gpu words are per project (atlas-dev #150, journal ATLAS-USES:0002).** In a web repository a
+screenshot is a browser PNG and a bench is a unit benchmark, so those words infer no gpu by default. A project
+whose screenshots and benches do use the gpu turns them on in its `atlas.project.json`:
+
+```json
+{"name": "skyforge", "orchestrate": {"bare_gpu_words": true}}
+```
+
+`bare_gpu_words` is the only `orchestrate` key a project file or a `projects` entry may set; the user-level
+`orchestrate.bare_gpu_words` is the default for projects that do not. Bare `gpu` is not an inference word: on
+the `lanes-eval` corpus it raised the briefs with a spurious gpu from 23 to 31 of 60, since a brief names the gpu
+without needing it.
 
 The kind is classified as today (`Kind:` line, `subagent_type`, `isolation: worktree`, the default).
 
@@ -97,8 +111,8 @@ builder is never held back by a running review. Reviews are their own queue in `
 
 ### 3.2 Resources
 
-A resource has a capacity: how many holders it allows at once. Defaults: `gpu` 1, `compile` 1, any other name 1.
-They are set in atlas's configuration:
+A resource has a capacity: how many holders it allows at once. Defaults: `gpu` 1, `compile` 1, each
+`worktree:NAME` 1. They are set in atlas's configuration:
 
 ```json
 {"orchestrate": {"resources": {"gpu": 1, "compile": 2, "db:staging": 1}}}
@@ -109,6 +123,23 @@ so two items in different worktrees do not conflict and two in the same one do.
 
 A capacity of 0 means "never serialize this resource". This is how a user turns off a resource atlas infers
 (for example `compile: 0` on a machine where parallel builds are fine).
+
+**Only a limit denies or queues (atlas-dev #150).** A resource is a limit when it has its own entry, its class
+has one (`sqlport` for `sqlport:15126`), or it is `gpu`, `compile` or a `worktree:NAME`. Any other word on a
+`Uses:` line (a repository name such as `db` or `react`) is not a limit: the hook never denies a launch for it
+and the proposal never holds an item back for it. When a running agent uses the same word, the launch is let
+through with one note naming the word and the holder (`shares db with Build ES1-1663`), whether the word was
+declared or inferred. An entry with capacity N >= 1 makes a word a limit; capacity 0 turns it off, with no
+note. `Uses:` is for exclusive resources: the gpu, the compile slots, one worktree, one port or one database,
+not the repositories an agent touches in its own worktree.
+
+**Parsing.** A `Uses:` value is split on commas into pieces, and each piece on spaces into words. Backticks,
+quotes and a trailing `.` are trimmed and every word is lowercased. A word made only of digits joins the word
+before it in the same piece as its value, so `sqlport 15126`, `sqlport: 15126`, `sqlport  15126` and
+`sqlport:15126` are all `sqlport:15126`. Any other word is its own resource (`Uses: gpu compile` is gpu and
+compile), and a number after a comma stays its own resource (`sqlport, 15126` is two). `none` and `and` are
+dropped, `read-only` sets read-only, and the list is sorted with duplicates removed. A queued item's `uses:`
+meta, written by the hook or by hand in a planned item, is read the same way.
 
 ### 3.3 What holds a resource
 
@@ -180,6 +211,13 @@ the orchestrator may still try one (Q-QL2):
 - **Otherwise** (the launch inferred the field, or the holders fill it only with inferred ones counted): the
   launch is let through with a one-line warning naming the holders, since an inference may be wrong. A `Lane:`
   or `Uses:` line corrects it.
+- **A word that is not a limit** (section 3.2), shared with running work, declared or inferred: the launch is
+  let through with a one-line note naming the word and its holders. It is never denied or queued for it.
+
+A launch that starts takes its waiting entry off the queue: the item its `Queue: KEY` line names, else the
+waiting launch with the same description and brief, else (a reworded brief, #150) the oldest waiting launch
+with the same declared `Lane:` and the same kind. The hook names the key it took off. A planned item leaves
+only by its `Queue:` key, and a launch with an inferred or no lane retires nothing by lane.
 
 Lanes compare without case (`Lane: parser` and `PARSER` are one lane), as resources do.
 
@@ -193,7 +231,7 @@ corrected by adding a declaration to the brief.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `orchestrate.resources` | `{"gpu": 1, "compile": 1}` | Resource capacities; other names have 1; 0 never serializes |
+| `orchestrate.resources` | `{"gpu": 1, "compile": 1}` | Resource capacities (a name or a class); `worktree:*` has 1; other names are not limits and only warn; 0 never serializes |
 | `orchestrate.aging_minutes` | 60 | Minutes of waiting that raise an item one class; 0 is no aging |
 
 Everything here applies only in orchestrated mode (`orchestrate.enabled`), like the caps.
@@ -251,7 +289,35 @@ branch without working in it. Neither can be read from words alone. So:
   spurious resources on at most 10% of briefs; `file:` is declared only.
 - **Q-QL4.** Aging raises an item one class per 60 minutes waited, configurable (`orchestrate.aging_minutes`).
 
-## 10. Planned work
+## 10. The backlog comb
+
+`atlas backlog` (src/backlog.rs) finds placed work that nobody started. A queue entry is placement, not liveness:
+TRACKS had one for six days and still dropped (journal TRACKS:0002). The comb reads store records only, plus
+queued vault notes from the index, and never writes the queue.
+
+- **Live** (Brandon 2026-11-10): a `brief` or `commit` entry within 7 days in the item's lane (a lane holding
+  only that item, or named after it), or naming its ID as a whole token anywhere; or a running agent whose
+  brief declares `Lane: ID` or names it (`--transcript`). Questions, decisions, notes, measurements, reviews,
+  `next` entries and handoffs do not count.
+- **Done**: a `done:` mark, a retirement, a commit title saying merged, landed, deployed or shipped about it, or
+  the newest ruling whose subject is the ID closing it (dropped, killed, merged, folds into) when it is dated on
+  or after the item's placement. A ruling deferring it (stays in the X backlog, parked) lists it as waiting with
+  that ruling as the reason.
+- **Aging** (shown as `aging`; the internal state is still `Overdue` until BC-2): not live, not done, and asked again (Brandon's words with an ask cue, dated on or after the
+  placement), or its written-order turn came 2 days ago (every `after:` predecessor started, landed or live, or
+  the previous `order:` in its lane), or placed over 14 days ago. Order in prose is not a written order.
+  An aging item is shown with its days only; it is not a call to pull it forward.
+  This aging is the comb's own state, unrelated to `orchestrate.aging_minutes` (Q-QL4), which raises a
+  queued item's priority class while it waits for a slot.
+- **Joins are exact**: a whole-token ID (`TRACKS-2` does not name `TRACKS`), a key, or the item's own lane. An
+  ask naming several items of one lane chain counts for the chain's head.
+- **Rank**: 40 per ask date, 15 when the turn came, 15 for a front-of-queue ruling, 5 per extra dated ruling,
+  5 for placed work, plus a point a day of age up to 30. Weights and cue lists are the `backlog` section of the
+  configuration.
+- `--as-of T` reads each record at its newest version at or before T and ignores what was written, retired or
+  marked after it; INTENT items are dated by the date they state.
+
+## 11. Planned work
 
 The queue holds all planned work, not only refused launches. A planned item is a `queued` entry with
 `planned: true` in its meta; its body is a short scope, because the real brief is written at launch.

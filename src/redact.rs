@@ -82,7 +82,8 @@ fn unreadable(path: Option<std::ffi::OsString>) -> bool {
 }
 
 /// A denylist file's terms: one per line, lowercased, blank lines and `#`
-/// comments skipped.
+/// comments skipped. The release leak check's `#[word]` marker line is a
+/// comment here, so a whole-word term is still redacted as a substring.
 pub fn parse_terms(text: &str) -> Vec<String> {
     text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_ascii_lowercase).collect()
 }
