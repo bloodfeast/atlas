@@ -125,12 +125,21 @@ fn the_server_calibrates_in_the_background_unless_turned_off() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(rows(&db), 1, "{err}");
 
-    let report = command(&t, &cfg, &claude, true).arg("--token-report").output().unwrap();
+    let report = command(&t, &cfg, &claude, true).args(["--token-report", "--tsv"]).output().unwrap();
     let text = String::from_utf8_lossy(&report.stdout);
     assert!(text.contains("30 pre-atlas lookup episodes in 5 of 5 transcripts before "), "{text}");
     // The hook above logged the store's first atlas answer: that is the cutoff.
     assert!(text.contains("(the store's first atlas answer)") && text.contains(&format!("lookup rules v{}", atlas::calibrate::RULES_VERSION)), "{text}");
     assert!(!text.contains("stale"), "{text}");
+    // The default is the human layout: the same baseline, in a titled block.
+    let human = command(&t, &cfg, &claude, true).arg("--token-report").output().unwrap();
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human.starts_with("Headline\n")
+            && human.contains("30 pre-atlas lookup episodes in 5 of 5 transcripts before ")
+            && !human.contains('\t'),
+        "{human}"
+    );
 
     // By hand: progress and the result, the same numbers from the stored calls.
     let by_hand = command(&t, &cfg, &claude, true).arg("--calibrate").output().unwrap();
@@ -142,7 +151,7 @@ fn the_server_calibrates_in_the_background_unless_turned_off() {
 }
 
 #[test]
-fn too_little_history_gives_the_upper_bound_only() {
+fn too_little_history_gives_the_ledger_ratio_only() {
     let t = Temp::new("calibrate-few");
     let (cfg, claude, db) = fixture(&t);
     // Two of the five transcripts: 12 episodes.
@@ -152,11 +161,12 @@ fn too_little_history_gives_the_upper_bound_only() {
     let out = command(&t, &cfg, &claude, true).arg("--calibrate").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(rows(&db), 1);
-    let report = command(&t, &cfg, &claude, true).arg("--token-report").output().unwrap();
+    let report = command(&t, &cfg, &claude, true).args(["--token-report", "--tsv"]).output().unwrap();
     let text = String::from_utf8_lossy(&report.stdout);
     assert!(text.contains("measured ratio per answer: none, too little pre-atlas history: 12 pre-atlas lookup episodes in 2 of 2 transcripts"), "{text}");
     assert!(text.contains("needs 30 episodes in 5 transcripts") && text.contains("runs again when the lookup rules or the configured targets change"), "{text}");
-    assert!(text.contains("upper bound per answer"), "{text}");
+    assert!(text.contains("ledger ratio per answer (rule-based, not a bound"), "{text}");
+    assert!(!text.contains("upper bound"), "{text}");
 }
 
 #[test]

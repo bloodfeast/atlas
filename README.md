@@ -79,7 +79,7 @@ update` turns them off). Building from source, uninstalling and the data folders
    SDK) asks nothing and counts as nothing asked, and atlas stays silent if it could not record your answer. `atlas settings add-project .` and
    `atlas settings orchestrate` do the same from a terminal. The vault question is per folder.
 4. Work as usual. Large Bash, Read and Grep results now arrive as digests with a handle; Claude pulls what it
-   needs with `atlas slice h:ID --item NAME` or `--failures`. Grep and Read results name the enclosing item and
+   needs with `recall key=h:ID item=NAME` or `failures=true`. Grep and Read results name the enclosing item and
    its line range.
 5. Ask Claude to remember a decision (`remember`), and start the next session: relevant records are recalled
    on each prompt, within a 600-token budget (`recall.budget_tokens`). The recall defaults (600 tokens, a 0.53
@@ -89,6 +89,8 @@ update` turns them off). Building from source, uninstalling and the data folders
    `--yes` without a terminal).
    With the compaction features on (the default; `"compact": {"enabled": false}` or `atlas settings off compact`
    turns them off), `atlas settings compact-md` offers a Compact instructions block for a project's `CLAUDE.md` the same way.
+   For a project with no rules, `atlas --setup` and `atlas settings rules-template` offer a starter `CLAUDE.md` and
+   `.claude/atlas-rules.md` ([the rules template](https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files#the-rules-template)).
 
 ## Projects
 
@@ -148,9 +150,12 @@ edit, run `/mcp` and reconnect atlas, or restart Claude Code. Every key is on
 
 ## Security in brief
 
-- **Local only.** One process over stdio. No socket, HTTP client or DNS in the code or its dependencies;
-  nothing reaches the network at query time. The model download at setup and the update check go through
-  the system `curl`, to pinned `https` URLs, and are verified (SHA-256, and an ed25519 signature for updates).
+- **Local only.** One process over stdio. No HTTP client or DNS in the code or its dependencies, and one socket:
+  `atlas pr-events serve`, run only from the command line, listens on 127.0.0.1 for signed GitHub events and
+  never connects out; the events reach it through `gh webhook forward`, which it starts with `gh`. Nothing
+  reaches the network at query time. The model download at setup and the update
+  check go through the system `curl`, to pinned `https` URLs, and are verified (SHA-256, and an ed25519
+  signature for updates).
 - **Confined.** Every path is checked to stay inside a configured folder, lexically and after resolving links;
   dot folders are refused.
 - **A fixed deny-list.** `.env*`, keys, keystores and credential files are never read, whatever the
@@ -172,7 +177,7 @@ The wiki is the full manual:
 - [Configuration reference](https://github.com/bloodfeast/atlas/wiki/Configuration-reference): every key of `atlas.json`
 - [Projects and multi-repo](https://github.com/bloodfeast/atlas/wiki/Projects-and-multi-repo): scoped projects and repository graphs
 - [Token savings and method](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method): where the tokens go and how it is measured
-- [Handles and digests](https://github.com/bloodfeast/atlas/wiki/Handles-and-digests): routing, `atlas slice`, `atlas run`
+- [Handles and digests](https://github.com/bloodfeast/atlas/wiki/Handles-and-digests): routing, `recall h:ID`, `atlas run`
 - [Tools reference](https://github.com/bloodfeast/atlas/wiki/Tools-reference): every MCP tool and the answer format
 - [Code index](https://github.com/bloodfeast/atlas/wiki/Code-index): `symbol`, item ranges and language coverage
 - [Semantic search](https://github.com/bloodfeast/atlas/wiki/Semantic-search): the owned embedder and hybrid search

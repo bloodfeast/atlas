@@ -91,6 +91,10 @@ fn updater(t: &Temp, base: &str) -> Updater {
         pin: None,
         check_every: Duration::from_secs(3600),
         max_time: 5,
+        install: true,
+        notify: true,
+        live: false,
+        gate: atlas::update::SwapGate::default(),
     }
 }
 

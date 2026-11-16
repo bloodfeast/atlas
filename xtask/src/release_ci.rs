@@ -5,8 +5,11 @@
 //! cargo xtask release --pr --remote URL [--expect vX.Y.Z] [--dry-run]
 //!     In the development repository (the release-pr workflow): the early
 //!     checks of the release, the export, the leak check of the exported
-//!     tree and the wiki pages, then branch release/vX.Y.Z of URL with the
-//!     exported tree on top of its main (bin/ kept as main has it), pushed,
+//!     tree and the wiki pages (or, in the release-pr job, which holds no
+//!     denylist, the check that HEAD is the commit the linux-leak job
+//!     exported and checked: ATLAS_LEAK_CHECKED), then branch
+//!     release/vX.Y.Z of URL with the exported tree on top of its main
+//!     (bin/ kept as main has it), pushed,
 //!     and a pull request into main whose body is the release notes. No
 //!     tests and no builds: the public CI tests the pull request.
 //! cargo xtask release assets --dir DIR --notes FILE [--expect vX.Y.Z]
@@ -19,13 +22,18 @@
 //!     binaries, checks each SHA-256 and size against the manifest, the
 //!     leak denylist against every file and every file for secret-shaped
 //!     runs (`secret_scan.rs`, the shapes push protection refuses; in a dry
-//!     run as well), commits the binaries to the public
+//!     run as well), each binary's build provenance (`gh attestation
+//!     verify`: made by the public repository's release.yml on main at the
+//!     draft's commit, on a GitHub-hosted runner; in a dry run as well),
+//!     commits the binaries to the public
 //!     main as bin/ (the plugin install is a git clone), signs the manifest
 //!     with ATLAS_SIGN_KEY, uploads manifest.json.sig, pushes main and the
-//!     wiki, and publishes the draft on the binaries commit, which creates
+//!     wiki, and publishes the draft on the binaries commit, with notes it
+//!     makes again from the changelog at the draft's commit and the verified
+//!     binaries (no attestation covers the draft's body), which creates
 //!     the tag as the owner. --dry-run stops before signing and pushing.
 //! cargo xtask release check [--force]
-//! cargo xtask release gate --dir DIR
+//! cargo xtask release gate --dir DIR [--export]
 //! cargo xtask release accept-hit FILE... [--print]
 //!     The binary leak check before anything is public, its CI half, and
 //!     the accepted-hits file's writer: see `release_check.rs`.
@@ -48,7 +56,8 @@
 //! ATLAS_LEAK_ACCEPTED names the file, else `leak-accepted.txt` beside the
 //! denylist is read when it is there.
 //!
-//! Environment: ATLAS_LEAK_DENYLIST (required), ATLAS_PUBLIC_REPO,
+//! Environment: ATLAS_LEAK_DENYLIST (required, except by `--pr` in the
+//! release-pr job, which takes ATLAS_LEAK_CHECKED instead), ATLAS_PUBLIC_REPO,
 //! ATLAS_PUBLIC_NAME, ATLAS_PUBLIC_EMAIL, ATLAS_RELEASE_STAGE and
 //! ATLAS_GITHUB_STUB as for the release (see `release.rs`); ATLAS_SIGN_KEY
 //! for `sign`; GH_TOKEN for `gh` (in CI, the release app's installation
@@ -58,7 +67,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::release::{
-    bin_name, binaries_table, cargo_version, changelog_section, check_public_files, check_section, copy, drop_leading_blank, env, fill_notes, key_const, leak_check, ls, magic_ok, manifest_json, mkdir,
+    bin_name, binaries_table, cargo_version, changelog_section, check_public_files, check_section, copy, drop_leading_blank, env, fill_notes, key_const, leak_check, ls, magic_ok, manifest_json, manifest_notes, mkdir,
     model_rows, output, plugin_version, read_text, release_date, repo_root, rm_rf, say, sha256_file, sign_manifest, size_of, status, write, Notes, DEFAULT_PUBLIC_REPO, TARGETS,
 };
 use atlas::json::Value;
@@ -71,7 +80,7 @@ pub const USAGE: &str = "usage: cargo xtask release --pr --remote URL [--expect 
        cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
        cargo xtask release ship vX.Y.Z
        cargo xtask release check [--force]
-       cargo xtask release gate --dir DIR
+       cargo xtask release gate --dir DIR [--export]
        cargo xtask release accept-hit FILE... [--print]";
 
 /// The binaries table row of the pull request's notes: the binaries are
@@ -558,6 +567,13 @@ pub fn run(args: Vec<String>) -> R {
             // A push to GitHub from a local checkout is guarded; the
             // release-pr job's checkout is fresh, is the dispatched commit,
             // and keeps no credentials to fetch with.
+            //
+            // These variables are not proof of CI: a local run that sets
+            // GITHUB_ACTIONS, GITHUB_REPOSITORY and ATLAS_LEAK_CHECKED skips
+            // the export's leak check here (leak_source). That is the same
+            // trust as ATLAS_PUBLISH below, which the same forged variables
+            // unlock: whoever can set them at a terminal already holds the
+            // push credentials, so they add nothing a push could not do.
             let in_ci = env("GITHUB_ACTIONS").as_deref() == Some("true") && env("GITHUB_REPOSITORY").as_deref() == Some("bloodfeast/atlas-dev");
             let guard_checkout = !dry_run && !Path::new(&remote).is_dir() && !in_ci;
             let p = Pr {
@@ -573,7 +589,7 @@ pub fn run(args: Vec<String>) -> R {
                 expect,
                 dry_run,
                 require_clean: true,
-                denylist: denylist_from_env()?,
+                leak: leak_source(env("ATLAS_LEAK_DENYLIST"), env("ATLAS_LEAK_CHECKED"), in_ci)?,
                 repo,
                 ident: Ident::from_env(),
                 api: api.as_ref(),
@@ -585,6 +601,75 @@ pub fn run(args: Vec<String>) -> R {
 }
 
 // ---------------------------------------------------------------- --pr
+
+/// Where `--pr`'s leak check of the export comes from.
+#[derive(Debug, Clone)]
+pub enum Leak {
+    /// The denylist: the export and the wiki pages are checked here.
+    Denylist(PathBuf),
+    /// The release-pr job, which never holds the denylist: the commit the
+    /// linux-leak job exported and checked (`release gate --export`); the
+    /// export here must be of that commit.
+    CheckedAt(String),
+}
+
+/// `--pr`'s leak check from ATLAS_LEAK_DENYLIST (`denylist`) when set;
+/// else, in the release-pr job only, from ATLAS_LEAK_CHECKED (`checked`),
+/// the commit the linux-leak job checked.
+pub(crate) fn leak_source(denylist: Option<String>, checked: Option<String>, in_ci: bool) -> R<Leak> {
+    if let Some(d) = denylist {
+        let d = PathBuf::from(d);
+        if std::fs::File::open(&d).is_err() {
+            return Err("the denylist is not readable".into());
+        }
+        return Ok(Leak::Denylist(d));
+    }
+    match checked {
+        // Git prints commits in lowercase; HEAD is compared with this.
+        Some(c) if in_ci && is_full_sha(&c) => Ok(Leak::CheckedAt(c.to_ascii_lowercase())),
+        Some(c) if in_ci => Err(format!("ATLAS_LEAK_CHECKED is {c:?}, not a commit (40 hex digits)")),
+        _ => Err("ATLAS_LEAK_DENYLIST is not set".into()),
+    }
+}
+
+/// Commit `rev` of `root` exported as the release exports it (`git
+/// archive`, so export-ignore holds) into `<stage>/tree`, `stage` replaced:
+/// the public files present, no bin/. The tree's path.
+fn export_commit(root: &Path, stage: &Path, rev: &str) -> R<PathBuf> {
+    rm_rf(stage)?;
+    mkdir(stage)?;
+    let src_tar = stage.join("src.tar");
+    if !status(git(root).args(["archive", "--format=tar", "-o"]).arg(&src_tar).arg(rev))? {
+        return Err("git archive failed".into());
+    }
+    let archive = std::fs::read(&src_tar).map_err(|e| format!("{}: {e}", src_tar.display()))?;
+    let tree = stage.join("tree");
+    crate::tar::extract(&archive, &tree)?;
+    check_public_files(&tree)?;
+    if tree.join("bin").exists() {
+        return Err("the export carries bin/: bin/ in the public repository is the release's binaries, committed by `release sign`".into());
+    }
+    Ok(tree)
+}
+
+/// Every exported file and every wiki page the export makes, against the
+/// denylist.
+fn export_leak_gates(tree: &Path, stage: &Path, denylist: &Path) -> R {
+    leak_gate(tree, denylist, "the exported tree")?;
+    let pages = stage.join("wiki-pages");
+    crate::wiki::stage_pages(&tree.join("wiki"), &read_text(&tree.join("CHANGELOG.md"))?, &pages)?;
+    leak_gate(&pages, denylist, "the wiki pages")
+}
+
+/// `release gate --export` (the linux-leak job): HEAD exported as `--pr`
+/// exports it, its files and wiki pages checked against the denylist; the
+/// commit checked, which the pr job then exports again.
+pub(crate) fn export_gate(root: &Path, stage: &Path, denylist: &Path) -> R<String> {
+    let head = git_out(root, &["rev-parse", "HEAD"])?;
+    let tree = export_commit(root, stage, &head)?;
+    export_leak_gates(&tree, stage, denylist)?;
+    Ok(head)
+}
 
 /// What `--pr` works from.
 pub struct Pr<'a> {
@@ -601,8 +686,8 @@ pub struct Pr<'a> {
     /// Run `checkout_guard` (HEAD is origin/main): a push from a local
     /// checkout.
     pub guard_checkout: bool,
-    /// The leak denylist.
-    pub denylist: PathBuf,
+    /// Where the leak check of the export comes from.
+    pub leak: Leak,
     /// The public repository's owner/name.
     pub repo: String,
     /// The public identity.
@@ -661,23 +746,17 @@ pub fn pr(p: &Pr) -> R<PrMade> {
     }
 
     say("export");
-    rm_rf(&p.stage)?;
-    mkdir(&p.stage)?;
-    let src_tar = p.stage.join("src.tar");
-    if !status(git(root).args(["archive", "--format=tar", "-o"]).arg(&src_tar).arg("HEAD"))? {
-        return Err("git archive failed".into());
+    let head = git_out(root, &["rev-parse", "HEAD"])?;
+    let tree = export_commit(root, &p.stage, &head)?;
+    match &p.leak {
+        Leak::Denylist(denylist) => export_leak_gates(&tree, &p.stage, denylist)?,
+        // The release-pr job: linux-leak checked this export, if it is of
+        // the same commit.
+        Leak::CheckedAt(c) if *c == head => say(&format!("leak check of the export: done by the linux-leak job on {}", short(c))),
+        Leak::CheckedAt(c) => {
+            return Err(format!("the linux-leak job checked the export of {}, but this is {}: export the commit it checked", short(c), short(&head)));
+        }
     }
-    let archive = std::fs::read(&src_tar).map_err(|e| format!("{}: {e}", src_tar.display()))?;
-    let tree = p.stage.join("tree");
-    crate::tar::extract(&archive, &tree)?;
-    check_public_files(&tree)?;
-    if tree.join("bin").exists() {
-        return Err("the export carries bin/: bin/ in the public repository is the release's binaries, committed by `release sign`".into());
-    }
-    leak_gate(&tree, &p.denylist, "the exported tree")?;
-    let pages = p.stage.join("wiki-pages");
-    crate::wiki::stage_pages(&tree.join("wiki"), &read_text(&tree.join("CHANGELOG.md"))?, &pages)?;
-    leak_gate(&pages, &p.denylist, "the wiki pages")?;
 
     let models: String = model_rows(&read_text(&tree.join("config/atlas.template.json"))?).iter().map(|m| m.row()).collect();
     let date = release_date();
@@ -793,22 +872,19 @@ pub fn assets(root: &Path, dir: &Path, notes_out: &Path, expect: Option<&str>, r
         let b = std::fs::read(dir.join(f)).map_err(|e| format!("{f}: {e}"))?;
         magic_ok(f, &b).map_err(|m| format!("{f} is not the file its name says (starts {m})"))?;
     }
+    let changes = changelog_section(&read_text(&root.join("CHANGELOG.md"))?, &tag);
+    check_section(&changes, &tag)?;
     let _ = std::fs::remove_file(dir.join("manifest.json"));
-    let manifest = manifest_json(&version, repo, dir)?;
+    // The notice fields (issue #190): the section's Highlights and whether
+    // the plugin's files changed since the last release (the workflow
+    // fetches the tags for this).
+    let manifest = manifest_json(&version, repo, dir, &manifest_notes(root, &version, &changes)?)?;
     let m = atlas::update::parse_manifest(manifest.as_bytes())?;
     if m.files.len() != TARGETS.len() {
         return Err(format!("the manifest lists {} files, not {}", m.files.len(), TARGETS.len()));
     }
     write(&dir.join("manifest.json"), &manifest)?;
-    let changes = changelog_section(&read_text(&root.join("CHANGELOG.md"))?, &tag);
-    check_section(&changes, &tag)?;
-    let models: String = model_rows(&read_text(&root.join("config/atlas.template.json"))?).iter().map(|m| m.row()).collect();
-    let date = release_date();
-    let notes = fill_notes(
-        &read_text(&root.join("scripts/release-notes.md.in"))?,
-        &Notes { tag: &tag, date: &date, repo, changes: &changes, binaries: &binaries_table(dir)?, missing: "", models: &models },
-    );
-    write(notes_out, &notes)?;
+    write(notes_out, release_notes(root, &tag, repo, dir)?)?;
     say(&format!("{tag}: manifest.json for {} binaries, notes in {}", m.files.len(), notes_out.display()));
     Ok(())
 }
@@ -834,8 +910,13 @@ pub trait Releases {
     fn download(&self, tag: &str, dir: &Path) -> R;
     /// Uploads `file` as an asset, replacing one of the same name.
     fn upload(&self, tag: &str, file: &Path) -> R;
-    /// Publishes the draft on `target` (this creates the tag).
-    fn publish(&self, tag: &str, target: &str) -> R;
+    /// Publishes the draft on `target` (this creates the tag), its body
+    /// replaced by the file `notes`, in one edit.
+    fn publish(&self, tag: &str, target: &str, notes: &Path) -> R;
+    /// The build provenance of the downloaded asset `file` of release `tag`:
+    /// `gh attestation verify`'s JSON (see [`attest_argv`]), an error when
+    /// no attestation verifies.
+    fn attestation(&self, tag: &str, file: &Path, repo: &str, commit: &str) -> R<String>;
 }
 
 /// `gh release`, as the user gh is logged in as.
@@ -875,9 +956,13 @@ impl Releases for GhReleases {
         crate::release_ci::no_gh_in_tests();
         output(Command::new("gh").args(["release", "upload", tag, "--repo", &self.repo, "--clobber"]).arg(file)).map(|_| ())
     }
-    fn publish(&self, tag: &str, target: &str) -> R {
+    fn publish(&self, tag: &str, target: &str, notes: &Path) -> R {
         crate::release_ci::no_gh_in_tests();
-        output(Command::new("gh").args(["release", "edit", tag, "--repo", &self.repo, "--draft=false", "--latest", "--target", target])).map(|_| ())
+        output(Command::new("gh").args(["release", "edit", tag, "--repo", &self.repo, "--draft=false", "--latest", "--target", target, "--notes-file"]).arg(notes)).map(|_| ())
+    }
+    fn attestation(&self, _tag: &str, file: &Path, repo: &str, commit: &str) -> R<String> {
+        crate::release_ci::no_gh_in_tests();
+        output(Command::new("gh").args(attest_argv(file, repo, commit))).map_err(|e| format!("gh attestation verify refused it ({e})"))
     }
 }
 
@@ -905,8 +990,15 @@ impl Releases for StubReleases {
         mkdir(&d)?;
         copy(file, &d.join(file.file_name().ok_or("no file name")?))
     }
-    fn publish(&self, tag: &str, target: &str) -> R {
+    /// `published.txt` holds the target, `notes.md` the body.
+    fn publish(&self, tag: &str, target: &str, notes: &Path) -> R {
+        copy(notes, &self.0.join(format!("release-{tag}")).join("notes.md"))?;
         write(&self.0.join(format!("release-{tag}")).join("published.txt"), target)
+    }
+    /// `release-<tag>/attest/<file name>.json`, as gh would print it.
+    fn attestation(&self, tag: &str, file: &Path, _repo: &str, _commit: &str) -> R<String> {
+        let name = file.file_name().ok_or("no file name")?.to_string_lossy();
+        read_text(&self.0.join(format!("release-{tag}")).join("attest").join(format!("{name}.json"))).map_err(|_| "no attestation (stub)".to_string())
     }
 }
 
@@ -1008,6 +1100,135 @@ pub fn verify_assets(dir: &Path, tag: &str, repo: &str) -> R<atlas::update::Mani
     }
 }
 
+/// The workflow whose build provenance `sign` accepts, in the public
+/// repository: `.github/workflows/release.yml`.
+pub const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
+
+/// `gh attestation verify`'s arguments for one downloaded binary: a build
+/// provenance attestation signed by `repo`'s release workflow, for the
+/// source commit `commit` on main, made on a GitHub-hosted runner, as JSON.
+pub fn attest_argv(file: &Path, repo: &str, commit: &str) -> Vec<String> {
+    let mut v: Vec<String> = vec!["attestation".into(), "verify".into(), file.to_string_lossy().into_owned()];
+    for (k, val) in [("--repo", repo.to_string()), ("--signer-workflow", format!("{repo}/{RELEASE_WORKFLOW}")), ("--source-digest", commit.to_string()), ("--source-ref", "refs/heads/main".into())] {
+        v.push(k.into());
+        v.push(val);
+    }
+    v.extend(["--deny-self-hosted-runners", "--format", "json"].map(String::from));
+    v
+}
+
+/// Reads `gh attestation verify --format json` output again rather than
+/// trusting its exit status alone: at least one verified attestation, and
+/// every one of them of the file whose SHA-256 is `sha256`, from source
+/// commit `commit` on main of `repo`, signed by its release workflow, on a
+/// GitHub-hosted runner. Errors start with `name: `.
+pub fn check_attestation(json: &str, name: &str, sha256: &str, commit: &str, repo: &str) -> R {
+    let err = |why: String| Err(format!("{name}: {why}"));
+    let Ok(v) = atlas::json::parse(json) else {
+        return err("gh attestation verify: not JSON".into());
+    };
+    let list = v.as_array().map(Vec::as_slice).unwrap_or_default();
+    if list.is_empty() {
+        return err("no verified attestation".into());
+    }
+    let signer = format!("https://github.com/{repo}/{RELEASE_WORKFLOW}@");
+    let source = format!("https://github.com/{repo}");
+    for a in list {
+        let r = a.get("verificationResult");
+        let cert = r.and_then(|r| r.get("signature")).and_then(|s| s.get("certificate"));
+        let field = |k: &str| cert.and_then(|c| c.get(k)).and_then(Value::as_str).unwrap_or_default();
+        let subjects = r.and_then(|r| r.get("statement")).and_then(|s| s.get("subject")).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        if !subjects.iter().any(|s| s.get("digest").and_then(|d| d.get("sha256")).and_then(Value::as_str) == Some(sha256)) {
+            return err(format!("an attestation is not of this file (sha256 {sha256})"));
+        }
+        // gh checked the signer's repository; the source repository is
+        // checked as well (defence in depth).
+        if field("sourceRepositoryURI") != source {
+            return err(format!("an attestation's source repository is {:?}, not {source}", field("sourceRepositoryURI")));
+        }
+        if field("sourceRepositoryDigest") != commit {
+            return err(format!("an attestation's source commit is {:?}, not the draft's {commit}", field("sourceRepositoryDigest")));
+        }
+        if field("sourceRepositoryRef") != "refs/heads/main" {
+            return err(format!("an attestation's source ref is {:?}, not refs/heads/main", field("sourceRepositoryRef")));
+        }
+        if !field("buildSignerURI").starts_with(&signer) {
+            return err(format!("an attestation is signed by {:?}, not {repo}'s {RELEASE_WORKFLOW}", field("buildSignerURI")));
+        }
+        if field("runnerEnvironment") != "github-hosted" {
+            return err(format!("an attestation was made on a {:?} runner, not github-hosted (self-hosted refused)", field("runnerEnvironment")));
+        }
+    }
+    Ok(())
+}
+
+/// The release notes of `tag` as the draft's are made: from `tree`'s
+/// CHANGELOG.md section (which must pass the changelog rule), notes
+/// template and model pins, and the binaries in `bins`, dated
+/// [`release_date`]. `assets` writes the draft's with it, and `sign`
+/// makes them again from the draft's commit, so the published body is
+/// what that commit and the verified binaries give, whatever the draft
+/// held.
+pub(crate) fn release_notes(tree: &Path, tag: &str, repo: &str, bins: &Path) -> R<String> {
+    let changes = changelog_section(&read_text(&tree.join("CHANGELOG.md"))?, tag);
+    check_section(&changes, tag)?;
+    let models: String = model_rows(&read_text(&tree.join("config/atlas.template.json"))?).iter().map(|m| m.row()).collect();
+    let date = release_date();
+    Ok(fill_notes(
+        &read_text(&tree.join("scripts/release-notes.md.in"))?,
+        &Notes { tag, date: &date, repo, changes: &changes, binaries: &binaries_table(bins)?, missing: "", models: &models },
+    ))
+}
+
+/// Every binary of the manifest must carry build provenance from `repo`'s
+/// release workflow at `commit` (the draft's, which ship has checked is the
+/// release pull request's merge commit). Every failure is named.
+fn check_provenance(rel: &dyn Releases, tag: &str, dir: &Path, m: &atlas::update::Manifest, repo: &str, commit: &str) -> R {
+    let mut errs = Vec::new();
+    for f in &m.files {
+        let p = dir.join(&f.file);
+        let checked = sha256_file(&p).and_then(|sha| rel.attestation(tag, &p, repo, commit).map_err(|e| format!("{}: {e}", f.file)).and_then(|json| check_attestation(&json, &f.file, &sha, commit, repo)));
+        if let Err(e) = checked {
+            errs.push(e);
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the draft {tag}'s binaries lack build provenance from {repo}'s {RELEASE_WORKFLOW} on main at {}: {}", short(commit), errs.join("; ")))
+    }
+}
+
+/// The manifest's notice fields as the signing step shows them: its
+/// Highlights, which must be the `### Highlights` of the release's CHANGELOG
+/// `section` (as `manifest_highlights` reads it), and its
+/// `plugin_changed_in`, which must not be after the release.
+///
+/// # Errors
+///
+/// A message naming the mismatch.
+pub fn signed_notes(m: &atlas::update::Manifest, section: &str) -> R<String> {
+    let want = crate::release::manifest_highlights(section);
+    if m.highlights != want {
+        return Err(format!("the manifest's Highlights {:?} are not the CHANGELOG's {want:?}: rebuild the draft from this CHANGELOG", m.highlights));
+    }
+    let mut t = format!("signing v{}: {} Highlights line(s)", m.version, m.highlights.len());
+    for h in &m.highlights {
+        t.push_str(&format!("\n  - {h}"));
+    }
+    match m.plugin_changed_in.as_deref() {
+        Some(p) => {
+            let (pv, mv) = (atlas::update::parse_version(p), atlas::update::parse_version(&m.version));
+            if pv > mv {
+                return Err(format!("the manifest says the plugin files changed in {p}, after the release {}", m.version));
+            }
+            t.push_str(&format!("\nplugin files last changed in {p}: a plugin older than that is told to run /plugin"));
+        }
+        None => t.push_str("\nno plugin_changed_in: no notice says to run /plugin"),
+    }
+    Ok(t)
+}
+
 /// What `sign` did.
 #[derive(Debug)]
 pub struct Signed {
@@ -1062,6 +1283,11 @@ pub fn sign(s: &Sign) -> R<Signed> {
     let _ = std::fs::remove_file(dir.join("manifest.json.sig"));
     binary_leak_gate(&dir, &s.denylist, s.accepted.as_deref(), "the release assets")?;
     secret_gate(&dir, "the release assets")?;
+    // Who built the bytes: the manifest comes from the same draft as the
+    // binaries, so only an attestation from the public release workflow at
+    // the draft's commit says they are what that workflow built.
+    check_provenance(s.rel, tag, &dir, &m, &s.repo, &d.target)?;
+    say(&format!("provenance: {} binaries built by {}'s {RELEASE_WORKFLOW} on main at {}", m.files.len(), s.repo, short(&d.target)));
 
     // The public main must be the draft's commit, or the binaries commit on
     // it from an earlier run of this step.
@@ -1075,6 +1301,10 @@ pub fn sign(s: &Sign) -> R<Signed> {
     if tag_on_remote(&public, tag)? {
         return Err(format!("{tag} already exists in {}", s.remote));
     }
+    // What the signature will vouch for, shown, and checked against the
+    // CHANGELOG of the commit being published.
+    let section = changelog_section(&read_text(&public.join("CHANGELOG.md"))?, tag);
+    say(&signed_notes(&m, &section)?);
     let head = git_out(&public, &["rev-parse", "HEAD"])?;
     let subject = format!("atlas {tag} binaries");
     let resumed = head != d.target;
@@ -1138,6 +1368,14 @@ pub fn sign(s: &Sign) -> R<Signed> {
     let commit = git_out(&public, &["rev-parse", "HEAD"])?;
     say(&format!("binaries commit {} on {}", &commit[..12], d.target.get(..12).unwrap_or(&d.target)));
 
+    // The draft's body is covered by no attestation: the notes are made
+    // again here from the draft commit's changelog (the public checkout
+    // holds it; the binaries commit changes bin/ only) and the verified
+    // binaries, and the publish replaces the body with them.
+    let notes_path = s.stage.join("notes.md");
+    write(&notes_path, release_notes(&public, tag, &s.repo, &dir)?)?;
+    say(&format!("notes: made from the changelog at {} and the verified binaries ({})", short(&d.target), notes_path.display()));
+
     say("wiki");
     let pages = s.stage.join("wiki-pages");
     let names = crate::wiki::stage_pages(&public.join("wiki"), &read_text(&public.join("CHANGELOG.md"))?, &pages)?;
@@ -1147,7 +1385,7 @@ pub fn sign(s: &Sign) -> R<Signed> {
     say(&if wiki.changed { format!("wiki commit: {} pages, {}", names.len(), wiki.stat.lines().last().unwrap_or("").trim()) } else { "wiki: no page changed".into() });
 
     if s.dry_run {
-        say(&format!("dry run: not signed, nothing pushed or published. It would sign manifest.json, upload manifest.json.sig, push main ({}) and the wiki, and publish {tag} on it.", &commit[..12]));
+        say(&format!("dry run: not signed, nothing pushed or published. It would sign manifest.json, upload manifest.json.sig, push main ({}) and the wiki, and publish {tag} on it with the notes in {}.", &commit[..12], notes_path.display()));
         return Ok(Signed { commit, published: false });
     }
     // The key's preflight, after every other check: openssl on PATH and a
@@ -1177,7 +1415,7 @@ pub fn sign(s: &Sign) -> R<Signed> {
     if wiki.changed {
         say(&format!("pushed the wiki to {}", wiki.remote));
     }
-    s.rel.publish(tag, &commit)?;
+    s.rel.publish(tag, &commit, &notes_path)?;
     if s.rel.view(tag)?.draft {
         return Err(format!("{tag} is still a draft after publishing"));
     }
@@ -1188,6 +1426,24 @@ pub fn sign(s: &Sign) -> R<Signed> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The notice fields of the fixture release: its CHANGELOG section is
+    /// one plain item, so one Highlights line.
+    pub(crate) fn fixture_notes() -> crate::release::ManifestNotes {
+        crate::release::ManifestNotes { highlights: vec!["one".into()], plugin_changed_in: Some("1.2.3".into()) }
+    }
+
+    #[test]
+    fn signing_shows_the_highlights_and_checks_them_against_the_changelog() {
+        let m = |h: &[&str], p: Option<&str>| atlas::update::Manifest { version: "1.2.3".into(), files: Vec::new(), highlights: h.iter().map(|s| s.to_string()).collect(), plugin_changed_in: p.map(str::to_string) };
+        let section = "### Highlights\n\n- Faster recall\n- A badge\n\n### Fixed\n\n- x";
+        let t = signed_notes(&m(&["Faster recall", "A badge"], Some("1.2.0")), section).unwrap();
+        assert!(t.contains("  - Faster recall") && t.contains("  - A badge") && t.contains("1.2.0"), "{t}");
+        let e = signed_notes(&m(&["Faster recall"], None), section).unwrap_err();
+        assert!(e.contains("not the CHANGELOG"), "{e}");
+        assert!(signed_notes(&m(&["Faster recall", "A badge"], Some("1.3.0")), section).is_err(), "a plugin change after the release");
+        assert!(signed_notes(&m(&[], None), "").unwrap().contains("no plugin_changed_in"));
+    }
 
     /// A person who types what each prompt asks.
     pub(crate) struct Yes;
@@ -1272,7 +1528,7 @@ pub(crate) mod tests {
         let d = tmp("manifest");
         let bins = d.join("bins");
         fake_bins(&bins);
-        let text = manifest_json("1.2.3", REPO, &bins).unwrap();
+        let text = manifest_json("1.2.3", REPO, &bins, &crate::release::ManifestNotes::default()).unwrap();
         let m = atlas::update::parse_manifest(text.as_bytes()).unwrap();
         assert_eq!(m.version, "1.2.3");
         assert_eq!(m.files.len(), 5);
@@ -1326,12 +1582,51 @@ pub(crate) mod tests {
         out
     }
 
+    /// The secrets a job's lines read, as `secrets.NAME` (comments
+    /// skipped), and how many times any `secrets` appears at all, so a read
+    /// in another form (`secrets[...]`, `toJSON(secrets)`) shows as a
+    /// difference.
+    fn secrets_named(lines: &[String]) -> (Vec<String>, usize) {
+        let (mut named, mut uses) = (Vec::new(), 0);
+        for l in lines.iter().filter(|l| !l.trim_start().starts_with('#')) {
+            uses += l.matches("secrets").count();
+            for (i, _) in l.match_indices("secrets.") {
+                let rest = &l[i + "secrets.".len()..];
+                named.push(rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect());
+            }
+        }
+        (named, uses)
+    }
+
+    /// The private setup notes of the development repository, found without
+    /// naming them (this file is exported): the tracked `.gitattributes`
+    /// below the root that marks its whole folder export-ignore, and the
+    /// Markdown files beside it. `(folder, notes)`.
+    fn private_notes(root: &Path) -> Vec<(String, String)> {
+        let files = output(Command::new("git").arg("-C").arg(root).args(["ls-files"])).unwrap();
+        let mut out = Vec::new();
+        for attrs in files.lines().filter(|f| f.ends_with("/.gitattributes")) {
+            if !read_text(&root.join(attrs)).unwrap().lines().any(|l| l.trim() == "* export-ignore") {
+                continue;
+            }
+            let folder = attrs.trim_end_matches(".gitattributes");
+            for f in files.lines().filter(|f| f.starts_with(folder) && f.ends_with(".md") && !f[folder.len()..].contains('/')) {
+                out.push((folder.trim_end_matches('/').to_string(), f.to_string()));
+            }
+        }
+        out
+    }
+
     /// Whether the tests run in the development repository. The public one
     /// is its export, which leaves out the release-pr workflow
     /// (export-ignore) and carries the release's binaries in bin/.
     fn in_dev_repo(root: &Path) -> bool {
         root.join(".github/workflows/release-pr.yml").is_file()
     }
+
+    /// Debian 11 (glibc 2.31), the Linux build image, pinned by its
+    /// multi-platform index digest.
+    const BULLSEYE: &str = "debian:bullseye@sha256:6f519a81440354a85eb592c5f32109ab80605f6b892455983a6f618bf87fabe9";
 
     /// The release workflows read as the rules say: every action pinned by
     /// a full commit SHA, no `pull_request_target`, no token permission by
@@ -1360,15 +1655,48 @@ pub(crate) mod tests {
                 assert!(sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "{file}: not pinned by SHA: {l}");
                 assert!(rest.contains("# v"), "{file}: the pinned version is named: {l}");
             }
+            // Every container is pinned by digest, the same image everywhere.
+            for l in text.lines().filter(|l| l.trim_start().starts_with("container:")) {
+                let image = l.split("container:").nth(1).unwrap().trim();
+                assert_eq!(image, BULLSEYE, "{file}: a container not pinned by digest: {l}");
+            }
+            // A public build started by hand builds main only: the gate of
+            // the first job names the ref too.
+            let gate_line = if file == ".github/workflows/release.yml" { format!("if: github.repository == '{gate}' && github.ref == 'refs/heads/main'") } else { format!("if: github.repository == '{gate}'") };
             let js = jobs(&text);
             assert!(!js.is_empty(), "{file}: no jobs");
             for (name, lines) in &js {
                 assert!(lines.iter().any(|l| l.starts_with("    permissions:")), "{file}: job {name} sets no permissions");
-                let gated = lines.iter().any(|l| l.trim() == format!("if: github.repository == '{gate}'"));
+                let gated = lines.iter().any(|l| l.trim() == gate_line);
                 let behind = lines.iter().any(|l| l.trim_start().starts_with("needs:"));
                 assert!(gated || behind, "{file}: job {name} is not gated to {gate}");
-                let writes: Vec<&String> = lines.iter().filter(|l| l.trim_end().ends_with(": write") && !l.contains("permission-")).collect();
-                assert!(writes.is_empty() || (file.ends_with("release.yml") && name == "draft" && writes.len() == 1), "{file}: job {name} writes: {writes:?}");
+                let mut writes: Vec<&str> = lines.iter().filter(|l| l.trim_end().ends_with(": write") && !l.contains("permission-")).map(|l| l.trim()).collect();
+                writes.sort();
+                let allowed: &[&str] = match (file, name.as_str()) {
+                    // Each build job attests its own binaries, and only that.
+                    (".github/workflows/release.yml", "linux" | "windows" | "macos") => &["attestations: write", "id-token: write"],
+                    (".github/workflows/release.yml", "draft") => &["contents: write"],
+                    _ => &[],
+                };
+                assert_eq!(writes, allowed, "{file}: job {name} writes");
+                // Secrets only in the development repository's main-only
+                // Environments, never in a public workflow or the PR check,
+                // and each Environment's job names only its own: the leak
+                // secrets in `release-leak` (linux-leak), the app's in
+                // `release` (pr).
+                let env = lines.iter().find_map(|l| l.strip_prefix("    environment: ")).map(str::trim);
+                let (named, uses) = secrets_named(lines);
+                let (want_env, allowed): (Option<&str>, &[&str]) = match (file, name.as_str()) {
+                    (".github/workflows/release-pr.yml", "linux-leak") => (Some("release-leak"), &["ATLAS_LEAK_ACCEPTED", "ATLAS_LEAK_DENYLIST"]),
+                    (".github/workflows/release-pr.yml", "pr") => (Some("release"), &["ATLAS_RELEASE_APP_ID", "ATLAS_RELEASE_APP_KEY"]),
+                    _ => (None, &[]),
+                };
+                assert_eq!(env, want_env, "{file}: job {name}'s Environment");
+                assert_eq!(uses, named.len(), "{file}: job {name} reads secrets other than as secrets.NAME");
+                let mut named: Vec<&str> = named.iter().map(String::as_str).collect();
+                named.sort();
+                named.dedup();
+                assert_eq!(named, allowed, "{file}: job {name} reads a secret its Environment does not hold");
             }
         }
         let attrs = output(Command::new("git").arg("-C").arg(&root).args(["check-attr", "export-ignore", "--", dev_only[0], dev_only[1], ".github/workflows/release.yml"])).unwrap();
@@ -1376,6 +1704,56 @@ pub(crate) mod tests {
             assert!(attrs.contains(&format!("{f}: export-ignore: set")), "{attrs}");
         }
         assert!(attrs.contains(".github/workflows/release.yml: export-ignore: unspecified"), "{attrs}");
+        // The public page keeps no setup detail: the app, its secrets, the
+        // rulesets' settings and the owner's steps are in the private notes.
+        let page = read_text(&root.join("wiki/Releasing.md")).unwrap();
+        for s in ["ATLAS_RELEASE_APP", "gh secret set", "rulesets --input", "## The owner's steps", "## The public repository's setup", "release-leak"] {
+            assert!(!page.contains(s), "wiki/Releasing.md still carries {s}");
+        }
+        if dev {
+            // The release setup notes stay private, and the public tree does
+            // not name them: their folder's own attributes file keeps the
+            // folder, itself included, out of the export.
+            let notes = private_notes(&root);
+            assert_eq!(notes.len(), 1, "one private setup page: {notes:?}");
+            let (folder, page_path) = &notes[0];
+            let attrs_path = format!("{folder}/.gitattributes");
+            let attrs = output(Command::new("git").arg("-C").arg(&root).args(["check-attr", "export-ignore", "--", page_path, &attrs_path])).unwrap();
+            for f in [page_path, &attrs_path] {
+                assert!(attrs.contains(&format!("{f}: export-ignore: set")), "{attrs}");
+            }
+            let stem = Path::new(page_path).file_stem().unwrap().to_string_lossy().into_owned();
+            for name in [folder.as_str(), stem.as_str()] {
+                let hits = output(Command::new("git").arg("-C").arg(&root).args(["grep", "-l", "-F", name])).unwrap_or_default();
+                let named: Vec<&str> = hits.lines().filter(|f| !f.starts_with(&format!("{folder}/"))).collect();
+                if !named.is_empty() {
+                    let a = output(Command::new("git").arg("-C").arg(&root).args(["check-attr", "export-ignore", "--"]).args(&named)).unwrap();
+                    let exported: Vec<&str> = a.lines().filter(|l| !l.ends_with(": export-ignore: set")).collect();
+                    assert!(exported.is_empty(), "an exported file names the private notes: {exported:?}");
+                }
+            }
+            // The owner's steps for both Environments and their secrets.
+            let text = read_text(&root.join(page_path)).unwrap();
+            for s in [
+                "ATLAS_RELEASE_APP_KEY",
+                "Ruleset `main`",
+                "Settings, Environments, New environment, name `release`,",
+                "Settings, Environments, New environment, name `release-leak`,",
+                "gh secret set ATLAS_RELEASE_APP_ID  --repo bloodfeast/atlas-dev --env release ",
+                "gh secret set ATLAS_RELEASE_APP_KEY --repo bloodfeast/atlas-dev --env release ",
+                "gh secret set ATLAS_LEAK_DENYLIST   --repo bloodfeast/atlas-dev --env release-leak ",
+                "gh secret set ATLAS_LEAK_ACCEPTED   --repo bloodfeast/atlas-dev --env release-leak ",
+                "gh api -X PUT repos/bloodfeast/atlas-dev/environments/release-leak",
+            ] {
+                assert!(text.contains(s), "the private setup notes lack {s}");
+            }
+            // Every `gh secret set` puts its secret in that secret's Environment.
+            for l in text.lines().filter(|l| l.starts_with("gh secret set ")) {
+                let env = l.split_whitespace().skip_while(|w| *w != "--env").nth(1);
+                let want = if l.contains("ATLAS_LEAK_") { "release-leak" } else { "release" };
+                assert_eq!(env, Some(want), "the private setup notes set a secret in the wrong Environment: {l}");
+            }
+        }
 
         let text = read_text(&root.join(".github/workflows/release.yml")).unwrap();
         assert!(text.contains("  CARGO_PROFILE_RELEASE_STRIP: symbols\n") && text.contains("  ATLAS_RELEASE_BUILD: 1\n"));
@@ -1394,6 +1772,25 @@ pub(crate) mod tests {
         }
         let linux = body("linux");
         assert!(linux.contains("container: debian:bullseye") && linux.contains("[ \"$max\" -gt 31 ]"), "the glibc floor");
+        // Build provenance (the sign step checks it): each build job attests
+        // what it uploads, after the build and its checks.
+        for (job, subject) in [("linux", "dist/atlas-${{ matrix.target }}"), ("windows", "dist/atlas.exe"), ("macos", "dist/atlas-*-apple-darwin")] {
+            let b = body(job);
+            let at = b.find("uses: actions/attest-build-provenance@").unwrap_or_else(|| panic!("{job}: no build provenance"));
+            assert!(b[at..].contains(&format!("subject-path: {subject}\n")), "{job}: attests {subject}");
+            assert!(b.find("cargo build --release").unwrap() < at && at < b.find("actions/upload-artifact@").unwrap(), "{job}: attests after the build, before the upload");
+            if job == "linux" {
+                assert!(b.find("glibc floor").unwrap() < at, "linux: attests after the glibc floor");
+            }
+        }
+        // The draft job runs no repository code: the manifest and notes are
+        // written by a job with a read-only token.
+        let (assets_job, draft) = (body("assets"), body("draft"));
+        assert!(assets_job.contains("cargo xtask release assets") && assets_job.contains("contents: read"));
+        assert!(draft.lines().any(|l| l.trim() == "needs: [plan, assets]"), "draft waits on assets");
+        for no in ["cargo", "actions/checkout@"] {
+            assert!(!draft.contains(no), "the draft job runs {no}");
+        }
         // The remaps the local release makes, by the same names.
         let ctx = crate::release::Ctx { stage: PathBuf::from("S"), cargo_home: PathBuf::from("C"), sysroot: "R".into() };
         let f = ctx.rustflags("x86_64-pc-windows-msvc");
@@ -1424,16 +1821,30 @@ pub(crate) mod tests {
         };
         assert_eq!(script(&leak), script(release_linux), "release-pr.yml's Linux build is release.yml's");
         let build = leak.find("cargo build --release --locked").unwrap();
-        let gate = leak.find("cargo xtask release gate --dir dist").expect("the binary gate");
+        // The binary gate, and the export's: every exported file and wiki
+        // page against the denylist, which the pr job never holds.
+        let gate = leak.find("cargo xtask release gate --dir dist --export").expect("the binary and export gates");
         let secret = leak.find("secrets.ATLAS_LEAK_DENYLIST").unwrap();
         assert!(build < secret && leak.find("cargo build -q --locked -p xtask").unwrap() < secret && secret < gate, "builds before the denylist is in the job");
         assert!(leak.contains("ATLAS_LEAK_ACCEPTED: ${{ runner.temp }}/leak-accepted.txt"));
+        // The commit it checked goes to the pr job, which exports it again
+        // and refuses any other.
+        let checked = leak.find("echo \"commit=$(git rev-parse HEAD)\" >> \"$GITHUB_OUTPUT\"").expect("linux-leak names the commit it checked");
+        assert!(gate < checked && leak.contains("commit: ${{ steps.checked.outputs.commit }}"), "the commit is an output only after the gates pass");
+        assert!(pr.contains("ATLAS_LEAK_CHECKED: ${{ needs.linux-leak.outputs.commit }}"), "the pr job takes the checked commit");
+        assert!(!pr.contains("DENYLIST") && !pr.contains("leak-denylist"), "the pr job holds no denylist");
         // Ship dispatches a commit it checked and finds the run by a nonce
         // in its name; both jobs build and export that commit, on main only.
-        assert!(text.contains("run-name: ${{ github.event_name == 'workflow_dispatch' && format('release-pr v{0} {1}', inputs.version, inputs.nonce)"));
+        // Nothing else starts the workflow: no tag trigger.
+        assert!(text.contains("run-name: release-pr v${{ inputs.version }} ${{ inputs.nonce }}\n"), "release-pr.yml: the run's name");
+        let on = &text[text.find("\non:\n").unwrap()..text.find("\npermissions: {}").unwrap()];
+        assert!(on.contains("  workflow_dispatch:") && !on.contains("push") && !on.contains("tags"), "release-pr.yml: dispatch only: {on}");
+        for gone in ["github.ref_name", "github.sha", "github.event_name", "REF_NAME"] {
+            assert!(!text.contains(gone), "release-pr.yml: {gone} is left of the tag trigger");
+        }
         for (name, b) in [("linux-leak", &leak), ("pr", &pr)] {
-            assert!(b.contains("ref: ${{ inputs.commit || github.sha }}") && b.contains("fetch-depth: 0"), "release-pr.yml: {name} checks out the dispatched commit");
-            assert!(b.contains(r#"if [ "$EVENT" = workflow_dispatch ] && [ -z "$COMMIT" ]; then"#), "release-pr.yml: {name} refuses a dispatch without a commit");
+            assert!(b.contains("ref: ${{ inputs.commit }}\n") && b.contains("fetch-depth: 0"), "release-pr.yml: {name} checks out the dispatched commit");
+            assert!(b.contains(r#"if ! printf '%s\n' "$COMMIT" | grep -Eqx '[0-9a-f]{40}'; then"#), "release-pr.yml: {name} refuses a dispatch without a commit");
             let on_main = b.find("git merge-base --is-ancestor HEAD refs/remotes/origin/main").unwrap_or_else(|| panic!("release-pr.yml: {name} refuses a commit off main"));
             assert!(on_main < b.find("secrets.").unwrap(), "release-pr.yml: {name} checks the commit before any secret");
         }
@@ -1586,9 +1997,10 @@ Signed-off-by: S <s@example.invalid>");
         let stub = d.join("stub");
         let assets = stub.join("release-v1.2.3").join("assets");
         fake_bins(&assets);
-        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets).unwrap()).unwrap();
+        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets, &fixture_notes()).unwrap()).unwrap();
         let list: Vec<String> = ls(&assets).unwrap().iter().map(|f| format!(r#"{{"name": "{f}", "size": {}}}"#, size_of(&assets.join(f)).unwrap())).collect();
         write_view(&stub, &target, &list.join(", "));
+        attest(&stub, &target);
         Fixture { d, bare, stub, target }
     }
 
@@ -1643,7 +2055,9 @@ Signed-off-by: S <s@example.invalid>");
     /// draft's commit (beside the last release's bin/), and as the
     /// development checkouts of the guard tests hold it (beside
     /// `DEV_ONLY`, which the export leaves out).
-    pub(crate) const SOURCE: [(&str, &str); 9] = [
+    pub(crate) const SOURCE: [(&str, &str); 11] = [
+        ("scripts/release-notes.md.in", "# atlas @VERSION@\n\nReleased @DATE@.\n\n@HIGHLIGHTS@\n\n| Platform | File | SHA-256 |\n|---|---|---|\n@BINARIES@\n"),
+        ("config/atlas.template.json", "{}\n"),
         ("Cargo.toml", "[package]\nname = \"x\"\nversion = \"1.2.3\"\n"),
         (".claude-plugin/plugin.json", "{\n  \"version\": \"1.2.3\"\n}\n"),
         ("scripts/launcher.sh", "#!/bin/sh\necho launcher\n"),
@@ -1824,7 +2238,7 @@ Signed-off-by: S <s@example.invalid>");
             dry_run: false,
             require_clean: true,
             guard_checkout,
-            denylist: denylist(&d),
+            leak: Leak::Denylist(denylist(&d)),
             repo: REPO.into(),
             ident: Ident { name: "P".into(), email: "pub@example.invalid".into() },
             stage: d.join("stage"),
@@ -1844,6 +2258,101 @@ Signed-off-by: S <s@example.invalid>");
         let e = pr(&mk(false)).unwrap_err();
         assert!(!e.contains("origin/main") && !e.contains("uncommitted"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `gh attestation verify --format json` output as the release workflow's
+    /// attestation would give it: one verified statement of a file whose
+    /// SHA-256 is `sha256`, signed by release.yml on main of the public
+    /// repository at `commit`, on a GitHub-hosted runner.
+    pub(crate) fn attestation_json(sha256: &str, commit: &str) -> String {
+        format!(
+            r#"[{{"verificationResult": {{"statement": {{"subject": [{{"name": "f", "digest": {{"sha256": "{sha256}"}}}}]}}, "signature": {{"certificate": {{"sourceRepositoryURI": "https://github.com/{REPO}", "sourceRepositoryDigest": "{commit}", "sourceRepositoryRef": "refs/heads/main", "buildSignerURI": "https://github.com/{REPO}/.github/workflows/release.yml@refs/heads/main", "runnerEnvironment": "github-hosted"}}}}}}}}]"#
+        )
+    }
+
+    /// The stub's attestations: every binary of the draft attested at `commit`.
+    pub(crate) fn attest(stub: &Path, commit: &str) {
+        let assets = stub.join("release-v1.2.3").join("assets");
+        let dir = stub.join("release-v1.2.3").join("attest");
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ls(&assets).unwrap().into_iter().filter(|f| f != "manifest.json") {
+            std::fs::write(dir.join(format!("{f}.json")), attestation_json(&sha256_file(&assets.join(&f)).unwrap(), commit)).unwrap();
+        }
+    }
+
+    /// What sign asks gh: the public repository's release workflow, at the
+    /// draft's commit on main, on a GitHub-hosted runner, as JSON.
+    #[test]
+    fn provenance_is_asked_of_gh_for_the_release_workflow_at_the_commit() {
+        let c = "c".repeat(40);
+        let argv = attest_argv(Path::new("d/atlas.exe"), "bloodfeast/atlas", &c);
+        assert_eq!(
+            argv.join(" "),
+            format!("attestation verify d/atlas.exe --repo bloodfeast/atlas --signer-workflow bloodfeast/atlas/.github/workflows/release.yml --source-digest {c} --source-ref refs/heads/main --deny-self-hosted-runners --format json")
+        );
+    }
+
+    /// gh's answer is read again, not trusted for its exit status alone:
+    /// every verified attestation must be of this file, from this commit on
+    /// main, signed by release.yml, on a GitHub-hosted runner.
+    #[test]
+    fn provenance_must_name_the_file_the_commit_main_and_the_release_workflow() {
+        let (sha, c) = ("a".repeat(64), "c".repeat(40));
+        let ok = attestation_json(&sha, &c);
+        assert_eq!(check_attestation(&ok, "atlas.exe", &sha, &c, REPO), Ok(()));
+        for (bad, why) in [
+            ("[]".to_string(), "no verified attestation"),
+            ("not json".to_string(), "not JSON"),
+            (attestation_json(&"b".repeat(64), &c), "not of this file"),
+            (attestation_json(&sha, &"d".repeat(40)), "source commit"),
+            (ok.replace("\"sourceRepositoryRef\": \"refs/heads/main\"", "\"sourceRepositoryRef\": \"refs/heads/other\""), "refs/heads/main"),
+            (ok.replace(".github/workflows/release.yml@", ".github/workflows/other.yml@"), "release.yml"),
+            (ok.replace("acme/tool/.github", "evil/tool/.github"), "release.yml"),
+            (ok.replace("github-hosted", "self-hosted"), "self-hosted"),
+            // Defence in depth: the source repository is checked too.
+            (ok.replace("\"sourceRepositoryURI\": \"https://github.com/acme/tool\"", "\"sourceRepositoryURI\": \"https://github.com/evil/tool\""), "source repository"),
+            (ok.replace("\"sourceRepositoryURI\": \"https://github.com/acme/tool\"", "\"sourceRepositoryURI\": \"https://github.com/acme/tool-fork\""), "source repository"),
+            (ok.replace("\"sourceRepositoryURI\": \"https://github.com/acme/tool\", ", ""), "source repository"),
+            (format!("[{}, {}]", &ok[1..ok.len() - 1], &attestation_json(&sha, &"d".repeat(40))[1..ok.len() - 1]), "source commit"),
+        ] {
+            let e = check_attestation(&bad, "atlas.exe", &sha, &c, REPO).unwrap_err();
+            assert!(e.starts_with("atlas.exe: ") && e.contains(why), "{why}: {e}");
+        }
+    }
+
+    /// The binaries must come from the public release workflow at the
+    /// draft's commit: a binary with no provenance, provenance from another
+    /// commit, or bytes swapped after the build (manifest and all) are
+    /// refused before anything is committed, signed or uploaded, in a dry
+    /// run as well.
+    #[test]
+    fn sign_refuses_a_binary_without_provenance_from_the_release_workflow() {
+        let fx = fixture("sign-provenance");
+        let rel = StubReleases(fx.stub.clone());
+        let att = fx.stub.join("release-v1.2.3").join("attest");
+        std::fs::remove_file(att.join("atlas.exe.json")).unwrap();
+        for dry_run in [true, false] {
+            let e = sign(&signer(&fx, &rel, dry_run, None)).unwrap_err();
+            assert!(e.contains("build provenance") && e.contains("atlas.exe: ") && !e.contains("ATLAS_SIGN_KEY"), "{e}");
+        }
+        attest(&fx.stub, &"0".repeat(40));
+        let e = sign(&signer(&fx, &rel, true, None)).unwrap_err();
+        assert!(e.contains("build provenance") && e.contains("source commit"), "{e}");
+        // The draft's bytes and manifest swapped after the build: the
+        // attestation is of the file the workflow built.
+        attest(&fx.stub, &fx.target);
+        let assets = fx.stub.join("release-v1.2.3").join("assets");
+        let f = assets.join("atlas.exe");
+        let mut b = std::fs::read(&f).unwrap();
+        b.extend_from_slice(b" swapped");
+        std::fs::write(&f, b).unwrap();
+        std::fs::remove_file(assets.join("manifest.json")).unwrap();
+        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets, &fixture_notes()).unwrap()).unwrap();
+        relist(&fx);
+        let e = sign(&signer(&fx, &rel, true, None)).unwrap_err();
+        assert!(e.contains("build provenance") && e.contains("atlas.exe: ") && e.contains("not of this file"), "{e}");
+        assert!(!uploaded(&fx) && !fx.d.join("stage").join("public").join("bin").exists());
+        let _ = std::fs::remove_dir_all(&fx.d);
     }
 
     #[test]
@@ -1897,7 +2406,7 @@ Signed-off-by: S <s@example.invalid>");
         relist(&fx);
         assert_eq!(sign(&signer(&fx, &rel, true, None)).unwrap_err(), "the draft has no manifest.json");
         fake_bins(&assets);
-        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets).unwrap()).unwrap();
+        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets, &fixture_notes()).unwrap()).unwrap();
         std::fs::write(assets.join("extra.txt"), "x").unwrap();
         relist(&fx);
         let e = sign(&signer(&fx, &rel, true, None)).unwrap_err();
@@ -1915,7 +2424,7 @@ Signed-off-by: S <s@example.invalid>");
         b.extend_from_slice(format!("\0/home/{}/src\0", term().to_uppercase()).as_bytes());
         std::fs::write(&f, b).unwrap();
         std::fs::remove_file(assets.join("manifest.json")).unwrap();
-        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets).unwrap()).unwrap();
+        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets, &fixture_notes()).unwrap()).unwrap();
         relist(&fx);
         let rel = StubReleases(fx.stub.clone());
         let e = sign(&signer(&fx, &rel, true, None)).unwrap_err();
@@ -1949,7 +2458,7 @@ Signed-off-by: S <s@example.invalid>");
         b.extend_from_slice(format!("\0{}{}{}\0", "sk_test", "_rk_live_", "modelssourcequote").as_bytes());
         std::fs::write(&f, b).unwrap();
         std::fs::remove_file(assets.join("manifest.json")).unwrap();
-        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets).unwrap()).unwrap();
+        std::fs::write(assets.join("manifest.json"), manifest_json("1.2.3", REPO, &assets, &fixture_notes()).unwrap()).unwrap();
         relist(&fx);
         let rel = StubReleases(fx.stub.clone());
         let e = sign(&signer(&fx, &rel, true, None)).unwrap_err();
@@ -1964,6 +2473,7 @@ Signed-off-by: S <s@example.invalid>");
     fn sign_refuses_when_main_moved_or_the_release_is_out() {
         let fx = fixture("sign-moved");
         write_view(&fx.stub, &"a".repeat(40), "");
+        attest(&fx.stub, &"a".repeat(40));
         let rel = StubReleases(fx.stub.clone());
         let e = sign(&signer(&fx, &rel, true, None)).unwrap_err();
         assert!(e.contains("but the draft v1.2.3 targets aaaa"), "{e}");
@@ -1984,6 +2494,14 @@ Signed-off-by: S <s@example.invalid>");
         assert!(!r.published && r.commit != fx.target);
         assert_eq!(sh(&fx.bare, &["rev-parse", "main"]), fx.target, "a dry run pushes nothing");
         assert!(!uploaded(&fx));
+        // The notes are made again from the draft commit's changelog and the
+        // verified binaries, not taken from the draft, whose body nothing
+        // attests.
+        let notes = std::fs::read_to_string(fx.d.join("stage").join("notes.md")).unwrap();
+        assert!(notes.starts_with("# atlas v1.2.3\n\nReleased ") && notes.contains("\n- one\n"), "{notes}");
+        let exe = sha256_file(&fx.stub.join("release-v1.2.3/assets/atlas.exe")).unwrap();
+        assert!(notes.contains(&format!("| bin/atlas.exe | `{exe}` |")) && !notes.contains("bin/manifest.json"), "{notes}");
+        assert!(!fx.stub.join("release-v1.2.3/notes.md").exists(), "a dry run sets no notes");
         let Some(key) = temp_key(&fx.d) else {
             eprintln!("openssl not found: the publishing half skipped");
             return;
@@ -1999,6 +2517,7 @@ Signed-off-by: S <s@example.invalid>");
         assert!(sh(&fx.bare, &["ls-tree", "main", "bin/atlas-x86_64-unknown-linux-gnu"]).starts_with("100755"));
         assert!(sh(&fx.bare, &["ls-tree", "main", "bin/atlas.exe"]).starts_with("100644"));
         assert_eq!(std::fs::read_to_string(fx.stub.join("release-v1.2.3/published.txt")).unwrap(), r.commit);
+        assert_eq!(std::fs::read_to_string(fx.stub.join("release-v1.2.3/notes.md")).unwrap(), std::fs::read_to_string(fx.d.join("stage").join("notes.md")).unwrap(), "published with the notes made here");
         let sig = std::fs::read(fx.stub.join("release-v1.2.3/uploaded/manifest.json.sig")).unwrap();
         let man = std::fs::read(fx.stub.join("release-v1.2.3/assets/manifest.json")).unwrap();
         assert!(atlas::update::verify(&man, &sig, &atlas::update::key_from_hex(&key.1).unwrap()));
@@ -2029,6 +2548,7 @@ Signed-off-by: S <s@example.invalid>");
         for f in &m.files {
             assert!(n.contains(&format!("| bin/{} | `{}` |", f.file, f.sha256)), "{} not in the notes", f.file);
         }
+        assert!(!n.contains("bin/manifest.json"), "the manifest is no binary: {n}");
         assert!(assets(&root, &dir, &notes, Some("v0.0.0"), REPO).unwrap_err().contains("asked to release v0.0.0"));
         std::fs::remove_file(dir.join("atlas-x86_64-apple-darwin")).unwrap();
         std::fs::write(dir.join("stray"), "x").unwrap();
@@ -2071,7 +2591,7 @@ Signed-off-by: S <s@example.invalid>");
             dry_run,
             require_clean: false,
             guard_checkout: false,
-            denylist: denylist(&d),
+            leak: Leak::Denylist(denylist(&d)),
             repo: DEFAULT_PUBLIC_REPO.into(),
             ident: Ident { name: "P".into(), email: "pub@example.invalid".into() },
             stage: d.join("stage"),
@@ -2085,6 +2605,14 @@ Signed-off-by: S <s@example.invalid>");
         let made = pr(&mk(true)).unwrap();
         assert!(sh(&bare, &["branch", "--list", &branch]).is_empty(), "a dry run pushes nothing");
         assert!(made.notes.contains(PENDING_BINARIES.trim_end()) && made.notes.contains(&format!("# atlas {tag}")));
+        // In the release-pr job the denylist stays in linux-leak: the export
+        // goes on only when it is of the commit that job checked.
+        let mut checked = mk(true);
+        checked.leak = Leak::CheckedAt("0".repeat(40));
+        let e = pr(&checked).unwrap_err();
+        assert!(e.contains("linux-leak") && e.contains("000000000000"), "{e}");
+        checked.leak = Leak::CheckedAt(sh(&root, &["rev-parse", "HEAD"]));
+        assert!(pr(&checked).unwrap().notes.contains(&format!("# atlas {tag}")));
         let made = pr(&mk(false)).unwrap();
         assert_eq!(made.branch, branch);
         assert_eq!(sh(&bare, &["rev-parse", &branch]), made.commit);
@@ -2107,6 +2635,43 @@ Signed-off-by: S <s@example.invalid>");
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// linux-leak's export gate: HEAD exported as `--pr` exports it, every
+    /// file and wiki page against the denylist; the commit it checked.
+    #[test]
+    fn export_gate_checks_the_export_and_names_its_commit() {
+        let root = repo_root();
+        if !in_dev_repo(&root) {
+            eprintln!("skipped: the export gate runs only in the development repository");
+            return;
+        }
+        let d = tmp("export-gate");
+        let head = sh(&root, &["rev-parse", "HEAD"]);
+        assert_eq!(export_gate(&root, &d.join("stage"), &denylist(&d)).unwrap(), head);
+        let hit = d.join("hit.txt");
+        std::fs::write(&hit, "# a word the export holds\nChangelog\n").unwrap();
+        let e = export_gate(&root, &d.join("stage"), &hit).unwrap_err();
+        assert!(e.contains("the exported tree"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Where `--pr`'s leak check comes from: the denylist when it is set;
+    /// in the release-pr job without it, the commit linux-leak checked;
+    /// anywhere else, nothing.
+    #[test]
+    fn pr_leak_check_is_the_denylist_or_the_leak_jobs_commit() {
+        let c = "c".repeat(40);
+        assert!(matches!(leak_source(None, Some(c.clone()), true), Ok(Leak::CheckedAt(x)) if x == c));
+        assert!(leak_source(None, Some(c.clone()), false).unwrap_err().contains("ATLAS_LEAK_DENYLIST is not set"));
+        assert!(leak_source(None, None, true).unwrap_err().contains("ATLAS_LEAK_DENYLIST is not set"));
+        assert!(leak_source(None, Some("HEAD".into()), true).unwrap_err().contains("40 hex"));
+        // Git prints a commit in lowercase: an uppercase one is the same commit.
+        assert!(matches!(leak_source(None, Some("C".repeat(40)), true), Ok(Leak::CheckedAt(x)) if x == c));
+        let d = tmp("leak-source");
+        let deny = denylist(&d);
+        assert!(matches!(leak_source(Some(deny.to_string_lossy().into_owned()), Some(c), true), Ok(Leak::Denylist(p)) if p == deny));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A push of the release branch to GitHub: ATLAS_PUBLISH counts in the
     /// release-pr job only; anywhere else the typed `open vX.Y.Z` is asked,
     /// and ATLAS_PUBLISH does not stand for it.
@@ -2120,7 +2685,7 @@ Signed-off-by: S <s@example.invalid>");
             dry_run: false,
             require_clean: true,
             guard_checkout: false,
-            denylist: d.join("deny.txt"),
+            leak: Leak::Denylist(d.join("deny.txt")),
             repo: REPO.into(),
             ident: Ident { name: "P".into(), email: "pub@example.invalid".into() },
             stage: d.join("stage"),

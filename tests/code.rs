@@ -486,6 +486,48 @@ fn shell_reads_are_annotated_like_grep_and_read() {
         assert!(u.is_none() && note.is_empty(), "{cmd}");
     }
 }
+/// A routed grep that printed nothing used to panic the hook (and, once the
+/// hooks thread had died, the server's main thread): its segment holds no
+/// lines, but `annotate_grep("")` returns one empty line, written back one
+/// past the end of the output. Every shape of output keeps its line count and
+/// its separators, and nothing panics.
+#[test]
+fn an_empty_grep_part_of_a_batch_never_panics_or_eats_a_line() {
+    let f = fixture("code-shell-empty");
+    write(&f.root.join("src/a.rs"), "fn a() {\n    let x = 1;\n}\n");
+    let _code = setup(&f);
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let cwd = f.root.to_string_lossy().replace('\\', "/");
+    let mut router = atlas::hook_rewrite::Router::with_db(&f.db, None);
+    let bash = |cmd: &str, stdout: &str| {
+        atlas::hooks::HookEvent::from_value(&json!({
+            "hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Bash", "cwd": cwd,
+            "tool_input": {"command": cmd},
+            "tool_response": {"stdout": stdout, "stderr": "", "interrupted": false, "isImage": false, "noOutputExpected": false}
+        }))
+    };
+    let cases: &[(&str, &str)] = &[
+        // The last grep matched nothing and Claude Code trimmed the newline:
+        // the output ends on the echo line.
+        ("grep -n x src/a.rs; echo ----; grep -n nothing src/a.rs", "2:    let x = 1;\n----"),
+        ("grep -n x src/a.rs; echo ----; grep -rn nothing src | head -5", "2:    let x = 1;\n----"),
+        ("grep -n x src/a.rs; echo ----; grep -rn nothing src | cut -c1-200", "src/a.rs:2:    let x = 1;\r\n----"),
+        // CRLF output, a trailing newline, an empty last line.
+        ("grep -n x src/a.rs; echo ----; grep -n nothing src/a.rs", "2:    let x = 1;\r\n----\r\n"),
+        ("grep -rn x src; echo ----; grep -rn nothing src", "src/a.rs:2:    let x = 1;\n----\n"),
+        ("grep -rn x src; echo ----; grep -rn y src", "src/a.rs:2:    let x = 1;\r\n----\r\nsrc/a.rs:1:fn a() {\r\n\r\n"),
+        // An empty grep between two separators keeps the second separator.
+        ("grep -n x src/a.rs; echo ----; grep -n nothing src/a.rs; echo ====; grep -rn x src", "2:    let x = 1;\n----\n====\nsrc/a.rs:2:    let x = 1;"),
+    ];
+    for (cmd, out) in cases {
+        let (u, _) = router.annotate(&bash(cmd, out)).unwrap();
+        let got = u.map_or_else(|| out.to_string(), |u| u["stdout"].as_str().unwrap().to_string());
+        assert_eq!(got.split('\n').count(), out.split('\n').count(), "{cmd}: {got:?}");
+        for sep in ["----", "===="] {
+            assert_eq!(got.matches(sep).count(), out.matches(sep).count(), "{cmd}: {got:?}");
+        }
+    }
+}
 /// Until a root's first walk since start finishes, its state is Starting
 /// (symbol says "indexing"), never the "stale ... reindex pending" of a root
 /// that changed after it was indexed.

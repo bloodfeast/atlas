@@ -166,7 +166,7 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
 
     let (_, items) = crate::queue::items(store, now)?;
     if !items.is_empty() {
-        let p = crate::queue::propose(orch, &items, &crate::queue::holders(&running, &dir, &[], orch.lanes.bare_gpu_words));
+        let p = crate::queue::propose(orch, &items, &crate::queue::holders(&running, &dir, &[], &orch.lanes, &|_| None));
         let mut q = format!("- work queue: {} waiting", items.len());
         if !p.start.is_empty() {
             let keys: Vec<&str> = p.start.iter().take(MAX_START).map(|&i| items[i].key.as_str()).collect();
@@ -360,8 +360,7 @@ mod tests {
 
     #[test]
     fn the_newest_goal_record_decides() {
-        let d = std::env::temp_dir().join(format!("atlas-resume-goal-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = fresh_dir("goal-record");
         let p = d.join("t.jsonl");
         let status = |met: bool| format!(r#"{{"type":"attachment","attachment":{{"type":"goal_status","met":{met},"sentinel":true,"condition":"ship it"}}}}"#);
         let clear = r#"{"type":"user","message":{"content":"<command-name>/goal</command-name>\n<command-args>clear</command-args>"}}"#;
@@ -388,10 +387,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    fn store_in(name: &str) -> (PathBuf, MemoryStore) {
-        let d = std::env::temp_dir().join(format!("atlas-resume-{name}-{}", std::process::id()));
+    /// An empty folder of its own for each call: tests run in parallel, and two
+    /// that shared one folder deleted it under each other.
+    fn fresh_dir(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("atlas-resume-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn store_in(name: &str) -> (PathBuf, MemoryStore) {
+        let d = fresh_dir(name);
         let s = MemoryStore::open(&d.join("memory.sqlite")).unwrap();
         (d, s)
     }
@@ -529,8 +537,7 @@ mod tests {
 
     #[test]
     fn the_goal_search_reads_backward_across_blocks() {
-        let d = std::env::temp_dir().join(format!("atlas-resume-blocks-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = fresh_dir("blocks");
         let p = d.join("t.jsonl");
         let block = usize::try_from(GOAL_BLOCK).unwrap();
         let filler = format!("{{\"type\":\"user\",\"pad\":\"{}\"}}", "y".repeat(1000));

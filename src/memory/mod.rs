@@ -94,20 +94,78 @@ CREATE TRIGGER IF NOT EXISTS records_key_fixed BEFORE UPDATE OF key, kind, rid O
 
 /// The schema's version (`PRAGMA user_version`). An older store is brought up
 /// by [`migrate`], a newer one is refused (see [`MemoryStore::open`]).
-pub const SCHEMA_VERSION: i64 = 2;
+///
+/// 3 adds the worktree ownership ledger ([`crate::worktree_ledger::SCHEMA`]).
+/// An atlas built for 2 refuses a store at 3 ([`Error::StoreTooNew`]).
+pub const SCHEMA_VERSION: i64 = 3;
+
+/// The schema texts a store at [`SCHEMA_VERSION`] holds, in order: [`SCHEMA`]
+/// (versions 1 and 2, unchanged since), then the ledger (version 3).
+fn schema_parts() -> [&'static str; 2] {
+    [SCHEMA, crate::worktree_ledger::SCHEMA]
+}
 
 /// Brings a store at version `from` (0 is a fresh file) up to
-/// [`SCHEMA_VERSION`]. Run by [`MemoryStore::open`] inside its one
-/// `BEGIN IMMEDIATE` transaction, so the steps and the version land together.
+/// [`SCHEMA_VERSION`]. Run by [`make_schema`] inside its one
+/// `BEGIN IMMEDIATE` transaction, so the steps and the version land together:
+/// a crash or an error at any statement leaves the store at `from`.
 ///
-/// Versions 0, 1 and 2 differ only by what [`SCHEMA`] makes with
-/// `IF NOT EXISTS`, so every older store takes that one step. A step that
-/// transforms rows for version N goes after it as `if from < N { ... }`; the
-/// version is written last.
-fn migrate(conn: &Connection, from: i64) -> rusqlite::Result<()> {
+/// Versions 0 to 3 differ only by what the [`schema_parts`] make with
+/// `IF NOT EXISTS`, so every older store takes that one step; no row is
+/// changed. A step that transforms rows for version N goes after it as
+/// `if from < N { ... }`; the version is written last. `fail` is the test
+/// failpoint, called after each statement with its number.
+fn migrate(conn: &Connection, from: i64, fail: &mut dyn FnMut(usize) -> Result<()>) -> Result<()> {
+    use rusqlite::fallible_iterator::FallibleIterator as _;
     debug_assert!(from < SCHEMA_VERSION);
-    conn.execute_batch(SCHEMA)?;
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+    let mut step = 0;
+    for part in schema_parts() {
+        let mut batch = rusqlite::Batch::new(conn, part);
+        while let Some(mut st) = batch.next()? {
+            st.raw_execute()?;
+            step += 1;
+            fail(step)?;
+        }
+    }
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    fail(step + 1)
+}
+
+/// Where the copy of a store at version `from` is kept before it is
+/// migrated: `memory.sqlite.v2.bak` beside `memory.sqlite`.
+pub fn backup_path(path: &Path, from: i64) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(format!(".v{from}.bak"));
+    PathBuf::from(s)
+}
+
+/// Copies the store at `path` to [`backup_path`] with `VACUUM INTO` on a
+/// second, read-only connection, while the caller holds the write lock: the
+/// copy is the last committed state, which no other process can change
+/// before the migration commits. Written to a `.tmp` name, synced, then
+/// renamed, so a crash never leaves a partial copy under the final name.
+fn backup(path: &Path, from: i64) -> Result<PathBuf> {
+    let out = backup_path(path, from);
+    let mut tmp = out.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    src.busy_timeout(BUSY_TIMEOUT)?;
+    src.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])?;
+    drop(src);
+    // Windows flushes only through a handle that can write.
+    OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, &out)?;
+    #[cfg(unix)]
+    if let Some(d) = out.parent() {
+        std::fs::File::open(d)?.sync_all()?;
+    }
+    Ok(out)
 }
 
 /// The refusal for a memory store at `version`, when it is newer than this
@@ -162,20 +220,45 @@ pub(crate) fn check_locked(conn: &Connection, path: &Path) -> Result<()> {
 /// # Errors
 ///
 /// [`Error::StoreTooNew`] (rolled back), or [`Error::Db`].
-fn make_schema(conn: &Connection, path: &Path) -> Result<()> {
+fn make_schema(conn: &Connection, path: &Path) -> Result<Option<Migrated>> {
+    make_schema_with(conn, path, &mut |_| Ok(()))
+}
+
+/// What [`make_schema`] did to an existing store: the version it found and
+/// where its copy is ([`backup_path`]; `None` for a file that held nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Migrated {
+    /// The version the store was at.
+    pub from: i64,
+    /// The copy taken before the migration.
+    pub backup: Option<PathBuf>,
+}
+
+/// [`make_schema`] with a failpoint: `fail(0)` after the copy, then
+/// `fail(n)` after each migration statement and the version write (see
+/// [`migrate`]). An error there rolls everything back.
+fn make_schema_with(conn: &Connection, path: &Path, fail: &mut dyn FnMut(usize) -> Result<()>) -> Result<Option<Migrated>> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let made = (|| -> Result<()> {
+    let made = (|| -> Result<Option<Migrated>> {
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if let Some(e) = too_new(path, v) {
             return Err(e);
         }
-        if v < SCHEMA_VERSION {
-            migrate(conn, v)?;
+        if v >= SCHEMA_VERSION {
+            // Another process migrated it while this one waited for the lock.
+            conn.execute_batch("COMMIT")?;
+            return Ok(None);
         }
+        // A file with anything in it is copied first, under the lock; no
+        // copy, no migration.
+        let held: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))?;
+        let copy = if held > 0 && !path.as_os_str().is_empty() { Some(backup(path, v)?) } else { None };
+        fail(0)?;
+        migrate(conn, v, fail)?;
         conn.execute_batch("COMMIT")?;
-        Ok(())
+        Ok(Some(Migrated { from: v, backup: copy }))
     })();
-    if made.is_err() {
+    if made.is_err() && !conn.is_autocommit() {
         let _ = conn.execute_batch("ROLLBACK");
     }
     made
@@ -403,6 +486,8 @@ pub struct MemoryStore {
     /// was read at (any write to the index, from any connection, changes it;
     /// a commit that leaves the index alone does not).
     vocab: std::cell::RefCell<Option<Vocab>>,
+    /// What this open migrated, if it did.
+    migrated: Option<Migrated>,
 }
 
 /// The shortest `expected_sha` prefix a revision accepts.
@@ -747,6 +832,7 @@ impl MemoryStore {
         if let Some(e) = too_new(path, version) {
             return Err(e);
         }
+        let mut migrated = None;
         if version < SCHEMA_VERSION {
             // Two sessions can open a fresh store at once. Switching to WAL
             // answers SQLITE_BUSY at once (the busy handler is not consulted
@@ -766,14 +852,22 @@ impl MemoryStore {
                     Err(e) => return Err(e.into()),
                 }
             }
-            make_schema(&conn, path)?;
+            migrated = make_schema(&conn, path)?;
+            if let Some(m) = migrated.as_ref().filter(|m| m.from > 0 || m.backup.is_some()) {
+                eprintln!(
+                    "atlas: memory store {} upgraded from schema {} to {SCHEMA_VERSION}; the copy taken before is {}. An atlas older than this one now refuses the store.",
+                    path.display(),
+                    m.from,
+                    m.backup.as_ref().map_or_else(|| "none (the file was empty)".to_string(), |b| b.display().to_string())
+                );
+            }
         }
         conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         let jsonl = jsonl_path(path);
         if jsonl_end(&conn)?.is_none() {
             record_jsonl_end(&conn, path, &jsonl)?;
         }
-        Ok(MemoryStore { conn, path: path.to_path_buf(), jsonl, vocab: Default::default() })
+        Ok(MemoryStore { conn, path: path.to_path_buf(), jsonl, vocab: Default::default(), migrated })
     }
 
     /// An in-memory store with no `.jsonl` copy (round-trip checks, tests).
@@ -783,8 +877,16 @@ impl MemoryStore {
     /// [`Error::Db`] if the schema cannot be made.
     pub fn in_memory() -> Result<MemoryStore> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(MemoryStore { conn, path: PathBuf::new(), jsonl: PathBuf::new(), vocab: Default::default() })
+        for part in schema_parts() {
+            conn.execute_batch(part)?;
+        }
+        Ok(MemoryStore { conn, path: PathBuf::new(), jsonl: PathBuf::new(), vocab: Default::default(), migrated: None })
+    }
+
+    /// What this open migrated: `None` when the store was already at
+    /// [`SCHEMA_VERSION`] (or another process migrated it first).
+    pub fn migrated(&self) -> Option<&Migrated> {
+        self.migrated.as_ref()
     }
 
     /// The connection (read paths in other modules).
@@ -944,6 +1046,19 @@ impl MemoryStore {
         Ok(rows)
     }
 
+    /// The journal entries of one kind on one lane (its case ignored), in
+    /// any status, oldest first: meta and titles only.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn lane_entries_no_body(&self, sub: &str, lane: &str) -> Result<Vec<Head>> {
+        let sql = format!("{HEAD_SQL_NO_BODY} WHERE r.kind = 'journal' AND r.sub = ?1 AND r.scope = ?2 COLLATE NOCASE ORDER BY r.rid");
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let rows = st.query_map([sub, lane], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// [`MemoryStore::head`], meta and title only (as
     /// [`MemoryStore::active_entries_no_body`]).
     ///
@@ -975,6 +1090,29 @@ impl MemoryStore {
         let sql = "SELECT v.meta FROM records r JOIN versions v ON v.vid = r.head WHERE r.kind = 'journal' AND r.sub = 'note' AND substr(v.meta, 1, length(?1)) = ?1 ORDER BY r.rid";
         let mut st = self.conn.prepare_cached(sql)?;
         let rows = st.query_map([prefix], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// The newest record id (0 for an empty store).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn max_rid(&self) -> Result<i64> {
+        Ok(self.conn.prepare_cached("SELECT coalesce(max(rid), 0) FROM records")?.query_row([], |r| r.get(0))?)
+    }
+
+    /// The active journal notes after record id `rid` whose meta starts with
+    /// `prefix` (the PR event notes), oldest first, meta and titles only. A
+    /// range over the row id: only records newer than `rid` are read.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn notes_after(&self, rid: i64, prefix: &str) -> Result<Vec<Head>> {
+        let sql = format!("{HEAD_SQL_NO_BODY} WHERE r.rid > ?1 AND r.kind = 'journal' AND r.sub = 'note' AND r.status = 'active' AND substr(v.meta, 1, length(?2)) = ?2 ORDER BY r.rid");
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let rows = st.query_map(rusqlite::params![rid, prefix], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1317,6 +1455,23 @@ impl MemoryStore {
         Ok(rows)
     }
 
+    /// [`Self::lane`] with its sub-lanes (`lane/2`, `lane/3`, ...): what
+    /// `recall lane=NAME` shows, so records filed under a sub-lane read
+    /// under their parent: numbered ones only, with case as [`Self::lane`]
+    /// has it. Oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn lane_family(&self, lane: &str) -> Result<Vec<Head>> {
+        // `0` follows `/`: the range is every scope that starts `lane/`.
+        let sql = format!("{HEAD_SQL} WHERE (r.scope = ?1 OR (r.scope >= ?1 || '/' AND r.scope < ?1 || '0')) AND r.kind IN ('journal', 'handoff') ORDER BY r.rid");
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let rows = st.query_map([lane], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        // A numbered sub-lane only: `lane/notes` is another lane.
+        Ok(rows.into_iter().filter(|h| h.scope == lane || crate::lanes::parent_lane(&h.scope) == lane).collect())
+    }
+
     /// Every lane with a journal or a handoff, newest activity first.
     ///
     /// # Errors
@@ -1436,6 +1591,18 @@ impl MemoryStore {
             self.conn.prepare_cached("INSERT INTO mem_meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?.execute([key, value])?;
             Ok(())
         })
+    }
+
+    /// Runs `f` inside one write transaction ([`guarded`]: `BEGIN
+    /// IMMEDIATE` after the version re-check, or the caller's own), so a
+    /// read of `mem_meta` and the write that depends on it are one step
+    /// another process cannot split.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, [`Error::StoreTooNew`] or [`Error::Db`].
+    pub fn meta_update<T>(&self, f: impl FnOnce(&MemoryStore) -> Result<T>) -> Result<T> {
+        guarded(&self.conn, &self.path, || f(self))
     }
 
     /// The next free key `<prefix><n>` (n zero-padded to `width`).
@@ -2184,6 +2351,319 @@ mod skew_tests {
         let missing = d.join("missing.sqlite");
         assert_eq!(store_skew(&missing), None);
         assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The upgrade from schema 2 to 3, against v2 fixtures built by the v2
+/// schema text (pinned below) and the real write paths. Never a live store.
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// The child test the kill test starts, and its inputs.
+    const CHILD: &str = "memory::upgrade_tests::migration_killed_child";
+    const CHILD_STORE: &str = "ATLAS_TEST_MIGRATE_STORE";
+    const CHILD_STEP: &str = "ATLAS_TEST_MIGRATE_ABORT_AT";
+
+    fn dir(tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        let d = std::env::temp_dir().join(format!("atlas-upgrade-{tag}-{}-{n}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A store as an atlas at schema 2 leaves it: WAL, [`SCHEMA`] (the v2
+    /// text, unchanged), the vectors table, version 2, and rows in every
+    /// table, written through the store's own write paths where it has them.
+    fn v2_fixture(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0)).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(vectors::SCHEMA).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        let jsonl = jsonl_path(path);
+        record_jsonl_end(&conn, path, &jsonl).unwrap();
+        let mut s = MemoryStore { conn, path: path.to_path_buf(), jsonl, vocab: Default::default(), migrated: None };
+        let d = |t: &str| Draft {
+            title: t.into(),
+            meta: format!("type: {t}"),
+            body: format!("{t} body text"),
+            reason: "fixture".into(),
+            author: "test".into(),
+            client: "test".into(),
+            ..Draft::default()
+        };
+        let mut w = s.writer().unwrap();
+        w.create("alpha", "memory", "feedback", "", &d("alpha"), Some(("mem", Place::End))).unwrap();
+        w.create("beta", "memory", "", "", &d("beta"), Some(("mem", Place::End))).unwrap();
+        w.create("journal:L:0001", "journal", "decision", "L", &d("one"), None).unwrap();
+        w.create("journal:L:0002", "journal", "question", "L", &d("two"), None).unwrap();
+        w.revise("alpha", None, &d("alpha two")).unwrap();
+        w.supersede(&["beta".to_string()], "gamma", "memory", "", "", &d("gamma"), None).unwrap();
+        w.retire("journal:L:0001", "fixture").unwrap();
+        w.add_refs("journal:L:0002", &[("answers".into(), "journal:L:0001".into())]).unwrap();
+        w.commit().unwrap();
+        s.meta_set("fixture", "v2").unwrap();
+        s.conn.execute("INSERT INTO export_files VALUES('mem', 'alpha.md', 'abc', '2026-01-01T00:00:00.000Z')", []).unwrap();
+        s.conn.execute("INSERT INTO rec_vec VALUES('model', 'abc', x'00010203')", []).unwrap();
+        let empty: Vec<String> = digest(&s.conn).into_iter().filter(|(_, (n, _))| *n == 0).map(|(t, _)| t).collect();
+        assert!(empty.is_empty(), "every table of the fixture holds rows: {empty:?} do not");
+    }
+
+    /// Every real table (virtual ones are read through their shadow tables):
+    /// its row count and a SHA-256 over its rows, sorted.
+    fn digest(c: &Connection) -> BTreeMap<String, (usize, String)> {
+        let mut st =
+            c.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND sql NOT LIKE 'CREATE VIRTUAL%' ORDER BY name").unwrap();
+        let names: Vec<String> = st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        let mut out = BTreeMap::new();
+        for t in names {
+            let mut q = c.prepare(&format!("SELECT * FROM \"{t}\"")).unwrap();
+            let n = q.column_count();
+            let mut rows: Vec<String> = q
+                .query_map([], |r| Ok((0..n).map(|i| format!("{:?}", r.get_ref(i).unwrap())).collect::<Vec<_>>().join("\u{1f}")))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows.sort();
+            out.insert(t, (rows.len(), crate::sha256::hex(rows.join("\u{1e}").as_bytes())));
+        }
+        out
+    }
+
+    /// The schema objects, sorted.
+    fn master(c: &Connection) -> Vec<(String, String, Option<String>)> {
+        let mut st = c.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").unwrap();
+        let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect();
+        v
+    }
+
+    fn version(c: &Connection) -> i64 {
+        c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    /// The state a check compares: version, schema objects, table digests.
+    type State = (i64, Vec<(String, String, Option<String>)>, BTreeMap<String, (usize, String)>);
+
+    fn state(path: &Path) -> State {
+        let c = Connection::open(path).unwrap();
+        c.busy_timeout(BUSY_TIMEOUT).unwrap();
+        (version(&c), master(&c), digest(&c))
+    }
+
+    /// The statements a migration from 2 runs ([`migrate`] numbers them from 1).
+    fn statements() -> usize {
+        use rusqlite::fallible_iterator::FallibleIterator as _;
+        let c = Connection::open_in_memory().unwrap();
+        let mut n = 0;
+        for p in schema_parts() {
+            let mut b = rusqlite::Batch::new(&c, p);
+            while let Some(mut st) = b.next().unwrap() {
+                st.raw_execute().unwrap();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// After a v2 store took the upgrade: version 3, every v2 object and row
+    /// exactly as before, and the ledger table there and empty.
+    fn assert_upgraded(path: &Path, before: &State) {
+        let (v, m, d) = state(path);
+        assert_eq!(v, SCHEMA_VERSION);
+        for o in &before.1 {
+            assert!(m.contains(o), "{o:?} is kept as it was");
+        }
+        for (t, x) in &before.2 {
+            assert_eq!(d.get(t), Some(x), "table {t}: row count and checksum");
+        }
+        assert_eq!(d.get("worktree_owners").map(|x| x.0), Some(0), "the ledger is made, empty");
+        assert_eq!(d.len(), before.2.len() + 1, "one table is added and no other");
+    }
+
+    /// The v2 text the fixtures are built from is the text atlas shipped at
+    /// schema 2 (origin/main 5789f958, line endings aside): a later schema
+    /// change is a new schema part and a version bump, never an edit here.
+    #[test]
+    fn the_v2_schema_text_is_the_one_atlas_shipped() {
+        assert_eq!(
+            crate::sha256::hex(SCHEMA.replace('\r', "").as_bytes()),
+            "b68c975c6062c3344aa89b15e311c8c70ee8b4a679c26abdf95df7843a21dd37"
+        );
+    }
+
+    #[test]
+    fn a_v2_store_takes_the_upgrade_with_every_row_kept_and_a_copy_beside_it() {
+        let d = dir("v2");
+        let path = d.join("memory.sqlite");
+        v2_fixture(&path);
+        let before = state(&path);
+        assert_eq!(before.0, 2);
+        let s = MemoryStore::open(&path).unwrap();
+        let bak = d.join("memory.sqlite.v2.bak");
+        assert_eq!(s.migrated(), Some(&Migrated { from: 2, backup: Some(bak.clone()) }));
+        // The store still reads, and the ledger is there.
+        assert_eq!(s.head("alpha").unwrap().unwrap().title, "alpha two");
+        assert_eq!(crate::worktree_ledger::open_rows(s.conn()).unwrap(), []);
+        drop(s);
+        assert_upgraded(&path, &before);
+        // The copy is the v2 store as it was.
+        assert_eq!(state(&bak), before, "the copy is the store before the upgrade");
+        assert!(!d.join("memory.sqlite.v2.bak.tmp").exists());
+        // A binary built for schema 2 refuses the upgraded store, by design.
+        assert!(state(&path).0 > 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn opening_a_v3_store_again_changes_nothing() {
+        let d = dir("again");
+        let path = d.join("memory.sqlite");
+        v2_fixture(&path);
+        drop(MemoryStore::open(&path).unwrap());
+        let bak = backup_path(&path, 2);
+        let bak_bytes = std::fs::read(&bak).unwrap();
+        let first = state(&path);
+        for _ in 0..3 {
+            let s = MemoryStore::open(&path).unwrap();
+            assert_eq!(s.migrated(), None);
+            drop(s);
+            assert_eq!(state(&path), first, "version, schema and every row unchanged");
+        }
+        assert_eq!(std::fs::read(&bak).unwrap(), bak_bytes, "no second copy is taken");
+        assert_eq!(
+            std::fs::read_dir(&d).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".bak")).count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_error_after_any_statement_leaves_a_v2_store_and_the_next_open_migrates() {
+        let n = statements();
+        assert!(n > 20, "{n} statements");
+        // 0: after the copy; 1..=n: after each statement; n + 1: after the version write.
+        for k in 0..=n + 1 {
+            let d = dir("fail");
+            let path = d.join("memory.sqlite");
+            v2_fixture(&path);
+            let before = state(&path);
+            let conn = Connection::open(&path).unwrap();
+            conn.busy_timeout(BUSY_TIMEOUT).unwrap();
+            let e = make_schema_with(&conn, &path, &mut |s| {
+                if s == k {
+                    Err(Error::InvalidArgument(format!("injected at {s}")))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("the failpoint fails it");
+            assert_eq!(e, Error::InvalidArgument(format!("injected at {k}")));
+            assert!(conn.is_autocommit(), "step {k}: rolled back");
+            drop(conn);
+            assert_eq!(state(&path), before, "step {k}: the store is the v2 store, every row and object as it was");
+            let s = MemoryStore::open(&path).unwrap();
+            assert_eq!(s.migrated().map(|m| m.from), Some(2), "step {k}: the next open retries");
+            drop(s);
+            assert_upgraded(&path, &before);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// The process the kill test starts: migrates the store it is given and
+    /// aborts the process at the step it is given. Without its inputs (a
+    /// normal test run) it does nothing.
+    #[test]
+    fn migration_killed_child() {
+        let (Ok(p), Ok(k)) = (std::env::var(CHILD_STORE), std::env::var(CHILD_STEP)) else { return };
+        let k: usize = k.parse().unwrap();
+        let path = PathBuf::from(p);
+        let conn = Connection::open(&path).unwrap();
+        conn.busy_timeout(BUSY_TIMEOUT).unwrap();
+        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0)).unwrap();
+        let r = make_schema_with(&conn, &path, &mut |s| {
+            if s == k {
+                std::process::abort();
+            }
+            Ok(())
+        });
+        panic!("step {k} was never reached: {r:?}");
+    }
+
+    #[test]
+    fn a_process_killed_at_any_step_leaves_a_v2_store_and_the_next_open_migrates() {
+        let exe = std::env::current_exe().unwrap();
+        let n = statements();
+        for k in 0..=n + 1 {
+            let d = dir("kill");
+            let path = d.join("memory.sqlite");
+            v2_fixture(&path);
+            let before = state(&path);
+            let out = std::process::Command::new(&exe)
+                .args(["--exact", CHILD, "--nocapture", "--test-threads=1"])
+                .env(CHILD_STORE, &path)
+                .env(CHILD_STEP, k.to_string())
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(!out.status.success(), "step {k}: the child is killed: {text}");
+            assert!(
+                !text.contains("never reached") && text.contains("running 1 test"),
+                "step {k}: the child ran and was killed at its step: {text}"
+            );
+            assert_eq!(state(&path), before, "step {k}: the killed migration left the v2 store");
+            let s = MemoryStore::open(&path).unwrap();
+            assert_eq!(s.migrated().map(|m| m.from), Some(2), "step {k}: the next open retries");
+            drop(s);
+            assert_upgraded(&path, &before);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn opens_racing_on_a_v2_store_migrate_it_once() {
+        for round in 0..6 {
+            let d = dir("race");
+            let path = d.join("memory.sqlite");
+            v2_fixture(&path);
+            let before = state(&path);
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let hs: Vec<_> = (0..3)
+                .map(|_| {
+                    let (gate, path) = (gate.clone(), path.clone());
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        let s = MemoryStore::open(&path).unwrap();
+                        assert_eq!(version(s.conn()), SCHEMA_VERSION, "each opener sees v3");
+                        s.migrated().cloned()
+                    })
+                })
+                .collect();
+            let got: Vec<Option<Migrated>> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(got.iter().filter(|m| m.is_some()).count(), 1, "round {round}: exactly one migrates: {got:?}");
+            assert_upgraded(&path, &before);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn no_copy_means_no_migration() {
+        let d = dir("nocopy");
+        let path = d.join("memory.sqlite");
+        v2_fixture(&path);
+        let before = state(&path);
+        // The copy cannot be put in place: a folder holds its name.
+        let bak = backup_path(&path, 2);
+        std::fs::create_dir_all(bak.join("in-the-way")).unwrap();
+        assert!(MemoryStore::open(&path).is_err());
+        assert_eq!(state(&path), before, "the v2 store is untouched");
+        std::fs::remove_dir_all(&bak).unwrap();
+        drop(MemoryStore::open(&path).unwrap());
+        assert_upgraded(&path, &before);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

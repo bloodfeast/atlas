@@ -12,7 +12,7 @@
 use crate::orchestrate::Kind;
 
 /// How many leading lines are read for declarations (as for `Kind:`).
-const DECL_LINES: usize = 40;
+pub(crate) const DECL_LINES: usize = 40;
 
 /// A priority class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -87,6 +87,10 @@ pub struct Class {
     pub uses: Vec<(String, Source)>,
     /// Declared `Uses: read-only`: it shares its lane (Q-QL1).
     pub read_only: bool,
+    /// The repository a `Repo:` line declares, normalised ([`norm_repo`]).
+    pub repo: Option<String>,
+    /// The branch a `Branch:` line declares.
+    pub branch: Option<String>,
 }
 
 impl Class {
@@ -97,14 +101,23 @@ impl Class {
 
     /// The meta lines a queued entry records (`atlas queue show`).
     pub fn meta(&self) -> String {
-        let uses = if self.uses.is_empty() { "none".to_string() } else { self.uses.iter().map(|(r, s)| format!("{r} ({})", s.note())).collect::<Vec<_>>().join(", ") };
-        format!(
+        let uses = if self.uses.is_empty() {
+            "none".to_string()
+        } else {
+            self.uses.iter().map(|(r, s)| format!("{r} ({})", s.note())).collect::<Vec<_>>().join(", ")
+        };
+        let mut m = format!(
             "lane_from: {}\npriority: {} ({})\nuses: {uses}{}",
             self.lane.as_ref().map_or_else(|| "none".to_string(), |_| self.lane_src.note()),
             self.priority.name(),
             self.priority_src.note(),
             if self.read_only { "\nread_only: declared" } else { "" }
-        )
+        );
+        // The scheduler holds a queued writer while its branch is held.
+        if let (Some(r), Some(b)) = (&self.repo, &self.branch) {
+            m.push_str(&format!("\nrepo: {r}\nbranch: {b}"));
+        }
+        m
     }
 }
 
@@ -119,6 +132,10 @@ pub struct Declared {
     pub uses: Option<Vec<String>>,
     /// `Uses:` lists `read-only`.
     pub read_only: bool,
+    /// `Repo:`, normalised ([`norm_repo`]).
+    pub repo: Option<String>,
+    /// `Branch:`.
+    pub branch: Option<String>,
 }
 
 /// A declaration line's value: `Name: value`, with markdown bullets,
@@ -137,13 +154,42 @@ pub(crate) fn decl<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     Some(rest.trim().trim_matches(['`', '"', '\'', '*']).trim())
 }
 
-/// Reads the `Lane:`, `Priority:` and `Uses:` lines.
+/// The lane token of a `Lane:` value: letters, digits, `-`, `_`, `.`, and
+/// a `/` that starts a sub-lane (`ATLAS-TOOLING/2`).
+pub(crate) fn lane_token(v: &str) -> String {
+    let tok: String = v.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')).collect();
+    tok.trim_end_matches(['/', '.']).to_string()
+}
+
+/// A repository as a `Repo:` line names it, in one spelling: lowercase,
+/// forward slashes, no trailing `/` or `.git`, so `D:\src\x\` and
+/// `d:/src/x.git` are one repository.
+pub fn norm_repo(v: &str) -> String {
+    let r = v.trim().replace('\\', "/").to_ascii_lowercase();
+    let r = r.trim_end_matches('/');
+    r.strip_suffix(".git").unwrap_or(r).trim_end_matches('/').to_string()
+}
+
+/// The first word of a declaration value, without the punctuation that
+/// ends a sentence (`Repo: D:/src/x. Make a worktree` reads `D:/src/x`).
+fn first_token(v: &str) -> Option<String> {
+    let w = v.split_whitespace().next()?.trim_matches(['`', '"', '\'']).trim_end_matches(['.', ',', ';', ':']);
+    (!w.is_empty()).then(|| w.to_string())
+}
+
+/// Reads the `Lane:`, `Priority:`, `Uses:`, `Repo:` and `Branch:` lines,
+/// with the default resource policy ([`declared_in`]).
 pub fn declared(brief: &str) -> Declared {
+    declared_in(brief, &Policy::default())
+}
+
+/// [`declared`], reading `Uses:` against `policy` ([`parse_uses`]).
+pub fn declared_in(brief: &str, policy: &Policy) -> Declared {
     let mut d = Declared::default();
     for line in brief.lines().take(DECL_LINES) {
         if d.lane.is_none() {
             if let Some(v) = decl(line, "lane") {
-                let tok: String = v.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).collect();
+                let tok = lane_token(v);
                 if !tok.is_empty() {
                     d.lane = Some(tok);
                 }
@@ -156,22 +202,58 @@ pub fn declared(brief: &str) -> Declared {
         }
         if d.uses.is_none() {
             if let Some(v) = decl(line, "uses") {
-                let (r, read_only) = parse_uses(v);
+                let (r, read_only) = parse_uses(v, policy);
                 d.read_only = read_only;
                 d.uses = Some(r);
             }
+        }
+        if d.repo.is_none() {
+            d.repo = decl(line, "repo").and_then(first_token).map(|r| norm_repo(&r)).filter(|r| !r.is_empty());
+        }
+        if d.branch.is_none() {
+            d.branch = decl(line, "branch").and_then(first_token);
         }
     }
     d
 }
 
-/// Reads a `Uses:` value: the resources, lowercased, sorted and deduped,
-/// and whether it lists `read-only`. Commas and spaces separate resources,
-/// except that a bare number joins the word before it in the same
-/// comma-separated piece: `sqlport 15126`, `sqlport: 15126` and
-/// `sqlport:15126` are all `sqlport:15126`, while `sqlport, 15126` is two
-/// resources. `none` and `and` are not resources.
-pub fn parse_uses(v: &str) -> (Vec<String>, bool) {
+/// A `Uses:` value without its parenthesised text (nested parentheses
+/// included; an unclosed one runs to the end).
+fn strip_parens(v: &str) -> String {
+    let (mut out, mut depth) = (String::with_capacity(v.len()), 0usize);
+    for c in v.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Reads a `Uses:` line as tokens: the resources `policy` limits (`gpu`,
+/// `compile`, `worktree:NAME` and the names and classes the configuration
+/// lists, [`Policy::limit`]), lowercased, sorted and deduped, and whether
+/// it lists `read-only`. Text in parentheses and every other word are free
+/// text and dropped, so `compile (the crate; one heavy compile at a time)`
+/// is `compile` alone. The words are split as [`parse_uses_words`] splits
+/// them (`sqlport 15126` is `sqlport:15126`); a bare `worktree` with no
+/// name is no token.
+pub fn parse_uses(v: &str, policy: &Policy) -> (Vec<String>, bool) {
+    let (mut r, read_only) = parse_uses_words(&strip_parens(v).replace(';', ","));
+    r.retain(|t| t != "worktree" && policy.limit(t).is_some());
+    (r, read_only)
+}
+
+/// Splits a `Uses:` value into words: lowercased, sorted and deduped, and
+/// whether it lists `read-only`. Commas and spaces separate words, except
+/// that a bare number joins the word before it in the same comma-separated
+/// piece: `sqlport 15126`, `sqlport: 15126` and `sqlport:15126` are all
+/// `sqlport:15126`, while `sqlport, 15126` is two words. `none` and `and`
+/// are dropped. A queued item's `uses:` meta is read with it; a brief's
+/// `Uses:` line with [`parse_uses`], which keeps only the tokens.
+pub fn parse_uses_words(v: &str) -> (Vec<String>, bool) {
     let mut r: Vec<String> = Vec::new();
     for piece in v.split(',') {
         // Whether the last resource of this piece can take a number.
@@ -183,7 +265,9 @@ pub fn parse_uses(v: &str) -> (Vec<String>, bool) {
             }
             let number = w.bytes().all(|b| b.is_ascii_digit());
             match r.last_mut() {
-                Some(last) if open && number => {
+                // `worktree: NAME` takes its name the way `sqlport: 15126`
+                // takes its number.
+                Some(last) if open && (number || last == "worktree:") => {
                     if !last.ends_with(':') {
                         last.push(':');
                     }
@@ -410,13 +494,15 @@ fn priority_of(hit: &[Option<&'static str>; NGROUPS]) -> (Priority, Source) {
 /// The bare gpu words (`capture`, `screenshot`, `bench`, ...) infer no gpu:
 /// [`classify_in`] takes the project's setting.
 pub fn classify(brief: &str, known: &[String]) -> Class {
-    classify_in(brief, known, false)
+    classify_in(brief, known, &Policy::default())
 }
 
-/// [`classify`], with the project's `orchestrate.bare_gpu_words`: when on,
-/// the bare gpu words infer gpu too.
-pub fn classify_in(brief: &str, known: &[String], bare_gpu_words: bool) -> Class {
-    let d = declared(brief);
+/// [`classify`] under the project's policy: `Uses:` keeps the tokens it
+/// limits ([`parse_uses`]), and with `bare_gpu_words` on the bare gpu
+/// words infer gpu too.
+pub fn classify_in(brief: &str, known: &[String], policy: &Policy) -> Class {
+    let bare_gpu_words = policy.bare_gpu_words;
+    let d = declared_in(brief, policy);
     // One lowercase copy and one scan serve every inference, made only
     // when a field is not declared.
     let lower = if d.lane.is_none() || d.priority.is_none() || d.uses.is_none() { brief.to_ascii_lowercase() } else { String::new() };
@@ -436,7 +522,7 @@ pub fn classify_in(brief: &str, known: &[String], bare_gpu_words: bool) -> Class
         Some(u) => u.into_iter().map(|r| (r, Source::Declared)).collect(),
         None => infer_uses(brief, &lower, &hit, bare_gpu_words),
     };
-    Class { lane, lane_src, priority, priority_src, uses, read_only: d.read_only }
+    Class { lane, lane_src, priority, priority_src, uses, read_only: d.read_only, repo: d.repo, branch: d.branch }
 }
 
 /// Resource capacities and the aging step.
@@ -490,7 +576,21 @@ impl Policy {
 /// review, and holds none (journal ATLAS-V03:0095): two reviews of one PR
 /// run together, beside the builder that owns the lane.
 pub fn held_lane(kind: Kind, class: &Class) -> Option<&String> {
-    class.lane.as_ref().filter(|_| !class.read_only && kind != Kind::Reviewer)
+    class.lane.as_ref().filter(|_| !read_only(kind, class) && kind != Kind::Reviewer)
+}
+
+/// The kinds that can launch read-only: research and reviewer. Builder,
+/// brief-writer and none are writers whatever their `Uses:` says.
+pub const READ_ONLY_KINDS: [Kind; 2] = [Kind::Research, Kind::Reviewer];
+
+/// Whether a launch is read-only: it declared `Uses: read-only`, or its
+/// kind is one of [`READ_ONLY_KINDS`] and it declared nothing it uses
+/// (`Uses: none`, an empty `Uses:`, or no line). Only declared uses count:
+/// an inferred `compile` or worktree path never makes research or a review
+/// a writer. A read-only launch never takes or tests a lane, and conflicts
+/// with nothing it does not use.
+pub fn read_only(kind: Kind, class: &Class) -> bool {
+    class.read_only || (READ_ONLY_KINDS.contains(&kind) && class.uses.iter().all(|(_, s)| *s != Source::Declared))
 }
 
 /// Lanes compare without case (`Lane: parser` and `PARSER` are one lane).
@@ -618,13 +718,15 @@ pub struct Proposal {
 }
 
 /// The class with only the declared fields: inferred lanes and resources
-/// never schedule (they did not meet the Q-QL3 bar on `lanes-eval`).
-fn scheduled(class: &Class) -> Class {
+/// never schedule (they did not meet the Q-QL3 bar on `lanes-eval`), and
+/// neither does a word `policy` does not limit (free text a queued item's
+/// `uses:` meta kept).
+fn scheduled(class: &Class, policy: &Policy) -> Class {
     let mut c = class.clone();
     if c.lane_src != Source::Declared {
         c.lane = None;
     }
-    c.uses.retain(|(_, s)| *s == Source::Declared);
+    c.uses.retain(|(r, s)| *s == Source::Declared && policy.limit(r).is_some());
     c
 }
 
@@ -636,13 +738,21 @@ fn scheduled(class: &Class) -> Class {
 /// resources, so an item that needs two resources is not starved by items
 /// that need one, and aging, which raises its rank, does reach it.
 pub fn propose(items: &[Item], running: &[Holder], free_slots: &dyn Fn(Kind) -> usize, total_free: usize, policy: &Policy) -> Proposal {
-    let items: Vec<Item> = items.iter().map(|it| Item { class: scheduled(&it.class), ..it.clone() }).collect();
-    let running: Vec<Holder> = running.iter().map(|h| Holder { class: scheduled(&h.class), ..h.clone() }).collect();
+    let items: Vec<Item> = items.iter().map(|it| Item { class: scheduled(&it.class, policy), ..it.clone() }).collect();
+    let running: Vec<Holder> = running.iter().map(|h| Holder { class: scheduled(&h.class, policy), ..h.clone() }).collect();
     let (items, running) = (&items[..], &running[..]);
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&i| (policy.rank(items[i].class.priority, items[i].waited_minutes), Order::key(items[i].order.as_ref()), -items[i].waited_minutes, i));
     // Lanes held: lane -> who holds it.
     let mut lanes: Vec<(String, String)> = running.iter().filter_map(|h| held_lane(h.kind, &h.class).map(|l| (l.clone(), h.name.clone()))).collect();
+    // Branches held by writers: ((repo, branch), who). Two writers never
+    // share one ("Queue them": the second waits here, not in a deny loop).
+    let branch_of = |kind: Kind, c: &Class| match (&c.repo, &c.branch) {
+        (Some(r), Some(b)) if !read_only(kind, c) => Some((r.clone(), b.clone())),
+        _ => None,
+    };
+    let mut branches: Vec<((String, String), String)> =
+        running.iter().filter_map(|h| branch_of(h.kind, &h.class).map(|rb| (rb, h.name.clone()))).collect();
     // Resource holders: (resource, who).
     let mut held: Vec<(String, String)> = running.iter().flat_map(|h| h.class.resources().map(|r| (r.to_string(), h.name.clone())).collect::<Vec<_>>()).collect();
     let mut taken: Vec<(Kind, usize)> = Vec::new();
@@ -659,7 +769,14 @@ pub fn propose(items: &[Item], running: &[Holder], free_slots: &dyn Fn(Kind) -> 
         } else if it.takes_slot && used >= free_slots(it.kind) {
             Some(format!("{} slots full", it.kind.name()))
         } else {
-            let lane = held_lane(it.kind, &it.class).and_then(|l| lanes.iter().find(|(x, _)| same_lane(x, l))).map(|(l, who)| format!("lane {l}, after {who}"));
+            let branch = branch_of(it.kind, &it.class);
+            let lane = held_lane(it.kind, &it.class)
+                .and_then(|l| lanes.iter().find(|(x, _)| same_lane(x, l)))
+                .map(|(l, who)| format!("lane {l}, after {who}"))
+                .or_else(|| {
+                    let rb = branch.as_ref()?;
+                    branches.iter().find(|(x, _)| x == rb).map(|((r, b), who)| format!("branch {b} of {r}, after {who}"))
+                });
             let res = || {
                 it.class.resources().find_map(|r| {
                     // A word that is not a limit never waits (#150).
@@ -679,6 +796,9 @@ pub fn propose(items: &[Item], running: &[Holder], free_slots: &dyn Fn(Kind) -> 
                 let who = format!("{} (reserved)", it.key);
                 if let Some(l) = held_lane(it.kind, &it.class) {
                     lanes.push((l.clone(), who.clone()));
+                }
+                if let Some(rb) = &branch {
+                    branches.push((rb.clone(), who.clone()));
                 }
                 if res.is_some() {
                     for x in it.class.resources() {
@@ -702,6 +822,9 @@ pub fn propose(items: &[Item], running: &[Holder], free_slots: &dyn Fn(Kind) -> 
                 if let Some(l) = held_lane(it.kind, &it.class) {
                     lanes.push((l.clone(), it.key.clone()));
                 }
+                if let Some(rb) = branch_of(it.kind, &it.class) {
+                    branches.push((rb, it.key.clone()));
+                }
                 for r in it.class.resources() {
                     held.push((r.to_string(), it.key.clone()));
                 }
@@ -714,42 +837,131 @@ pub fn propose(items: &[Item], running: &[Holder], free_slots: &dyn Fn(Kind) -> 
 /// One conflict of a launch with what runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflict {
-    /// What conflicts (`lane parser held by a1`, `gpu held by a2`).
+    /// What conflicts (`worktree:w held by a1`, `gpu held by a2`).
     pub what: String,
     /// The launch declared the field and declared holders alone fill it
-    /// (Q-QL2: deny and queue); otherwise an inference is involved (warn).
+    /// (Q-QL2: deny); otherwise an inference is involved (warn).
     pub declared: bool,
-    /// A word the policy does not list, shared with running work: never a
-    /// limit, only a note (`db with a1`; #150). Never `declared`.
-    pub advisory: bool,
+    /// Two writers touch one thing (a worktree, or one repo and branch):
+    /// a conflict, not a wait for capacity.
+    pub touch: bool,
 }
 
 /// The conflicts a launch would have with what runs. Empty when none.
+///
+/// A lane name is a label, never a lock: two launches in one lane conflict
+/// only on what they touch. Two writers (neither [`read_only`]) conflict
+/// when they share a `worktree:NAME` or both declare the same `Repo:` and
+/// `Branch:`; any launch waits on a capped resource ([`Policy::limit`])
+/// its holders fill.
 pub fn conflicts(kind: Kind, class: &Class, running: &[Holder], policy: &Policy) -> Vec<Conflict> {
     let names = |hs: &[&Holder]| hs.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", ");
+    let writer = !read_only(kind, class);
     let mut out = Vec::new();
-    if let Some(l) = held_lane(kind, class) {
-        let hs: Vec<&Holder> = running.iter().filter(|h| held_lane(h.kind, &h.class).is_some_and(|x| same_lane(x, l))).collect();
+    if let (true, Some(repo), Some(branch)) = (writer, &class.repo, &class.branch) {
+        let hs: Vec<&Holder> = running
+            .iter()
+            .filter(|h| !read_only(h.kind, &h.class) && h.class.repo.as_ref() == Some(repo) && h.class.branch.as_ref() == Some(branch))
+            .collect();
         if !hs.is_empty() {
-            let decl: Vec<&Holder> = hs.iter().copied().filter(|h| h.class.lane_src == Source::Declared).collect();
-            let declared = class.lane_src == Source::Declared && !decl.is_empty();
-            out.push(Conflict { what: format!("lane {l} held by {}", names(if declared { &decl } else { &hs })), declared, advisory: false });
+            out.push(Conflict { what: format!("branch {branch} of {repo} held by {}", names(&hs)), declared: true, touch: true });
         }
     }
     for (r, src) in &class.uses {
-        let hs: Vec<(&Holder, bool)> = running.iter().filter_map(|h| h.class.uses.iter().find(|(x, _)| x == r).map(|(_, s)| (h, *s == Source::Declared))).collect();
+        let touch = r.starts_with("worktree:");
+        if touch && !writer {
+            continue;
+        }
+        let hs: Vec<(&Holder, bool)> = running
+            .iter()
+            .filter(|h| !touch || !read_only(h.kind, &h.class))
+            .filter_map(|h| h.class.uses.iter().find(|(x, _)| x == r).map(|(_, s)| (h, *s == Source::Declared)))
+            .collect();
         let all: Vec<&Holder> = hs.iter().map(|(h, _)| *h).collect();
-        match policy.limit(r) {
-            None if !hs.is_empty() => out.push(Conflict { what: format!("{r} with {}", names(&all)), declared: false, advisory: true }),
-            Some(cap) if cap > 0 && hs.len() >= cap => {
-                let decl: Vec<&Holder> = hs.iter().filter(|(_, d)| *d).map(|(h, _)| *h).collect();
-                let declared = *src == Source::Declared && decl.len() >= cap;
-                out.push(Conflict { what: format!("{r} held by {}", names(if declared { &decl } else { &all })), declared, advisory: false });
-            }
-            _ => {}
+        // A word that is no limit is never a token ([`parse_uses`]); one
+        // built by hand still conflicts with nothing.
+        if let Some(cap) = policy.limit(r).filter(|c| *c > 0 && hs.len() >= *c) {
+            let decl: Vec<&Holder> = hs.iter().filter(|(_, d)| *d).map(|(h, _)| *h).collect();
+            let declared = *src == Source::Declared && decl.len() >= cap;
+            out.push(Conflict { what: format!("{r} held by {}", names(if declared { &decl } else { &all })), declared, touch });
         }
     }
     out
+}
+
+/// What the launch check does with a launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// Let it through, with a note for each conflict that rests on an
+    /// inference (empty when there is none).
+    Allow(Vec<String>),
+    /// Deny and queue it: it touches what a running writer holds (a
+    /// worktree, or a repo and branch), declared on both sides. The
+    /// scheduler holds it while that branch or worktree is held.
+    Conflict(String),
+    /// Deny and queue it: its kind's slots are full, or a capped resource
+    /// it declared is full of declared holders.
+    Queue(String),
+}
+
+/// The launch check, a pure function of what runs and the launch:
+///
+/// | the launch | decision |
+/// |---|---|
+/// | its kind has `kind_cap` running already | queue (`builder slots full`) |
+/// | read-only ([`read_only`]) and uses nothing | allow |
+/// | a writer sharing a declared `worktree:NAME` or `Repo:` + `Branch:` with a running writer | conflict: queue |
+/// | a declared capped resource its declared holders fill | queue |
+/// | any of these resting on an inference | allow, with a note |
+/// | anything else, a shared lane name included | allow |
+///
+/// `kind_cap` is the kind's cap; the hook passes `None`, since the agent
+/// cap ([`crate::orchestrate::Agents::admit`]) has already counted it.
+pub fn decide(kind: Kind, class: &Class, running: &[Holder], policy: &Policy, kind_cap: Option<usize>) -> Decision {
+    if let Some(max) = kind_cap {
+        if running.iter().filter(|h| h.kind == kind).count() >= max {
+            return Decision::Queue(format!("{} slots full", kind.name()));
+        }
+    }
+    let c = conflicts(kind, class, running, policy);
+    let join = |v: &[&Conflict]| v.iter().map(|c| c.what.as_str()).collect::<Vec<_>>().join("; ");
+    let touch: Vec<&Conflict> = c.iter().filter(|c| c.declared && c.touch).collect();
+    if !touch.is_empty() {
+        return Decision::Conflict(join(&touch));
+    }
+    let full: Vec<&Conflict> = c.iter().filter(|c| c.declared).collect();
+    if !full.is_empty() {
+        return Decision::Queue(join(&full));
+    }
+    Decision::Allow(c.into_iter().map(|c| c.what).collect())
+}
+
+/// Whether record scope `scope` is in lane `lane`: the lane itself, or one
+/// of its sub-lanes (`lane/2`, `lane/3`, ...). Without case, as lanes
+/// compare.
+pub fn in_lane(scope: &str, lane: &str) -> bool {
+    same_lane(scope, lane)
+        || (scope.get(..lane.len()).is_some_and(|p| p.eq_ignore_ascii_case(lane)) && scope[lane.len()..].starts_with('/'))
+}
+
+/// The parent of a sub-lane (`NAME/2` is in `NAME`), or the lane itself.
+pub fn parent_lane(lane: &str) -> &str {
+    match lane.rsplit_once('/') {
+        Some((p, n)) if !p.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => p,
+        _ => lane,
+    }
+}
+
+/// The sub-lane a launch in `lane` runs as when running work already holds
+/// that lane (`running` is the running agents' lanes): `lane/2`, `lane/3`,
+/// the first number no running agent's lane takes. `None` when no running
+/// agent is in `lane` itself. The caller skips this for a lane with a
+/// `brief` journal entry of its own (planned work that continues there).
+pub fn sub_lane(lane: &str, running: &[&str]) -> Option<String> {
+    if !running.iter().any(|r| same_lane(r, lane)) {
+        return None;
+    }
+    (2..).map(|n| format!("{lane}/{n}")).find(|s| !running.iter().any(|r| same_lane(r, s)))
 }
 
 #[cfg(test)]
@@ -776,7 +988,7 @@ mod tests {
     #[test]
     fn missing_fields_are_inferred() {
         let b = "Journal to lane PARSER-FIX.\nFix the reader, then run cargo test -j 16 and take a capture of the menu.\nWork in H:/w/repo-worktrees/parser-fix.";
-        let c = classify_in(b, &[], true);
+        let c = classify_in(b, &[], &Policy { bare_gpu_words: true, ..Policy::default() });
         assert_eq!(c.lane.as_deref(), Some("PARSER-FIX"));
         assert_eq!(c.resources().collect::<Vec<_>>(), ["compile", "gpu", "worktree:parser-fix"]);
         // Without the project's bare gpu words, `a capture` is no gpu.
@@ -861,8 +1073,8 @@ mod tests {
         let running = vec![h("r1", "Lane: parser\nUses: compile"), h("r2", "Uses: compile"), h("r3", "Journal to lane PARSER. Run cargo test.")];
         let c = conflicts(Kind::Builder, &classify("Lane: PARSER\nUses: compile", &[]), &running, &pol);
         let what: Vec<(&str, bool)> = c.iter().map(|c| (c.what.as_str(), c.declared)).collect();
-        // Lanes compare without case; r3's lane and compile are inferred.
-        assert_eq!(what, [("lane PARSER held by r1", true), ("compile held by r1, r2", true)]);
+        // A shared lane is no conflict; r3's compile is inferred.
+        assert_eq!(what, [("compile held by r1, r2", true)]);
         // One declared holder of two units: only a warning.
         let c = conflicts(Kind::Builder, &classify("Lane: other\nUses: compile", &[]), &running[1..], &pol);
         assert_eq!(c.iter().map(|c| (c.what.as_str(), c.declared)).collect::<Vec<_>>(), [("compile held by r2, r3", false)]);
@@ -884,8 +1096,8 @@ Simplicity review of PR 113.", &[]);
         assert!(conflicts(Kind::Reviewer, &simplicity, &[builder.clone(), review.clone()], &pol).is_empty());
         // A builder taking the lane is not blocked by a running review.
         assert!(conflicts(Kind::Builder, &classify("Lane: ATLAS-V03", &[]), &[review], &pol).is_empty());
-        // A builder still conflicts with the lane's builder.
-        assert!(conflicts(Kind::Builder, &classify("Lane: ATLAS-V03", &[]), std::slice::from_ref(&builder), &pol).iter().any(|c| c.declared));
+        // A builder beside the lane's builder: a lane is a label, not a lock.
+        assert!(conflicts(Kind::Builder, &classify("Lane: ATLAS-V03", &[]), std::slice::from_ref(&builder), &pol).is_empty());
         // Both reviews of one PR start together; a third waits for a slot.
         let items = vec![
             item("simplicity", Kind::Reviewer, "Lane: ATLAS-V03
@@ -995,12 +1207,12 @@ Cost review of PR 114.", 1),
         let running = vec![Holder { name: "r1".into(), kind: Kind::Builder, class: classify("Lane: a\nUses: compile, worktree:w", &[]) }];
         let c = classify("Lane: a\nUses: compile, worktree:w", &[]);
         let what = |v: Vec<Conflict>| v.into_iter().map(|c| (c.what, c.declared)).collect::<Vec<_>>();
-        assert_eq!(what(conflicts(Kind::Builder, &c, &running, &pol)), [("lane a held by r1".to_string(), true), ("worktree:w held by r1".to_string(), true)]);
+        assert_eq!(what(conflicts(Kind::Builder, &c, &running, &pol)), [("worktree:w held by r1".to_string(), true)]);
         assert!(conflicts(Kind::Builder, &classify("Lane: a\nUses: read-only", &[]), &running, &pol).is_empty());
         // An inferred side makes it a warning.
         let inferred = classify("Journal to lane A-ONE. Work in /w/x-worktrees/w.", &[]);
         let running = vec![Holder { name: "r2".into(), kind: Kind::Builder, class: classify("Lane: A-ONE\nUses: worktree:w", &[]) }];
-        assert_eq!(what(conflicts(Kind::Builder, &inferred, &running, &pol)), [("lane A-ONE held by r2".to_string(), false), ("worktree:w held by r2".to_string(), false)]);
+        assert_eq!(what(conflicts(Kind::Builder, &inferred, &running, &pol)), [("worktree:w held by r2".to_string(), false)]);
     }
 
     /// The two headers of atlas-dev #150.
@@ -1011,7 +1223,8 @@ Cost review of PR 114.", 1),
     /// only where the project turns them on; explicit gpu words always do.
     #[test]
     fn bare_gpu_words_infer_gpu_only_when_the_project_says_so() {
-        let gpu = |b: &str, on: bool| classify_in(b, &[], on).resources().any(|r| r == "gpu");
+        let gpu =
+            |b: &str, on: bool| classify_in(b, &[], &Policy { bare_gpu_words: on, ..Policy::default() }).resources().any(|r| r == "gpu");
         let web = "Lane: WEB-1\nMockup-vs-built screenshots for the PR bodies.";
         assert!(!gpu(web, false) && gpu(web, true));
         for b in ["Lane: X\nTake a frame capture of the menu.", "Lane: X\nHold the GPU timing window.","Lane: X\nThe CUDA kernel.", "Lane: X\nA Vulkan pass.", "Lane: X\nTake the gpu lock first."] {
@@ -1025,63 +1238,208 @@ Cost review of PR 114.", 1),
         assert!(!gpu("Lane: X\nThe gpu module's docs.", true));
     }
 
+    /// A policy that lists the #150 words, so they are tokens.
+    fn web_policy() -> Policy {
+        let mut p = Policy::default();
+        for w in ["db", "contracts", "api", "react", "sqlport"] {
+            p.resources.push((w.into(), 1));
+        }
+        p
+    }
+
+    fn item_in(key: &str, kind: Kind, brief: &str, pol: &Policy) -> Item {
+        Item {
+            key: key.into(),
+            kind,
+            class: classify_in(brief, &[], pol),
+            waited_minutes: 0,
+            order: None,
+            takes_slot: true,
+            unmet: Vec::new(),
+        }
+    }
+
     #[test]
     fn uses_joins_a_bare_number_to_the_word_before_it() {
-        let uses = |b: &str| declared(b).uses.unwrap_or_default();
+        let pol = web_policy();
+        let uses = |b: &str| declared_in(b, &pol).uses.unwrap_or_default();
         assert_eq!(uses(ISSUE_A), ["api", "contracts", "db", "react", "sqlport:15126"]);
         for same in ["Uses: sqlport 15126", "Uses: sqlport: 15126", "Uses: sqlport  15126", "Uses: sqlport:15126", "Uses: SQLPort 15126.", "Uses: `sqlport 15126`"] {
             assert_eq!(uses(same), ["sqlport:15126"], "{same}");
         }
-        // A comma separates; a word is not a value; `name:` alone is the name.
-        assert_eq!(uses("Uses: sqlport, 15126"), ["15126", "sqlport"]);
+        // A comma separates; a lone number is no token; `name:` alone is the name.
+        assert_eq!(uses("Uses: sqlport, 15126"), ["sqlport"]);
         assert_eq!(uses("Uses: gpu compile"), ["compile", "gpu"]);
         assert_eq!(uses("Uses: gpu and compile, gpu"), ["compile", "gpu"]);
         assert_eq!(uses("Uses: sqlport:"), ["sqlport"]);
-        assert_eq!(uses("Uses: worktree:a 7"), ["7", "worktree:a"]);
+        assert_eq!(uses("Uses: worktree:a 7"), ["worktree:a"]);
         assert!(uses("Uses: none").is_empty());
-        let d = declared("Uses: sqlport 15126, read-only");
+        let d = declared_in("Uses: sqlport 15126, read-only", &pol);
         assert_eq!((d.uses.unwrap(), d.read_only), (vec!["sqlport:15126".to_string()], true));
+        // The raw split still keeps every word (a queued item's meta).
+        assert_eq!(parse_uses_words("sqlport, 15126").0, ["15126", "sqlport"]);
+    }
+
+    /// The coordinator's report, 2026-11-14: free text on a `Uses:` line
+    /// shared words ("the", "a", "runq") with a running agent. Only the
+    /// tokens the policy limits are read; parentheses are free text.
+    #[test]
+    fn uses_reads_only_tokens_and_drops_free_text() {
+        let pol = Policy::default();
+        let (u, ro) = parse_uses("compile (the atlas crate; one heavy compile at a time through runq)", &pol);
+        assert_eq!((u, ro), (vec!["compile".to_string()], false));
+        assert!(parse_uses("none (read-only analysis; no cargo, no builds)", &pol).0.is_empty());
+        assert_eq!(parse_uses("gpu; worktree:fix-a, the build", &pol).0, ["gpu", "worktree:fix-a"]);
+        // A bare `worktree` names none; a word the policy does not list is no token.
+        assert!(parse_uses("worktree, db, react", &pol).0.is_empty());
+        assert_eq!(parse_uses("db, react", &web_policy()).0, ["db", "react"]);
+        // Two prompts that share only free text share no token.
+        let running = vec![Holder {
+            name: "b1".into(),
+            kind: Kind::Builder,
+            class: classify("Kind: builder\nLane: A\nUses: compile (the crate; one heavy compile at a time through runq)", &[]),
+        }];
+        let c = classify("Kind: builder\nLane: B\nUses: gpu (the capture, one at a time with runq)", &[]);
+        assert_eq!(decide(Kind::Builder, &c, &running, &pol, None), Decision::Allow(Vec::new()));
     }
 
     #[test]
-    fn an_unlisted_word_only_warns_in_the_hook_and_never_waits_in_the_batch() {
+    fn unlisted_words_are_not_tokens_and_never_conflict() {
         let pol = Policy::default();
         let running = vec![Holder { name: "Build ES1-1663".into(), kind: Kind::Builder, class: classify(ISSUE_A, &[]) }];
-        let c = conflicts(Kind::Builder, &classify(ISSUE_B, &[]), &running, &pol);
-        let what: Vec<(&str, bool, bool)> = c.iter().map(|c| (c.what.as_str(), c.declared, c.advisory)).collect();
-        assert_eq!(what, [("api with Build ES1-1663", false, true), ("contracts with Build ES1-1663", false, true), ("db with Build ES1-1663", false, true), ("react with Build ES1-1663", false, true)]);
+        assert!(running[0].class.uses.is_empty(), "{:?}", running[0].class.uses);
+        assert!(conflicts(Kind::Builder, &classify(ISSUE_B, &[]), &running, &pol).is_empty());
         // The scheduler starts both together.
         let items = vec![item("a", Kind::Builder, ISSUE_A, 10), item("b", Kind::Builder, ISSUE_B, 5)];
         assert_eq!(propose(&items, &[], &|_| 5, 5, &pol).start, [0, 1]);
         assert_eq!(propose(&items[1..], &running, &|_| 5, 5, &pol).start, [0]);
-        // An inferred unlisted word warns the same way (no inference makes
-        // one today, so the class is built by hand).
-        let mut inferred = classify("Lane: x\nUses: none", &[]);
-        inferred.uses = vec![("db".into(), Source::Inferred("db".into()))];
-        assert!(conflicts(Kind::Builder, &inferred, &running, &pol).iter().all(|c| c.advisory && !c.declared));
+        // A word built into a class by hand, with no limit, conflicts with nothing.
+        let mut odd = classify("Lane: x\nUses: none", &[]);
+        odd.uses = vec![("db".into(), Source::Declared)];
+        let mut held = running.clone();
+        held[0].class.uses = vec![("db".into(), Source::Declared)];
+        assert!(conflicts(Kind::Builder, &odd, &held, &pol).is_empty());
     }
 
     #[test]
     fn listed_words_gpu_compile_and_worktrees_still_limit() {
-        let h = |b: &str| vec![Holder { name: "r1".into(), kind: Kind::Builder, class: classify(b, &[]) }];
-        let denied = |pol: &Policy, held: &str, launch: &str| conflicts(Kind::Builder, &classify(launch, &[]), &h(held), pol).iter().any(|c| c.declared);
+        let h = |b: &str, pol: &Policy| vec![Holder { name: "r1".into(), kind: Kind::Builder, class: classify_in(b, &[], pol) }];
+        let denied = |pol: &Policy, held: &str, launch: &str| {
+            conflicts(Kind::Builder, &classify_in(launch, &[], pol), &h(held, pol), pol).iter().any(|c| c.declared)
+        };
         let def = Policy::default();
         for r in ["gpu", "compile", "worktree:x"] {
             let (a, b) = (format!("Lane: a\nUses: {r}"), format!("Lane: b\nUses: {r}"));
             assert!(denied(&def, &a, &b), "{r}");
-            assert_eq!(propose(&[item("q", Kind::Builder, &b, 0)], &h(&a), &|_| 5, 5, &def).start, Vec::<usize>::new(), "{r}");
+            assert_eq!(propose(&[item("q", Kind::Builder, &b, 0)], &h(&a, &def), &|_| 5, 5, &def).start, Vec::<usize>::new(), "{r}");
         }
         assert!(!denied(&def, "Lane: a\nUses: worktree:x", "Lane: b\nUses: worktree:y"));
         // Capacity 0 turns a word off: no deny and no note.
         let off = Policy { resources: vec![("db".into(), 0)], aging_minutes: 60, bare_gpu_words: false };
-        assert!(conflicts(Kind::Builder, &classify("Lane: b\nUses: db", &[]), &h("Lane: a\nUses: db"), &off).is_empty());
+        assert!(conflicts(Kind::Builder, &classify_in("Lane: b\nUses: db", &[], &off), &h("Lane: a\nUses: db", &off), &off).is_empty());
         // Capacity 1 makes a word a limit, in the hook and the batch.
         let one = Policy { resources: vec![("db".into(), 1), ("sqlport".into(), 1)], aging_minutes: 60, bare_gpu_words: false };
         assert!(denied(&one, "Lane: a\nUses: db", "Lane: b\nUses: db"));
-        assert_eq!(propose(&[item("q", Kind::Builder, "Lane: b\nUses: db", 0)], &h("Lane: a\nUses: db"), &|_| 5, 5, &one).wait, [(0, "db held by r1".to_string())]);
+        let p = propose(&[item_in("q", Kind::Builder, "Lane: b\nUses: db", &one)], &h("Lane: a\nUses: db", &one), &|_| 5, 5, &one);
+        assert_eq!(p.wait, [(0, "db held by r1".to_string())]);
         // A class entry limits each port on its own.
         assert!(!denied(&one, "Lane: a\nUses: sqlport 15126", "Lane: b\nUses: sqlport 15127"));
         assert!(denied(&one, "Lane: a\nUses: sqlport 15126", "Lane: b\nUses: sqlport: 15126"));
-        assert_eq!(propose(&[item("q", Kind::Builder, "Lane: b\nUses: sqlport 15127", 0)], &h("Lane: a\nUses: sqlport 15126"), &|_| 5, 5, &one).start, [0]);
+        let held = h("Lane: a\nUses: sqlport 15126", &one);
+        assert_eq!(propose(&[item_in("q", Kind::Builder, "Lane: b\nUses: sqlport 15127", &one)], &held, &|_| 5, 5, &one).start, [0]);
+    }
+
+    fn holder(name: &str, kind: Kind, brief: &str) -> Holder {
+        Holder { name: name.into(), kind, class: classify(brief, &[]) }
+    }
+
+    /// The defect of 2026-11-14: a read-only research launch in a builder's
+    /// lane was refused for the lane name alone.
+    #[test]
+    fn decide_lets_a_read_only_launch_beside_a_builder_in_its_lane() {
+        let pol = Policy::default();
+        let running = vec![holder("b1", Kind::Builder, "Kind: builder\nLane: ATLAS-TOOLING\nUses: compile, worktree:queue-lanes")];
+        for kind in READ_ONLY_KINDS {
+            for uses in ["Uses: none", "Uses:", "Uses: none (read-only analysis; no cargo, no builds)"] {
+                let c = classify(&format!("Kind: {}\nLane: ATLAS-TOOLING\n{uses}\n\nMeasure it.", kind.name()), &[]);
+                assert!(read_only(kind, &c), "{kind:?} {uses}");
+                assert_eq!(held_lane(kind, &c), None, "a read-only launch takes no lane");
+                assert_eq!(decide(kind, &c, &running, &pol, None), Decision::Allow(Vec::new()), "{kind:?} {uses}");
+            }
+        }
+        // Builder and brief-writer are writers, whatever their `Uses:` says.
+        let c = classify("Lane: ATLAS-TOOLING\nUses: none", &[]);
+        assert!(!read_only(Kind::Builder, &c) && !read_only(Kind::BriefWriter, &c));
+        // A research launch that uses a resource is a writer of it.
+        let c = classify("Kind: research\nLane: ATLAS-TOOLING\nUses: compile", &[]);
+        assert!(!read_only(Kind::Research, &c));
+        assert_eq!(decide(Kind::Research, &c, &running, &pol, None), Decision::Queue("compile held by b1".into()));
+    }
+
+    #[test]
+    fn decide_lets_two_builders_in_one_lane_with_disjoint_uses_run() {
+        let pol = Policy::default();
+        let running = vec![holder("b1", Kind::Builder, "Lane: ATLAS-TOOLING\nUses: compile, worktree:a")];
+        let c = classify("Lane: ATLAS-TOOLING\nUses: gpu, worktree:b", &[]);
+        assert_eq!(decide(Kind::Builder, &c, &running, &pol, None), Decision::Allow(Vec::new()));
+        // No `Uses:` line and nothing inferred: allowed too (today's
+        // behaviour, less the lane lock).
+        let bare = classify("Lane: ATLAS-TOOLING\n\nDo it.", &[]);
+        assert_eq!(decide(Kind::Builder, &bare, &running, &pol, None), Decision::Allow(Vec::new()));
+    }
+
+    #[test]
+    fn decide_conflicts_two_writers_on_one_worktree_or_branch() {
+        let pol = Policy::default();
+        let running = vec![holder("b1", Kind::Builder, "Lane: A\nUses: worktree:x\nRepo: D:\\src\\tools\\atlas\\\nBranch: fix-a")];
+        let c = classify("Lane: B\nUses: worktree:x", &[]);
+        assert_eq!(decide(Kind::Builder, &c, &running, &pol, None), Decision::Conflict("worktree:x held by b1".into()));
+        // One repo (spelled two ways) and one branch, both declared.
+        let c = classify("Lane: B\nRepo: d:/src/tools/atlas.git. Make a worktree.\nBranch: `fix-a`", &[]);
+        assert_eq!(c.repo.as_deref(), Some("d:/src/tools/atlas"));
+        let want = Decision::Conflict("branch fix-a of d:/src/tools/atlas held by b1".into());
+        assert_eq!(decide(Kind::Builder, &c, &running, &pol, None), want);
+        // Another branch, or no branch declared on one side: no conflict.
+        for b in ["Lane: B\nRepo: D:/src/tools/atlas\nBranch: fix-b", "Lane: B\nRepo: D:/src/tools/atlas"] {
+            assert_eq!(decide(Kind::Builder, &classify(b, &[]), &running, &pol, None), Decision::Allow(Vec::new()), "{b}");
+        }
+        // A worktree shared with an inferred side is a note, not a deny.
+        let c = classify("Lane: B\n\nWork in H:/w/x-worktrees/x.", &[]);
+        assert_eq!(decide(Kind::Builder, &c, &running, &pol, None), Decision::Allow(vec!["worktree:x held by b1".into()]));
+    }
+
+    #[test]
+    fn decide_queues_a_capped_resource_over_its_cap_and_the_kind_cap() {
+        let pol = Policy { resources: vec![("compile".into(), 2)], aging_minutes: 60, bare_gpu_words: false };
+        let one = vec![holder("b1", Kind::Builder, "Lane: A\nUses: compile")];
+        let c = classify_in("Lane: B\nUses: compile (one heavy compile at a time through runq)", &[], &pol);
+        assert_eq!(decide(Kind::Builder, &c, &one, &pol, None), Decision::Allow(Vec::new()));
+        let two = vec![one[0].clone(), holder("b2", Kind::Builder, "Lane: C\nUses: compile")];
+        assert_eq!(decide(Kind::Builder, &c, &two, &pol, None), Decision::Queue("compile held by b1, b2".into()));
+        // The per-kind cap: full queues whatever the launch uses.
+        let free = classify("Lane: D\nUses: none", &[]);
+        assert_eq!(decide(Kind::Builder, &free, &two, &pol, Some(2)), Decision::Queue("builder slots full".into()));
+        assert_eq!(decide(Kind::Builder, &free, &two, &pol, Some(3)), Decision::Allow(Vec::new()));
+        // A read-only launch still counts against its own kind's cap.
+        let research = vec![holder("r1", Kind::Research, "Kind: research\nUses: none")];
+        let c = classify("Kind: research\nLane: D\nUses: none", &[]);
+        assert_eq!(decide(Kind::Research, &c, &research, &pol, Some(1)), Decision::Queue("research slots full".into()));
+    }
+
+    #[test]
+    fn a_sub_lane_takes_the_first_free_number() {
+        assert_eq!(sub_lane("ATLAS-TOOLING", &[]), None);
+        assert_eq!(sub_lane("ATLAS-TOOLING", &["OTHER"]), None);
+        assert_eq!(sub_lane("ATLAS-TOOLING", &["atlas-tooling"]), Some("ATLAS-TOOLING/2".into()));
+        let busy = ["ATLAS-TOOLING", "ATLAS-TOOLING/2", "ATLAS-TOOLING/4"];
+        assert_eq!(sub_lane("ATLAS-TOOLING", &busy), Some("ATLAS-TOOLING/3".into()));
+        // Only a holder of the lane itself makes a sub-lane.
+        assert_eq!(sub_lane("ATLAS-TOOLING", &["ATLAS-TOOLING/2"]), None);
+        // The sub-lane is in its parent, and reads back from a `Lane:` line.
+        assert!(in_lane("ATLAS-TOOLING/2", "ATLAS-TOOLING") && in_lane("ATLAS-TOOLING", "atlas-tooling"));
+        assert!(!in_lane("ATLAS-TOOLING-2", "ATLAS-TOOLING") && !in_lane("ATLAS", "ATLAS-TOOLING"));
+        assert_eq!(parent_lane("ATLAS-TOOLING/3"), "ATLAS-TOOLING");
+        assert_eq!(parent_lane("ATLAS-TOOLING"), "ATLAS-TOOLING");
+        assert_eq!(declared("Kind: research\n- **Lane:** `ATLAS-TOOLING/2`\n").lane.as_deref(), Some("ATLAS-TOOLING/2"));
     }
 }

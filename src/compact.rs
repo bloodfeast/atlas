@@ -360,16 +360,7 @@ pub fn check(store: &MemoryStore, roots: &[RefRoot], text: &str) -> Result<RefCh
             Status::Unchecked => c.unchecked += 1,
         }
     }
-    let mut seen = HashSet::new();
-    for word in text.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '@'))) {
-        if word.contains('@') {
-            continue;
-        }
-        let w = word.trim_end_matches([':', '-']);
-        let Some((p, rest)) = w.split_once(':') else { continue };
-        if rest.is_empty() || !prefixes.contains(p) || !seen.insert(w.to_string()) {
-            continue;
-        }
+    for w in bare_keys(text, &prefixes) {
         c.bare += 1;
         if store.head(w)?.is_none() {
             c.bare_missing += 1;
@@ -378,19 +369,57 @@ pub fn check(store: &MemoryStore, roots: &[RefRoot], text: &str) -> Result<RefCh
     Ok(c)
 }
 
+/// The words of a text written as a record key without a hash
+/// (`prefix:rest`, with `prefix` one of `prefixes`), in order, each once.
+/// A word with an `@` is a ref ([`refs_in`]), not a bare key. Whether each
+/// names a stored record is the caller's test.
+pub(crate) fn bare_keys<'a>(text: &'a str, prefixes: &HashSet<String>) -> Vec<&'a str> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for word in text.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '@'))) {
+        if word.contains('@') {
+            continue;
+        }
+        let w = word.trim_end_matches([':', '-']);
+        let Some((p, rest)) = w.split_once(':') else { continue };
+        if rest.is_empty() || !prefixes.contains(p) || !seen.insert(w) {
+            continue;
+        }
+        out.push(w);
+    }
+    out
+}
+
 /// The part before the first `:` of every stored key that has one.
-fn key_prefixes(store: &MemoryStore) -> Result<HashSet<String>> {
+pub(crate) fn key_prefixes(store: &MemoryStore) -> Result<HashSet<String>> {
     let mut st = store.conn().prepare_cached("SELECT DISTINCT substr(key, 1, instr(key, ':') - 1) FROM records WHERE instr(key, ':') > 1")?;
     let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<HashSet<_>>>()?;
     Ok(rows)
 }
 
+/// The MCP tools that read (by the name after the last `__`): the only MCP
+/// calls [`lookup_sig`] counts as lookups. A write (`journal`, `remember`,
+/// `note`, `edit`, `handoff`, `hook`, `miss`, `discuss`, ...) carries a lane
+/// or a key too, but writing again after a compaction is no re-read (#211).
+pub const READ_TOOLS: &[&str] = &["recall", "search", "section", "lookup", "grep", "read_note", "symbol", "ids", "list_notes"];
+
+/// The SQL condition on a `compact_miss` row that keeps it a lookup or a
+/// repeat of one: a first lookup (its target is not stored), a shell
+/// target, or a target whose first word is a Read, Grep or Glob or a
+/// [`READ_TOOLS`] name. It drops the write rows an older atlas logged
+/// before [`lookup_sig`] left writes out (#211).
+fn read_rows_sql() -> String {
+    let words: Vec<String> = ["read", "grep", "glob"].iter().chain(READ_TOOLS).map(|w| format!("'{w}'")).collect();
+    format!("(kind = 'lookup' OR substr(sig, 1, 2) = '$ ' OR substr(sig, 1, instr(sig || ' ', ' ') - 1) IN ({}))", words.join(", "))
+}
+
 /// The normalized target of a lookup tool call, or `None` for a call that
-/// is not a lookup (an edit, a shell command, an agent).
+/// is not a lookup (an edit, a shell command, an agent, an MCP write).
 ///
 /// A Read is its file; a Grep its pattern, path and glob; a Glob its
-/// pattern and path; an atlas tool (or any MCP tool) its name and its key,
-/// query, path, id, heading, name or pattern. Lowercase, `\` read as `/`.
+/// pattern and path; an MCP tool named in [`READ_TOOLS`] its name and its
+/// key, query, path, id, heading, name or pattern. Lowercase, `\` read as
+/// `/`.
 pub fn lookup_sig(tool: &str, input: &Value) -> Option<String> {
     let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let sig = match tool {
@@ -399,6 +428,9 @@ pub fn lookup_sig(tool: &str, input: &Value) -> Option<String> {
         "Glob" => format!("glob {} {}", f("pattern"), f("path")),
         t if t.starts_with("mcp__") => {
             let name = t.rsplit("__").next().unwrap_or(t);
+            if !READ_TOOLS.contains(&name) {
+                return None;
+            }
             let mut parts = vec![name.to_string()];
             for k in ["vault", "source", "key", "query", "path", "id", "heading", "name", "pattern", "lane"] {
                 let v = f(k);
@@ -919,19 +951,25 @@ pub fn totals(conn: &Connection, bytes_per_token: f64) -> Result<Option<Totals>>
         return Ok((t.n > 0 || t.misses > 0).then_some(t));
     }
     // A shell target starts `$ `; it is never one of the replay's lookups.
+    // Write rows an older atlas logged are no lookups (#211), and the
+    // unstamped figures use the same window as the lookups and repeats.
     let w = MISS_WINDOW as i64;
-    (t.window_lookups, t.window_repeats, t.window_misses, t.stamped_misses, t.changed_targets, t.unstamped, t.unstamped_shell) = conn.query_row(
-        "SELECT ifnull(SUM(calls <= ?1 AND substr(sig, 1, 2) <> '$ '), 0),
-                ifnull(SUM(calls <= ?1 AND kind <> 'lookup' AND substr(sig, 1, 2) <> '$ '), 0),
-                ifnull(SUM(calls <= ?1 AND kind = 'miss'), 0),
-                ifnull(SUM(kind = 'miss'), 0),
-                ifnull(SUM(kind = 'changed'), 0),
-                ifnull(SUM(kind = 'unstamped'), 0),
-                ifnull(SUM(kind = 'unstamped' AND substr(sig, 1, 2) = '$ '), 0)
-         FROM compact_miss",
-        [w],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-    )?;
+    (t.window_lookups, t.window_repeats, t.window_misses, t.stamped_misses, t.changed_targets, t.unstamped, t.unstamped_shell) = conn
+        .query_row(
+            &format!(
+                "SELECT ifnull(SUM(calls <= ?1 AND substr(sig, 1, 2) <> '$ '), 0),
+                    ifnull(SUM(calls <= ?1 AND kind <> 'lookup' AND substr(sig, 1, 2) <> '$ '), 0),
+                    ifnull(SUM(calls <= ?1 AND kind = 'miss'), 0),
+                    ifnull(SUM(kind = 'miss'), 0),
+                    ifnull(SUM(kind = 'changed'), 0),
+                    ifnull(SUM(calls <= ?1 AND kind = 'unstamped'), 0),
+                    ifnull(SUM(calls <= ?1 AND kind = 'unstamped' AND substr(sig, 1, 2) = '$ '), 0)
+             FROM compact_miss WHERE {}",
+                read_rows_sql()
+            ),
+            [w],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )?;
     Ok((t.n > 0 || t.misses > 0 || t.window_lookups > 0 || t.stamped_misses + t.changed_targets + t.unstamped > 0).then_some(t))
 }
 
@@ -964,12 +1002,15 @@ pub fn repeats(conn: &Connection, since: &str, limit: usize) -> Result<Vec<Repea
     if !has_miss_table(conn)? {
         return Ok(Vec::new());
     }
-    let mut st = conn.prepare(
+    let mut st = conn.prepare(&format!(
         "SELECT sig, SUM(kind = 'miss'), SUM(kind = 'changed'), SUM(kind = 'unstamped') FROM compact_miss
-         WHERE kind <> 'lookup' AND time >= ?1 GROUP BY sig ORDER BY COUNT(*) DESC, sig LIMIT ?2",
-    )?;
+         WHERE kind <> 'lookup' AND time >= ?1 AND {} GROUP BY sig ORDER BY COUNT(*) DESC, sig LIMIT ?2",
+        read_rows_sql()
+    ))?;
     let rows = st
-        .query_map(params![since, limit as i64], |r| Ok(Repeat { sig: r.get(0)?, misses: r.get(1)?, changed: r.get(2)?, unstamped: r.get(3)? }))?
+        .query_map(params![since, limit as i64], |r| {
+            Ok(Repeat { sig: r.get(0)?, misses: r.get(1)?, changed: r.get(2)?, unstamped: r.get(3)? })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -1136,8 +1177,26 @@ pub enum Stamp {
     Writes(u64),
     /// A memory record's sha.
     Record(String),
+    /// The memory store's records outside the sessions' own checkpoint
+    /// lanes (`session:<id>`): the newest head, the records, the active
+    /// ones ([`records_stamp`]). A recall by query or lane, which any
+    /// write may change.
+    Store(i64, i64, i64),
     /// No stamp.
     None,
+}
+
+/// The stamp of the memory store's records for a recall without a key:
+/// the newest head version, the number of records and of active ones, over
+/// every record outside the `session:<id>` checkpoint lanes (a compaction
+/// writes its own checkpoint there, which is no change a recall repeat
+/// should be excused by). A new record, a revision, or a status change
+/// moves it.
+fn records_stamp(store: &MemoryStore) -> Result<Stamp> {
+    let mut st = store.conn().prepare_cached(
+        "SELECT ifnull(MAX(head), 0), COUNT(*), ifnull(SUM(status = 'active'), 0) FROM records WHERE scope NOT LIKE 'session:%'",
+    )?;
+    Ok(st.query_row([], |r| Ok(Stamp::Store(r.get(0)?, r.get(1)?, r.get(2)?)))?)
 }
 
 /// A path as the tracker compares it: resolved against `cwd` when relative,
@@ -1229,8 +1288,8 @@ impl MissTracker {
 
     /// The stamp of a lookup's target, from the raw tool input: a Read's
     /// file; a Grep's or Glob's file, else the writes under its folder (or
-    /// under `cwd` with no path); an atlas call's record by its `key`.
-    /// Anything else has none.
+    /// under `cwd` with no path); an atlas call's record by its `key`; an
+    /// atlas recall without a key, the store's state. Anything else has none.
     pub fn stamp(&self, session: &str, tool: &str, input: &Value, cwd: &str, store: &MemoryStore) -> Stamp {
         let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
         let resolve = |p: &str| if Path::new(p).is_relative() && !cwd.is_empty() { Path::new(cwd).join(p) } else { PathBuf::from(p) };
@@ -1248,6 +1307,12 @@ impl MissTracker {
                 Ok(None) => Stamp::Absent,
                 Err(_) => Stamp::None,
             },
+            // A recall by query (or lane) reads the whole store: its stamp is
+            // the store's records, so any write since makes a repeat changed
+            // (#211). Not `MemoryStore::stamp`: that moves on every commit,
+            // the compaction's own checkpoint included, so every repeat
+            // across a compaction would read as changed.
+            t if is_atlas_tool(t) && t.ends_with("__recall") => records_stamp(store).unwrap_or(Stamp::None),
             _ => Stamp::None,
         }
     }
@@ -1365,6 +1430,40 @@ mod tests {
         let q = crate::json::parse(r#"{"key": "rules:r1"}"#).unwrap();
         assert_eq!(lookup_sig("mcp__plugin_atlas_atlas__recall", &q).as_deref(), Some("recall rules:r1"));
         assert_eq!(lookup_sig("Read", &Value::Null), None);
+        // #211: a write carries a lane or a key but is never a lookup.
+        let j = crate::json::parse(r#"{"lane": "L", "kind": "decision", "text": "x"}"#).unwrap();
+        assert_eq!(lookup_sig("mcp__atlas__journal", &j), None);
+        assert_eq!(lookup_sig("mcp__atlas__remember", &q), None);
+        let s = crate::json::parse(r#"{"query": "widget"}"#).unwrap();
+        assert_eq!(lookup_sig("mcp__atlas__search", &s).as_deref(), Some("search widget"));
+    }
+
+    /// #211: a stored write row (an old store's) is neither a lookup nor a
+    /// repeat, and the unstamped figure uses the same window as the lookups.
+    #[test]
+    fn stored_writes_are_no_lookups_and_unstamped_is_windowed() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MISS_TABLE).unwrap();
+        let row = |sig: &str, kind: &str, calls: i64| {
+            c.execute(
+                "INSERT INTO compact_miss(time, session, sig, kind, calls) VALUES('2026-11-14T00:00:00Z', 's', ?1, ?2, ?3)",
+                params![sig, kind, calls],
+            )
+            .unwrap();
+        };
+        row("", "lookup", 1);
+        row("", "lookup", 2);
+        row("read c:/a.rs", "miss", 3);
+        // (a) a journal write repeated after a compaction.
+        row("journal atlas-tokenreport", "unstamped", 4);
+        row("$ gh pr #abc", "unstamped", 5);
+        // (b) an unstamped row beyond the window.
+        row("$ gh pr #def", "unstamped", 50);
+        let t = totals(&c, 4.0).unwrap().unwrap();
+        assert_eq!((t.window_lookups, t.window_repeats, t.window_misses, t.unstamped, t.unstamped_shell), (3, 1, 1, 1, 1));
+        let r = repeats(&c, "", 10).unwrap();
+        assert!(r.iter().all(|r| !r.sig.starts_with("journal")), "{r:?}");
+        assert_eq!(r.len(), 3, "{r:?}");
     }
 
     #[test]

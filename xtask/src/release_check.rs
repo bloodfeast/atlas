@@ -15,9 +15,12 @@
 //!     accepted-hits file's SHA-256; a later run with the same key says so
 //!     and builds nothing (--force runs it anyway), and a change to any of
 //!     the three runs it again.
-//! cargo xtask release gate --dir DIR
+//! cargo xtask release gate --dir DIR [--export]
 //!     The same gates on the binaries in DIR (the release-pr workflow's
-//!     Linux build).
+//!     Linux build). With --export, also HEAD exported as `release --pr`
+//!     exports it, every file and wiki page against the denylist: the
+//!     release-pr job's pr job holds no denylist and exports only the
+//!     commit this checked.
 //! cargo xtask release accept-hit FILE... [--print]
 //!     Lists every place of every term in the release binaries FILE... and
 //!     appends an entry for each place not yet accepted to the
@@ -72,17 +75,27 @@ pub fn run(root: &Path, args: Vec<String>) -> R {
             check_here(root, &format!("v{version}"), &denylist, accepted.as_deref(), force).map(|_| ())
         }
         "gate" => {
-            let mut dir = None;
+            let (mut dir, mut export) = (None, false);
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--dir" => dir = it.next().map(PathBuf::from),
+                    "--export" => export = true,
                     _ => return Err(format!("unknown argument {a}\n{USAGE}")),
                 }
             }
             let dir = dir.ok_or(USAGE)?;
             let denylist = denylist_from_env()?;
             let accepted = accepted_file(env("ATLAS_LEAK_ACCEPTED"), &denylist)?;
-            gate(&dir, &denylist, accepted.as_deref())
+            gate(&dir, &denylist, accepted.as_deref())?;
+            if export {
+                // The release-pr job's pr job holds no denylist: the export
+                // is checked here, and that job exports this commit again.
+                let version = cargo_version(&read_text(&root.join("Cargo.toml"))?).ok_or("no version in Cargo.toml")?;
+                let stage = stage_root(root).join(format!("v{version}")).join("gate-export");
+                let commit = crate::release_ci::export_gate(root, &stage, &denylist)?;
+                say(&format!("export of {commit}: every file and wiki page checked, no hits"));
+            }
+            Ok(())
         }
         "accept-hit" => {
             let (mut files, mut print) = (Vec::new(), false);

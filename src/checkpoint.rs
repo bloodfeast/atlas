@@ -778,7 +778,7 @@ pub fn state(store: &MemoryStore, session: &str, since: &str, until: &str, lanes
     };
     let in_window = |time: &str| time >= since && (until.is_empty() || time <= until);
     let own = format!("session:{session}");
-    let prev = store.lane(&own)?.into_iter().rev().find(|h| h.sub == "checkpoint" && (until.is_empty() || h.time.as_str() <= until));
+    let prev = store.lane(&own)?.into_iter().rev().find(|h| by_hook(h) && (until.is_empty() || h.time.as_str() <= until));
     let since = match &prev {
         Some(p) => {
             s.since = Some(href(p));
@@ -869,16 +869,93 @@ pub fn body(s: &State, t: &Tail, budget: usize) -> String {
 /// The card SessionStart(compact) injects: the checkpoint's own ref and its
 /// body.
 pub fn card(h: &Head) -> String {
-    format!("atlas checkpoint {} (the state before this compaction; recall any key@hash for its exact text)\n{}", href(h), h.body.trim_end())
+    card_before(h, "this compaction")
 }
 
-/// The newest checkpoint of a session, if any.
+/// [`card`] for the state before `what` (`the /clear`).
+pub fn card_before(h: &Head, what: &str) -> String {
+    format!("atlas checkpoint {} (the state before {what}; recall any key@hash for its exact text)\n{}", href(h), h.body.trim_end())
+}
+
+/// Whether a session-lane checkpoint is one a hook wrote (its meta carries
+/// the hook's timing), not the model's own `checkpoint` journal entry.
+pub fn by_hook(h: &Head) -> bool {
+    h.sub == "checkpoint" && h.meta.contains("hook_ms:")
+}
+
+/// The newest checkpoint a hook wrote for a session, if any.
 ///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
 pub fn newest(store: &MemoryStore, session: &str) -> Result<Option<Head>> {
-    Ok(store.lane(&format!("session:{session}"))?.into_iter().rev().find(|h| h.sub == "checkpoint"))
+    Ok(store.lane(&format!("session:{session}"))?.into_iter().rev().find(by_hook))
+}
+
+/// How long after its SessionEnd a /clear checkpoint is still the one the
+/// new session's SessionStart(clear) takes (Claude Code runs SessionEnd
+/// before it clears, then SessionStart). Two minutes (ATLAS-CLEAR 0008):
+/// the two hooks run back to back, and a longer window lets a clear that
+/// wrote nothing take another session's checkpoint.
+pub const CLEAR_CARD_SECS: i64 = 120;
+
+/// The checkpoint SessionEnd (reason clear) wrote for the session a cleared
+/// session replaces: the one hook-written `checkpoint (clear)` of another
+/// session whose transcript is in `dir` (the new transcript's folder),
+/// written in the last [`CLEAR_CARD_SECS`]. No transcript is guessed at: no
+/// such checkpoint, no card; and two or more (several sessions cleared in
+/// one folder) cannot be told apart, so they give no card either.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn cleared(store: &MemoryStore, dir: &Path, session: &str) -> Result<Option<Head>> {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    cleared_at(store, dir, session, secs)
+}
+
+/// [`cleared`] as of `now` (seconds since the Unix epoch).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn cleared_at(store: &MemoryStore, dir: &Path, session: &str, now: i64) -> Result<Option<Head>> {
+    // Whole seconds on both sides: a stored time has milliseconds
+    // (`...:12.123Z`) and `.` sorts before `Z`.
+    let since = crate::discussion::civil(now - CLEAR_CARD_SECS);
+    let second = |t: &str| t.get(..19).unwrap_or(t).to_string();
+    let since = second(&since);
+    let own = format!("session:{session}");
+    let mut found = store.active_entries_no_body("checkpoint")?.into_iter().filter(|h| {
+        second(&h.time) >= since
+            && h.scope.starts_with("session:")
+            && h.scope != own
+            && h.title.starts_with("checkpoint (clear)")
+            && by_hook(h)
+            && h.meta.lines().filter_map(|l| l.strip_prefix("transcript: ")).any(|t| Path::new(t).parent() == Some(dir))
+    });
+    match (found.next(), found.next()) {
+        (Some(h), None) => store.head(&h.key),
+        _ => Ok(None),
+    }
+}
+
+/// The model's own newest checkpoint entry in a session's lane written at
+/// or after `since` (the segment's start; empty: any).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn model_entry(store: &MemoryStore, session: &str, since: &str) -> Result<Option<Head>> {
+    Ok(store.lane(&format!("session:{session}"))?.into_iter().rev().find(|h| h.sub == "checkpoint" && !by_hook(h) && h.time.as_str() >= since))
+}
+
+/// The checkpoint line naming the model's entry, or saying it is missing.
+pub fn model_line(h: Option<&Head>) -> String {
+    match h {
+        Some(h) => format!("model: {}\n", href(h)),
+        None => "model: missing (no checkpoint journal entry by the model in this segment)\n".to_string(),
+    }
 }
 
 /// A transcript's per-request context curve (the main chain, one point per

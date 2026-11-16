@@ -54,6 +54,23 @@ On an Agent PreToolUse, while caps are on:
      Claude Code process that started them, so an unfinished meta from an earlier process is dead;
    - its transcript or meta changed within `stale_minutes`. This is the only liveness rule left for the command
      hook transport, which has no resident start time.
+   - no SubagentStop was seen for it since its transcript last changed (one the backstop sends back keeps it
+     running, and an interim task notification, an agent waiting on its own background work, undoes it). This
+     is atlas's own record: an agent that dies on a full disk (ENOSPC) never gets its `"finished": true`
+     written, and before #204 it held its lane, slot and resources for `stale_minutes`. The stop is kept in the
+     hook server's memory and, best effort, as a release record on disk (below) for other processes; on a
+     full disk that write fails too, and `atlas queue next`, `atlas backlog` and command hooks see the agent
+     until `disk_full_minutes` or `stale_minutes`;
+   - no release record (`agent-<id>.atlas-released` beside the meta file, written by `atlas queue release
+     AGENT`) is newer than its last write. The command refuses an agent that wrote in the last 5 minutes unless
+     `--force`, finds the agent under Claude Code's projects folder or in the session `--transcript PATH` names,
+     and never edits the meta file. An agent that writes after its release counts again;
+   - its transcript's last message line (`user` or `assistant`; the hook attachments, `api-request` and
+     `system` lines Claude Code writes after a tool result, and a torn last line, are passed over) is not a
+     tool error saying the disk is full (`ENOSPC`, "no space left", or Windows' "not enough space on the
+     disk" / "os error 112", in any case), or it changed within `disk_full_minutes` (default 10; 0 turns the
+     rule off). A live agent answers a tool error within seconds, so ten quiet minutes after one means it died
+     there. The end is read from 64 KiB, further back up to 4 MiB while no message line is whole in it.
 3. **Add admitted launches whose agent has not started yet.** Each admitted launch leaves a pending record, so
    two Agent calls in one message cannot both slip under the cap. The record ends when its agent starts: the
    SubagentStart event pairs it (by the meta's `toolUseId` when the record has the launch's `tool_use_id`, else
@@ -101,6 +118,7 @@ also in `atlas settings`.
   "enabled": false,
   "window": 0,
   "stale_minutes": 360,
+  "disk_full_minutes": 10,
   "default_kind": "builder",
   "mode": "enforced",
   "fresh": "auto",
@@ -126,9 +144,11 @@ also in `atlas settings`.
 - **`max`** is clamped to Claude Code's limit (`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`, else 20). A value of 0
   means no agent of that kind is launched.
 - **`window`**: 0 infers the window, in this order:
-  1. `CLAUDE_CODE_AUTO_COMPACT_WINDOW`;
-  2. 200,000 when `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set;
-  3. otherwise 1,000,000.
+  1. 200,000 when `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set;
+  2. otherwise 1,000,000.
+
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is not read: it is where Claude Code compacts, and atlas writes it from its hard
+  limit (`atlas settings auto-compact`, ATLAS-CLEAR 0006).
 
   It can be set per kind (`kinds.X.window`).
 - **`limit`** is the hard limit. In order: `kinds.X.limit`, else `cap.block_tokens`, else 450,000 scaled by the
@@ -189,7 +209,8 @@ through costs one extra agent.
 Guards against a stuck count:
 
 - the server-start rule and `stale_minutes`, so dead agents expire;
-- a real finish notification counts as finished, even if the meta file never says so;
+- a real finish notification or a SubagentStop counts as finished, even if the meta file never says so;
+- `disk_full_minutes` and `atlas queue release`, for agents that died on a full disk (below);
 - the deny reason lists what it counted, so a wrong count shows at once;
 - `orchestrate.enabled: false` is the off switch.
 
@@ -317,7 +338,8 @@ runs next (Q-QU2).
 - **Q-OR1.** Not a silent default. `atlas --setup` (through `atlas settings offer`) and the first session ask the
   user whether to work in orchestrated mode, and on yes ask its options. Section 3.1.
 - **Q-OR2.** The window comes from the `window` setting, else `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else 200k when
-  `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set, else 1M.
+  `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set, else 1M. (ATLAS-CLEAR 0006 drops `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from
+  this order: atlas writes it from the hard limit, so it is no longer the model's window.)
 - **Q-OR3.** An unclassified agent is a builder.
 - **Q-OR4.** Past the handoff point a SendMessage passes with a wrap-up-only note; past the hard limit it is
   refused.

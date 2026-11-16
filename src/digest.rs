@@ -7,7 +7,7 @@
 //! always gives the same digest and the same items, so a hook answer is
 //! reproducible.
 //!
-//! The item table ([`items`]) is what `slice --item` and `slice --failures`
+//! The item table ([`items`]) is what `recall h:ID item=NAME` and `failures=true`
 //! resolve against. It is recomputed from the stored output on each slice
 //! (milliseconds) rather than stored.
 
@@ -29,7 +29,7 @@ const QUOTE: usize = 160;
 /// message, a file's hits, an item of a source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
-    /// The name `slice --item` matches (a test path, `error:2`, a file
+    /// The name `item=NAME` matches (a test path, `error:2`, a file
     /// path, `Type::fn`).
     pub name: String,
     /// First line, 1-based.
@@ -878,14 +878,14 @@ pub fn digest(id: &str, label: &str, shape: Shape, text: &str, exit: Option<i32>
         Shape::Grep => grep(id, text, max_bytes),
         Shape::Listing => listing(id, text, max_bytes),
         Shape::Source(lang) => source(id, lang, text, max_bytes * OUTLINE_MAX_BYTES / DEFAULT_MAX_BYTES.max(1)),
-        Shape::Summary => summary(text) + &hint(id, "--failures | --grep RE"),
+        Shape::Summary => summary(text) + &hint(id, "failures=true | grep=RE"),
         Shape::Generic => generic(id, text, exit, max_bytes),
     };
     out.push_str(&body);
     out
 }
 
-/// The items of an output, for `slice --item` and `slice --failures`.
+/// The items of an output, for `recall h:ID item=NAME` and `failures=true`.
 pub fn items(shape: Shape, text: &str) -> Vec<Item> {
     match shape {
         Shape::CargoTest | Shape::Summary => {
@@ -945,8 +945,16 @@ fn tail(text: &str, budget: usize) -> String {
     s
 }
 
+/// The digest's last line: how to read more of the stored output, as the
+/// `recall` tool's arguments (`recall h:ID lines=A-B | grep=RE`, one
+/// alternative per call).
 fn hint(id: &str, sels: &str) -> String {
-    format!("atlas slice {id} {sels}\n")
+    format!("recall {id} {sels}\n")
+}
+
+/// Whether a line is a digest's [`hint`] line.
+pub fn is_hint(line: &str) -> bool {
+    line.starts_with("recall h:")
 }
 
 // ---- cargo test ----------------------------------------------------------
@@ -1166,7 +1174,7 @@ fn cargo_test(id: &str, text: &str, exit: Option<i32>, max: usize) -> String {
     out.push_str(&format!("tests {} passed {} failed {} ignored ({} binaries): {verdict}\n", t.passed, t.failed, t.ignored, t.binaries));
     let errors = build_items(text).iter().filter(|i| i.status == "error").count();
     if errors > 0 {
-        out.push_str(&format!("build: {errors} errors (atlas slice {id} --item error:1)\n"));
+        out.push_str(&format!("build: {errors} errors (recall {id} item=error:1)\n"));
     }
     for f in failed.iter().take(MAX_FAILURES) {
         let block = items.iter().find(|i| i.status == "failed-output" && i.name == f.name);
@@ -1181,7 +1189,7 @@ fn cargo_test(id: &str, text: &str, exit: Option<i32>, max: usize) -> String {
         // keeps a wrong guess from hiding a failure.
         out.push_str(&tail(text, max.saturating_sub(out.len()).max(200)));
     }
-    out.push_str(&hint(id, "--failures | --item NAME | --lines A-B | --grep RE"));
+    out.push_str(&hint(id, "failures=true | item=NAME | lines=A-B | grep=RE"));
     out
 }
 
@@ -1813,7 +1821,7 @@ fn runner_test(r: &Runner, id: &str, raw: &str, exit: Option<i32>, max: usize) -
         // keeps a wrong guess from hiding a failure.
         out.push_str(&tail(&text, max.saturating_sub(out.len()).max(200)));
     }
-    out.push_str(&hint(id, "--failures | --item NAME | --lines A-B | --grep RE"));
+    out.push_str(&hint(id, "failures=true | item=NAME | lines=A-B | grep=RE"));
     out
 }
 
@@ -1926,7 +1934,7 @@ fn cargo_build(id: &str, text: &str, exit: Option<i32>, max: usize) -> String {
     if exit != Some(0) {
         out.push_str(&tail(text, max.saturating_sub(out.len()).max(160)));
     }
-    out.push_str(&hint(id, "--item error:N | --item warning:N | --lines A-B | --grep RE"));
+    out.push_str(&hint(id, "item=error:N | item=warning:N | lines=A-B | grep=RE"));
     out
 }
 
@@ -2026,7 +2034,7 @@ fn grep(id: &str, text: &str, max: usize) -> String {
         out.push_str(&format!("({shown} of {hits} {} shown)\n", if named { "hits" } else { "lines" }));
     }
     let _ = items;
-    out.push_str(&hint(id, if named { "--item PATH | --grep RE | --lines A-B" } else { "--grep RE | --lines A-B" }));
+    out.push_str(&hint(id, if named { "item=PATH | grep=RE | lines=A-B" } else { "grep=RE | lines=A-B" }));
     out
 }
 
@@ -2069,7 +2077,7 @@ fn listing(id: &str, text: &str, max: usize) -> String {
     if shown < paths.len() {
         out.push_str(&format!("({shown} of {} shown)\n", paths.len()));
     }
-    out.push_str(&hint(id, "--grep RE | --lines A-B"));
+    out.push_str(&hint(id, "grep=RE | lines=A-B"));
     out
 }
 
@@ -2327,7 +2335,7 @@ fn source(id: &str, lang: Lang, text: &str, max: usize) -> String {
             used += q.len();
             out.push_str(&q);
         }
-        out.push_str(&hint(id, "--lines A-B | --grep RE"));
+        out.push_str(&hint(id, "lines=A-B | grep=RE"));
         return out;
     }
     out.push_str(&format!("outline, {} items (the text is not shown; slice it):\n", items.len()));
@@ -2385,9 +2393,9 @@ fn source(id: &str, lang: Lang, text: &str, max: usize) -> String {
             out.push_str(&block);
             k = j;
         }
-        out.push_str(&format!("({shown} of {} items shown; atlas slice {id} --item NAME)\n", items.len()));
+        out.push_str(&format!("({shown} of {} items shown; recall {id} item=NAME)\n", items.len()));
     }
-    out.push_str(&hint(id, "--item NAME | --lines A-B | --grep RE"));
+    out.push_str(&hint(id, "item=NAME | lines=A-B | grep=RE"));
     out
 }
 
@@ -2590,7 +2598,7 @@ pub fn cli(args: Vec<String>) -> Result<std::process::ExitCode, String> {
             let d = digest("file", &file, s, &text, None, DEFAULT_MAX_BYTES);
             // No handle backs a file: the slice hint does not apply.
             match d.trim_end().rsplit_once('\n') {
-                Some((head, last)) if last.starts_with("atlas slice ") => format!("{head}\n"),
+                Some((head, last)) if is_hint(last) => format!("{head}\n"),
                 _ => d,
             }
         }
@@ -2618,7 +2626,7 @@ fn generic(id: &str, text: &str, exit: Option<i32>, max: usize) -> String {
         out.push_str(&q);
     }
     out.push_str(&tail(text, max.saturating_sub(out.len()).max(200)));
-    out.push_str(&hint(id, "--lines A-B | --grep RE"));
+    out.push_str(&hint(id, "lines=A-B | grep=RE"));
     out
 }
 
@@ -2880,7 +2888,7 @@ all good
                 "FAILED TestTable/one calc_test.go:15 got 2, want 1",
             ]
         );
-        assert!(d.ends_with("atlas slice h:1 --failures | --item NAME | --lines A-B | --grep RE
+        assert!(d.ends_with("recall h:1 failures=true | item=NAME | lines=A-B | grep=RE
 "), "{d}");
         // -v prints each message before the result line: the same failures.
         let v = digest("h:2", "go test -v ./...", go, &go_out("verbose.txt"), Some(1), 600);
@@ -2947,7 +2955,7 @@ mod runner_rows {
     /// The digest's lines after its header, up to the tail.
     fn head(cmd: &str, text: &str, exit: Option<i32>) -> Vec<String> {
         let d = digest("h:1", cmd, shape("bash", cmd, text), text, exit, 600);
-        d.lines().skip(1).take_while(|l| !l.starts_with("last ") && !l.starts_with("atlas slice")).map(str::to_string).collect()
+        d.lines().skip(1).take_while(|l| !l.starts_with("last ") && !is_hint(l)).map(str::to_string).collect()
     }
 
     #[test]

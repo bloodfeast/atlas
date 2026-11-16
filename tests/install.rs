@@ -91,8 +91,8 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
         }
     }
     let events: Vec<&str> = hook_ids.iter().map(|(_, e)| e.as_str()).chain(commands.iter().map(String::as_str)).collect();
-    assert_eq!(commands, ["SessionStart"]);
-    for e in ["SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop", "PreToolUse", "PostToolUse", "PreCompact"] {
+    assert_eq!(commands, ["SessionStart", "SessionEnd"]);
+    for e in ["SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop", "PreToolUse", "PostToolUse", "PreCompact"] {
         assert!(events.contains(&e), "hooks.json wires {e}");
     }
     lines.push(json!({"jsonrpc": "2.0", "id": 90, "method": "tools/call", "params": {"name": "remember", "arguments": {"kind": "rule", "title": "Cache eviction", "body": "The cache evicts entries by age, oldest first, when it is full.", "reason": "install test"}}}));

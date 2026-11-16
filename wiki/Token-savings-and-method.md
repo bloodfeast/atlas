@@ -37,7 +37,7 @@ target the 36% shell-read bucket. A 1-hour subagent cache targets the 25% re-wri
   over a threshold (12 KB, or 3 KB for `cargo` build and test output) is stored whole under a handle such
   as `h:3f9a2c1b0e`. The model gets a digest instead: test totals and each failure's location and
   message, compiler errors and warnings by lint, grep hits by file, or a file's outline with line ranges.
-  It pulls exactly what it needs with `atlas slice h:ID --item NAME | --failures | --lines A-B | --grep RE`.
+  It pulls exactly what it needs with `recall key=h:ID` and one of `item`, `failures`, `lines` or `grep`.
   Routing is on by default and fails open: any error passes the call through untouched. One limit: a
   PowerShell command that exits nonzero is routed only for `cargo` builds and tests on Windows. Claude
   Code offers no read-only PowerShell tail that keeps the exit code, so any other failing PowerShell command

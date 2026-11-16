@@ -380,13 +380,24 @@ pub struct Judge<'a> {
     export_files: HashMap<String, String>,
     acts: HashMap<String, Vec<Act>>,
     records: HashMap<String, Option<RecordInfo>>,
+    /// Only acts at or before this time are read (empty: all).
+    until: String,
 }
 
 impl<'a> Judge<'a> {
     /// A judge over the store, given each export's file name.
     pub fn new(mem: &'a MemoryStore, exports: &[crate::memory::export::ExportSpec]) -> Judge<'a> {
         let export_files = exports.iter().map(|e| (e.name.clone(), e.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default())).collect();
-        Judge { mem, export_files, acts: HashMap::new(), records: HashMap::new() }
+        Judge { mem, export_files, acts: HashMap::new(), records: HashMap::new(), until: String::new() }
+    }
+
+    /// The same judge reading only the transcript acts at or before `until`
+    /// (an RFC 3339 UTC time): the token report bounds it to the ledger's
+    /// last row, so both sides cover the same window and a rerun on the
+    /// same store gives the same verdicts while sessions go on.
+    pub fn until(mut self, until: &str) -> Judge<'a> {
+        self.until = until.to_string();
+        self
     }
 
     fn record(&mut self, key: &str) -> Option<&RecordInfo> {
@@ -405,7 +416,11 @@ impl<'a> Judge<'a> {
     /// or `None`.
     pub fn hit(&mut self, inj: &Injection) -> Option<&'static str> {
         if !self.acts.contains_key(&inj.transcript) {
-            self.acts.insert(inj.transcript.clone(), acts(Path::new(&inj.transcript)));
+            let mut a = acts(Path::new(&inj.transcript));
+            if !self.until.is_empty() {
+                a.retain(|a| a.time <= self.until);
+            }
+            self.acts.insert(inj.transcript.clone(), a);
         }
         let key = inj.key.clone();
         // A lane view, or the head line an agent's report gets: either is
@@ -444,6 +459,37 @@ impl<'a> Judge<'a> {
         self.acts.insert(inj.transcript.clone(), acts);
         verdict
     }
+}
+
+/// The hooks' credit by hit (#217): for each logged injection the
+/// [`Judge`] marks a hit, its `read` (the counterfactual the hook's
+/// token-log row summed for it), by `hook:<event>` and day; an injection
+/// that is no hit credits nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HitCredit {
+    /// Credited bytes by (`hook:<event>`, `YYYY-MM-DD`).
+    pub by: std::collections::BTreeMap<(String, String), i64>,
+    /// Injections judged.
+    pub injected: usize,
+    /// Of them, hits.
+    pub hits: usize,
+}
+
+/// Judges every logged injection and sums the hits' reads ([`HitCredit`]).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn hit_credit(conn: &Connection, judge: &mut Judge) -> Result<HitCredit> {
+    let mut c = HitCredit::default();
+    for i in logged(conn, "")? {
+        c.injected += 1;
+        if judge.hit(&i).is_some() {
+            c.hits += 1;
+            *c.by.entry((format!("hook:{}", i.hook), i.time.get(..10).unwrap_or("").to_string())).or_default() += i.read as i64;
+        }
+    }
+    Ok(c)
 }
 
 /// One hook's totals.
@@ -525,8 +571,8 @@ pub fn at_floor(rows: &[(Injection, Option<&'static str>)], floor: f32, scale: f
 ///
 /// * `rows` - injections and verdicts (from `--hook-report`).
 /// * `scale` - the share of a hit's counterfactual credited (1 is the
-///   ledger's upper bound; the measured ratio over the upper bound is the
-///   measured alternative).
+///   ledger's rule-based credit; the measured ratio over the ledger ratio is
+///   the measured alternative).
 pub fn tune(rows: &[(Injection, Option<&'static str>)], scale: f64) -> FloorPoint {
     let mut cands: Vec<f32> = rows.iter().filter_map(|(i, _)| i.cos).collect();
     // Above every cosine: inject only the keys without one.

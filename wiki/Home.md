@@ -15,7 +15,7 @@ The README is the front page; this wiki is the whole manual.
 ## What it saves
 
 - [[Token savings and method]]: where a session's tokens go, what atlas changes, how it is measured.
-- [[Handles and digests]]: large tool output as a handle and a digest; `atlas slice`, `atlas run`.
+- [[Handles and digests]]: large tool output as a handle and a digest; `recall h:ID`, `atlas run`.
 
 ## Reference
 
@@ -36,5 +36,5 @@ The README is the front page; this wiki is the whole manual.
 - [[Security model]]: threat model, path confinement, the deny-list, updates, dependencies.
 - [[SQLite store]]: the index database's tables, rebuilds and the audit log.
 - [[Testing and coverage]]: the suite, the adversarial tests, coverage and development tasks.
-- [[Releasing]]: the changelog rule, release notes, the wiki publish and the public repository's setup.
+- [[Releasing]]: the changelog rule, release notes, the wiki publish and the public-repository guard.
 - [[Changelog]]: every release, newest first.

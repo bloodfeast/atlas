@@ -381,6 +381,65 @@ fn windowed(cmd: &str) -> bool {
     (c.starts_with("sed ") && c.contains(" -n")) || ((c.starts_with("head ") || c.starts_with("tail ")) && (c.contains(" -n") || c.contains(" -")))
 }
 
+/// How `lean.route_read` answers a whole-file Read
+/// (journal:ATLAS-HOOK-VALUE:0012).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadMode {
+    /// Every Read passes whole.
+    Off,
+    /// Only a tool's or a background task's saved output is digested (the default).
+    Outputs,
+    /// Files of `lean.route_read_min_kb` or more.
+    Tuned,
+    /// Every file from `lean.handles.threshold_bytes`, as before.
+    All,
+}
+
+/// The default `lean.route_read_min_kb`.
+pub const DEFAULT_ROUTE_READ_MIN_KB: u64 = 32;
+
+impl ReadMode {
+    /// From `lean.route_read`: a mode name, or the old boolean (true is
+    /// `tuned`, false is `off`); absent or unknown is `outputs`.
+    pub fn from_lean(lean: Option<&Value>) -> ReadMode {
+        let v = lean.and_then(|l| l.get("route_read"));
+        match (v.and_then(Value::as_str), v.and_then(Value::as_bool)) {
+            (Some("off"), _) | (None, Some(false)) => ReadMode::Off,
+            (Some("tuned"), _) | (None, Some(true)) => ReadMode::Tuned,
+            (Some("all"), _) => ReadMode::All,
+            _ => ReadMode::Outputs,
+        }
+    }
+}
+
+/// `lean.route_read_min_kb` in bytes (`tuned` only).
+pub fn route_read_min_bytes(lean: Option<&Value>) -> usize {
+    let kb = lean.and_then(|l| l.get("route_read_min_kb")).and_then(Value::as_u64).unwrap_or(DEFAULT_ROUTE_READ_MIN_KB);
+    (kb.clamp(1, 16 << 10) as usize) << 10
+}
+
+/// A file Claude Code wrote to hold a tool's or a background task's
+/// output: a path with a `tool-results` folder, or an `.output` file in a
+/// `tasks` folder, on either separator.
+pub fn is_tool_output(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    p.contains("/tool-results/") || (p.contains("/tasks/") && p.ends_with(".output"))
+}
+
+/// Whether a whole text Read of `len` bytes is answered with a digest, before
+/// the already-read pass. A ranged Read never is.
+fn digest_read(mode: ReadMode, path: &str, ranged: bool, len: usize, threshold: usize, min_tuned: usize) -> bool {
+    if ranged {
+        return false;
+    }
+    match mode {
+        ReadMode::Off => false,
+        ReadMode::Outputs => is_tool_output(path) && len >= threshold,
+        ReadMode::Tuned => len >= min_tuned,
+        ReadMode::All => len >= threshold,
+    }
+}
+
 impl Router {
     /// The router for these settings.
     pub fn new(settings: &Settings) -> Router {
@@ -535,26 +594,34 @@ impl Router {
                 if crate::sources::path_denied(std::path::Path::new(s(&file, "filePath"))) {
                     return Ok(None);
                 }
-                let windowed = input.get("limit").is_some() || input.get("offset").is_some();
+                // A ranged Read is the agent choosing its window: it passes.
+                let ranged = input.get("limit").is_some() || input.get("offset").is_some();
+                let mode = ReadMode::from_lean(self.lean.as_ref());
+                if ranged || mode == ReadMode::Off {
+                    return Ok(None);
+                }
+                let path = s(&file, "filePath").to_string();
                 let mut content = s(&file, "content").to_string();
                 // A whole-file Read can come back cut short (Claude Code caps
                 // it); the handle keeps the whole file so the outline and
                 // every slice cover all of it.
                 let total = file.get("totalLines").and_then(Value::as_u64).unwrap_or(0);
                 let shown = file.get("numLines").and_then(Value::as_u64).unwrap_or(0);
-                if !windowed && total > shown {
-                    let p = s(&file, "filePath");
-                    if let Ok(b) = std::fs::read(p) {
+                if total > shown {
+                    if let Ok(b) = std::fs::read(&path) {
                         if b.len() <= crate::handles::MAX_CAPTURE {
                             content = String::from_utf8_lossy(&b).into_owned();
                         }
                     }
                 }
-                let limit = if windowed { th * 3 } else { th };
-                if content.len() < limit {
+                if !digest_read(mode, &path, ranged, content.len(), th, route_read_min_bytes(self.lean.as_ref())) {
                     return Ok(None);
                 }
-                let path = s(&file, "filePath").to_string();
+                // The session already holds this file's read handle: this
+                // Read is the agent coming back for the text.
+                if self.handles()?.has_read(&path, &session)? {
+                    return Ok(None);
+                }
                 let start = file.get("startLine").and_then(Value::as_u64).unwrap_or(1);
                 let shown = relative(&path, &ev.cwd);
                 let label = if start > 1 { format!("{shown} from line {start}") } else { shown };
@@ -594,12 +661,11 @@ impl Router {
         let row = h.put(full.as_bytes(), &meta)?;
         let shape = Handles::shape_of(&row, &full);
         let digest = crate::digest::digest(&row.id, &row.meta.label, shape, &full, meta.exit_code.map(|c| c as i32), h.cfg.digest_bytes);
-        let _ = crate::tokens::log_row(
-            h.conn(),
-            &format!("route:{}", ev.tool_name),
-            digest.len(),
-            Some(crate::tokens::Counterfactual { grep: 0, read: full.len() }),
-        );
+        // A routed Read is logged with no saving credited: the ledger cannot
+        // see the follow-up reads, which made it overstate (ATLAS-HOOK-VALUE:0012).
+        // Any other output saves at most what Claude Code would have shown of it (#215).
+        let cf = (ev.tool_name != "Read").then_some(crate::tokens::Counterfactual { grep: 0, read: crate::tokens::shown_bytes(&full) });
+        let _ = crate::tokens::log_row(h.conn(), &format!("route:{}", ev.tool_name), digest.len(), cf);
         let mut out = resp.clone();
         let o = out.as_object_mut().ok_or_else(|| Error::InvalidArgument("tool_response".into()))?;
         match ev.tool_name.as_str() {
@@ -653,7 +719,12 @@ impl Router {
         let m = Meta { kind: kind.into(), label: cmd.lines().next().unwrap_or("").to_string(), cmd: cmd.into(), cwd: ev.cwd.clone(), session: session.to_string(), exit_code: exit, ..Meta::default() };
         let h = self.handles().ok()?;
         let d = crate::pr_digest::route(h, &pc, &w, stdout, &m, small).ok()??;
-        let _ = crate::tokens::log_row(h.conn(), "route:gh-pr", d.digest.len(), Some(crate::tokens::Counterfactual { grep: 0, read: stdout.len() }));
+        let _ = crate::tokens::log_row(
+            h.conn(),
+            "route:gh-pr",
+            d.digest.len(),
+            Some(crate::tokens::Counterfactual { grep: 0, read: crate::tokens::shown_bytes(stdout) }),
+        );
         Some(d.digest)
     }
 
@@ -710,9 +781,15 @@ impl Router {
                 let lines: Vec<&str> = stdout.split('\n').collect();
                 let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
                 let mut notes: Vec<String> = Vec::new();
+                // A part whose annotation does not fit its lines is passed
+                // through as printed and recorded as a miss after the loop.
+                let mut unfit: Vec<String> = Vec::new();
                 let conn = self.handles()?.conn();
                 for seg in segs {
-                    let text = lines[seg.from..seg.to].join("\n");
+                    // A read that printed nothing (`from == to`) has nothing
+                    // to annotate: joined, it is "", which splits as one line.
+                    let Some(part) = lines.get(seg.from..seg.to).filter(|p| !p.is_empty()) else { continue };
+                    let text = part.join("\n");
                     match seg.read {
                         ShellRead::Window { file, from, to, tail } => {
                             let abs = absolute(&file, &seg.dir);
@@ -724,7 +801,7 @@ impl Router {
                                 continue;
                             }
                             let (a, b) = match (to, tail) {
-                                (Some(b), _) => (from, b.min(from + printed - 1)),
+                                (Some(b), _) => (from, b.min(from.saturating_add(printed - 1))),
                                 (None, Some(n)) => {
                                     let Ok(t) = std::fs::read(&abs) else { continue };
                                     let total = t.split(|&c| c == b'\n').count() as u32 - u32::from(t.ends_with(b"\n"));
@@ -741,11 +818,14 @@ impl Router {
                         ShellRead::Grep { single } => {
                             let single = single.map(|f| absolute(&f, &seg.dir)).filter(|f| Path::new(f).is_file());
                             let done = annotate_grep(&text, &seg.dir, single.as_deref(), &mut |p| crate::code::file_items(conn, p))?;
-                            for (k, l) in done.split('\n').enumerate() {
-                                out[seg.from + k] = l.to_string();
+                            if !splice(&mut out, seg.from, seg.to, &done) {
+                                unfit.push(format!("lines {}..{} annotated as {}", seg.from, seg.to, done.split('\n').count()));
                             }
                         }
                     }
+                }
+                for u in unfit {
+                    self.miss(ev, &Error::InvalidArgument(format!("grep annotation does not fit its part: {u}")));
                 }
                 let joined = out.join("\n");
                 let updated = (joined.len() != stdout.len()).then(|| {
@@ -1258,6 +1338,21 @@ pub fn segments(shell: &str, cmd: &str, stdout: &str, cwd: &str) -> Option<Vec<S
     (!out.is_empty()).then_some(out)
 }
 
+/// Writes `done` (an annotated part, lines split on `\n`) over `out[from..to]`
+/// when it has exactly that many lines; otherwise leaves `out` as it is and
+/// returns `false`, so a miscount passes the part through instead of
+/// indexing past the end.
+fn splice(out: &mut [String], from: usize, to: usize, done: &str) -> bool {
+    let Some(dst) = out.get_mut(from..to) else { return false };
+    if done.split('\n').count() != dst.len() {
+        return false;
+    }
+    for (o, l) in dst.iter_mut().zip(done.split('\n')) {
+        l.clone_into(o);
+    }
+    true
+}
+
 /// The most cut items a Read note names.
 const READ_NOTE_ITEMS: usize = 6;
 
@@ -1370,6 +1465,20 @@ mod tests {
         assert_eq!(relative("e\u{301}.rs", "S"), "e\u{301}.rs");
         assert_eq!(relative("/w/\u{e9}t\u{e9}/a.rs", "/w/e"), "/w/\u{e9}t\u{e9}/a.rs");
         assert_eq!(relative("/w/x/a.rs", "/w/x"), "a.rs");
+    }
+
+    #[test]
+    fn a_splice_that_does_not_fit_leaves_the_output_alone() {
+        let v = |s: &[&str]| s.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let mut out = v(&["a", "----", "b"]);
+        assert!(splice(&mut out, 2, 3, "b [fn f 1-2]"));
+        assert_eq!(out, v(&["a", "----", "b [fn f 1-2]"]));
+        // An empty part at the end, more lines than the part, a range past the end.
+        for (from, to, done) in [(3, 3, ""), (2, 3, "b\nextra"), (0, 2, "a"),(2, 9, "b"), (3, 2, "")] {
+            let before = out.clone();
+            assert!(!splice(&mut out, from, to, done), "{from}..{to} {done:?}");
+            assert_eq!(out, before);
+        }
     }
 
     #[test]

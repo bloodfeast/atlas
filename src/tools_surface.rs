@@ -18,6 +18,11 @@ use crate::error::{Error, Result};
 /// The help resource's URI.
 pub const HELP_URI: &str = "atlas://help";
 
+/// The habits paragraph of the `initialize` instructions, sent in every
+/// session: what atlas is, the habits, and where the full guide is. Its
+/// token budget is a test (`xtask/src/skill.rs`).
+pub const GUIDE: &str = "atlas is this project's memory: rulings, decisions, lane journals, handoffs and the work queue, kept across sessions. Habits: `recall` before asking what may already be decided; `journal` decisions and measurements to your lane as they happen; write a `handoff` before you stop; name planned work by its queue key; put `Kind:` and `Lane:` lines in every agent brief. Full guide: the bundled `atlas` skill; every op and argument: atlas://help or `note op=help`.";
+
 /// One op of a merged tool: the tool, the op, the full tool it runs.
 struct Op {
     tool: &'static str,
@@ -162,7 +167,7 @@ pub(super) const LISTED: &[ToolDef] = &[
     },
     ToolDef {
         name: "recall",
-        description: "Memory by key, query or lane; op status: lanes, op log: versions.",
+        description: "Memory by key (or h:ID), query or lane; op status: lanes, op log: versions.",
         read_only: true,
         schema: || {
             schema(
@@ -378,6 +383,9 @@ pub fn help() -> String {
         match t.name {
             "lookup" => out.push_str("  - without `id` runs `ids`\n"),
             "remember" => out.push_str("  - with `old` runs `supersede`\n"),
+            "recall" => out.push_str(
+                "  - `key` `h:ID` (a digest's handle) reads that stored output: its first page, or one of `lines` (A-B), `item`, `failures`, `grep` (with `context`), `head`, `tail`, `page`, `digest`; a hint line `recall h:ID lines=A-B` is those arguments, and they may also follow the id in `key`; `key` `h:` lists the newest\n",
+            ),
             "edit" => out.push_str("  - op `link`: `vault` and `path` are the note the link is written into\n"),
             "journal" => out.push_str(
                 "  - entry `queued` files planned work, as `atlas queue plan` does: the text's first line is the title, the rest its scope; `meta` lines `kind:`, `priority:`, `uses:`, `after:` (queue keys or free text) and `order:` are checked, other lines kept\n  - entry `review` files a review for the merge gate (`orchestrate.reviews`): `meta` lines `role:`, `pr:`, `head:` (the sha read), `verdict:` (pass, merge, merge with follow-ups, request changes) and `report:`\n  - `amend: KEY` with `expected_sha` (the head's sha) rewrites that entry's title and body as a new version; its lane, entry, meta lines and refs stay (pass the same `lane` and `entry`, no `meta` or `refs`)\n",

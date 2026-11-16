@@ -77,6 +77,13 @@ impl Tokenizer {
         }
     }
 
+    /// True when `c` splits words the way [`Tokenizer::words`] splits them:
+    /// the token count of a text is the sum of the counts of its runs
+    /// between such characters (see [`crate::embed::window`]).
+    pub fn is_space(&self, c: char) -> bool {
+        self.class(c) & WHITESPACE != 0
+    }
+
     /// The basic tokenizer: the words and punctuation marks of `text`.
     ///
     /// # Arguments

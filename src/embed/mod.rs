@@ -9,6 +9,7 @@
 
 pub mod bert;
 pub mod gemm;
+pub mod window;
 pub mod wordpiece;
 
 use std::path::Path;

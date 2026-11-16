@@ -74,7 +74,7 @@ pub fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
             // byte once.
             // Claude Code names the tool_use_id of a call in `_meta`; the
             // PreToolUse hook names the same id with the agent.
-            let use_id = params.get("_meta").and_then(|m| m.as_object()).and_then(|m| m.iter().find(|(k, _)| k.ends_with("toolUseId")).and_then(|(_, v)| v.as_str()));
+            let use_id = meta_use_id(&params);
             match server.answer_call(name, &args, use_id) {
                 Ok(answer) => Some(ok(id, content(answer.into_text(), false))),
                 Err(crate::error::Error::NotFound(m)) if m.starts_with("tool ") => {
@@ -159,10 +159,10 @@ pub fn serve_refused(refusal: &crate::Error, mut input: impl BufRead, mut output
     let mut notice = crate::hooks::RefusalNotice::default();
     let text = format!("atlas is off: {refusal}");
     loop {
-        let msg = match read_incoming(&mut input, &mut buf)? {
+        let msg = match read_incoming(&mut input, &mut buf).map_err(|e| on("stdin read", e))? {
             Incoming::Eof => return Ok(()),
             Incoming::Reply(r) => {
-                write_line(&mut output, &r)?;
+                write_line(&mut output, &r).map_err(|e| on("stdout write", e))?;
                 continue;
             }
             Incoming::Message(m) => m,
@@ -170,7 +170,7 @@ pub fn serve_refused(refusal: &crate::Error, mut input: impl BufRead, mut output
         let (id, method, params) = match request(&msg) {
             Ok(r) => r,
             Err(Some(r)) => {
-                write_line(&mut output, &r)?;
+                write_line(&mut output, &r).map_err(|e| on("stdout write", e))?;
                 continue;
             }
             Err(None) => continue,
@@ -184,7 +184,7 @@ pub fn serve_refused(refusal: &crate::Error, mut input: impl BufRead, mut output
             "tools/call" => ok(id, content(text.clone(), true)),
             m => plain(id, m, &params),
         };
-        write_line(&mut output, &r)?;
+        write_line(&mut output, &r).map_err(|e| on("stdout write", e))?;
     }
 }
 
@@ -240,7 +240,15 @@ fn write_line(out: &mut impl Write, v: &Value) -> io::Result<()> {
     let mut s = v.to_string();
     s.push('\n');
     out.write_all(s.as_bytes())?;
-    out.flush()
+    out.flush()?;
+    crate::serve_log::responded();
+    Ok(())
+}
+
+/// `e` with the stream it came from in its text. The text goes to stderr
+/// only; the server log takes just the error's kind.
+fn on(stream: &str, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{stream}: {e}"))
 }
 
 /// One line read from the client: a parsed message, an error response to
@@ -290,7 +298,16 @@ fn hook_call(msg: &Value) -> Option<(Value, Value)> {
     if params.get("name").and_then(Value::as_str) != Some("hook") {
         return None;
     }
-    Some((msg.get("id")?.clone(), params.get("arguments").cloned().unwrap_or(Value::Null)))
+    // A model's call of the tool carries its toolUseId in `_meta`; a hook
+    // does not. Marked over whatever the arguments say.
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    Some((msg.get("id")?.clone(), crate::hooks::mark_tool_use(&args, meta_use_id(params))))
+}
+
+/// The tool call's id Claude Code names in a request's `_meta` (a key
+/// ending in `toolUseId`).
+fn meta_use_id(params: &Value) -> Option<&str> {
+    params.get("_meta").and_then(|m| m.as_object()).and_then(|m| m.iter().find(|(k, _)| k.ends_with("toolUseId")).and_then(|(_, v)| v.as_str()))
 }
 
 /// Serves until `input` closes, answering `hook` calls on their own worker
@@ -343,11 +360,16 @@ pub fn serve_with_hooks(
                     if hooks.is_none() {
                         match crate::hooks::Hooks::open(settings.clone()) {
                             Ok(mut h) => {
+                                h.detect_offer_paths();
                                 // A hook over this route may come from anyone's
                                 // tools/call, and the server outlives any one
                                 // session: nothing says a user is there to answer.
                                 h.set_unattended(true);
                                 h.set_index_opener(index.take());
+                                h.set_binding(Some(crate::hooks::binding_compiler()));
+                                if let Some(w) = h.binding_warning() {
+                                    eprintln!("{w}");
+                                }
                                 h.warm();
                                 *hooks = Some(h);
                                 *failed = None;
@@ -395,7 +417,7 @@ pub fn serve_with_hooks(
         let mut input = input;
         let mut buf = Vec::new();
         loop {
-            match read_incoming(&mut input, &mut buf)? {
+            match read_incoming(&mut input, &mut buf).map_err(|e| on("stdin read", e))? {
                 Incoming::Eof => return Ok(()),
                 Incoming::Message(m) => {
                     if let (Some(tx), Some(call)) = (&hook_tx, hook_call(&m)) {
@@ -432,7 +454,7 @@ pub fn serve_with_hooks(
         if let Some(r) = response {
             let mut w = out.lock().map_err(|_| io::Error::other("output lock poisoned"))?;
             if let Err(e) = write_line(&mut *w, &r) {
-                result = Err(e);
+                result = Err(on("stdout write", e));
                 break;
             }
             drop(w);
@@ -451,4 +473,18 @@ pub fn serve_with_hooks(
         let _ = w.join();
     }
     read
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hook_call_is_marked_by_its_meta_not_its_arguments() {
+        let call = |meta: Value| crate::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "hook", "arguments": {"event": "UserPromptSubmit", "_tool_use": false}, "_meta": meta}});
+        let (_, args) = hook_call(&call(crate::json!({"claudecode/toolUseId": "toolu_1"}))).unwrap();
+        assert_eq!(args.get(crate::hooks::TOOL_USE_ARG), Some(&Value::Bool(true)), "a model's tool call");
+        let (_, args) = hook_call(&call(Value::Null)).unwrap();
+        assert_eq!(args.get(crate::hooks::TOOL_USE_ARG), Some(&Value::Bool(false)), "a hook");
+    }
 }

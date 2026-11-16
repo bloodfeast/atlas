@@ -167,7 +167,7 @@ pub fn cli(args: Vec<String>, db: &std::path::Path, lean: Option<&crate::json::V
         Ok(row) => {
             let shape = shape.unwrap_or_else(|| Handles::shape_of(&row, &text));
             let d = digest::digest(&row.id, &row.meta.label, shape, &text, Some(code), cfg.digest_bytes);
-            print!("{d}");
+            print!("{}", crate::handles::HintForm::for_stdout().apply(&d));
             println!("({:.1} s)", ms as f64 / 1000.0);
         }
         Err(e) => {

@@ -71,7 +71,7 @@ impl Rng {
         let mut s = String::new();
         for _ in 0..n {
             if self.chance(3, 4) {
-                s.push_str(self.pick(tokens));
+                s.push_str(self.pick::<&str>(tokens));
             } else {
                 s.push(self.char());
             }

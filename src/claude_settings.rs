@@ -298,6 +298,16 @@ impl Paths {
         Paths::detect_in(atlas_config, db, None)
     }
 
+    /// Claude Code's user `settings.json` (`$CLAUDE_CONFIG_DIR`, else
+    /// `<home>/.claude`), parsed; `None` when there is none or it does not
+    /// parse.
+    pub fn user_settings() -> Option<Value> {
+        let env = |n: &str| std::env::var_os(n).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let dir = env("CLAUDE_CONFIG_DIR").or_else(|| env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| h.join(".claude")))?;
+        let text = std::fs::read_to_string(dir.join("settings.json")).ok()?;
+        crate::json::parse(&text).ok()
+    }
+
     /// [`Paths::detect`], with the offer state and the routing flag in
     /// `user_state` when given (a configuration with projects; see
     /// [`crate::project::user_state_dir`]).
@@ -615,6 +625,7 @@ macro_rules! say {
 
 mod orchestrated;
 pub use orchestrated::{orchestrate_line, starter_compile, Machine};
+pub mod rules_template;
 
 fn show(v: Option<&Value>) -> String {
     match v {
@@ -794,7 +805,7 @@ fn backup(p: &Paths, stem: &str, path: &Path, core: Option<&str>) -> Result<(Pat
 /// project file atlas created (always an `.absent` backup, holding the
 /// file's path, so undo removes it), and a vault folder atlas registered
 /// (an `.absent` record; see [`undo_vault`]).
-const STEMS: [&str; 5] = ["settings", "atlas", "project", "vault", "claudemd"];
+const STEMS: [&str; 6] = ["settings", "atlas", "project", "vault", "claudemd", rules_template::STEM];
 
 /// The newest backups of any kind, each kind read from its own folder:
 /// one, or the files of one change that wrote several (they share a stamp).
@@ -827,6 +838,10 @@ fn restore(p: &Locked, io: &mut Io, b: &Path) -> Result<(), String> {
     }
     if name.starts_with("claudemd.") {
         say!(io, "{}", undo_compact_md(b));
+        return Ok(());
+    }
+    if name.starts_with(&format!("{}.", rules_template::STEM)) {
+        say!(io, "{}", rules_template::undo(b));
         return Ok(());
     }
     let target = if name.starts_with("project.") {
@@ -917,6 +932,8 @@ fn undo_summary(p: &Paths, all: &[PathBuf]) -> String {
         } else if name.starts_with("claudemd.") {
             let note = std::fs::read_to_string(format!("{}.path", b.display())).ok().or_else(|| std::fs::read_to_string(b).ok()).unwrap_or_default();
             format!("remove atlas's Compact instructions from {}", note.trim())
+        } else if name.starts_with(&format!("{}.", rules_template::STEM)) {
+            rules_template::summary(b)
         } else {
             let target = if name.starts_with("project.") {
                 PathBuf::from(std::fs::read_to_string(b).unwrap_or_default().trim())
@@ -969,6 +986,12 @@ fn manual(s: &Item, v: Option<&Value>) -> String {
 
 /// Applies changes to Claude Code's settings.json in one write.
 fn write_claude(p: &Locked, io: &mut Io, changes: &[(&Item, Option<Value>)], label: &str) -> Result<bool, String> {
+    write_claude_in(p, io, changes, label, None)
+}
+
+/// [`write_claude`], the backup joining the change stamped `core` when
+/// given (one undo then reverts both).
+fn write_claude_in(p: &Locked, io: &mut Io, changes: &[(&Item, Option<Value>)], label: &str, core: Option<&str>) -> Result<bool, String> {
     let doc = load(&p.settings())?;
     let mut v = doc.value.clone();
     for (s, val) in changes {
@@ -1009,7 +1032,7 @@ fn write_claude(p: &Locked, io: &mut Io, changes: &[(&Item, Option<Value>)], lab
     };
     let old = doc.text.clone().unwrap_or_default();
     let _ = write!(io.out, "{}", diff(&doc.path.display().to_string(), &old, &text));
-    commit(p, io, "settings", &doc.path, &text, label)?;
+    commit_in(p, io, "settings", &doc.path, &text, label, core)?;
     say!(io, "Settings read at session start take effect in the next session.");
     Ok(true)
 }
@@ -1173,7 +1196,7 @@ fn find<'a>(items: &'a [Item], id: Option<&String>) -> Result<&'a Item, String> 
 }
 
 /// The usage of `atlas settings`.
-pub const HELP: &str = "usage: atlas settings list | set ID VALUE | off ID | undo [--yes] | offer [--yes ID... | --no] | orchestrate [--yes OPTIONS | --no] | compact-md [DIR] [--yes] | add-project --no DIR | add-project [--vault | --vault-at FOLDER | --new [--name NAME] [--vault-at FOLDER | --no-vault] | --to PROJECT] [--dry-run] (DIR | --yes) | migrate-projects NAME";
+pub const HELP: &str = "usage: atlas settings list | set ID VALUE | off ID | undo [--yes] | offer [--yes ID... | --no] | orchestrate [--yes OPTIONS | --no] | compact-md [DIR] [--yes] | rules-template [DIR] [--yes] | auto-compact [--yes | --off] | add-project --no DIR | add-project [--vault | --vault-at FOLDER | --new [--name NAME] [--vault-at FOLDER | --no-vault] | --to PROJECT] [--dry-run] (DIR | --yes) | migrate-projects NAME";
 
 /// Runs one `atlas settings` command against `p`, talking through `io`.
 ///
@@ -1181,12 +1204,13 @@ pub const HELP: &str = "usage: atlas settings list | set ID VALUE | off ID | und
 ///
 /// A message for the user (an unknown id, a bad value, an unreadable file).
 pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> {
-    let items = manifest()?;
+    let mut items = manifest()?;
     let word = args.first().map(String::as_str).unwrap_or("list");
     // A no reads nothing from settings.json: a settings.json that does not parse must not stop
     // one being recorded, or the question it answers would return for good.
     let answers_no = matches!(word, "offer" | "orchestrate" | "add-project") && args.iter().any(|a| a == "--no");
     let claude = if answers_no { Value::Null } else { load(&p.settings())?.value };
+    resolve(&mut items, &claude);
     let atlas = atlas_value(p);
     match word {
         "list" => {
@@ -1198,10 +1222,18 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             for s in &items {
                 say!(io, "{}", describe(s, current(s, &claude, &atlas)));
             }
+            let a = auto_item();
+            let d = describe(&a, current(&a, &claude, &atlas));
+            let (head, _) = d.rsplit_once("\n  Change any time:").unwrap_or((d.as_str(), ""));
+            say!(io, "{head}\n  Change any time: atlas settings auto-compact [--yes | --off] (it then follows atlas's hard limit)");
             Ok(ExitCode::SUCCESS)
         }
+        "auto-compact" => auto_compact(p, io, &args[1..]),
         "set" => {
             let s = find(&items, args.get(1))?;
+            if s.id == STATUSLINE_ID {
+                return Err(format!("[{STATUSLINE_ID}] has no value to set: `atlas settings offer --yes {STATUSLINE_ID}` adds the update badge to the status line, `atlas settings off {STATUSLINE_ID}` takes it out"));
+            }
             let raw = args.get(2).ok_or("set needs ID VALUE")?;
             // For this one the word off is its own value, "off", the full off;
             // false and its other spellings are the same as unset.
@@ -1229,6 +1261,10 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             }
             let label = format!("[{}] set to {}", s.id, show(Some(&v)));
             let ok = if s.kind == Kind::Atlas { write_atlas(&held, io, s, Some(&v), &label)? } else { write_claude(&held, io, &[(s, Some(v))], &label)? };
+            drop(held);
+            if ok && moves_limit(s) {
+                follow(p, io);
+            }
             Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         "off" => {
@@ -1236,6 +1272,17 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             let held = lock_for(p, s)?;
             let (claude, atlas) = (load(&p.settings())?.value, atlas_value(p));
             let have = current(s, &claude, &atlas);
+            // The badge comes out of the status line: the command it wrapped
+            // is put back, or the line atlas wrote is removed.
+            if s.id == STATUSLINE_ID {
+                let Some(back) = have.and_then(statusline_without_badge) else {
+                    say!(io, "[{}] the status line has no atlas badge; nothing to change", s.id);
+                    return Ok(ExitCode::SUCCESS);
+                };
+                let label = format!("[{}] badge taken out of the status line", s.id);
+                let ok = write_claude(&held, io, &[(s, back)], &label)?;
+                return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            }
             // An on-by-default switch is turned off; anything else is removed.
             let target = s.default_on().then_some(Value::Bool(false));
             if have == target.as_ref() {
@@ -1249,6 +1296,10 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             let note = if s.default_note.is_empty() { String::new() } else { format!(" ({})", s.default_note) };
             let label = if target.is_some() { format!("[{}] turned off", s.id) } else { format!("[{}] removed{note}", s.id) };
             let ok = if s.kind == Kind::Atlas { write_atlas(&held, io, s, target.as_ref(), &label)? } else { write_claude(&held, io, &[(s, None)], &label)? };
+            drop(held);
+            if ok && moves_limit(s) {
+                follow(p, io);
+            }
             Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
         "undo" => {
@@ -1291,6 +1342,9 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
                 let _ = std::fs::remove_file(label_file(b));
                 restore(&held, io, b)?;
             }
+            drop(held);
+            // A restored limit takes the window with it (review S1 of #192).
+            follow(p, io);
             Ok(ExitCode::SUCCESS)
         }
         "offer" if args.iter().any(|a| a == "--no") => {
@@ -1303,8 +1357,17 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             say!(io, "No setting was changed, and atlas will not ask about these again; `atlas settings offer` asks any time.");
             Ok(ExitCode::SUCCESS)
         }
-        "offer" => offer(p, io, &items, &claude, &atlas, args.iter().position(|a| a == "--yes").map(|i| &args[i + 1..])),
-        "orchestrate" => orchestrated::command(p, io, &items, &atlas, &args[1..]),
+        // Both can turn orchestrated mode on or off, and set its limit.
+        "offer" => {
+            let code = offer(p, io, &items, &claude, &atlas, args.iter().position(|a| a == "--yes").map(|i| &args[i + 1..]))?;
+            follow(p, io);
+            Ok(code)
+        }
+        "orchestrate" => {
+            let code = orchestrated::command(p, io, &items, &atlas, &args[1..])?;
+            follow(p, io);
+            Ok(code)
+        }
         "add-project" => {
             let mut new = false;
             let mut to: Option<String> = None;
@@ -1388,6 +1451,15 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
             };
             Ok(if compact_md(p, io, &dir, yes)? { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
+        "rules-template" => {
+            let yes = args.iter().any(|a| a == "--yes");
+            let dir = match args.iter().skip(1).find(|a| !a.starts_with("--")) {
+                Some(d) => PathBuf::from(d),
+                None => std::env::current_dir().map_err(|e| format!("the current folder: {e}"))?,
+            };
+            let ok = rules_template::rules_template_prompt(p, io, &dir, yes, rules_template::COMMAND_NO_TERMINAL)?;
+            Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+        }
         "migrate-projects" => {
             let name = args.get(1).ok_or("migrate-projects needs the project's name")?;
             Ok(if migrate_projects(p, io, name)? { ExitCode::SUCCESS } else { ExitCode::FAILURE })
@@ -1398,6 +1470,149 @@ pub fn run(args: &[String], p: &Paths, io: &mut Io) -> Result<ExitCode, String> 
         }
         w => Err(format!("unknown settings command {w:?}\n{HELP}")),
     }
+}
+
+// ------------------------------------------------------------ auto-compact
+
+/// Claude Code's auto-compact window as an entry (never offered: it is
+/// written from atlas's hard limit by `atlas settings auto-compact`).
+fn auto_item() -> Item {
+    Item {
+        id: "auto-compact".into(),
+        kind: Kind::Env,
+        key: crate::autocompact::WINDOW_ENV.into(),
+        value: None,
+        typ: String::new(),
+        min_version: None,
+        short: "auto-compact point".into(),
+        title: "Have Claude Code compact at atlas's hard limit".into(),
+        what: "Writes CLAUDE_CODE_AUTO_COMPACT_WINDOW (absolute tokens: atlas's hard limit, context-limit, plus Claude Code's 20,000 output reserve and 13,000 summary buffer) so Claude Code compacts on its own at the hard limit, and keeps it there when the limit changes. atlas asks the main session for its checkpoint checkpoint-margin tokens before that point. Claude Code clamps it to each model's window, so an agent on a smaller window (200k) keeps its own default point.".into(),
+        cost: "Automatic compaction comes earlier than Claude Code's default (the model's window less 33,000) for every session and agent of a model whose window is larger than the value. A subagent is not compacted there: past its handoff point under an enforced limit atlas blocks its compaction, so it gets the hard limit's deny and hands off.".into(),
+        basis: "Read from Claude Code 2.1.323: the value is held to 100,000..1,000,000 and clamped to the model's window; the point is that less min(output limit, 20,000) less 13,000. atlas never reads it as the model's window.".into(),
+        docs: String::new(),
+        choices: Vec::new(),
+        range: None,
+        warn: Vec::new(),
+        default_note: "Claude Code default: not set, compacts at the window less 33,000".into(),
+        flag: false,
+    }
+}
+
+/// The auto-compact window for atlas's hard limit: (value, limit, model
+/// window, point), or `None` when Claude Code compacts at or before the
+/// limit anyway. The model's window is atlas's `compact.window`, else as
+/// settings.json's `env` and then this process's environment give it (never
+/// the auto-compact window itself).
+fn auto_target(p: &Paths, claude: &Value) -> Result<Option<(String, u64, u64, u64)>, String> {
+    let config = match &p.atlas_config {
+        Some(c) if c.is_file() => Some(crate::config::Config::load(c).map_err(|e| format!("atlas's configuration: {e}"))?),
+        _ => None,
+    };
+    let db = p.db.clone().unwrap_or_else(|| PathBuf::from("atlas.sqlite"));
+    let s = crate::memory::settings::Settings::from_config(config.as_ref(), &db).map_err(|e| e.to_string())?;
+    let env = |k: &str| claude.get("env").and_then(|e| e.get(k)).and_then(Value::as_str).map(str::to_string).or_else(|| std::env::var(k).ok());
+    let window = if s.compact.window > 0 { s.compact.window } else { crate::orchestrate::inferred_window(&env) };
+    let limit = s.cap.block_tokens;
+    Ok(crate::autocompact::window_for(limit, window).map(|w| (w.to_string(), limit, window, crate::autocompact::threshold(w.min(window), None))))
+}
+
+/// `atlas settings auto-compact [--yes | --off]`.
+fn auto_compact(p: &Paths, io: &mut Io, args: &[String]) -> Result<ExitCode, String> {
+    let item = auto_item();
+    let (yes, off) = (args.iter().any(|a| a == "--yes"), args.iter().any(|a| a == "--off"));
+    if let Some(a) = args.iter().find(|a| !matches!(a.as_str(), "--yes" | "--off")) {
+        return Err(format!("auto-compact: unknown argument {a:?}; usage: atlas settings auto-compact [--yes | --off]"));
+    }
+    if off {
+        let held = p.lock_settings()?;
+        let claude = load(&p.settings())?.value;
+        if current(&item, &claude, &Value::Null).is_none() {
+            say!(io, "[auto-compact] already off; nothing to change");
+            return Ok(ExitCode::SUCCESS);
+        }
+        let ok = write_claude(&held, io, &[(&item, None)], "[auto-compact] removed (Claude Code default)")?;
+        return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+    }
+    let claude = load(&p.settings())?.value;
+    let Some((v, limit, window, at)) = auto_target(p, &claude)? else {
+        say!(io, "[auto-compact] Claude Code already compacts at or before atlas's hard limit; nothing to write.");
+        return Ok(ExitCode::SUCCESS);
+    };
+    say!(io, "[auto-compact] atlas's hard limit is {limit} tokens: with {}={v}, Claude Code compacts at {at} tokens on a {window}-token model window (a smaller model window keeps its own point).", crate::autocompact::WINDOW_ENV);
+    if !yes {
+        if !io.interactive {
+            say!(io, "Nothing written: there is no terminal here to confirm in. Run `atlas settings auto-compact --yes` to write it.");
+            return Ok(ExitCode::FAILURE);
+        }
+        let _ = write!(io.out, "Write it to settings.json? [y/N] ");
+        let _ = io.out.flush();
+        let mut line = String::new();
+        let _ = io.input.read_line(&mut line);
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            say!(io, "nothing written");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    let held = p.lock_settings()?;
+    let claude = load(&p.settings())?.value;
+    if current(&item, &claude, &Value::Null).and_then(Value::as_str) == Some(v.as_str()) {
+        say!(io, "[auto-compact] already {v}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let ok = write_claude(&held, io, &[(&item, Some(Value::String(v.clone())))], &format!("[auto-compact] set to {v}"))?;
+    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+/// Whether an entry's key moves atlas's hard limit (`cap.block_tokens`,
+/// or orchestrated mode, whose limit replaces it).
+fn moves_limit(s: &Item) -> bool {
+    s.kind == Kind::Atlas && (matches!(s.key.as_str(), "cap.block_tokens" | "orchestrate.enabled" | "compact.window") || s.key.starts_with("orchestrate.other."))
+}
+
+/// [`follow_limit`] after a command whose own change has landed: a failure
+/// is a warning, not the command's error.
+fn follow(p: &Paths, io: &mut Io) {
+    if let Err(e) = follow_limit(p, io) {
+        say!(io, "warning: the auto-compact window was not moved to atlas's hard limit: {e}. `atlas settings auto-compact --yes` writes it again.");
+    }
+}
+
+/// After a change to atlas's configuration: an override `auto-compact`
+/// wrote follows the hard limit (nothing when none is set). The write
+/// joins the newest change (the command's own, or after an undo the one
+/// before it), so one undo reverts a limit and its window together.
+fn follow_limit(p: &Paths, io: &mut Io) -> Result<(), String> {
+    let item = auto_item();
+    // Nothing to follow without an override; that is read without the lock,
+    // so a command that moves no window takes none in Claude Code's folder.
+    if current(&item, &load(&p.settings())?.value, &Value::Null).is_none() {
+        return Ok(());
+    }
+    let held = p.lock_settings()?;
+    let claude = load(&p.settings())?.value;
+    let Some(have) = current(&item, &claude, &Value::Null).cloned() else { return Ok(()) };
+    let target = auto_target(p, &claude)?;
+    let want = target.as_ref().map(|(v, ..)| Value::String(v.clone()));
+    if want.as_ref() == Some(&have) {
+        return Ok(());
+    }
+    let core = newest_backups(p).first().and_then(|b| backup_core(b));
+    let label = match &target {
+        Some((v, limit, _, at)) => format!("[auto-compact] follows the hard limit {limit}: {v} (Claude Code compacts at {at})"),
+        None => "[auto-compact] removed: Claude Code compacts at or before the hard limit anyway".into(),
+    };
+    say!(io, "{label}");
+    write_claude_in(&held, io, &[(&item, want)], &label, core.as_deref())?;
+    Ok(())
+}
+
+/// The stamp a backup file is named with (`STEM.CORE.EXT`), which a
+/// change's other backups share.
+fn backup_core(b: &Path) -> Option<String> {
+    let name = b.file_name()?.to_string_lossy().to_string();
+    let (_, rest) = name.split_once('.')?;
+    let (core, _) = rest.rsplit_once('.')?;
+    Some(core.to_string())
 }
 
 fn offer(p: &Paths, io: &mut Io, items: &[Item], claude: &Value, atlas: &Value, yes: Option<&[String]>) -> Result<ExitCode, String> {
@@ -1418,6 +1633,12 @@ fn offer(p: &Paths, io: &mut Io, items: &[Item], claude: &Value, atlas: &Value, 
         let have = current(s, claude, atlas);
         if applied(s, have) {
             say!(io, "[{}] already applied", s.id);
+            continue;
+        }
+        // Nothing atlas can write (a status line that is not a command):
+        // never asked, and a yes changes nothing.
+        if s.value.is_none() {
+            say!(io, "[{}] skipped: {}", s.id, unofferable(s));
             continue;
         }
         if let (Some(need), Some(have)) = (s.min_version, io.version) {
@@ -1504,6 +1725,144 @@ fn offer(p: &Paths, io: &mut Io, items: &[Item], claude: &Value, atlas: &Value, 
     Ok(if ok && !missed { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
+// ------------------------------------------- the status line's update badge
+
+/// The manifest id of the status line offer: atlas's update badge (issue
+/// #190) in Claude Code's `statusLine`, written when there is none, else
+/// appended to the command there is.
+pub const STATUSLINE_ID: &str = "statusline";
+
+/// The flag that runs atlas's badge; a status line command holding it
+/// already has the badge.
+const BADGE_FLAG: &str = "--statusline";
+
+/// A wrapped status line command (POSIX sh, as Claude Code runs it) is
+/// `WRAP_HEAD`, the command as it was, `WRAP_MID`, atlas's quoted path and
+/// `WRAP_TAIL`: both read the same status line input, the command's output
+/// is printed as it was, and a badge, when there is one, follows it after
+/// ` | `. The command keeps its own line, and is put back by
+/// [`statusline_without_badge`].
+const WRAP_HEAD: &str = "input=$(cat); out=$(printf '%s' \"$input\" | { ";
+const WRAP_MID: &str = "\n}); badge=$(printf '%s' \"$input\" | ";
+const WRAP_TAIL: &str = " --statusline); printf '%s' \"$out\"; if [ -n \"$badge\" ]; then printf ' | %s' \"$badge\"; fi";
+
+/// This binary's absolute path as a status line command names it (forward
+/// slashes, which Windows takes too), or `None` when it cannot be named
+/// safely inside double quotes.
+pub fn badge_exe() -> Option<String> {
+    let p = std::env::current_exe().ok()?;
+    let p = std::fs::canonicalize(&p).unwrap_or(p);
+    let s = p.to_string_lossy().replace('\\', "/");
+    // `canonicalize` on Windows gives a verbatim path.
+    let s = s.strip_prefix("//?/").map(str::to_string).unwrap_or(s);
+    (!s.is_empty() && !s.contains(['"', '$', '`', '\n'])).then_some(s)
+}
+
+/// The `statusLine` atlas offers, given the one there is (`have`) and
+/// atlas's path: a command running the badge alone when there is none, the
+/// one there is when it already runs the badge, else that command wrapped
+/// to print the badge after its own output (its other keys kept). `None`
+/// when the status line is not a command atlas can add to.
+pub fn statusline_offer(have: Option<&Value>, exe: &str) -> Option<Value> {
+    let quoted = format!("\"{exe}\"");
+    let Some(v) = have.filter(|v| !v.is_null()) else {
+        let mut m = Map::new();
+        m.insert("type".into(), Value::String("command".into()));
+        m.insert("command".into(), Value::String(format!("{quoted} {BADGE_FLAG}")));
+        return Some(Value::Object(m));
+    };
+    if v.get("type").and_then(Value::as_str) != Some("command") {
+        return None;
+    }
+    let cmd = v.get("command").and_then(Value::as_str).filter(|c| !c.trim().is_empty())?;
+    if cmd.contains(BADGE_FLAG) {
+        return Some(v.clone());
+    }
+    let mut m = v.as_object()?.clone();
+    m.insert("command".into(), Value::String(format!("{WRAP_HEAD}{cmd}{WRAP_MID}{quoted}{WRAP_TAIL}")));
+    Some(Value::Object(m))
+}
+
+/// The `statusLine` without atlas's badge: `Some(Some(v))` with the wrapped
+/// command put back, `Some(None)` when the badge was the whole command
+/// (the key is removed), `None` when there is no badge to take out.
+pub fn statusline_without_badge(have: &Value) -> Option<Option<Value>> {
+    let cmd = have.get("command").and_then(Value::as_str)?;
+    if let Some(rest) = cmd.strip_prefix(WRAP_HEAD) {
+        let at = rest.rfind(WRAP_MID)?;
+        let mut m = have.as_object()?.clone();
+        m.insert("command".into(), Value::String(rest[..at].to_string()));
+        return Some(Some(Value::Object(m)));
+    }
+    cmd.contains(BADGE_FLAG).then_some(None)
+}
+
+/// The byte range of the atlas path inside a status line command that
+/// [`statusline_offer`] wrote (the badge alone, or wrapping a command), or
+/// `None` for any other command.
+fn badge_span(cmd: &str) -> Option<std::ops::Range<usize>> {
+    let quoted = if cmd.starts_with(WRAP_HEAD) {
+        let body = cmd.strip_suffix(WRAP_TAIL)?;
+        body.rfind(WRAP_MID)? + WRAP_MID.len()..body.len()
+    } else {
+        0..cmd.strip_suffix(BADGE_FLAG)?.strip_suffix(' ')?.len()
+    };
+    let inner = cmd[quoted.clone()].strip_prefix('"')?.strip_suffix('"')?;
+    (!inner.is_empty() && !inner.contains(['"', '$', '`', '\n'])).then_some(quoted.start + 1..quoted.end - 1)
+}
+
+/// Whether two badge paths name the same file (Windows paths ignore case).
+fn same_exe(a: &str, b: &str) -> bool {
+    a == b || (cfg!(windows) && a.eq_ignore_ascii_case(b))
+}
+
+/// Points atlas's own status line badge at `exe` (ruling (a) on #194):
+/// `/plugin` installs each version in its own folder, so the absolute path
+/// the badge was written with goes stale. Only a command atlas wrote is
+/// changed, and only its path; every other byte of `settings.json` is kept,
+/// and the change is backed up for `atlas settings undo`. Silent: returns
+/// whether it wrote.
+pub fn repair_statusline(p: &Paths, exe: &str) -> bool {
+    let stale = |doc: &Doc| -> Option<String> {
+        let line = doc.value.get("statusLine").filter(|v| v.get("type").and_then(Value::as_str) == Some("command"))?;
+        let cmd = line.get("command").and_then(Value::as_str)?;
+        let at = badge_span(cmd)?;
+        if same_exe(&cmd[at.clone()], exe) || exe.is_empty() || exe.contains(['"', '$', '`', '\n']) {
+            return None;
+        }
+        let new = format!("{}{exe}{}", &cmd[..at.start], &cmd[at.end..]);
+        splice(doc.text.as_deref()?, &["statusLine", "command"], Some(&Value::String(new)))
+    };
+    // A cheap look first: most sessions have nothing to repair and take no lock.
+    if !load(&p.settings()).is_ok_and(|d| stale(&d).is_some()) {
+        return false;
+    }
+    let Ok(l) = p.lock_settings() else { return false };
+    let Ok(doc) = load(&l.settings()) else { return false };
+    let Some(text) = stale(&doc) else { return false };
+    let (mut out, mut input) = (std::io::sink(), &b""[..]);
+    let mut io = Io { out: &mut out, input: &mut input, interactive: false, version: None, dry_run: false, machine: None };
+    commit_in(&l, &mut io, "settings", &doc.path, &text, "repaired: statusline (atlas moved)", None).is_ok()
+}
+
+/// Fills the values the manifest cannot hold: the status line atlas offers
+/// depends on the one there is and on where atlas is installed. `None`
+/// when there is nothing atlas can write.
+fn resolve(items: &mut [Item], claude: &Value) {
+    for s in items.iter_mut().filter(|s| s.id == STATUSLINE_ID) {
+        s.value = badge_exe().and_then(|exe| statusline_offer(claude.get(s.key.as_str()), &exe));
+    }
+}
+
+/// Why an entry with no value is not offered.
+fn unofferable(s: &Item) -> String {
+    if s.id == STATUSLINE_ID {
+        "the status line is not a command atlas can add its badge to (or atlas's path cannot be quoted); add `atlas --statusline` to it by hand".into()
+    } else {
+        "nothing to write".into()
+    }
+}
+
 // ------------------------------------------------------- the first-run offer
 
 fn offered(p: &Paths) -> Vec<String> {
@@ -1547,12 +1906,21 @@ fn mark_answered(p: &Paths, items: &[Item]) -> bool {
 /// when shown. `None` when there is nothing to say, or when the state cannot be
 /// recorded: an answer would be lost and the line would never stop.
 pub fn session_start_line(p: &Paths) -> Option<String> {
-    let items = manifest().ok()?;
+    let mut items = manifest().ok()?;
     let seen = offered(p);
     let claude = load(&p.settings()).map(|d| d.value).unwrap_or(Value::Null);
+    resolve(&mut items, &claude);
     let fresh = |s: &&Item| !seen.contains(&s.id);
-    let offer: Vec<&Item> = items.iter().filter(fresh).filter(|s| s.kind != Kind::Atlas && !applied(s, current(s, &claude, &Value::Null))).collect();
-    let defaults: Vec<&Item> = items.iter().filter(fresh).filter(|s| s.default_on()).collect();
+    // The status line badge is offered by `atlas settings` only: a
+    // convenience, not worth a question in every session's context.
+    let offer: Vec<&Item> = items.iter().filter(fresh).filter(|s| s.kind != Kind::Atlas && s.id != STATUSLINE_ID && s.value.is_some() && !applied(s, current(s, &claude, &Value::Null))).collect();
+    // A part of a feature whose switch is listed (`compact.checkpoint_prompt`
+    // under `compact.enabled`) goes with it.
+    let part = |s: &Item| items.iter().any(|o| o.id != s.id && o.default_on() && o.key.ends_with(".enabled") && s.key.starts_with(o.key.trim_end_matches("enabled")));
+    // The main-session compact prompt says what it is each time it speaks,
+    // so it is not announced here too (the line stays under 240 bytes).
+    let announced = |s: &Item| s.id != "main-session-compact";
+    let defaults: Vec<&Item> = items.iter().filter(fresh).filter(|s| s.default_on() && !part(s) && announced(s)).collect();
     if offer.is_empty() && defaults.is_empty() {
         return None;
     }
@@ -2430,6 +2798,23 @@ pub fn offer_project_interactive(config: Option<&Path>, db: &Path, user_state: O
     let mut out = std::io::stdout();
     let mut io = Io { out: &mut out, input: &mut input, interactive, version: None, dry_run: false, machine: None };
     project_prompt(&p, &mut io, Path::new(&key))
+}
+
+/// The rules template offer `atlas --setup` runs for the folder it runs in
+/// (see [`rules_template`]): nothing is asked where the folder has rules,
+/// and without a terminal nothing is written.
+///
+/// # Errors
+///
+/// A message for the user when the offer cannot run.
+pub fn offer_rules_template_interactive(config: Option<&Path>, db: &Path, user_state: Option<&Path>, dir: &Path) -> Result<(), String> {
+    let Some(p) = Paths::detect_in(config, db, user_state) else { return Ok(()) };
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    let mut input = stdin.lock();
+    let mut out = std::io::stdout();
+    let mut io = Io { out: &mut out, input: &mut input, interactive, version: None, dry_run: false, machine: None };
+    rules_template::rules_template_prompt(&p, &mut io, dir, false, rules_template::SETUP_NO_TERMINAL).map(|_| ())
 }
 
 /// The yes/no question itself (see [`offer_project_interactive`]).
@@ -3372,10 +3757,11 @@ mod tests {
     fn the_manifest_is_well_formed() {
         let m = manifest().unwrap();
         let ids: Vec<&str> = m.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["subagent-cache-1h", "goal-checkin-120", "routing", "update", "update-pin", "compact", "orchestrate", "memory-rules", "agents-builders", "agents-reviewers", "agents-research", "context-mode", "context-limit", "context-handoff", "resources-compile", "resources-gpu"]);
+        assert_eq!(ids, ["subagent-cache-1h", "goal-checkin-120", "statusline", "routing", "update", "update-pin", "compact", "orchestrate", "memory-rules", "agents-builders", "agents-reviewers", "agents-research", "context-mode", "context-limit", "context-handoff", "resources-compile", "resources-gpu", "main-session-compact", "main-compact-point", "checkpoint-prompt", "checkpoint-margin", "clear-floor"]);
         for s in &m {
             assert!(!s.title.is_empty() && !s.what.is_empty() && !s.cost.is_empty() && !s.basis.is_empty() && !s.short.is_empty(), "{}", s.id);
-            if s.kind != Kind::Atlas {
+            // The status line's value is filled at run time (see `resolve`).
+            if s.kind != Kind::Atlas && s.id != STATUSLINE_ID {
                 assert!(s.value.is_some() && !s.docs.is_empty(), "{}", s.id);
                 // The offered value passes its own check.
                 let raw = s.value.as_ref().and_then(Value::as_str).unwrap();
@@ -3469,6 +3855,294 @@ mod tests {
         assert!(no.contains("kept as it is"), "{no}");
         assert_eq!(vaults(), ["notes", "alpha-notes", "beta-notes"]);
         assert_eq!(offered_projects(&p).len(), 3, "each answer is recorded");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ------------------------------------------------- the rules template
+
+    /// A temp folder of its own, and Paths beside it: atlas's configuration
+    /// with compaction on or off, and `extra` top-level keys.
+    fn rules_home(name: &str, compaction_on: bool, extra: &str) -> (PathBuf, Paths) {
+        let base = std::env::temp_dir().join(format!("atlas-rules-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let compact = if compaction_on { "" } else { ",\n  \"compact\": {\"enabled\": false}" };
+        let cfg = base.join("atlas.json");
+        std::fs::write(&cfg, format!("{{\n  \"vaults\": []{compact}{extra}\n}}\n")).unwrap();
+        let p = Paths { claude_dir: base.join("claude"), atlas_config: Some(cfg), state: None, db: None, user_state: None, project: None };
+        (base, p)
+    }
+
+    /// A repository folder (a `.git` folder bounds the walk upwards).
+    fn rules_repo(base: &Path) -> PathBuf {
+        let root = base.join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        root
+    }
+
+    /// Runs the offer; returns its output and the bytes of input left unread.
+    fn rules_offer(p: &Paths, dir: &Path, input: &str, interactive: bool, yes: bool) -> (String, usize) {
+        let mut out = Vec::new();
+        let mut inp: &[u8] = input.as_bytes();
+        {
+            let mut io = Io { out: &mut out, input: &mut inp, interactive, version: None, dry_run: false, machine: None };
+            assert!(rules_template::rules_template_prompt(p, &mut io, dir, yes, rules_template::SETUP_NO_TERMINAL).unwrap());
+        }
+        (String::from_utf8(out).unwrap(), inp.len())
+    }
+
+    /// Runs `atlas settings ARGS...` without a terminal.
+    fn rules_settings(p: &Paths, args: &[&str]) -> (ExitCode, String) {
+        let mut out = Vec::new();
+        let mut inp: &[u8] = b"";
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let code =
+            run(&args, p, &mut Io { out: &mut out, input: &mut inp, interactive: false, version: None, dry_run: false, machine: None })
+                .unwrap();
+        (code, String::from_utf8(out).unwrap())
+    }
+
+    fn rules_written(dir: &Path) -> (Option<String>, Option<String>) {
+        (std::fs::read_to_string(dir.join("CLAUDE.md")).ok(), std::fs::read_to_string(dir.join(".claude").join("atlas-rules.md")).ok())
+    }
+
+    #[test]
+    fn rules_template_yes_with_compaction_off_carries_the_compact_block() {
+        let (base, p) = rules_home("a", false, "");
+        let dir = rules_repo(&base);
+        let (out, _) = rules_offer(&p, &dir, "y\n", true, false);
+        assert!(out.contains("Write the atlas rules template? [y/N] "), "{out}");
+        assert!(
+            out.contains(&dir.join("CLAUDE.md").display().to_string()) && out.contains("atlas-rules.md"),
+            "both paths are named: {out}"
+        );
+        let (md, rules) = rules_written(&dir);
+        assert_eq!(rules.as_deref(), Some(rules_template::RULES_FILE), "atlas-rules.md is the template's bytes");
+        let md = md.expect("CLAUDE.md written");
+        assert_eq!(md, rules_template::RULES_CLAUDE_MD.replacen(rules_template::COMPACT_PLACEHOLDER, &compact_block(), 1));
+        assert!(has_compact_block(&md), "compact-md sees the block as present");
+        assert_eq!(md.lines().last(), Some("@.claude/atlas-rules.md"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rules_template_yes_with_compaction_on_has_no_compact_block() {
+        let (base, p) = rules_home("a2", true, "");
+        let dir = rules_repo(&base);
+        rules_offer(&p, &dir, "yes\n", true, false);
+        let md = rules_written(&dir).0.expect("CLAUDE.md written");
+        assert_eq!(md, rules_template::RULES_CLAUDE_MD.replacen(&format!("{}\n", rules_template::COMPACT_PLACEHOLDER), "", 1));
+        assert!(!has_compact_block(&md) && !md.contains("atlas:compact-block") && !md.contains(COMPACT_INSTRUCTIONS), "{md}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rules_template_no_or_an_empty_answer_writes_nothing() {
+        let (base, p) = rules_home("b", true, "");
+        for (i, answer) in ["n\n", "\n", ""].iter().enumerate() {
+            let dir = rules_repo(&base.join(i.to_string()));
+            let (out, _) = rules_offer(&p, &dir, answer, true, false);
+            assert!(out.contains("[y/N]") && out.contains("nothing written"), "{answer:?}: {out}");
+            assert!(!dir.join("CLAUDE.md").exists() && !dir.join(".claude").exists(), "{answer:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Asserts the offer left `existing` alone, asked nothing, read nothing
+    /// and said so in one line naming it.
+    fn rules_left_alone(p: &Paths, dir: &Path, existing: &Path) {
+        let before = std::fs::read(existing).unwrap();
+        let mtime = std::fs::metadata(existing).unwrap().modified().unwrap();
+        let (out, unread) = rules_offer(p, dir, "y\n", true, false);
+        assert_eq!(std::fs::read(existing).unwrap(), before);
+        assert_eq!(std::fs::metadata(existing).unwrap().modified().unwrap(), mtime);
+        assert_eq!(unread, 2, "the answer is left unread: {out}");
+        assert!(!out.contains("[y/N]"), "no question: {out}");
+        let name = existing.file_name().unwrap().to_string_lossy().to_string();
+        assert!(out.starts_with("existing rules left alone: ") && out.contains(&name), "{out}");
+        assert_eq!(out.lines().count(), 1, "one line: {out}");
+    }
+
+    #[test]
+    fn rules_template_leaves_an_existing_claude_md_alone() {
+        let (base, p) = rules_home("c", true, "");
+        // In the folder, in each of the three places.
+        for (i, name) in ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"].iter().enumerate() {
+            let dir = rules_repo(&base.join(i.to_string()));
+            let f = dir.join(name);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, "mine\n").unwrap();
+            rules_left_alone(&p, &dir, &f);
+            assert!(!dir.join(".claude").join("atlas-rules.md").exists(), "{name}");
+        }
+        // In a parent inside the same repository.
+        let root = rules_repo(&base.join("parent"));
+        let sub = root.join("crates").join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "mine\n").unwrap();
+        rules_left_alone(&p, &sub, &root.join("CLAUDE.md"));
+        assert!(!sub.join("CLAUDE.md").exists() && !sub.join(".claude").exists());
+        // Above the repository's root it is not this folder's rules.
+        let outer = base.join("outer");
+        let inner = rules_repo(&outer);
+        std::fs::write(outer.join("CLAUDE.md"), "not mine\n").unwrap();
+        rules_offer(&p, &inner, "y\n", true, false);
+        assert!(inner.join("CLAUDE.md").is_file(), "a CLAUDE.md above the repository does not count");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rules_template_leaves_atlas_rules_and_an_intent_file_alone() {
+        let (base, p) = rules_home("d", true, "");
+        let dir = rules_repo(&base.join("rules"));
+        let f = dir.join(".claude").join("atlas-rules.md");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "mine\n").unwrap();
+        rules_left_alone(&p, &dir, &f);
+        assert!(!dir.join("CLAUDE.md").exists());
+        // The intent file the configuration names for the folder's project.
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        let intent = root.join("docs").join("RULINGS.md");
+        std::fs::write(&intent, "# Rulings\n").unwrap();
+        let fwd = |x: &Path| x.display().to_string().replace('\\', "/");
+        let extra =
+            format!(",\n  \"projects\": [{{\"name\": \"demo\", \"roots\": [\"{}\"], \"intent\": \"{}\"}}]", fwd(&root), fwd(&intent));
+        let (base2, p2) = rules_home("d2", true, &extra);
+        rules_left_alone(&p2, &root, &intent);
+        assert!(!root.join("CLAUDE.md").exists() && !root.join(".claude").exists());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base2);
+    }
+
+    #[test]
+    fn rules_template_without_a_terminal_writes_nothing() {
+        let (base, p) = rules_home("e", true, "");
+        let dir = rules_repo(&base);
+        let (out, unread) = rules_offer(&p, &dir, "y\n", false, false);
+        assert!(out.contains(rules_template::SETUP_NO_TERMINAL), "{out}");
+        assert!(!out.contains("[y/N]") && unread == 2, "{out}");
+        assert!(!dir.join("CLAUDE.md").exists() && !dir.join(".claude").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rules_template_write_never_replaces_a_file_that_appeared() {
+        let (base, _) = rules_home("f", true, "");
+        let dir = rules_repo(&base);
+        let f = dir.join(".claude").join("atlas-rules.md");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "keep\n").unwrap();
+        let w = rules_template::write_template(&dir, &rules_template::claude_md_text(true));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "keep\n");
+        assert!(!dir.join("CLAUDE.md").exists(), "CLAUDE.md is not written after the rules file was found");
+        assert!(w.files.is_empty() && w.left.as_deref() == Some(f.as_path()), "{w:?}");
+        // CLAUDE.md appearing: atlas-rules.md is written, CLAUDE.md kept.
+        let dir2 = rules_repo(&base.join("two"));
+        std::fs::write(dir2.join("CLAUDE.md"), "keep\n").unwrap();
+        let w = rules_template::write_template(&dir2, &rules_template::claude_md_text(true));
+        assert_eq!(std::fs::read_to_string(dir2.join("CLAUDE.md")).unwrap(), "keep\n");
+        assert_eq!(w.files.len(), 1, "{w:?}");
+        assert_eq!(w.left.as_deref(), Some(dir2.join("CLAUDE.md").as_path()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rules_template_files_are_generic_ascii() {
+        for (name, t) in [("CLAUDE.md", rules_template::RULES_CLAUDE_MD), ("atlas-rules.md", rules_template::RULES_FILE)] {
+            let n = t.lines().count();
+            assert!((40..=100).contains(&n), "{name}: {n} lines");
+            let b = t.as_bytes();
+            assert!(b.iter().all(|&c| c == b'\n' || (0x20..=0x7e).contains(&c)), "{name}: printable ASCII and newlines only");
+            for w in b.windows(3) {
+                assert!(!(w[0].is_ascii_alphabetic() && w[1] == b':' && (w[2] == b'/' || w[2] == b'\\')), "{name}: a drive path");
+            }
+            for bad in ["/Users/", "/home/", "_KEY", "_TOKEN", "SECRET", "journal:"] {
+                assert!(!t.contains(bad), "{name}: {bad}");
+            }
+            for (i, _) in t.match_indices('@') {
+                let tok: String = t[i + 1..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-').collect();
+                let domain = !tok.starts_with('.')
+                    && tok
+                        .rsplit_once('.')
+                        .is_some_and(|(h, tld)| !h.is_empty() && tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()));
+                assert!(!domain, "{name}: @{tok}");
+            }
+            // No record key (LANE-NAME:0001).
+            for (i, _) in t.match_indices(':') {
+                let digits = t[i + 1..].chars().take(4).filter(char::is_ascii_digit).count() == 4;
+                let tok: String = t[..i]
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '-')
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let key = tok.starts_with(|c: char| c.is_ascii_uppercase()) && tok.contains('-');
+                assert!(!(digits && key), "{name}: {tok}:");
+            }
+            // Every rule is one line and a one-line Why.
+            let lines: Vec<&str> = t.lines().collect();
+            for (j, l) in lines.iter().enumerate() {
+                if l.starts_with("- ") {
+                    assert!(lines.get(j + 1).is_some_and(|w| w.starts_with("  Why: ")), "{name}: {l}");
+                }
+            }
+        }
+        assert_eq!(rules_template::RULES_CLAUDE_MD.lines().last(), Some("@.claude/atlas-rules.md"));
+        assert_eq!(rules_template::RULES_CLAUDE_MD.matches(rules_template::COMPACT_PLACEHOLDER).count(), 1);
+    }
+
+    #[test]
+    fn rules_template_command_writes_with_yes_and_never_over_rules() {
+        let (base, p) = rules_home("cmd", false, "");
+        let dir = rules_repo(&base.join("a"));
+        let d = dir.display().to_string();
+        let (code, out) = rules_settings(&p, &["rules-template", &d]);
+        assert!(out.contains(rules_template::COMMAND_NO_TERMINAL) && code == ExitCode::SUCCESS, "{out}");
+        assert!(!dir.join("CLAUDE.md").exists());
+        let (code, out) = rules_settings(&p, &["rules-template", &d, "--yes"]);
+        assert_eq!(code, ExitCode::SUCCESS, "{out}");
+        let (md, rules) = rules_written(&dir);
+        assert_eq!(rules.as_deref(), Some(rules_template::RULES_FILE));
+        assert_eq!(md, Some(rules_template::claude_md_text(false)));
+        assert!(has_compact_block(md.as_deref().unwrap()));
+        // Beside an existing CLAUDE.md, --yes writes nothing.
+        let dir2 = rules_repo(&base.join("b"));
+        std::fs::write(dir2.join("CLAUDE.md"), "mine\n").unwrap();
+        let (_, out) = rules_settings(&p, &["rules-template", &dir2.display().to_string(), "--yes"]);
+        assert!(out.contains("existing rules left alone: "), "{out}");
+        assert_eq!(std::fs::read_to_string(dir2.join("CLAUDE.md")).unwrap(), "mine\n");
+        assert!(!dir2.join(".claude").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rules_template_undo_removes_untouched_files() {
+        let (base, p) = rules_home("undo", true, "");
+        let dir = rules_repo(&base);
+        rules_settings(&p, &["rules-template", &dir.display().to_string(), "--yes"]);
+        assert!(dir.join("CLAUDE.md").is_file());
+        let (code, out) = rules_settings(&p, &["undo", "--yes"]);
+        assert_eq!(code, ExitCode::SUCCESS, "{out}");
+        assert!(out.contains("rules template"), "the summary names it: {out}");
+        assert!(!dir.join("CLAUDE.md").exists() && !dir.join(".claude").exists(), "{out}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rules_template_undo_leaves_an_edited_file_alone() {
+        let (base, p) = rules_home("undo-edit", true, "");
+        let dir = rules_repo(&base);
+        rules_settings(&p, &["rules-template", &dir.display().to_string(), "--yes"]);
+        let md = dir.join("CLAUDE.md");
+        let edited = format!("{}- My own rule.\n", std::fs::read_to_string(&md).unwrap());
+        std::fs::write(&md, &edited).unwrap();
+        let (_, out) = rules_settings(&p, &["undo", "--yes"]);
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), edited, "{out}");
+        assert!(out.contains("left as it is"), "{out}");
+        assert!(!dir.join(".claude").join("atlas-rules.md").exists(), "the untouched one is removed: {out}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

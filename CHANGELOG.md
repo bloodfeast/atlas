@@ -10,6 +10,213 @@ wiki's Changelog page. A section has these parts, in this order, and leaves out 
 
 `cargo xtask release` refuses to release a version whose section is missing, empty or has no highlights.
 
+Sections are not written here by hand. Each pull request adds a fragment, `changes/<pr>.md`, naming its bump
+and section, and `cargo xtask version` folds the pending fragments into one section for the next release, in
+the order above, and sets the version by replaying them in merge order (`changes/README.md`).
+
+## v0.6.0
+
+### Highlights
+
+- **Semantic search reads the whole of a long section.** A section longer than the encoder's 510 tokens was
+  embedded by its head only; it is now embedded as overlapping windows (510 tokens, a stride of 384) and scores
+  by its best window, so a question answered deep in a long section can find it. On 30 held-out questions
+  answered past token 620 of a long section, semantic hit@5 rose from 7 to 18 and hybrid from 18 to 24; on the
+  15 held-out control questions semantic went from 13 to 14 and hybrid from 14 to 15, and the memory eval is
+  unchanged.
+- **A rules template for projects that have none.** `atlas --setup` now offers, for the folder it runs in, a
+  starter `CLAUDE.md` and `.claude/atlas-rules.md`: the token-saving rules (compaction summaries as keys,
+  recall before asking, lean briefs, fewer and larger shell calls, no sleep polling, a fresh agent at each
+  handoff), the journal, handoff and multiple-choice habits, and agent, build and safety rules. Each rule is
+  one line and a one-line why. `atlas settings rules-template [DIR] [--yes]` offers the same for any folder.
+  Where a folder already has rules, nothing is asked or written; a file is never overwritten, and `atlas
+  settings undo` removes the files atlas wrote while they are unedited.
+- **PR file reads hide far context behind a marker you can open.** In a `gh pr diff` file read, a run of
+  context more than one line from a change is now one line, `= N hidden lines=A-B`, and
+  `recall h:F lines=A-B` reads those lines back exactly as stored. On held-out PR reviews the digest now
+  saves a median 1.47x (up from 1.27x and 1.29x), 1.38x and 1.45x on first rounds, and never less than 1.16x.
+
+### Upgrade notes
+
+- **The first search after upgrading embeds the windows of long sections in the background.** On the
+  maintainers' store that is about 2,390 window vectors (about 1.22M tokens) beside the 8,521 section vectors
+  already there, which are kept. Until it is done, answers note `windows pending: N windows, M sections not yet
+  split` and each section scores by the windows it has. On a 7,315-section store, 1,970 windows took 408 s on 8
+  encoder threads. The store's version does not change: an older atlas on the same store keeps working and never
+  deletes the new window vectors.
+- **The memory store moves to schema 3 the first time this build opens it.** The migration only adds the worktree
+  ledger's table, index and triggers, and changes no existing row. Before it migrates it writes a copy of the
+  schema 2 store to `memory.sqlite.v2.bak` beside it; if the copy fails, nothing migrates. An older atlas refuses
+  a schema 3 store ("Update atlas"), so install this build for every session at once.
+
+### Features
+
+- **A pull request review wakes the session that waits for it (`atlas pr-events serve`).** A queued item that waits
+  on `review pr#N` is met when GitHub delivers the review, and the waiting session is told at its next turn. `serve`
+  runs a listener on `127.0.0.1` that accepts only deliveries signed with a secret it generated (HMAC-SHA256, a new
+  secret for each forwarder start, held only in memory), and one `gh webhook forward` per repository in the
+  project's `repos` list, restarted with backoff. A review by the pull request's own author or by a bot meets no
+  wait. Each connection has one 10 s deadline and bodies are capped at 5 MB.
+- **Hook cleanup deletes only the hooks atlas proved it made.** A `cli` hook is recorded only once a delivery signed
+  with that start's secret names it, and the recorded ids persist in the store, so the next start sweeps what a
+  crashed run left. Another tool's hooks are reported and never deleted. One `serve` per store forwards (a lease
+  with a 15 s heartbeat, taken over after 60 s); others serve the listener only. Remotes on a GitHub Enterprise
+  host are carried through to every `gh` call. On Windows the forwarders end with atlas even when it is killed;
+  on Linux gh does, and the extension process it started may outlive it until the next start sweeps its hook.
+- **atlas keeps a ledger of which lane owns which worktree (`atlas worktrees`).** When an orchestrated launch is
+  let through and its brief declares `Uses: worktree:NAME`, the hook records the worktree's owning lane in the
+  memory store: the same lane bumps its row, another lane closes the old span and opens a new one. The ledger is
+  append-only (SQL triggers refuse a delete or a rewrite). `atlas worktrees list` shows the open rows and stamps
+  the ones whose folder is gone, `history PATH` shows one path's spans, and `backfill` adds a row for each linked
+  worktree that has none. Nothing removes a worktree, branch or folder. `orchestrate.worktree_roots` names the
+  folders a worktree name resolves under.
+- **What a subagent is given at its start is a setting (experimental; `recall.subagent_context`).** `"recall"` (the
+  default) is today's lane views and pointers. `"binding"` gives only the Binding block of the lane the brief declares
+  (its `Lane:` line, or an exact upper-case id after "lane"), compiled when the launch is let through and matched to
+  the agent by its launch's tool use id, at most 9,000 characters. `"off"` gives nothing from the store. The
+  block is compiled by `binding::compile` (#189); the server warns at setup if none is set. `recall.main_lane_bytes` (default
+  0, off) caps a main-session prompt to one lane view and a head line for each other lane it names.
+- **The main session is steered to compact, and a `/clear` leaves a checkpoint.** `cap.main_session` is on by default
+  and advice only: past its compact point the main session is told to ask for `/compact`, and once the context after
+  the newest compaction is at or above `compact.clear_floor` (80k) it recommends `/clear` instead. Before Claude Code's
+  automatic compaction (its point is computed from the model's window), the session is asked once to write its
+  checkpoint, and a compaction that arrives first waits once for it. `atlas settings auto-compact` sets
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` so Claude Code compacts at atlas's hard limit. A new `SessionEnd` hook (matcher
+  `clear`) writes `checkpoint (clear)` from the ending transcript, and the next session start injects its card. A
+  subagent past its handoff point under an enforced limit is not compacted: it hands off.
+- **atlas tells you about updates.** One line at session start, once per version, shown to you and not added
+  to the model's context: a newer release when you are pinned or have updates off, or the release you were
+  moved to with its signed highlights. When the installed plugin is older than the release that last changed
+  its hooks or skills (`plugin_changed_in` in the signed manifest), the line says to run `/plugin`. Each
+  running server tells its own session once when a newer atlas is on disk, so you know to reconnect. Many
+  servers on an old version download and swap in the release once between them. `atlas settings` offers an
+  update badge for your status line (`atlas --statusline`): it becomes the status line when you have none,
+  and follows your own command's output when you have one; `atlas settings off statusline` puts your command
+  back, and each session start keeps the badge pointed at the atlas `/plugin` installed.
+- **`recall` reads a stored output by its handle.** `recall key=h:ID` gives the output's first page, and one of
+  `lines` (`A-B`), `item`, `failures`, `grep` (with `context`), `head`, `tail`, `page` or `digest` gives that slice,
+  as `atlas slice` does in a terminal; `key=h:` lists the newest handles. Every digest, capped slice and PR digest
+  now names this form (`recall h:ID item=NAME | lines=A-B | grep=RE`), not `atlas slice`, which a model could not
+  run when the binary is not on its shell's PATH. The selectors are refused on any other key. `atlas run` and
+  `atlas slice` print the `atlas slice h:ID --lines A-B` form instead when their output is a terminal. A line over the
+  slice cap is cut to it with a note naming its size (`grep=RE` shows the part around a match), and under projects
+  a handle stored by another project's hook is found in that project's store.
+- **A Read is now digested only when it opens a tool's saved output** (`lean.route_read`, default `outputs`). After
+  a routed Read, agents fetched the same file again within 10 calls 92% of the time (1,045 routed Reads over 11.5
+  days), so the outline cost more turns than it saved; only saved tool and task output (a path under
+  `tool-results/`, or a `.output` file under `tasks/`) came out ahead. Any other file passes whole. A ranged Read,
+  and a whole Read of a file the session already holds a read handle for, now always pass. `"route_read": "all"`
+  keeps the old behaviour, `"tuned"` digests files from 32 KB (`lean.route_read_min_kb`), and `"off"` none; the
+  boolean form maps true to `tuned` and false to `off`. A routed Read is still logged in the token ledger but no
+  longer credited with a saving, because the ledger cannot see the follow-up reads.
+- **A fresh install teaches Claude how to use atlas.** The server's instructions, sent in every session, now
+  carry a short paragraph after the served vaults: what atlas is, the habits (recall before asking, journal
+  decisions and measurements, write a handoff before stopping, name work by its queue key, put a `Lane:` line in
+  every brief) and where the guide is, within a 200-token budget a test enforces. The plugin bundles an `atlas`
+  skill with the full guide: lanes and sub-lanes, journal entry kinds, the work queue and handoffs, context
+  limits and compaction, and the memory-fidelity bar for changes to atlas. Its `reference.md` (every tool, op,
+  argument, journal entry kind, queue command and setting, and the `atlas://help` text) is generated by
+  `cargo xtask skill`; a test fails when it drifts from the code or when the guide names something that no
+  longer exists. No user rules are injected.
+- **The token report now shows what atlas costs, and the net.** `atlas --token-report` measures atlas's own
+  context cost from bytes: the tool list and instructions at every session start, the hook injections as sent
+  and re-read until the next compaction, and every tool's output. It nets that cost against the credited
+  savings, by tool and in a `Net` block after the headline, and gives the cost per turn and per subagent. With
+  `--transcripts DIR` it reads Claude Code's transcripts (read only) for tool search loads and re-reads, and
+  prices each re-read by its request's real mix of cache reads, cache writes and uncached input. Without them,
+  the net line says it counts only the costs atlas can see. On one store, cost was 21.6M tokens against 47.7M
+  credited, a net of 26.1M; re-reads of injected text were over half the cost.
+
+### Fixes
+
+- **A subagent that starts before its meta file is written no longer takes another launch's brief.** Claude Code
+  writes the meta file after SubagentStart answers, so a start almost never knows its launch. Before, it took the
+  oldest launch still waiting, which could be one refused at the permission prompt, with that launch's brief recall
+  and sub-lane. Now a start takes a launch only when exactly one is waiting, or exactly one waiting launch has the
+  agent's type; a refusal seen in the session transcript drops that launch. The agent's first tool call checks the
+  launch against its meta file and, if the start guessed wrong, says so and gives the right context and sub-lane.
+  An ambiguous start is answered at that first tool call. A launch held at the permission prompt for more than two
+  minutes keeps its brief, Binding block and sub-lane.
+- **`atlas queue met ES1-1981` works.** `show`, `drop`, `done` and `met` take the lane key `atlas queue` shows
+  as well as the full `journal:LANE:NNNN` key: a lane with one waiting item resolves to it (for `done` and
+  `met`, one item waiting or started and not yet done), a lane with several lists their full keys, and a key
+  that resolves to nothing suggests the keys that contain it. `--help` prints the usage instead of being read
+  as a key.
+- **Reviews name repo-qualified PRs.** A `review` entry's `pr:` takes `repo#N` and `owner/repo#N` (or a `repo:`
+  line beside a bare number), and the merge gate matches reviews by repo and number, so PR 784 in one repo no
+  longer counts as reviewed by a review of PR 784 in another. Reviews filed before still count for their number,
+  and filing a review with a bare number warns. Repos are compared as lowercase `owner/repo` whatever the form
+  (`github.com/o/api`, a URL, `.git`). A refused review says which line was wrong.
+- **An agent with nothing to classify it by counts as `other`.** A subagent with no agent type and an empty
+  brief gets `orchestrate.other`'s limits instead of the default kind's.
+- **A subagent's automatic compaction is judged against its own model's window.** atlas blocks a subagent's
+  compaction past its handoff point only when its hard limit comes before Claude Code's own limit, and it now
+  reads that window from the subagent's model: its transcript's last real `message.model`, else its meta file's
+  `model` alias. Haiku is 200,000; opus, sonnet and fable are 1,000,000 (200,000 with
+  `CLAUDE_CODE_DISABLE_1M_CONTEXT`). A haiku subagent is no longer held to a 1M window. The new
+  `compact.model_windows` setting maps a model id, or a family alias such as `haiku`, to its window; ids and
+  keys match case-insensitively with a `[1m]` suffix ignored, and an exact id beats an alias.
+- **An agent that died on a full disk no longer holds its lane for six hours.** When the disk fills, Claude Code
+  never marks the agent finished, and atlas used to keep counting it against its lane, cap slot and resources
+  until `orchestrate.stale_minutes` (360) passed. Now a SubagentStop counts as a finish (an interim stop, while
+  the agent waits on its own background work, does not).
+  `atlas queue release AGENT` frees a dead agent at once; it refuses one that wrote in the last 5 minutes unless
+  you pass `--force`, and it never edits Claude Code's files. An agent whose last transcript message is a
+  disk-full tool error (`ENOSPC`, "no space left", or Windows' "not enough space on the disk" / "os error 112")
+  stops counting after `orchestrate.disk_full_minutes` (default 10; 0 turns it off).
+- **`--token-report --repeats` counts only lookups as repeats.** A write after a compaction (journal, remember,
+  note, edit, handoff and the other write tools) is no longer counted as a lookup or a repeat, the unstamped
+  total uses the same 40-call window as the lookup and repeat counts, and `recall {query}` lookups carry a stamp
+  so a repeat of an unchanged target is told apart from a needed re-read. On one store, repeats fell from 41 of
+  122 lookups (33.6%) to 3 of 84 (3.6%).
+- **The token report no longer overstates what lookups saved.** Each search, grep, lookup, section and symbol
+  answer is now credited at most the 90th-percentile pre-atlas lookup episode measured from your own history
+  (none when there is no pre-atlas baseline, and the report says so), grep output counts at most 250 lines, and
+  symbol's counterfactual matches whole, case-sensitive identifiers and reads only the files that define the
+  name. Live tool answers do not change. On one store since 2026-11-08, symbol fell from 4359x to 17.2x and
+  search from 45.9x to 2.7x.
+- **Routed shell output is credited only what Claude Code would have shown.** A routed Bash, PowerShell or
+  `gh pr` output now counts at most its first 30,000 characters in the token report, as Claude Code shows no
+  more, and routed reads count no saving, since the reads that follow them are not visible to the ledger. On
+  one store since 2026-11-08, route:Bash fell from 97.5x to 21.8x and route:Read from 24.2x to 0.
+- **Hook injections earn token-report credit only when they were used.** A recall hook's injection is now
+  credited only when `--hook-report` judges it a hit, and the report says how many injections were hits. Because
+  that verdict reads memory as it is when the report runs, the hook credit can move as memory changes. The
+  context-selection line drops its "saved" percentage, which compared against a whole-lane injection nobody would
+  send, and keeps the bytes. On one store since 2026-11-08, PreToolUse fell from 76.0x to 7.4x and hook credit
+  from 59.2M to 18.4M tokens.
+- **The token report headlines the measured mean, and no longer calls its ledger an upper bound.** The
+  headline is now the measured ratio of sums (pre-atlas episode bytes over atlas answer bytes), with the median
+  beside it marked not additive. The old "upper bound" line is the "ledger ratio (rule-based, not a bound)",
+  with the per-answer ledger median beside it, in the human report, `--tsv`, `--calibrate` and the wiki. On one
+  store the headline reads 6.4x, and the whole ledger since 2026-11-08 reads 7.0x where it read 26.0x before
+  this release's fixes.
+- **PR digests pair a change block's lines in order, and show a word diff only when it is shorter.** A line
+  inserted or removed inside a block no longer unpairs every line after it, and a pair is shown as a word diff
+  only when that is shorter than its two lines. On a held-out set of 16 review rounds from three public repos,
+  the lossless digest's median ratio rose from 1.276x to 1.287x, and no round got longer.
+- **The token report's brief and hook injection rows now count the same thing: agents.** The "brief without
+  atlas" row counted every `SubagentStart`, and Claude Code fires that again each time an agent resumes, so a
+  resumed agent was charged the rulebook again; the injection row counted agents. Both rows now count each
+  agent once (the brief at the rulebook of its first start, with the resumes named beside the raw start
+  count), and a new `brief vs injections` line compares the two on the agents both tables hold.
+
+### Security hardening
+
+- **Release binaries carry build provenance, and signing checks it.** Each binary of a release is attested by
+  the public release workflow as it is built, and the owner's sign step refuses any binary that was not built
+  by that workflow, from the public repository, on `main` at the release commit, on a GitHub-hosted runner, so
+  binaries swapped into a draft release after the build are never signed. The published release notes are
+  made again at signing from the changelog at the release commit, so a draft's notes edited after the build
+  are never published. A changelog fragment can no longer cut the release notes short: a `## v` or `###` line
+  inside a fenced block (backticks or tildes, indented up to three spaces) neither ends nor starts a section,
+  and a fragment is refused when it leaves a fence unclosed, indents a line of a fenced block less than its
+  opening fence (which ends the block on GitHub), starts a line outside a fence with `<` (which GitHub
+  reads as HTML that can hide what follows), comments included, puts a `#` heading after an indent or a list
+  marker or a setext underline (`===` or `---`) outside a fence, or holds a control character other than a tab
+  or a line ending (GitHub reads a lone carriage return as a line break). The release refuses a changelog
+  section by the same rules, so the released notes carry no HTML block, no stray heading and no control character.
+
 ## v0.5.0
 
 ### Highlights

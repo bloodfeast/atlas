@@ -254,6 +254,12 @@ impl Handles {
             }
             Ok(String::new())
         })?;
+        if !id.is_empty() && !m.session.is_empty() {
+            crate::store::guarded(&self.conn, || {
+                self.conn.execute("INSERT OR IGNORE INTO handle_sessions(id, session) VALUES(?1, ?2)", params![id, m.session])?;
+                Ok(())
+            })?;
+        }
         if id.is_empty() {
             return Err(Error::Db("handle id space exhausted".into()));
         }
@@ -293,6 +299,26 @@ impl Handles {
             )
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("handle {id} (evicted, or from another machine)")))
+    }
+
+    /// Whether `session` (a session or subagent id) already holds a read
+    /// handle for `path`: a whole Read of it again is the agent coming back
+    /// for the text, so it passes whole.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`] from SQLite.
+    pub fn has_read(&self, path: &str, session: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM handles h WHERE h.kind = 'read' AND h.cmd = ?1
+                 AND (h.session = ?2 OR EXISTS(SELECT 1 FROM handle_sessions s WHERE s.id = h.id AND s.session = ?2)) LIMIT 1",
+                params![path, session],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// A handle's row and text; marks it used.
@@ -349,6 +375,7 @@ impl Handles {
         let n = lines.len();
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         let mut note = String::new();
+        let mut focus: Option<crate::regex::Regex> = None;
         match sel {
             Sel::Lines(a, b) => {
                 let a = (*a).max(1);
@@ -378,6 +405,7 @@ impl Handles {
                         }
                     }
                 }
+                focus = Some(r);
             }
             Sel::Item(name) => {
                 let items = digest::items(Handles::shape_of(&row, &text), &text);
@@ -418,7 +446,7 @@ impl Handles {
             return Ok(format!("{}: nothing selected ({n} lines)\n", row.id));
         }
         ranges.sort_unstable();
-        Ok(render(&row.id, &lines, &ranges, &note, self.cfg.slice_bytes))
+        Ok(render(&row.id, &lines, &ranges, &note, self.cfg.slice_bytes, focus.as_ref()))
     }
 
     /// The most recently used handles, newest first.
@@ -478,6 +506,7 @@ impl Handles {
             let mut orphans = Vec::new();
             for (id, sha) in &gone {
                 self.conn.execute("DELETE FROM handles WHERE id = ?1", [id])?;
+                self.conn.execute("DELETE FROM handle_sessions WHERE id = ?1", [id])?;
                 let left: i64 = self.conn.query_row("SELECT COUNT(*) FROM handles WHERE sha = ?1", [sha], |r| r.get(0))?;
                 if left == 0 && !orphans.contains(&sha.as_str()) {
                     orphans.push(sha.as_str());
@@ -506,12 +535,42 @@ fn find_items<'a>(items: &'a [Item], name: &str) -> Vec<&'a Item> {
         .collect()
 }
 
+/// The largest index at most `i` that is a char boundary of `s`.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The byte range `[s, e)` of a line over the cap that is shown: at most
+/// `room` bytes, from the start, or around the first match of `focus` (a
+/// `grep` slice) when it matches.
+pub fn clip_line(line: &str, room: usize, focus: Option<&crate::regex::Regex>) -> (usize, usize) {
+    let from = focus.and_then(|r| r.find(line)).map_or(0, |m| m.start().saturating_sub(room / 4));
+    let s = floor_boundary(line, from);
+    (s, floor_boundary(line, s + room))
+}
+
+/// The note after a line [`clip_line`] cut: its size, the bytes shown, and
+/// (unless a pattern already placed the cut) how to see another part.
+pub fn long_line_note(id: &str, k: usize, len: usize, (s, e): (usize, usize), focused: bool) -> String {
+    if focused {
+        format!("line {k} is {len} bytes; bytes {s}-{e} shown, around the first match\n")
+    } else {
+        format!("line {k} is {len} bytes; bytes {s}-{e} shown (recall {id} grep=RE shows the part around a match)\n")
+    }
+}
+
 /// Numbered lines of the ranges (sorted by start), with `--` between
 /// ranges that do not touch, capped at `cap` bytes with a "truncated" line
 /// naming the next range when cut. Overlapping ranges (a test's
 /// failure block and a compiler error inside it, both `--failures` items)
-/// are shown once.
-fn render(id: &str, lines: &[&str], ranges: &[(usize, usize)], note: &str, cap: usize) -> String {
+/// are shown once. A first line alone over the cap is cut to it
+/// ([`clip_line`], around `focus`'s first match) with a
+/// [`long_line_note`].
+fn render(id: &str, lines: &[&str], ranges: &[(usize, usize)], note: &str, cap: usize, focus: Option<&crate::regex::Regex>) -> String {
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for &(a, b) in ranges {
         match merged.last_mut() {
@@ -530,10 +589,26 @@ fn render(id: &str, lines: &[&str], ranges: &[(usize, usize)], note: &str, cap: 
             out.push_str("--\n");
         }
         for k in a..=b {
+            let last = ranges.last().map_or(b, |r| r.1);
             let line = format!("{k}\t{}\n", lines[k - 1]);
             if out.len() + line.len() > cap && shown > 0 {
                 let left = total - shown;
-                out.push_str(&format!("truncated, {left} more lines (atlas slice {id} --lines {k}-{})\n", ranges.last().map_or(b, |r| r.1)));
+                out.push_str(&format!("truncated, {left} more lines (recall {id} lines={k}-{last})\n"));
+                return out;
+            }
+            if out.len() + line.len() > cap {
+                // One line alone over the cap: cut it, and say so.
+                let text = lines[k - 1];
+                let room = cap.saturating_sub(out.len() + format!("{k}\t\n").len()).max(64);
+                let (s, e) = clip_line(text, room, focus);
+                let focused = focus.is_some_and(|r| r.is_match(text));
+                out.push_str(&format!("{k}\t{}\n", &text[s..e]));
+                out.push_str(&long_line_note(id, k, text.len(), (s, e), focused));
+                shown += 1;
+                if total > shown {
+                    let next = if k < b { k + 1 } else { ranges.iter().map(|r| r.0).find(|&s| s > k).unwrap_or(last) };
+                    out.push_str(&format!("truncated, {} more lines (recall {id} lines={next}-{last})\n", total - shown));
+                }
                 return out;
             }
             out.push_str(&line);
@@ -557,8 +632,172 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
     }
 }
 
-/// Parses the selector words of `atlas slice` (and the MCP `slice` tool's
-/// string form).
+/// The selector arguments `recall` takes with an `h:` key, each one of
+/// `atlas slice`'s flags without its dashes.
+pub const SLICE_ARGS: &[&str] = &["lines", "item", "failures", "grep", "context", "head", "tail", "page", "digest"];
+
+/// What a `recall h:ID` call asks of a stored output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ask {
+    /// One slice.
+    Slice(Sel),
+    /// The digest again.
+    Digest,
+}
+
+/// What each value-taking selector's value is, for a refusal.
+fn value_of(k: &str) -> &'static str {
+    match k {
+        "lines" => "A-B",
+        "item" => "NAME",
+        "grep" => "RE",
+        "page" => "K",
+        _ => "N",
+    }
+}
+
+/// Parses `recall`'s selector arguments, as (name, value) pairs in the
+/// order given: `lines=A-B`, `item=NAME`, `failures=true`, `grep=RE` (with
+/// `context=N`), `head=N`, `tail=N`, `page=K` or `digest=true`. At most one
+/// selector; none is [`Sel::Whole`]. One surrounding pair of double quotes
+/// around a value is dropped (`grep="^diff --git"` copied whole).
+///
+/// # Errors
+///
+/// A message naming the argument that is unknown, repeated, malformed or
+/// without its value.
+pub fn parse_args(pairs: &[(String, String)]) -> std::result::Result<Ask, String> {
+    let flag = |k: &str, v: &str| match v {
+        "true" | "" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("{k} is true or false, not {v:?}")),
+    };
+    let mut words: Vec<String> = Vec::new();
+    let mut chosen: Vec<&str> = Vec::new();
+    let mut digest = false;
+    let mut grep = false;
+    let mut context = false;
+    for (k, v) in pairs {
+        let k = k.as_str();
+        let v = v.trim();
+        let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v);
+        if k == "|" {
+            return Err("one selector at a time: a hint's `|` separates alternatives, so pick one (key \"h:ID lines=A-B\")".into());
+        }
+        if matches!(k, "context" | "lines" | "item" | "grep" | "head" | "tail" | "page") && v.is_empty() {
+            return Err(format!("{k} needs a value: {k}={}", value_of(k)));
+        }
+        match k {
+            "failures" | "digest" => {
+                if !flag(k, v)? {
+                    continue;
+                }
+                if k == "digest" {
+                    digest = true;
+                } else {
+                    words.push("--failures".into());
+                }
+            }
+            "context" => {
+                context = true;
+                words.extend(["--context".to_string(), v.to_string()]);
+                continue;
+            }
+            "lines" | "item" | "grep" | "head" | "tail" | "page" => {
+                grep |= k == "grep";
+                words.extend([format!("--{k}"), v.to_string()]);
+            }
+            _ => return Err(format!("unknown selector {k:?}; use one of {}", SLICE_ARGS.join(", "))),
+        }
+        chosen.push(k);
+    }
+    if chosen.len() > 1 {
+        return Err(format!("one selector at a time, not {}", chosen.join(" and ")));
+    }
+    if context && !grep {
+        return Err("context goes with grep".into());
+    }
+    if digest {
+        return Ok(Ask::Digest);
+    }
+    // The CLI's messages name its flags; these name the arguments.
+    parse_sel(&words).map(Ask::Slice).map_err(|e| e.strip_prefix("--").map_or(e.clone(), str::to_string))
+}
+
+/// The handle form of a `recall` key: the key from `h:` on, when it is one,
+/// also as a hint line or a command reads (`recall h:ID ...`,
+/// `recall key=h:ID ...`, `atlas slice h:ID ...`).
+pub fn handle_key(key: &str) -> Option<&str> {
+    let mut k = key.trim();
+    for p in ["recall ", "atlas slice "] {
+        if let Some(r) = k.strip_prefix(p) {
+            k = r.trim_start();
+        }
+    }
+    let k = k.strip_prefix("key=").unwrap_or(k);
+    k.starts_with("h:").then_some(k)
+}
+
+/// Splits a `recall` key that carries its selectors after the id, as a hint
+/// line writes them (`h:ID lines=A-B`, `h:ID grep="a b"`, `h:ID failures`)
+/// or as the CLI's flags (`h:ID --lines A-B`), into the id and (name, value)
+/// pairs for [`parse_args`]. Double quotes group words. A bare
+/// value-taking name (`h:ID grep`) has the empty value [`parse_args`]
+/// refuses; a hint's ` | ` between alternatives is kept as a `|` pair, which
+/// it refuses too.
+///
+/// # Errors
+///
+/// A message for a flag without its value or an unclosed quote.
+pub fn split_key(key: &str) -> std::result::Result<(String, Vec<(String, String)>), String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut any) = (false, false);
+    for c in key.trim().chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    words.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if quoted {
+        return Err(format!("key {key:?}: unclosed quote"));
+    }
+    if any {
+        words.push(cur);
+    }
+    let mut it = words.into_iter();
+    let id = it.next().unwrap_or_default();
+    let mut pairs = Vec::new();
+    while let Some(w) = it.next() {
+        if let Some(name) = w.strip_prefix("--") {
+            let name = if name == "symbol" { "item" } else { name };
+            let v = if matches!(name, "failures" | "digest") { "true".to_string() } else { it.next().ok_or_else(|| format!("{w} needs a value"))? };
+            pairs.push((name.to_string(), v));
+        } else if let Some((k, v)) = w.split_once('=') {
+            pairs.push((k.to_string(), v.to_string()));
+        } else if matches!(w.as_str(), "failures" | "digest") {
+            pairs.push((w, "true".to_string()));
+        } else {
+            pairs.push((w, String::new()));
+        }
+    }
+    Ok((id, pairs))
+}
+
+/// Parses the selector words of `atlas slice` (`recall`'s arguments go
+/// through [`parse_args`] to here).
 ///
 /// # Errors
 ///
@@ -593,6 +832,85 @@ pub fn parse_sel(words: &[String]) -> std::result::Result<Sel, String> {
         Some(s) => s,
         None => Sel::Whole,
     })
+}
+
+/// How hint lines name a slice. Every hint is written once, as `recall`'s
+/// arguments; [`to_cli`] is the only other form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintForm {
+    /// `recall h:ID lines=A-B`: the tool a model calls (output routed to a
+    /// model: a hook, or `atlas run` with its output captured).
+    Recall,
+    /// `atlas slice h:ID --lines A-B`: the command a person at a terminal
+    /// types.
+    Cli,
+}
+
+impl HintForm {
+    /// The form for this process's standard output: the command on a
+    /// terminal, `recall` otherwise.
+    pub fn for_stdout() -> HintForm {
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            HintForm::Cli
+        } else {
+            HintForm::Recall
+        }
+    }
+
+    /// `text` with its hints in this form.
+    pub fn apply(self, text: &str) -> String {
+        match self {
+            HintForm::Recall => text.to_string(),
+            HintForm::Cli => to_cli(text),
+        }
+    }
+}
+
+/// Rewrites every `recall h:ID sel=v | sel=v` in `text` as the CLI's
+/// `atlas slice h:ID --sel v | --sel v` (`failures=true` and `digest=true`
+/// as bare flags). A hint ends at the first word that is not a selector,
+/// or at `)`, `;` or `,`.
+pub fn to_cli(text: &str) -> String {
+    const PAT: &str = "recall h:";
+    let stop = |c: char| c.is_whitespace() || matches!(c, ')' | ';' | ',');
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut rest = text;
+    while let Some(i) = rest.find(PAT) {
+        out.push_str(&rest[..i]);
+        out.push_str("atlas slice ");
+        let s = &rest[i + "recall ".len()..];
+        let id_end = s.find(stop).unwrap_or(s.len());
+        out.push_str(&s[..id_end]);
+        let mut s = &s[id_end..];
+        let mut first = true;
+        loop {
+            let (sep, after) = if let Some(a) = s.strip_prefix(" | ").filter(|_| !first) {
+                (" | ", a)
+            } else if let Some(a) = s.strip_prefix(' ') {
+                (" ", a)
+            } else {
+                break;
+            };
+            let Some((name, v)) = after.split_once('=') else { break };
+            if !SLICE_ARGS.contains(&name) {
+                break;
+            }
+            let v_end =
+                if let Some(q) = v.strip_prefix('"') { q.find('"').map_or(v.len(), |e| e + 2) } else { v.find(stop).unwrap_or(v.len()) };
+            let value = &v[..v_end];
+            out.push_str(sep);
+            if matches!(name, "failures" | "digest") && value == "true" {
+                out.push_str(&format!("--{name}"));
+            } else {
+                out.push_str(&format!("--{name} {value}"));
+            }
+            s = &v[v_end..];
+            first = false;
+        }
+        rest = s;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The usage of `atlas slice`.
@@ -631,7 +949,7 @@ pub fn cli(args: Vec<String>, db: &std::path::Path, lean: Option<&crate::json::V
         let sel = parse_sel(rest)?;
         h.slice(first, &sel).map_err(|e| e.to_string())?
     };
-    print!("{out}");
+    print!("{}", HintForm::for_stdout().apply(&out));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -649,6 +967,65 @@ mod tests {
     }
 
     #[test]
+    fn recall_arguments_parse_as_the_cli_flags() {
+        let p = |v: &[(&str, &str)]| parse_args(&v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>());
+        assert_eq!(p(&[]), Ok(Ask::Slice(Sel::Whole)));
+        assert_eq!(p(&[("lines", "3-9")]), Ok(Ask::Slice(Sel::Lines(3, 9))));
+        assert_eq!(p(&[("grep", "x"), ("context", "3")]), Ok(Ask::Slice(Sel::Grep { re: "x".into(), context: 3 })));
+        assert_eq!(p(&[("failures", "true")]), Ok(Ask::Slice(Sel::Failures)));
+        assert_eq!(p(&[("failures", "false")]), Ok(Ask::Slice(Sel::Whole)));
+        assert_eq!(p(&[("digest", "true")]), Ok(Ask::Digest));
+        assert!(p(&[("lines", "1-2"), ("tail", "3")]).unwrap_err().contains("lines and tail"));
+        assert!(p(&[("context", "3")]).unwrap_err().contains("grep"));
+        assert!(p(&[("lines", "5-1")]).unwrap_err().starts_with("lines \"5-1\""));
+        assert!(p(&[("nope", "1")]).unwrap_err().contains("nope"));
+        let (id, pairs) = split_key("h:ab grep=\"a b\" --lines 2-3 failures").unwrap();
+        assert_eq!(id, "h:ab");
+        let want: Vec<(String, String)> = [("grep", "a b"), ("lines", "2-3"), ("failures", "true")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_eq!(pairs, want);
+        assert!(split_key("h:ab --item").is_err());
+        assert!(split_key("h:ab grep=\"x").is_err());
+    }
+
+    #[test]
+    fn hints_read_as_the_cli_on_a_terminal() {
+        assert_eq!(
+            to_cli("recall h:1 failures=true | item=NAME | lines=A-B | grep=RE\n"),
+            "atlas slice h:1 --failures | --item NAME | --lines A-B | --grep RE\n"
+        );
+        assert_eq!(to_cli("build: 2 errors (recall h:2 item=error:1)\n"), "build: 2 errors (atlas slice h:2 --item error:1)\n");
+        assert_eq!(
+            to_cli("a file: recall h:F; a hunk: recall h:F lines=A-B; in a file read = N hidden lines=A-B is context; whole output h:9\n"),
+            "a file: atlas slice h:F; a hunk: atlas slice h:F --lines A-B; in a file read = N hidden lines=A-B is context; whole output h:9\n"
+        );
+        assert_eq!(to_cli("3 more files: recall h:3 grep=\"^diff --git\"\n"), "3 more files: atlas slice h:3 --grep \"^diff --git\"\n");
+        assert_eq!(
+            to_cli("line 1 is 9 bytes; bytes 0-4 shown (recall h:4 grep=RE shows the part)\n"),
+            "line 1 is 9 bytes; bytes 0-4 shown (atlas slice h:4 --grep RE shows the part)\n"
+        );
+        assert_eq!(to_cli("no hint; recall {key} is a record\n"), "no hint; recall {key} is a record\n");
+    }
+
+    #[test]
+    fn a_line_over_the_cap_is_cut_around_the_match() {
+        let long = format!("{}NEEDLE{}", "a".repeat(5000), "b".repeat(5000));
+        let refs = [long.as_str(), "next"];
+        let out = render("h:1", &refs, &[(1, 2)], "", 1000, None);
+        assert!(
+            out.starts_with("1\taaa") && out.contains("line 1 is 10006 bytes; bytes 0-") && out.contains("recall h:1 grep=RE"),
+            "{out}"
+        );
+        assert!(out.trim_end().ends_with("truncated, 1 more lines (recall h:1 lines=2-2)"), "{out}");
+        let re = crate::regex::RegexBuilder::new("NEEDLE").build().unwrap();
+        let out = render("h:1", &refs, &[(1, 1)], "", 1000, Some(&re));
+        assert!(out.contains("NEEDLE") && out.contains("around the first match") && out.len() < 1200, "{out}");
+        // A multibyte line is cut on a char boundary.
+        let wide = "\u{e9}".repeat(3000);
+        let out = render("h:1", &[wide.as_str()], &[(1, 1)], "", 501, None);
+        assert!(out.contains("line 1 is 6000 bytes"), "{out}");
+    }
+
+    #[test]
     fn ranges_parse() {
         assert_eq!(parse_range("3-9"), Some((3, 9)));
         assert_eq!(parse_range("7"), Some((7, 7)));
@@ -660,7 +1037,7 @@ mod tests {
     fn slices_are_capped_with_a_next_range() {
         let lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let out = render("h:1", &refs, &[(1, 100)], "", 200);
+        let out = render("h:1", &refs, &[(1, 100)], "", 200, None);
         assert!(out.starts_with("1\tline 1\n"));
         assert!(out.contains("truncated, "));
         assert!(out.trim_end().ends_with("-100)"));
@@ -670,7 +1047,7 @@ mod tests {
     fn overlapping_ranges_are_shown_once() {
         let lines: Vec<String> = (1..=12).map(|i| format!("l{i}")).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let out = render("h:1", &refs, &[(2, 6), (4, 5), (5, 8), (11, 12)], "", 10_000);
+        let out = render("h:1", &refs, &[(2, 6), (4, 5), (5, 8), (11, 12)], "", 10_000, None);
         assert_eq!(out, "2\tl2\n3\tl3\n4\tl4\n5\tl5\n6\tl6\n7\tl7\n8\tl8\n--\n11\tl11\n12\tl12\n");
     }
 }

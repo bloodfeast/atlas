@@ -330,3 +330,41 @@ fn every_hooks_json_input_is_taken_by_the_hook_tool() {
     }
     assert!(sent >= 20, "{sent} hook inputs sent");
 }
+
+/// N3 of the #188 re-review: the server's hook worker sets BO-1's Binding
+/// compiler (protocol.rs), so a binding-mode subagent started through the
+/// `hook` tool is given its lane's block.
+#[test]
+fn the_hook_worker_sets_the_binding_compiler() {
+    let fx = Fx::new("surface-binding-wired");
+    let mut s = fx.server();
+    let mut settings = atlas::memory::settings::Settings::from_config(None, &fx.db).unwrap();
+    settings.recall.subagent_context = atlas::memory::settings::SubagentContext::Binding;
+    {
+        let mut m = atlas::memory::MemoryStore::open(&settings.store).unwrap();
+        let mut w = m.writer().unwrap();
+        for i in 1..=3 {
+            let d = atlas::memory::Draft { title: format!("decision {i}"), body: format!("Decision {i} of ALPHA.\n"), reason: "test".into(), author: "t".into(), client: "t".into(), ..Default::default() };
+            w.create(&format!("journal:ALPHA:{i:04}"), "journal", "decision", "ALPHA", &d, None).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    s.set_memory(settings.clone());
+    let sess = fx.tmp.path().join("proj").join("sess.jsonl");
+    std::fs::create_dir_all(fx.tmp.path().join("proj").join("sess").join("subagents")).unwrap();
+    std::fs::write(&sess, "").unwrap();
+    let tp = sess.to_string_lossy().into_owned();
+    let brief = "Lane: ALPHA\nBuild alpha.";
+    let hook = |id: &str, args: atlas::json::Value| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "hook", "arguments": args}}).to_string();
+    let msgs = [
+        hook("h1", json!({"event": "PreToolUse", "session_id": "S", "tool_name": "Agent", "tool_use_id": "tA", "transcript_path": tp, "tool_input": {"description": "d", "subagent_type": "general-purpose", "prompt": brief}})),
+        hook("h2", json!({"event": "SubagentStart", "session_id": "S", "agent_id": "x", "agent_type": "general-purpose", "transcript_path": tp})),
+    ];
+    let input = std::io::Cursor::new((msgs.join("\n") + "\n").into_bytes());
+    let out = Shared::default();
+    atlas::protocol::serve_with_hooks(&mut s, Some(settings), None, input, out.clone()).unwrap();
+    let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+    let start = text.lines().map(|l| atlas::json::parse(l).unwrap()).find(|v| v["id"] == json!("h2")).unwrap_or_else(|| panic!("no answer h2 in {text}"));
+    let said = start["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
+    assert!(said.contains("journal:ALPHA:0003"), "{said}");
+}

@@ -31,7 +31,7 @@ fn a_failing_cargo_test_digests_to_its_failures() {
     assert!(d.contains("tests 1 passed 2 failed 1 ignored (1 binaries): failed"), "{d}");
     assert!(d.contains("FAILED tests::adds_wrong src/lib.rs:7 assertion `left == right` failed (left: 3, right: 4)"), "{d}");
     assert!(d.contains("FAILED tests::panics_here src/lib.rs:8 the widget count went negative"), "{d}");
-    assert!(d.trim_end().ends_with("--failures | --item NAME | --lines A-B | --grep RE"), "{d}");
+    assert!(d.trim_end().ends_with("failures=true | item=NAME | lines=A-B | grep=RE"), "{d}");
     // Without an exit code the verdict says it is inferred and the tail stays verbatim.
     let d = digest::digest("h:1", "cargo test", Shape::CargoTest, &text, None, 600);
     assert!(d.contains("exit status unknown (inferred: failed)"), "{d}");
@@ -149,7 +149,7 @@ fn routing_swaps_large_results_and_keeps_the_shape() {
     let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
     assert_eq!(keys, vec!["stdout", "stderr", "interrupted", "isImage", "noOutputExpected"]);
     let stdout = out["stdout"].as_str().unwrap();
-    assert!(stdout.starts_with("h:") && stdout.contains("exit status unknown (inferred: failed)") && stdout.contains("atlas slice h:"), "{stdout}");
+    assert!(stdout.starts_with("h:") && stdout.contains("exit status unknown (inferred: failed)") && stdout.contains("recall h:"), "{stdout}");
     // Deterministic: the same event gives the same answer.
     assert_eq!(r.post_tool_use(&bash_event("cargo test", &text)).unwrap(), Some(out.clone()));
     // The escape mark and the slice command pass through.
@@ -236,7 +236,8 @@ fn routing_reads_a_persisted_bash_output_whole() {
 fn routing_swaps_read_grep_and_glob_in_their_shapes() {
     let t = Temp::new("tools");
     let db = t.path().join("index.sqlite");
-    let mut r = Router::with_db(&db, None);
+    // `all`: a source file is digested only in that mode (tests/read_route.rs).
+    let mut r = Router::with_db(&db, Some(json!({"route_read": "all"})));
     let body: String = (0..1000).map(|i| format!("fn function_number_{i}() {{}}\n")).collect();
     let read = HookEvent {
         event: "PostToolUse".into(),
@@ -250,7 +251,7 @@ fn routing_swaps_read_grep_and_glob_in_their_shapes() {
     assert_eq!(f["filePath"], json!("/w/a.rs"));
     assert_eq!(f["totalLines"], json!(1000));
     assert!(f["content"].as_str().unwrap().contains("outline, 1000 items"));
-    // A Read with its own window under three times the threshold passes.
+    // A Read with its own window passes.
     let mut windowed = read.clone();
     windowed.tool_input = json!({"file_path": "/w/a.rs", "offset": 1, "limit": 1000});
     assert_eq!(r.post_tool_use(&windowed).unwrap(), None);
@@ -299,7 +300,7 @@ fn atlas_run_prints_small_output_whole_and_large_output_as_a_digest() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.starts_with("h:") && s.contains("exit 0") && s.contains("3000 lines"), "{s}");
-    assert!(s.contains("atlas slice h:"), "{s}");
+    assert!(s.contains("recall h:") && !s.contains("atlas slice"), "routed to a model (stdout captured), the hints name recall: {s}");
     let small: Vec<String> = if cfg!(windows) { vec!["cmd".into(), "/C".into(), "echo hi".into()] } else { vec!["echo".into(), "hi".into()] };
     let out = run(&small);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");

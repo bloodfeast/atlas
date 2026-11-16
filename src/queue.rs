@@ -13,6 +13,7 @@
 //! atlas queue [list]      the waiting launches, oldest first: key, kind, lane, age, description
 //! atlas queue show KEY    one launch with its brief
 //! atlas queue drop KEY    removes one without starting it
+//! atlas queue release ID  counts a dead agent finished: its lane and slots are free
 //! ```
 //!
 //! The entries live in the memory store, so the queue outlives a command
@@ -87,6 +88,49 @@ fn sha_of(prompt: &str) -> String {
     crate::sha256::hex(prompt.as_bytes())[..16].to_string()
 }
 
+/// The header lines [`content_sha`] leaves out.
+const HEADER_LINES: [&str; 4] = ["kind", "lane", "priority", "uses"];
+
+/// A brief's content hash: the brief without its `Kind:`, `Lane:`,
+/// `Priority:` and `Uses:` lines (the first of each among the first
+/// [`crate::lanes::DECL_LINES`], the ones read; a later one is body text)
+/// and with every run of whitespace one space, so one brief relaunched
+/// under another lane, kind or priority, or re-wrapped, hashes the same.
+pub fn content_sha(prompt: &str) -> String {
+    let mut words: Vec<&str> = Vec::new();
+    let mut seen = [false; HEADER_LINES.len()];
+    for (i, l) in prompt.lines().enumerate() {
+        if i < crate::lanes::DECL_LINES {
+            if let Some(n) = HEADER_LINES.iter().position(|n| crate::lanes::decl(l, n).is_some()).filter(|&n| !seen[n]) {
+                seen[n] = true;
+                continue;
+            }
+        }
+        words.extend(l.split_whitespace());
+    }
+    sha_of(&words.join(" "))
+}
+
+/// A waiting entry's content hash: its `content_sha:` meta, else (an entry
+/// the hook queued before the meta existed) its brief's.
+fn entry_content_sha(store: &MemoryStore, h: &Head) -> Option<String> {
+    if let Some(c) = meta_value(&h.meta, "content_sha") {
+        return Some(c.to_string());
+    }
+    meta_value(&h.meta, "brief_sha")?;
+    store.head(&h.key).ok().flatten().map(|f| content_sha(&f.body))
+}
+
+/// The waiting refused launches with the same brief as `prompt` by
+/// [`content_sha`], under any lane: each key with its lane.
+fn duplicates(store: &MemoryStore, all: &[Head], prompt: &str) -> Vec<(String, String)> {
+    let c = content_sha(prompt);
+    all.iter()
+        .filter(|h| !is_planned(h) && entry_content_sha(store, h).as_deref() == Some(c.as_str()))
+        .map(|h| (h.key.clone(), h.scope.clone()))
+        .collect()
+}
+
 /// The meta of a hook-queued launch amended to `title` and `body` (as
 /// [`crate::memory::title_and_body`] made them): its `brief_sha:` follows
 /// the brief alone, never a long first line kept above it, and its
@@ -101,7 +145,16 @@ pub(crate) fn amended_meta(meta: &str, title: &str, body: &str) -> Option<String
     let mut out: Vec<String> = meta
         .lines()
         .filter(|l| !l.starts_with("description:"))
-        .map(|l| if l.trim_start().starts_with("brief_sha:") { format!("brief_sha: {}", sha_of(brief)) } else { l.to_string() })
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("brief_sha:") {
+                format!("brief_sha: {}", sha_of(brief))
+            } else if t.starts_with("content_sha:") {
+                format!("content_sha: {}", content_sha(brief))
+            } else {
+                l.to_string()
+            }
+        })
         .collect();
     out.extend(head.map(|h| format!("description: {h}")));
     let mut m = out.join("\n");
@@ -138,7 +191,7 @@ fn titled(description: &str) -> (String, Option<&str>) {
 /// agent type, session, classification, and the whole description when
 /// the title cut it.
 fn launch_meta(l: &Launch<'_>) -> String {
-    let mut meta = format!("kind: {}\nbrief_sha: {}", l.kind.name(), sha_of(l.prompt));
+    let mut meta = format!("kind: {}\nbrief_sha: {}\ncontent_sha: {}", l.kind.name(), sha_of(l.prompt), content_sha(l.prompt));
     if !l.subagent_type.is_empty() {
         meta.push_str(&format!("\nsubagent_type: {}", l.subagent_type));
     }
@@ -155,20 +208,31 @@ fn launch_meta(l: &Launch<'_>) -> String {
     meta
 }
 
-/// Files a refused launch, unless the same launch (description and brief)
-/// is already waiting. Returns its key and whether it was filed now.
+/// Files a refused launch, unless the same launch (description and brief,
+/// the key its `Queue:` line names, or the same brief by [`content_sha`]
+/// under any lane, description or priority, with its declared kind and its
+/// uses) is already waiting. Both identity matches agree on kind: the kind
+/// the prompt's own `Kind:` line declares must be the same (the same
+/// brief has the same line), and a kind that only the agent type or
+/// isolation gave is not compared, so the same work relaunched under
+/// another agent type keeps its entry and its kind (#135); only a relaunch
+/// by its `Queue:` key re-kinds an entry. A re-file by content that
+/// declares a higher priority raises the waiting entry's. Returns its key
+/// and whether it was filed now. Its meta records the brief's
+/// [`content_sha`], which a later start under any lane matches.
 ///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
 pub fn add(store: &mut MemoryStore, l: &Launch<'_>) -> Result<(String, bool)> {
     let named = queue_line(l.prompt);
-    if let Some(h) = waiting(store)?.into_iter().find(|h| same(h, l.description, l.prompt) || named.as_deref() == Some(h.key.as_str())) {
+    let all = waiting(store)?;
+    if let Some(h) = all.iter().find(|h| same(h, l.description, l.prompt) || named.as_deref() == Some(h.key.as_str())) {
         // A hook-queued launch relaunched by its `Queue:` key as another
         // kind (a `Kind:` line added) is this launch now: its meta and brief
         // are rebuilt from it, under the same key and lane.
         let by_key = named.as_deref() == Some(h.key.as_str());
-        if by_key && meta_value(&h.meta, "brief_sha").is_some() && kind_of(&h) != Some(l.kind) {
+        if by_key && meta_value(&h.meta, "brief_sha").is_some() && kind_of(h) != Some(l.kind) {
             let d = Draft {
                 title: h.title.clone(),
                 meta: launch_meta(l),
@@ -183,7 +247,22 @@ pub fn add(store: &mut MemoryStore, l: &Launch<'_>) -> Result<(String, bool)> {
             w.revise(&h.key, None, &d)?;
             w.commit()?;
         }
-        return Ok((h.key, false));
+        return Ok((h.key.clone(), false));
+    }
+    // Rule 3: the same brief by content, filed under another lane,
+    // description or priority, is this launch already waiting. Its
+    // declared kind and what it uses must match too: one body under two
+    // `Uses:` lines (a template run for two worktrees) or two `Kind:` lines
+    // is two launches.
+    let uses = qmeta(l.class_meta).uses;
+    let declared = crate::orchestrate::brief_kind(l.prompt);
+    let declared_of = |h: &Head| store.head(&h.key).ok().flatten().map(|f| crate::orchestrate::brief_kind(&f.body));
+    let dup = duplicates(store, &all, l.prompt)
+        .into_iter()
+        .find_map(|(k, _)| all.iter().find(|h| h.key == k && qmeta(&h.meta).uses == uses && declared_of(h) == Some(declared)));
+    if let Some(h) = dup {
+        raise_priority(store, h, l.class_meta)?;
+        return Ok((h.key.clone(), false));
     }
     let lane = l.lane.filter(|x| !x.trim().is_empty()).unwrap_or(LANE);
     let meta = launch_meta(l);
@@ -203,6 +282,36 @@ pub fn add(store: &mut MemoryStore, l: &Launch<'_>) -> Result<(String, bool)> {
     w.create(&key, "journal", ENTRY, lane, &d, None)?;
     w.commit()?;
     Ok((key, true))
+}
+
+/// Raises waiting entry `h`'s priority to the one `class_meta` records
+/// (a re-file of its brief), when that ranks higher: its `priority:` line is
+/// replaced, and its body and filing time (its wait) are kept.
+fn raise_priority(store: &mut MemoryStore, h: &Head, class_meta: &str) -> Result<()> {
+    let Some((new, _)) = qmeta(class_meta).priority else { return Ok(()) };
+    let old = qmeta(&h.meta).priority.map_or(crate::lanes::Priority::Normal, |p| p.0);
+    // Urgent sorts first.
+    if new >= old {
+        return Ok(());
+    }
+    let Some(line) = class_meta.lines().find(|l| l.starts_with("priority:")) else { return Ok(()) };
+    let Some(full) = store.head(&h.key)? else { return Ok(()) };
+    let mut lines: Vec<&str> = h.meta.lines().filter(|l| !l.starts_with("priority:")).collect();
+    lines.push(line);
+    let d = Draft {
+        title: h.title.clone(),
+        meta: lines.join("\n"),
+        body: full.body,
+        reason: "a queued launch filed again at a higher priority".into(),
+        author: "hook".into(),
+        client: "atlas-hook".into(),
+        provenance: None,
+        time: Some(h.time.clone()),
+    };
+    let mut w = store.writer()?;
+    w.revise(&h.key, None, &d)?;
+    w.commit()?;
+    Ok(())
 }
 
 /// The key a brief's `Queue: KEY` line names, if any.
@@ -228,12 +337,16 @@ pub enum Started {
     },
     /// Its `Queue:` line names a key that is not waiting.
     NotWaiting(String),
+    /// Waiting launches with the same brief by [`content_sha`], under any
+    /// lane or header, were retired: each key with its lane.
+    Duplicate(Vec<(String, String)>),
 }
 
 /// Retires the waiting item a started launch is: the key its brief's
 /// `Queue: KEY` line names, else the waiting launch with the same
-/// description and brief, else the oldest waiting launch with the same
-/// lane and kind. `lane` is the launch's declared `Lane:` (an inferred or
+/// description and brief, else every waiting launch with the same brief by
+/// [`content_sha`] under any lane or header, else the oldest waiting launch
+/// with the same lane and kind. `lane` is the launch's declared `Lane:` (an inferred or
 /// missing lane matches nothing). A planned item leaves only by its
 /// `Queue:` key.
 ///
@@ -249,6 +362,13 @@ pub fn started(store: &mut MemoryStore, description: &str, prompt: &str, lane: O
         }
     } else if let Some(h) = all.iter().find(|h| same(h, description, prompt)) {
         (h.key.clone(), Started::Retired(h.key.clone()))
+    } else if let dups @ [_, ..] = &duplicates(store, &all, prompt)[..] {
+        let mut w = store.writer()?;
+        for (k, _) in dups {
+            w.retire(k, "started (the same brief under another lane or header)")?;
+        }
+        w.commit()?;
+        return Ok(Started::Duplicate(dups.to_vec()));
     } else {
         // Oldest first, as `waiting` lists them.
         let mut matches = all.iter().filter(|h| !is_planned(h) && lane.is_some_and(|l| crate::lanes::same_lane(l, &h.scope)) && queued_kind(store, h) == Some(kind));
@@ -287,6 +407,9 @@ pub struct QMeta {
     pub after: Vec<String>,
     /// `order:`.
     pub order: Option<crate::lanes::Order>,
+    /// `repo:` and `branch:` (both, or neither), as the brief declared
+    /// them: a writer waits while its branch is held.
+    pub repo: Option<(String, String)>,
 }
 
 /// Splits on commas outside parentheses.
@@ -338,13 +461,15 @@ pub fn qmeta(meta: &str) -> QMeta {
         _ => None,
     });
     m.order = meta_value(meta, "order").and_then(|v| first(v).parse().ok());
+    let word = |k: &str| meta_value(meta, k).and_then(|v| v.split_whitespace().next()).map(str::to_string);
+    m.repo = word("repo").map(|r| crate::lanes::norm_repo(&r)).zip(word("branch"));
     m.read_only = meta_value(meta, "read_only").is_some();
     if let Some(v) = meta_value(meta, "uses") {
         let mut uses = Vec::new();
         for piece in split_top(v) {
             // The words before a `(declared)` or `(inferred ...)` note, read
             // as a `Uses:` line reads them (`sqlport 15126` is one).
-            let (names, read_only) = crate::lanes::parse_uses(piece.split('(').next().unwrap_or(""));
+            let (names, read_only) = crate::lanes::parse_uses_words(piece.split('(').next().unwrap_or(""));
             m.read_only |= read_only;
             uses.extend(names.into_iter().map(|n| (n, !piece.contains("(inferred"))));
         }
@@ -407,7 +532,9 @@ impl Marks {
         Ok(m)
     }
 
-    fn is_met(&self, item: &str, text: &str) -> bool {
+    /// Whether `item`'s condition `text` is met: a mark with the same text,
+    /// or a `*` mark on the item.
+    pub fn is_met(&self, item: &str, text: &str) -> bool {
         self.met.iter().any(|(k, c)| k == item && (c == text || c == "*"))
     }
 }
@@ -561,6 +688,45 @@ fn queued_item(store: &MemoryStore, key: &str) -> Option<Head> {
     store.head(key).ok().flatten().filter(|h| h.kind == "journal" && h.sub == ENTRY)
 }
 
+/// The lane's items that started and were not yet marked done (retired as
+/// started, not superseded): `done` and `met` act on them too.
+fn started_on_lane(store: &MemoryStore, lane: &str) -> Result<Vec<Head>> {
+    let on = store.lane_entries_no_body(ENTRY, lane)?;
+    if !on.iter().any(|h| h.status == "retired") {
+        return Ok(Vec::new());
+    }
+    let done = Marks::read(store)?.done;
+    let mut out = Vec::new();
+    for h in on {
+        if h.status == "retired" && h.superseded_by.is_none() && !done.contains(&h.key) && store.retired_reason(h.rid)?.is_some_and(|r| r.starts_with("started")) {
+            out.push(h);
+        }
+    }
+    Ok(out)
+}
+
+/// A KEY that is no queue key, read as a bare lane key (#182): the one
+/// item of `items` on that lane (any case); `state` names what they are
+/// (`waiting`). Several are listed with their
+/// full keys; none says so, with the keys that contain it as suggestions.
+fn by_lane(items: &[Head], key: &str, what: &str, state: &str) -> std::result::Result<Head, String> {
+    let on: Vec<&Head> = items.iter().filter(|h| h.scope.eq_ignore_ascii_case(key)).collect();
+    match on[..] {
+        [h] => Ok(h.clone()),
+        [] => {
+            let k = key.to_ascii_lowercase();
+            let near: Vec<&str> = items.iter().map(|h| h.key.as_str()).filter(|x| !k.is_empty() && x.to_ascii_lowercase().contains(&k)).take(3).collect();
+            let hint = if near.is_empty() { " (`atlas queue` lists them with their keys)".to_string() } else { format!("; did you mean {}?", near.join(" or ")) };
+            Err(format!("{key} is not {what}, and no queued item keyed {key} is {state} on that lane{hint}"))
+        }
+        _ => Err(format!(
+            "lane {key} has {} {state} items; give the full key: {}",
+            on.len(),
+            on.iter().map(|h| format!("{} ({})", h.key, h.title)).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 /// The kinds a queued item may have: the agent kinds, and `orchestrator`.
 fn known_kind(k: &str) -> bool {
     Kind::parse(k).is_some() || k == "orchestrator"
@@ -627,23 +793,34 @@ pub fn planned_meta(p: &Planned) -> String {
 
 /// Checks a planned item before it is filed: a known kind, and every
 /// `after` key naming a queued item (else it would wait forever). A new
-/// item has no dependents yet, so it cannot close a cycle.
+/// item has no dependents yet, so it cannot close a cycle. A bare
+/// `review pr#N` is refused unless `served` (the repositories atlas serves,
+/// [`crate::pr_events::served`]) holds exactly one ([`crate::pr_events::check_wait`]);
+/// an accepted one is bound to that repository, which `p` keeps in a
+/// `pr_repo:` meta line (Q9, [`crate::pr_events::filed_repo`]). A `pr_repo:`
+/// line the author wrote is dropped: atlas writes it.
 /// The keys are read before the writer opens, so a key dropped in between
 /// is not caught here; `next` and `list` then show it as dropped.
 ///
 /// # Errors
 ///
 /// A message naming what is wrong.
-pub fn check_planned(store: &MemoryStore, p: &Planned) -> std::result::Result<(), String> {
+pub fn check_planned(store: &MemoryStore, p: &mut Planned, served: &[String]) -> std::result::Result<(), String> {
     if !known_kind(&p.kind) {
         return Err(format!("unknown kind {:?}: builder, reviewer, research, none or orchestrator (a tool such as blender is a resource: uses)", p.kind));
     }
     for a in &p.after {
+        crate::pr_events::check_wait(a, served)?;
         if let Dep::Key(k) = dep(a) {
             if queued_item(store, &k).is_none() {
                 return Err(format!("after {k}: no such queued item (`atlas queue` lists them); free text that is not a key waits for `atlas queue met`"));
             }
         }
+    }
+    let key = crate::pr_events::REPO_META;
+    p.extra.retain(|l| l.split_once(':').is_none_or(|(k, _)| !k.trim().eq_ignore_ascii_case(key)));
+    if let Some(r) = crate::pr_events::filed_repo(&p.after, served) {
+        p.extra.push(format!("{key}: {r}"));
     }
     Ok(())
 }
@@ -763,6 +940,8 @@ pub fn items(store: &MemoryStore, now: &str) -> Result<(Vec<Head>, Vec<crate::la
                     priority_src: Source::Default,
                     uses: u.iter().map(|(r, d)| (r.clone(), if *d { Source::Declared } else { Source::Inferred("filed".into()) })).collect(),
                     read_only: m.read_only,
+                    repo: m.repo.as_ref().map(|(r, _)| r.clone()),
+                    branch: m.repo.as_ref().map(|(_, b)| b.clone()),
                 },
                 None => crate::lanes::classify(legacy.get(&h.rid).map_or("", String::as_str), &[]),
             };
@@ -792,14 +971,27 @@ pub fn items(store: &MemoryStore, now: &str) -> Result<(Vec<Head>, Vec<crate::la
 /// The running agents of a session as holders: each one's brief
 /// classified, named by its description and id. `known` serves lane
 /// inference, which only warns; scheduling reads declarations alone, so
-/// a caller that only proposes passes none.
-pub fn holders(running: &[crate::orchestrate::Running], dir: &std::path::Path, known: &[String], bare_gpu_words: bool) -> Vec<crate::lanes::Holder> {
+/// a caller that only proposes passes none. `sub_lane` gives the sub-lane
+/// a launch runs as, by its tool use id (the hook's record; its brief
+/// still names the parent lane), so the next launch does not take it again.
+pub fn holders(
+    running: &[crate::orchestrate::Running],
+    dir: &std::path::Path,
+    known: &[String],
+    policy: &crate::lanes::Policy,
+    sub_lane: &dyn Fn(&str) -> Option<String>,
+) -> Vec<crate::lanes::Holder> {
     running
         .iter()
         .map(|r| {
             let brief = crate::orchestrate::brief_of(&dir.join(format!("agent-{}.jsonl", r.id))).unwrap_or_default();
             let name = if r.description.is_empty() { r.id.clone() } else { format!("{} ({})", r.description, r.id) };
-            crate::lanes::Holder { name, kind: r.kind, class: crate::lanes::classify_in(&brief, known, bare_gpu_words) }
+            let mut class = crate::lanes::classify_in(&brief, known, policy);
+            if let Some(sub) = sub_lane(&r.tool_use_id) {
+                class.lane = Some(sub);
+                class.lane_src = crate::lanes::Source::Declared;
+            }
+            crate::lanes::Holder { name, kind: r.kind, class }
         })
         .collect()
 }
@@ -853,7 +1045,7 @@ pub fn proposal_line(items: &[crate::lanes::Item], heads: &[Head], p: &crate::la
 }
 
 /// How long ago a record time was, for the list (`12 min`, `3 h`, `2 d`).
-fn age(time: &str, now: &str) -> String {
+pub(crate) fn age(time: &str, now: &str) -> String {
     match (epoch_secs(time), epoch_secs(now)) {
         (Some(a), Some(b)) if b >= a => {
             let d = b - a;
@@ -870,7 +1062,7 @@ fn age(time: &str, now: &str) -> String {
 }
 
 /// The usage of `atlas queue`.
-pub const USAGE: &str = "usage: atlas queue [list | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next [--transcript PATH] | add --description TEXT [--kind KIND] FILE|- | plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT]]";
+pub const USAGE: &str = "usage: atlas queue [list [--lane LANE] | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next [--transcript PATH] | release AGENT [--force] [--transcript PATH] | add --description TEXT [--kind KIND] FILE|- | plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT]]";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -900,20 +1092,47 @@ pub fn known_lanes(store: &MemoryStore) -> Vec<String> {
 /// # Errors
 ///
 /// A message for a bad argument or an unreadable store.
-pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::OrchSettings) -> std::result::Result<ExitCode, String> {
+pub fn cli(
+    args: &[String],
+    store: &mut MemoryStore,
+    orch: &crate::orchestrate::OrchSettings,
+    served: &[String],
+) -> std::result::Result<ExitCode, String> {
     let s = |e: crate::Error| e.to_string();
-    let word = args.first().map_or("list", String::as_str);
+    let word = args.first().map(String::as_str).filter(|w| !w.starts_with("--lane")).unwrap_or("list");
+    // `show`, `drop`, `done` and `met` take a KEY; `--help` there is usage.
+    if matches!(word, "show" | "drop" | "done" | "met") && args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
     let find = |store: &MemoryStore, key: Option<&String>| -> std::result::Result<Head, String> {
         let key = key.ok_or_else(|| format!("name a queued launch\n{USAGE}"))?;
-        waiting(store).map_err(s)?.into_iter().find(|h| &h.key == key).ok_or_else(|| format!("{key} is not a waiting launch (`atlas queue` lists them)"))
+        let all = waiting(store).map_err(s)?;
+        match all.iter().find(|h| &h.key == key) {
+            Some(h) => Ok(h.clone()),
+            None => by_lane(&all, key, "a waiting launch", "waiting"),
+        }
     };
     let find_any = |store: &MemoryStore, key: Option<&String>| -> std::result::Result<Head, String> {
         let key = key.ok_or_else(|| format!("name a queued item\n{USAGE}"))?;
-        queued_item(store, key).ok_or_else(|| format!("{key} is not a queued item, waiting or started"))
+        match queued_item(store, key) {
+            Some(h) => Ok(h),
+            None => {
+                // The lane's started items count too: `done` and `met` act on them.
+                let mut open = waiting(store).map_err(s)?;
+                open.extend(started_on_lane(store, key).map_err(s)?);
+                by_lane(&open, key, "a queued item, waiting or started", "open (waiting or started)")
+            }
+        }
     };
     match word {
         "list" => {
-            let all = waiting(store).map_err(s)?;
+            // `--lane NAME` lists that lane and its sub-lanes (`NAME/2`, ...).
+            let lane = flag(args, "--lane");
+            let mut all = waiting(store).map_err(s)?;
+            if let Some(l) = &lane {
+                all.retain(|h| crate::lanes::in_lane(&h.scope, l));
+            }
             if all.is_empty() {
                 println!("no launches are waiting");
                 return Ok(ExitCode::SUCCESS);
@@ -985,7 +1204,7 @@ pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::
                     u.join(", ")
                 );
             }
-            println!("`atlas queue show KEY` prints one; `atlas queue next` proposes what starts now; a launch whose brief has `Queue: KEY` takes that item off the queue; `atlas queue drop KEY` removes one, `atlas queue done KEY` marks one done, `atlas queue met KEY [CONDITION]` marks a condition met.");
+            println!("`atlas queue show KEY` prints one; `atlas queue next` proposes what starts now; a launch whose brief has `Queue: KEY` takes that item off the queue; `atlas queue drop KEY` removes one, `atlas queue done KEY` marks one done, `atlas queue met KEY [CONDITION]` marks a condition met; `atlas queue release AGENT` frees the lane and slots of an agent that died without its finish recorded. KEY is an item's full key, or its lane when one item is open there (waiting, or started and not yet done; `show` and `drop` take waiting items only).");
             Ok(ExitCode::SUCCESS)
         }
         "show" => {
@@ -1011,8 +1230,10 @@ pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::
             let mut running = Vec::new();
             if let Some(t) = flag(args, "--transcript") {
                 let dir = crate::orchestrate::subagents_dir(&t);
-                let r = crate::orchestrate::Agents::new(None).running(orch, &dir, std::time::SystemTime::now()).map_err(|e| format!("{}: {e}", dir.display()))?;
-                running = holders(&r, &dir, &[], orch.lanes.bare_gpu_words);
+                let r = crate::orchestrate::Agents::new(None)
+                    .running(orch, &dir, std::time::SystemTime::now())
+                    .map_err(|e| format!("{}: {e}", dir.display()))?;
+                running = holders(&r, &dir, &[], &orch.lanes, &|_| None);
             } else {
                 println!("(no --transcript: running agents are not counted)");
             }
@@ -1036,7 +1257,7 @@ pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::
             };
             let kind = if flag(args, "--kind").is_some() { kind } else { crate::orchestrate::brief_kind_or(orch, &brief) };
             let known = known_lanes(store);
-            let class = crate::lanes::classify_in(&brief, &known, orch.lanes.bare_gpu_words);
+            let class = crate::lanes::classify_in(&brief, &known, &orch.lanes);
             let meta = class.meta();
             let launch = Launch { kind, lane: class.lane.as_deref(), description: &description, subagent_type: "", prompt: &brief, session: "", class_meta: &meta };
             let (key, new) = add(store, &launch).map_err(s)?;
@@ -1053,8 +1274,8 @@ pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::
             };
             let list = |n: &str| flag(args, n).map(|v| split_top(&v)).unwrap_or_default();
             let order = flag(args, "--order").map(|o| o.parse::<crate::lanes::Order>().map_err(|()| format!("--order needs a number such as 9 or 9.5, not {o:?}"))).transpose()?;
-            let p = Planned { lane, kind, priority, uses: list("--uses"), after: list("--after"), order, title: need("--title")?, scope: flag(args, "--scope").unwrap_or_default(), extra: Vec::new() };
-            check_planned(store, &p)?;
+            let mut p = Planned { lane, kind, priority, uses: list("--uses"), after: list("--after"), order, title: need("--title")?, scope: flag(args, "--scope").unwrap_or_default(), extra: Vec::new() };
+            check_planned(store, &mut p, served)?;
             let key = add_planned(store, &p).map_err(s)?;
             println!("planned {key} ({}, {}{})", p.kind, p.priority.map_or("normal", crate::lanes::Priority::name), p.order.as_ref().map(|o| format!(", order {o}")).unwrap_or_default());
             Ok(ExitCode::SUCCESS)
@@ -1077,6 +1298,45 @@ pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::
             println!("{} after {cond}: met ({key})", h.key);
             Ok(ExitCode::SUCCESS)
         }
+        "release" => {
+            // `release AGENT [--force] [--transcript PATH]` (#204).
+            let (mut id, mut force, mut transcript) = (None, false, None);
+            let mut it = args.iter().skip(1);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-h" | "--help" => {
+                        println!("{USAGE}");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    "--force" => force = true,
+                    "--transcript" => transcript = Some(it.next().ok_or_else(|| format!("--transcript needs a path\n{USAGE}"))?.clone()),
+                    f if f.starts_with('-') => return Err(format!("unknown release flag {f:?}\n{USAGE}")),
+                    a if id.is_none() => id = Some(a.to_string()),
+                    a => return Err(format!("release takes one agent id, not also {a:?}\n{USAGE}")),
+                }
+            }
+            let id = id.ok_or_else(|| format!("name an agent id (agent-<id> in the session's subagents folder)\n{USAGE}"))?;
+            let bare = id.strip_prefix("agent-").unwrap_or(&id);
+            let dir = match transcript {
+                Some(t) => {
+                    let dir = crate::orchestrate::subagents_dir(&t);
+                    if !dir.join(format!("agent-{bare}.meta.json")).is_file() {
+                        return Err(format!(
+                            "no agent {bare} in {}: --transcript takes the session transcript (<session>.jsonl, beside the subagents folder that holds agent-{bare}.meta.json), not an agent's own",
+                            dir.display()
+                        ));
+                    }
+                    dir
+                }
+                None => {
+                    let projects = crate::chain::projects_dir().ok_or("no home folder is known (set HOME, USERPROFILE or CLAUDE_CONFIG_DIR)")?;
+                    crate::orchestrate::find_agent_dir(&projects, bare)
+                        .ok_or_else(|| format!("no agent {bare} under {}; name its session with --transcript PATH", projects.display()))?
+                }
+            };
+            println!("{}", crate::orchestrate::release(&dir, bare, force, std::time::SystemTime::now())?);
+            Ok(ExitCode::SUCCESS)
+        }
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(ExitCode::SUCCESS)
@@ -1088,6 +1348,21 @@ pub fn cli(args: &[String], store: &mut MemoryStore, orch: &crate::orchestrate::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_content_hash_ignores_the_header_lines_and_whitespace() {
+        let a = "Kind: research\nLane: ATLAS-TOOLING\nPriority: normal\nUses: none (read-only)\n\n# Measure it\n\nRead the logs; build nothing.";
+        let b = "- **Kind:** builder\nLane: ATLAS-HOOK-VALUE\nUses: compile\n\n#  Measure it\nRead the logs;\n   build nothing.\n";
+        assert_eq!(content_sha(a), content_sha(b));
+        assert_eq!(content_sha(a), content_sha("# Measure it Read the logs; build nothing."));
+        // The body is the content: a changed word is another brief.
+        assert_ne!(content_sha(a), content_sha(&a.replace("nothing", "everything")));
+        // Header lines count only where they are read (the first 40 lines).
+        let late = format!("{}\nLane: X", "body line\n".repeat(45));
+        assert_ne!(content_sha(&late), content_sha(&format!("{}\nLane: Y", "body line\n".repeat(45))));
+        // A `Queue:` line is not a header line.
+        assert_ne!(content_sha("Queue: journal:x:0001\nDo it."), content_sha("Do it."));
+    }
 
     #[test]
     fn ages_read_minutes_hours_and_days() {

@@ -264,7 +264,7 @@ fn the_stored_parts_reassemble_the_output_byte_for_byte() {
     let big_id = d.parts.last().unwrap();
     assert!(d.digest.contains(&format!("M big.rs +400 -0 {big_id} 1 hunk @ 5-405")), "{}", d.digest);
     let s = h.slice(big_id, &Sel::Lines(5, 405)).unwrap();
-    assert!(s.starts_with("@@ -0,0 +1,400 @@\n") && s.ends_with(&format!("--lines {}-405\n", s.lines().count() + 4)), "{s}");
+    assert!(s.starts_with("@@ -0,0 +1,400 @@\n") && s.ends_with(&format!("lines={}-405\n", s.lines().count() + 4)), "{s}");
 }
 
 // ---- diff-native reads ----------------------------------------------------
@@ -286,25 +286,25 @@ fn over_cap() -> String {
     t
 }
 
-/// Every page of a file read: `atlas slice h:F`, then each `next page`
-/// (`--page K`), without the continuation lines.
+/// Every page of a file read: `recall h:F`, then each `next page`
+/// (`page=K`), without the continuation lines.
 fn read_file(h: &Handles, id: &str) -> Vec<String> {
     let mut pages = Vec::new();
     let mut s = h.slice(id, &Sel::Whole).unwrap();
     loop {
-        let (body, next) = match s.rfind("next page: atlas slice ") {
+        let (body, next) = match s.rfind("next page: recall ") {
             Some(i) if s[i..].lines().count() == 1 => (s[..i].to_string(), Some(s[i..].to_string())),
             _ => (s.clone(), None),
         };
         pages.push(body);
         let Some(next) = next else { return pages };
-        let k = next.trim_end().strip_prefix(&format!("next page: atlas slice {id} --page ")).unwrap_or_else(|| panic!("{next}"));
+        let k = next.trim_end().strip_prefix(&format!("next page: recall {id} page=")).unwrap_or_else(|| panic!("{next}"));
         s = h.slice(id, &Sel::Page(k.parse().unwrap())).unwrap();
     }
 }
 
 /// A default read put back into the stored bytes it stands for, without
-/// the header lines the row reproduces: each `= N hidden --lines A-B`
+/// the header lines the row reproduces: each `= N hidden lines=A-B`
 /// marker becomes the N context lines of its one slice, and each change
 /// block with a word diff (`~`) its `-` lines then
 /// its `+` lines.
@@ -320,7 +320,7 @@ fn decode_read(h: &Handles, id: &str, read: &str) -> String {
             continue;
         }
         if let Some(m) = l.strip_prefix("= ").and_then(|m| m.strip_suffix('\n')) {
-            let (n, range) = m.split_once(" hidden --lines ").unwrap_or_else(|| panic!("a marker: {l:?}"));
+            let (n, range) = m.split_once(" hidden lines=").unwrap_or_else(|| panic!("a marker: {l:?}"));
             let n: usize = n.parse().unwrap();
             let (a, b) = range.split_once('-').unwrap();
             let hidden = h.slice(id, &Sel::Lines(a.parse().unwrap(), b.parse().unwrap())).unwrap();
@@ -437,16 +437,16 @@ fn status_row(l: &str) -> bool {
     l.chars().nth(1) == Some(' ') && l.chars().next().is_some_and(|c| "MADRC".contains(c))
 }
 
-/// A part read as stored: `--lines 1-N` and each `next page`.
+/// A part read as stored: `lines=1-N` and each `next page`.
 fn read_raw(h: &Handles, id: &str) -> String {
     let mut out = String::new();
     let mut sel = Sel::Lines(1, usize::MAX);
     loop {
         let s = h.slice(id, &sel).unwrap();
-        match s.rfind("next page: atlas slice ") {
+        match s.rfind("next page: recall ") {
             Some(i) if s[i..].lines().count() == 1 => {
                 out.push_str(&s[..i]);
-                let r = s[i..].trim_end().strip_prefix(&format!("next page: atlas slice {id} --lines ")).unwrap_or_else(|| panic!("{s}"));
+                let r = s[i..].trim_end().strip_prefix(&format!("next page: recall {id} lines=")).unwrap_or_else(|| panic!("{s}"));
                 let (a, b) = r.split_once('-').unwrap();
                 sel = Sel::Lines(a.parse().unwrap(), b.parse().unwrap());
             }
@@ -464,7 +464,7 @@ type Kinds = std::collections::BTreeMap<&'static str, usize>;
 /// A round's stored diff rebuilt from what its digest names, in part order
 /// (the manifest gives the order, never the bytes):
 /// * a shown file row: the header lines the row stands for, then every page
-///   of its default read (`next page` lines dropped, `~` decoded);
+///   of its default read (`next page` lines dropped, `~` and markers decoded);
 /// * a row with seen hunks: the same from its `whole file h:X` handle;
 /// * a lock, generated or deleted row: the same from its handle;
 /// * an unchanged file: its listed handle's default read, with a plain
@@ -475,7 +475,8 @@ type Kinds = std::collections::BTreeMap<&'static str, usize>;
 /// * text between files with no row, and files past the row limit (only when
 ///   the digest says more files were left out): the whole output's handle.
 ///
-/// No default read may hold a context marker (`= N hidden`).
+/// A context marker (`= N hidden lines=A-B`) in a default read is put back
+/// from its one slice, so every hidden line is checked against the bytes.
 fn rebuild_round(h: &Handles, key: &str, d: &pr_digest::Digested) -> (String, Kinds) {
     let g = &d.digest;
     let whole = g.split_once(' ').unwrap().0;
@@ -485,7 +486,7 @@ fn rebuild_round(h: &Handles, key: &str, d: &pr_digest::Digested) -> (String, Ki
     let whole_parts = pr_digest::split_diff(&whole_text);
     let entries = pr_digest::manifest(h.conn(), key, d.round).unwrap();
     assert_eq!(whole_parts.len(), entries.len());
-    let more = g.lines().any(|l| l.contains(" more files: atlas slice ") || (l.starts_with("unchanged: ") && l.contains(" more")));
+    let more = g.lines().any(|l| l.contains(" more files: recall ") || (l.starts_with("unchanged: ") && l.contains(" more")));
     let mut trees: Vec<(String, String)> = Vec::new();
     for l in g.lines().filter(|l| l.starts_with("vendored ")) {
         let id = first_handle(l).unwrap();
@@ -498,13 +499,7 @@ fn rebuild_round(h: &Handles, key: &str, d: &pr_digest::Digested) -> (String, Ki
             trees.push((p.file.unwrap().path, t[p.start..p.end].to_string()));
         }
     }
-    let read = |row: &str, id: &str| {
-        let (rebuilt, pages) = rebuild_file(h, row, id);
-        for p in &pages {
-            assert!(!p.lines().any(|l| l.starts_with("= ")), "a context marker in the default read of {id}: {p}");
-        }
-        rebuilt
-    };
+    let read = |row: &str, id: &str| rebuild_file(h, row, id).0;
     let mut kinds = Kinds::new();
     let mut out = String::new();
     for (i, e) in entries.iter().enumerate() {
@@ -668,9 +663,9 @@ fn similarity_is_difflib_ratio_over_word_tokens() {
 }
 
 #[test]
-fn the_shipped_read_shows_word_diffs_and_hides_no_context() {
+fn the_shipped_read_shows_word_diffs_and_collapses_far_context() {
     assert_eq!(pr_digest::levers(), pr_digest::SHIPPED, "the suite runs the shipped levers");
-    assert_eq!(pr_digest::SHIPPED, pr_digest::Levers { wd: true, c1: false, del: true });
+    assert_eq!(pr_digest::SHIPPED, pr_digest::Levers { wd: true, c1: true, del: true });
     let t = Temp::new("prd-shipped");
     let mut h = store(&t);
     let text = edits();
@@ -680,23 +675,35 @@ fn the_shipped_read_shows_word_diffs_and_hides_no_context() {
     let at: Vec<&str> = text.split_inclusive('\n').collect();
     let want = [
         at[1],
-        &at[4..8].concat(),
+        at[4],
+        "= 2 hidden lines=6-7\n",
+        at[7],
         "~    let value = compute(alpha, [-beta-]{+gamma+});\n",
         "-    let other = thing();\n",
-        "+    totally different words here\n",
         "-    let gone = 0;\n",
-        &at[13..16].concat(),
+        "+    totally different words here\n",
+        at[13],
+        "= 1 hidden lines=15-15\n",
+        at[15],
         "~    s = \"\\~ \\\\\\\\ \\[- \\-] \\{+ \\+} \\[-[-x-]{+y+}\\-]\" + a;\n",
-        &at[18..25].concat(),
+        at[18],
+        "= 2 hidden lines=20-21\n",
+        &at[21..25].concat(),
     ]
     .concat();
     assert_eq!(read, want, "{read}");
-    assert!(!read.lines().any(|l| l.starts_with("= ")), "no context marker");
+    // Every hidden line decodes back through its marker's lines=A-B.
     assert_eq!(decode_read(&h, id, &read), [at[1], &at[4..25].concat()].concat());
     let shown = pr_digest::shown_lines(&h.text(id).unwrap().1, pr_digest::levers(), HandleCfg::default().slice_bytes).unwrap();
-    assert!(shown.iter().skip(1).all(|&s| s), "every line is in the read");
+    let hidden: Vec<usize> = (1..shown.len()).filter(|&k| !shown[k]).collect();
+    assert_eq!(hidden, vec![6, 7, 15, 20, 21], "far context is behind a marker");
     let footer = d.digest.lines().last().unwrap();
-    assert!(footer.contains("; in a file read ~ is an edited line as [-old-]{+new+}; whole output h:") && !footer.contains('='), "{footer}");
+    assert!(
+        footer.contains(
+            "; in a file read ~ is an edited line as [-old-]{+new+}, and = N hidden lines=A-B is context left out; whole output h:"
+        ),
+        "{footer}"
+    );
 }
 
 /// One file part with one hunk of `body` (which may end without a newline).
@@ -800,16 +807,193 @@ fn a_pair_without_a_final_newline_is_not_paired() {
 /// are not a change block: no word diff, every line as stored.
 #[test]
 fn only_a_closed_change_block_pairs() {
-    for body in ["-a b c d\n+a b c e\n-x y z w\n+x y z v\n", " c\n+p q r s\n-t u v w\n+t u v x\n"] {
+    for body in [
+        "-alpha beta gamma d\n+alpha beta gamma e\n-xray yankee zulu w\n+xray yankee zulu v\n",
+        " c\n+p q r s\n-tango uniform victor w\n+tango uniform victor x\n",
+    ] {
         let (text, f) = one_hunk("i.rs", body);
         assert_eq!(shipped_read(&text, &f, usize::MAX), hunk_as_stored(&text), "{body}");
     }
     // The same pairs alone do pair.
-    let (text, f) = one_hunk("i.rs", "-t u v w\n+t u v x\n");
-    assert_eq!(shipped_read(&text, &f, usize::MAX), "@@ -1,1 +1,1 @@\n~t u v [-w-]{+x+}\n");
+    let (text, f) = one_hunk("i.rs", "-tango uniform victor w\n+tango uniform victor x\n");
+    assert_eq!(shipped_read(&text, &f, usize::MAX), "@@ -1,1 +1,1 @@\n~tango uniform victor [-w-]{+x+}\n");
 }
 
-/// `--lines` over the cap pages between hunks: every `next page` starts at
+/// A shipped read's change lines put back as stored: each run of change
+/// lines with a word diff is its old sides in order, then its new sides.
+fn decode_blocks(read: &str) -> String {
+    let lines: Vec<&str> = read.split_inclusive('\n').collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i;
+        while j < lines.len() && lines[j].starts_with(['-', '+', '~']) {
+            j += 1;
+        }
+        if j == i {
+            out.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+        let (mut old, mut new) = (String::new(), String::new());
+        for x in &lines[i..j] {
+            match pr_digest::wd_decode(x) {
+                Some((o, n)) => {
+                    old.push_str(&o);
+                    new.push_str(&n);
+                }
+                None if x.starts_with('-') => old.push_str(x),
+                None => new.push_str(x),
+            }
+        }
+        out.push_str(&old);
+        out.push_str(&new);
+        i = j;
+    }
+    out
+}
+
+/// A line added or removed inside a change block does not unpair the lines
+/// after it: pairs are aligned in order, not taken by position. By position
+/// the first `-` line met the inserted `+` line and every later pair was one
+/// line off.
+#[test]
+fn a_change_block_pairs_its_lines_in_order_not_by_position() {
+    let body = "-let alpha = compute(one, two);\n-let beta = compute(three, four);\n+let inserted_line_here = 0;\n+let alpha = compute(one, 2);\n+let beta = compute(three, 4);\n";
+    let (text, f) = one_hunk("a.rs", body);
+    let read = shipped_read(&text, &f, usize::MAX);
+    assert_eq!(read, "@@ -1,2 +1,3 @@\n+let inserted_line_here = 0;\n~let alpha = compute(one, [-two-]{+2+});\n~let beta = compute(three, [-four-]{+4+});\n");
+    assert_eq!(decode_blocks(&read), hunk_as_stored(&text));
+    // A removed line in the middle: the unpaired `-` line comes before the
+    // pair that follows it.
+    let body = "-let alpha = compute(one, two);\n-let removed_line_here = 0;\n-let beta = compute(three, four);\n+let alpha = compute(one, 2);\n+let beta = compute(three, 4);\n ctx\n";
+    let (text, f) = one_hunk("a.rs", body);
+    let read = shipped_read(&text, &f, usize::MAX);
+    assert_eq!(read, "@@ -1,4 +1,3 @@\n~let alpha = compute(one, [-two-]{+2+});\n-let removed_line_here = 0;\n~let beta = compute(three, [-four-]{+4+});\n ctx\n");
+    assert_eq!(decode_blocks(&read), hunk_as_stored(&text));
+}
+
+/// A pair at the similarity whose word diff is not shorter than its two
+/// stored lines is shown as stored; one byte shorter, it is a word diff.
+#[test]
+fn a_word_diff_is_shown_only_when_it_is_shorter() {
+    assert!(pr_digest::similarity("a b", "a c") >= 0.6);
+    let (text, f) = one_hunk("s.rs", "-a b\n+a c\n");
+    assert_eq!(shipped_read(&text, &f, usize::MAX), hunk_as_stored(&text), "14 bytes for 10 stored");
+    // `~abcde [-b-]{+c+}\n` is 18 bytes for 18 stored: not shorter.
+    let (text, f) = one_hunk("s.rs", "-abcde b\n+abcde c\n");
+    assert_eq!(shipped_read(&text, &f, usize::MAX), hunk_as_stored(&text), "equal is not shorter");
+    let (text, f) = one_hunk("s.rs", "-abcdef b\n+abcdef c\n");
+    assert_eq!(shipped_read(&text, &f, usize::MAX), "@@ -1,1 +1,1 @@\n~abcdef [-b-]{+c+}\n", "19 bytes for 20 stored");
+}
+
+/// Common text shorter than the marks around it joins the two changes it
+/// sits between; longer common text stays common. Either way the line
+/// decodes to its pair.
+#[test]
+fn short_common_text_between_changes_joins_them() {
+    for (old, new, want) in [
+        ("call(a, b)", "call(x, y)", "~call([-a, b-]{+x, y+})\n"),
+        // 7 bytes between two full changes join (8 + 14 < 16 + 7); 8 do not.
+        ("f(a, 123, b)", "f(x, 123, y)", "~f([-a, 123, b-]{+x, 123, y+})\n"),
+        ("f(a, 1234, b)", "f(x, 1234, y)", "~f([-a-]{+x+}, 1234, [-b-]{+y+})\n"),
+        // An insertion and a later change have three marked sides: 3 bytes
+        // join (8 + 6 < 12 + 3), 4 do not.
+        ("run a de", "run NEW a DE", "~run[- a de-]{+ NEW a DE+}\n"),
+        ("run ab de", "run NEW ab DE", "~run{+ NEW+} ab [-de-]{+DE+}\n"),
+        // The bytes counted are the escaped ones: seven `~` are 14 bytes
+        // written, twice when joined (8 + 32 against 20 + 14).
+        ("a~~~~~~~b", "x~~~~~~~y", "~[-a-]{+x+}\\~\\~\\~\\~\\~\\~\\~[-b-]{+y+}\n"),
+        // One `\` is 2 bytes written and still joins (8 + 8 < 20 + 2).
+        ("call(a\\b)", "call(x\\y)", "~call([-a\\\\b-]{+x\\\\y+})\n"),
+        // A `[` joined to common text that starts with `-` is escaped: that
+        // byte makes the join no shorter (8 + 10 + 9 against 20 + 7).
+        ("f([- 1, 2 x)", "f({- 1, 2 y)", "~f([-[-]{+{+}- 1, 2 [-x-]{+y+})\n"),
+    ] {
+        let w = pr_digest::wd_line(old, new).unwrap_or_else(|| panic!("{old:?} pairs"));
+        assert_eq!(w, want, "{old:?} -> {new:?}");
+        assert_eq!(pr_digest::wd_decode(&w), Some((format!("-{old}\n"), format!("+{new}\n"))), "{w:?}");
+    }
+}
+
+/// Among the ordered pairings the one that saves the most bytes is shown:
+/// here the second `-` line with the first `+` line, which leaves the other
+/// two lines unpaired (pairing them too would cross).
+#[test]
+fn an_aligned_block_shows_the_pairing_that_saves_the_most() {
+    let body = "-alpha one two three four five;\n-let beta_long_name_here = compute(seven, eight, nine, ten);\n+let beta_long_name_here = compute(seven, eight, nine, 10);\n+alpha one two three four 5;\n";
+    let (text, f) = one_hunk("o.rs", body);
+    let read = shipped_read(&text, &f, usize::MAX);
+    let want = "@@ -1,2 +1,2 @@\n-alpha one two three four five;\n~let beta_long_name_here = compute(seven, eight, nine, [-ten-]{+10+});\n+alpha one two three four 5;\n";
+    assert_eq!(read, want);
+    assert_eq!(decode_blocks(&read), hunk_as_stored(&text));
+}
+
+/// An aligned block before `\ No newline at end of file` never pairs its
+/// last `+` line, which stays last, before the marker; CRLF and multi-byte
+/// lines align and decode as any other.
+#[test]
+fn an_aligned_block_keeps_a_marked_last_line_and_odd_bytes() {
+    let body = "-let alpha = compute(one, two);\n-let beta = compute(three, four);\n+let inserted_line_here = 0;\n+let alpha = compute(one, 2);\n+let beta = compute(three, 4);\n\\ No newline at end of file\n";
+    let (text, f) = one_hunk("m.rs", body);
+    let read = shipped_read(&text, &f, usize::MAX);
+    let want = "@@ -1,2 +1,3 @@\n+let inserted_line_here = 0;\n~let alpha = compute(one, [-two-]{+2+});\n-let beta = compute(three, four);\n+let beta = compute(three, 4);\n\\ No newline at end of file\n";
+    assert_eq!(read, want);
+    assert_eq!(decode_blocks(&read), hunk_as_stored(&text));
+    let body = "-let na\u{ef}ve = compute(\u{e9}t\u{e9}, two);\r\n-let beta = compute(three, four);\r\n+let inserted_line_here = 0;\r\n+let na\u{ef}ve = compute(\u{e9}t\u{e9}, 2);\r\n+let beta = compute(three, 4);\r\n";
+    let (text, f) = one_hunk("m.rs", body);
+    let read = shipped_read(&text, &f, usize::MAX);
+    assert_eq!(read.matches("\n~").count(), 2, "{read}");
+    assert!(read.contains("\n~let na\u{ef}ve = compute(\u{e9}t\u{e9}, [-two-]{+2+});\r\n"), "{read}");
+    assert_eq!(decode_blocks(&read), hunk_as_stored(&text));
+}
+
+/// A block of up to [`pr_digest::WD_ALIGN_CELLS`] line pairs is aligned; a
+/// larger one pairs by position (its k-th `-` line with its k-th `+` line),
+/// so the work on one block is bounded.
+#[test]
+fn a_block_over_the_alignment_bound_pairs_by_position() {
+    let block = |n: usize| {
+        let mut body = String::new();
+        for k in 0..n {
+            body.push_str(&format!("-let value_{k} = compute(alpha, input);\n"));
+        }
+        body.push_str("+// an inserted line with nothing in common\n");
+        for k in 0..n - 1 {
+            body.push_str(&format!("+let value_{k} = compute(beta, input);\n"));
+        }
+        body
+    };
+    assert_eq!(64 * 64, pr_digest::WD_ALIGN_CELLS);
+    let (text, f) = one_hunk("b.rs", &block(64));
+    let read = shipped_read(&text, &f, usize::MAX);
+    assert_eq!(read.matches("\n~").count(), 63, "aligned: every line but the last pairs with its own edit");
+    assert!(read.contains("\n~let value_62 = compute([-alpha-]{+beta+}, input);\n") && !read.contains("[-value_"), "{read}");
+    assert_eq!(decode_blocks(&read), hunk_as_stored(&text));
+    let (text, f) = one_hunk("b.rs", &block(65));
+    let read = shipped_read(&text, &f, usize::MAX);
+    assert!(read.contains("\n~let [-value_1-]{+value_0+} = compute([-alpha-]{+beta+}, input);\n"), "by position: {read}");
+    assert_eq!(decode_blocks(&read), hunk_as_stored(&text));
+}
+
+/// Aligned blocks spend their own budget ([`pr_digest::WD_ALIGN_STEPS`]),
+/// not the read's: 20 blocks of two `-` and two `+` lines, every pair about
+/// a million matcher steps. Four blocks' sixteen candidates spend the
+/// alignment budget; from the fifth, a block pairs by position on the
+/// read's budget, which sixteen pairs (eight blocks) spend; the last eight
+/// blocks are shown as stored. On one shared budget four blocks would pair.
+#[test]
+fn a_read_past_its_alignment_budget_pairs_by_position() {
+    let commas = ",".repeat(999);
+    let block = format!("-{commas},\n-{commas},\n+{commas}x\n+{commas}y\n ctx\n");
+    let (text, f) = one_hunk("q.min.js", &block.repeat(20));
+    let read = shipped_read(&text, &f, usize::MAX);
+    assert_eq!(read.lines().filter(|l| l.starts_with('~')).count(), 24, "8 aligned pairs, then 16 by position");
+    assert!(read.ends_with(&block.repeat(8)), "every later block as stored");
+    assert_eq!(decode_blocks(&read), hunk_as_stored(&text));
+}
+
+/// `lines=A-B` over the cap pages between hunks: every `next page` starts at
 /// a hunk's `@@` line.
 #[test]
 fn a_raw_read_pages_at_hunk_starts() {
@@ -825,8 +1009,8 @@ fn a_raw_read_pages_at_hunk_starts() {
     loop {
         let s = h.slice(id, &sel).unwrap();
         pages += 1;
-        let Some(i) = s.rfind("next page: atlas slice ") else { break };
-        let r = s[i..].trim_end().strip_prefix(&format!("next page: atlas slice {id} --lines ")).unwrap();
+        let Some(i) = s.rfind("next page: recall ") else { break };
+        let r = s[i..].trim_end().strip_prefix(&format!("next page: recall {id} lines=")).unwrap();
         let (a, b) = r.split_once('-').unwrap();
         let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
         assert!(lines[a - 1].starts_with("@@ "), "page {pages} continues at a hunk: line {a} {:?}", lines[a - 1]);
@@ -887,8 +1071,9 @@ fn a_read_no_row_backs_keeps_its_header() {
     }
 }
 
-/// C1 (context collapse) is measurement-only: reached here through
-/// [`pr_digest::view`] with the lever named, never through `levers()`.
+/// C1 (context collapse), on in shipped builds: reached here through
+/// [`pr_digest::view`] with the lever named, so the test holds whatever
+/// `levers()` returns.
 #[test]
 fn context_collapse_hides_far_context_behind_a_marker() {
     let t = Temp::new("prd-levers");
@@ -904,18 +1089,18 @@ fn context_collapse_hides_far_context_behind_a_marker() {
     let want = [
         "index 1..2 100644\n",
         "@@ -1,13 +1,12 @@ fn main()\n",
-        "= 2 hidden --lines 6-7\n",
+        "= 2 hidden lines=6-7\n",
         " let near = 3;\n",
         "~    let value = compute(alpha, [-beta-]{+gamma+});\n",
         "-    let other = thing();\n",
-        "+    totally different words here\n",
         "-    let gone = 0;\n",
+        "+    totally different words here\n",
         " let after = 4;\n",
-        "= 1 hidden --lines 15-15\n",
+        "= 1 hidden lines=15-15\n",
         " let context_far_after_the_change_two = 6;\n",
         "~    s = \"\\~ \\\\\\\\ \\[- \\-] \\{+ \\+} \\[-[-x-]{+y+}\\-]\" + a;\n",
         " let tail_context_line_far_enough_one = 7;\n",
-        "= 2 hidden --lines 20-21\n",
+        "= 2 hidden lines=20-21\n",
         "@@ -40,1 +40,1 @@\n",
         "-let last = old_value;\n",
         "+let last = new_value;\n",
@@ -997,7 +1182,7 @@ fn the_public_fixture_digests_to_one_row_per_file() {
     assert!(lines[0].ends_with(": burntsushi/ripgrep#3560 round 1, 2 files +46 -1, 3014 B"), "{}", d.digest);
     assert!(lines[1].starts_with("M crates/ignore/src/dir.rs +25 -0 h:") && lines[1].ends_with("1 hunk @ 5-36"), "{}", d.digest);
     assert!(lines[2].starts_with("M crates/ignore/src/incremental.rs +21 -1 h:") && lines[2].ends_with("2 hunks @ 5-13 14-38"), "{}", d.digest);
-    assert!(lines[3].starts_with("a file: atlas slice h:F; a hunk: atlas slice h:F --lines A-B; in a file read ~ is an edited line as [-old-]{+new+}; whole output h:"), "{}", d.digest);
+    assert!(lines[3].starts_with("a file: recall h:F; a hunk: recall h:F lines=A-B; in a file read ~ is an edited line as [-old-]{+new+}, and = N hidden lines=A-B is context left out; whole output h:"), "{}", d.digest);
     assert_eq!(lines.len(), 4);
 }
 
@@ -1301,6 +1486,16 @@ fn the_route_is_on_by_default_and_off_when_set_false() {
     // Logged apart from route:Bash.
     let n: i64 = Handles::open(&db, HandleCfg::default()).unwrap().conn().query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'route:gh-pr'", [], |r| r.get(0)).unwrap_or(-1);
     assert_eq!(n, 1);
+    // #215: a diff over 30,000 characters is credited only what Claude Code shows of it.
+    let huge = big_diff(400, "huge");
+    assert!(huge.len() > 30_000 && huge.is_ascii());
+    assert!(on.post_tool_use(&bash("gh pr diff 8 -R octo/demo", &huge)).unwrap().is_some());
+    let credit: i64 = Handles::open(&db, HandleCfg::default())
+        .unwrap()
+        .conn()
+        .query_row("SELECT read FROM token_log WHERE tool = 'route:gh-pr' ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(credit, 30_000);
     // Another command is untouched by the switch: the same answer as with it off.
     let other = "x\n".repeat(7000);
     assert_eq!(on.post_tool_use(&bash("cat big.txt", &other)).unwrap(), off.post_tool_use(&bash("cat big.txt", &other)).unwrap());
@@ -1374,22 +1569,22 @@ fn file_ranges(text: &str, repo: &Repo) -> Vec<(usize, usize, bool, String)> {
 
 /// What a review pulls on two routes, as text. Today: the generic digest, a
 /// grep for the file boundaries and line slices of the whole output. On: the
-/// PR digest and a file read (`atlas slice h:F` and its next pages) of every
+/// PR digest and a file read (`recall h:F` and its next pages) of every
 /// file row's handle. Each slice's command line counts too. `all` reads the
 /// collapsed files as well (every hunk), else they are skipped (realistic).
 fn read_today(h: &Handles, digest: &str, text: &str, repo: &Repo, all: bool) -> String {
     let whole = digest.split_once(' ').unwrap().0.to_string();
     let mut out = String::from(digest);
-    out.push_str(&format!("atlas slice {whole} --grep \"^diff --git\"\n"));
+    out.push_str(&format!("recall {whole} grep=\"^diff --git\"\n"));
     out.push_str(&h.slice(&whole, &Sel::Grep { re: "^diff --git".into(), context: 0 }).unwrap());
     for r in file_ranges(text, repo).iter().filter(|r| all || !r.2) {
         let (mut a, b) = (r.0, r.1);
         loop {
             let s = h.slice(&whole, &Sel::Lines(a, b)).unwrap();
-            out.push_str(&format!("atlas slice {whole} --lines {a}-{b}\n"));
+            out.push_str(&format!("recall {whole} lines={a}-{b}\n"));
             out.push_str(&s);
             let last = s.lines().last().unwrap_or("");
-            let Some(next) = last.strip_prefix("truncated, ").and_then(|l| l.split_once("--lines ")) else { break };
+            let Some(next) = last.strip_prefix("truncated, ").and_then(|l| l.split_once("lines=")) else { break };
             a = next.1.split('-').next().unwrap().parse().unwrap();
         }
     }
@@ -1409,21 +1604,22 @@ fn read_on(h: &Handles, digest: &str, all: bool) -> String {
             continue;
         }
         let mut s = h.slice(id, &Sel::Whole).unwrap();
-        out.push_str(&format!("atlas slice {id}\n"));
+        out.push_str(&format!("recall {id}\n"));
         loop {
             out.push_str(&s);
-            // A diff-native page ends `next page: atlas slice ID ...`; a
-            // numbered one (other kinds) `truncated, N more lines (... --lines K-B)`.
+            // A diff-native page ends `next page: recall h:ID ...`; a
+            // numbered one (other kinds) `truncated, N more lines (... lines=K-B)`.
             let last = s.lines().last().unwrap_or("");
-            if let Some(next) = last.strip_prefix(&format!("next page: atlas slice {id} ")) {
-                let sel = atlas::handles::parse_sel(&next.split(' ').map(String::from).collect::<Vec<_>>()).unwrap();
-                out.push_str(&format!("atlas slice {id} {next}\n"));
+            if let Some(next) = last.strip_prefix(&format!("next page: recall {id} ")) {
+                let (_, pairs) = atlas::handles::split_key(&format!("{id} {next}")).unwrap();
+                let atlas::handles::Ask::Slice(sel) = atlas::handles::parse_args(&pairs).unwrap() else { panic!("{next}") };
+                out.push_str(&format!("recall {id} {next}\n"));
                 s = h.slice(id, &sel).unwrap();
                 continue;
             }
-            let Some(next) = last.strip_prefix("truncated, ").and_then(|l| l.split_once("--lines ")).map(|x| x.1.trim_end_matches(')')) else { break };
+            let Some(next) = last.strip_prefix("truncated, ").and_then(|l| l.split_once("lines=")).map(|x| x.1.trim_end_matches(')')) else { break };
             let (a, b) = next.split_once('-').unwrap();
-            out.push_str(&format!("atlas slice {id} --lines {a}-{b}\n"));
+            out.push_str(&format!("recall {id} lines={a}-{b}\n"));
             s = h.slice(id, &Sel::Lines(a.parse().unwrap(), b.parse().unwrap())).unwrap();
         }
     }
@@ -1546,8 +1742,8 @@ fn pr_rounds(dir: &str, stem: &str, manifest: Option<&json::Value>) -> Vec<(Stri
 /// The ratio is today over on (realistic: collapsed files unread; every
 /// hunk: all read), and raw over on.
 ///
-/// The on arm (realistic) is charged one hunk read (`atlas slice h:F
-/// --lines A-B` and the hunk) for every hunk where a review comment of that
+/// The on arm (realistic) is charged one hunk read (`recall h:F
+/// lines=A-B` and the hunk) for every hunk where a review comment of that
 /// round sits on a line the default read does not show: behind a C1 marker,
 /// or in a collapsed or deleted file. The same comments are the proxy: how
 /// many commented lines are shown. Every file read is decoded back to its
@@ -1679,7 +1875,7 @@ fn measure_public_prs() {
                     }
                     let (a, b) = *f.hunks.iter().find(|hk| hk.0 <= at && at <= hk.1).unwrap();
                     if charged.insert((e.handle.clone(), a)) {
-                        pr.push_str(&format!("atlas slice {} --lines {a}-{b}\n", e.handle));
+                        pr.push_str(&format!("recall {} lines={a}-{b}\n", e.handle));
                         pr.push_str(&h.slice(&e.handle, &Sel::Lines(a, b)).unwrap());
                     }
                 }

@@ -404,13 +404,13 @@ const LANE_STATE: &[&str] = &["handoff", "brief", "open questions", "next"];
 
 /// A lane's open questions, by the store's one test
 /// (`memory::OPEN_QUESTION_SQL`), as the resume card and `lanes()` count them.
-fn open_in(store: &MemoryStore, lane: &str) -> Result<HashSet<String>> {
-    Ok(store.open_questions()?.into_iter().filter(|(l, _, _)| l == lane).map(|(_, k, _)| k).collect())
+pub(crate) fn open_in(store: &MemoryStore, lane: &str) -> Result<HashSet<String>> {
+    Ok(store.open_questions()?.into_iter().filter(|(l, _, _)| crate::lanes::in_lane(l, lane)).map(|(_, k, _)| k).collect())
 }
 
 /// The newest handoff by time (an active one before a superseded one), not
 /// the last inserted: an import can insert out of order.
-fn newest_handoff(all: &[Head]) -> Option<&Head> {
+pub(crate) fn newest_handoff(all: &[Head]) -> Option<&Head> {
     all.iter().filter(|h| h.kind == "handoff").max_by(|a, b| (a.status == "active", &a.time).cmp(&(b.status == "active", &b.time)))
 }
 
@@ -428,7 +428,7 @@ const HEAD_TITLE_CHARS: usize = 48;
 ///
 /// [`crate::Error::Db`].
 pub fn lane_head(store: &MemoryStore, lane: &str) -> Result<Option<String>> {
-    let all = store.lane(lane)?;
+    let all = store.lane_family(lane)?;
     if all.is_empty() {
         return Ok(None);
     }
@@ -466,7 +466,7 @@ pub fn lane_head(store: &MemoryStore, lane: &str) -> Result<Option<String>> {
 ///
 /// [`crate::Error::Db`].
 pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&str, usize)>) -> Result<LaneView> {
-    let all = store.lane(lane)?;
+    let all = store.lane_family(lane)?;
     if all.is_empty() {
         return Ok(LaneView::default());
     }

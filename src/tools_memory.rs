@@ -164,6 +164,12 @@ impl Server {
             Some("json") => true,
             Some(o) => return Err(Error::InvalidArgument(format!("format {o:?}; use text or json"))),
         };
+        // `recall h:ID`: a stored output's slice, not a memory record.
+        if name == "recall" {
+            if let Some(t) = self.recall_handle(a)? {
+                return Ok(if json { Answer::Json(crate::json!({"text": t})) } else { Answer::Text(t) });
+            }
+        }
         if !json || name == "hook" {
             return self.run_memory_text(name, a);
         }
@@ -213,10 +219,12 @@ impl Server {
     fn run_memory_text(&mut self, name: &str, a: &Map) -> Result<Answer> {
         match name {
             "hook" => {
-                let ev = HookEvent::from_value(&Value::Object(a.clone()));
+                let mut ev = HookEvent::from_value(&Value::Object(a.clone()));
+                ev.tool_use = self.hook_tool_use;
                 let m = self.mem()?;
                 if m.hooks.is_none() {
                     let mut h = Hooks::open(m.settings.clone())?;
+                    h.detect_offer_paths();
                     // As in `protocol`: a tool call does not say a user is there.
                     h.set_unattended(true);
                     m.hooks = Some(h);
@@ -567,8 +575,9 @@ impl Server {
             ("journal", Some(crate::queue::ENTRY), None) => {
                 let text = arg_nonblank(a, "text")?;
                 let (head, rest) = text.split_once('\n').unwrap_or((text, ""));
-                let p = crate::queue::planned_from_meta(arg_nonblank(a, "lane")?, head, rest, opt_str(a, "meta")?.unwrap_or("")).map_err(Error::InvalidArgument)?;
-                crate::queue::check_planned(store, &p).map_err(Error::InvalidArgument)?;
+                let mut p = crate::queue::planned_from_meta(arg_nonblank(a, "lane")?, head, rest, opt_str(a, "meta")?.unwrap_or("")).map_err(Error::InvalidArgument)?;
+                crate::queue::check_planned(store, &mut p, &crate::pr_events::served(settings.graph.as_deref()))
+                    .map_err(Error::InvalidArgument)?;
                 Some(crate::queue::planned_meta(&p))
             }
             _ => None,
@@ -578,6 +587,8 @@ impl Server {
         // A memory written to the user layer, and the keys it replaces: its
         // file goes to the user layer folder once the store has it.
         let mut user_write: Option<(String, Vec<String>)> = None;
+        // Warnings about what was written, printed after its `ok` line.
+        let mut warning = String::new();
         let written = match name {
             "journal" => {
                 let lane = arg_nonblank(a, "lane")?;
@@ -589,9 +600,20 @@ impl Server {
                 // An amend keeps the entry's meta, so a review's is not asked again.
                 let amend = opt_str(a, "amend")?;
                 if entry == crate::reviews::ENTRY && amend.is_none() && (crate::reviews::Review::parse(review_meta).is_none() || !crate::reviews::verdicts_known(review_meta)) {
-                    return Err(Error::InvalidArgument(
-                        "a review entry needs meta lines `role:` (or several, comma-separated), `pr:`, `head:` (the sha it read, 7 or more hex digits) and `verdict:` (pass, merge, merge with follow-ups or request changes, each with an optional `(role)`); `report:` is kept".into(),
-                    ));
+                    let why = crate::reviews::Review::problem(review_meta).unwrap_or("`verdict:` names an unknown verdict");
+                    return Err(Error::InvalidArgument(format!(
+                        "review entry refused: {why}. A review entry needs meta lines `role:` (or several, comma-separated), `pr:` (N, #N, repo#N or owner/repo#N; a `repo:` line names the repo of a bare N), `head:` (the sha it read, 7 or more hex digits) and `verdict:` (pass, merge, merge with follow-ups or request changes, each with an optional `(role)`); `report:` is kept"
+                    )));
+                }
+                // A bare `pr: N` with no repo is filed, but counts for PR N in
+                // every repo: say so.
+                if entry == crate::reviews::ENTRY && amend.is_none() {
+                    for p in crate::reviews::Review::parse(review_meta).into_iter().flat_map(|r| r.prs).filter(|p| p.repo.is_none()) {
+                        warning.push_str(&format!(
+                            "warning: `pr: {n}` names no repo, so this review counts for PR #{n} in every repo; name it as repo#{n} or owner/repo#{n}, or add a `repo:` line\n",
+                            n = p.number
+                        ));
+                    }
                 }
                 let text = arg_nonblank(a, "text")?;
                 let (head, rest) = text.split_once('\n').unwrap_or((text, ""));
@@ -791,6 +813,7 @@ impl Server {
         };
         w.commit()?;
         let mut out = format!("ok {} v{} sha={}{}\n", written.key, written.seq, &written.sha[..16], if written.changed { "" } else { " (unchanged)" });
+        out.push_str(&warning);
         if let (Some((key, old)), Some(dir)) = (user_write, settings.user_memory.as_ref()) {
             let index = settings.exports.iter().find(|e| e.name == USER).map_or("MEMORY.md", |e| e.index.as_str());
             let store = self.mem()?.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;

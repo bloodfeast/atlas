@@ -4,12 +4,14 @@
 //! at a server start, or `atlas --calibrate`; the method is documented
 //! there) and saved to `baseline_log`.
 //!
-//! The token ledger's counterfactual ([`crate::tokens`]) is an upper bound.
-//! `--token-report` heads its output with the **measured** ratio per answer:
-//! the median bytes of a pre-atlas lookup episode over the median bytes atlas
-//! returned per answer of the comparable read tools ([`COMPARABLE`]), the
-//! means beside it; and the **upper bound**: the sum of the counterfactual
-//! over the sum returned, over answers that have one.
+//! The token ledger's counterfactual ([`crate::tokens`]) is rule-based, not
+//! a bound: some rows overcount and others score 0 (#209). `--token-report`
+//! heads its output with the **measured** ratio per answer: the mean bytes of
+//! a pre-atlas lookup episode over the mean bytes atlas returned per answer
+//! of the comparable read tools ([`COMPARABLE`]), a ratio of sums; the
+//! medians' ratio beside it, which is not additive; and the **ledger
+//! ratio**: the sum of the counterfactual over the sum returned, over
+//! answers that have one, with the per-answer ledger median.
 
 use std::time::SystemTime;
 
@@ -159,6 +161,16 @@ pub fn save(conn: &Connection, b: &Baseline) -> Result<()> {
     })
 }
 
+/// Whether `baseline_log` has its `too_few` column (an older table may
+/// not): a read.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn has_too_few(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('baseline_log') WHERE name = 'too_few')", [], |r| r.get(0))?)
+}
+
 /// The latest saved calibration, with its time.
 ///
 /// # Errors
@@ -201,6 +213,9 @@ pub struct AtlasSide {
     pub counterfactual: f64,
     /// Sum returned over the same answers.
     pub returned_comparable: f64,
+    /// Per answer with a counterfactual that returned bytes: its credit over
+    /// what it returned, sorted.
+    pub ratios: Vec<f64>,
 }
 
 impl AtlasSide {
@@ -212,25 +227,38 @@ impl AtlasSide {
     pub fn read(conn: &Connection) -> Result<AtlasSide> {
         conn.execute_batch(crate::tokens::TOKEN_TABLE)?;
         let marks = COMPARABLE.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(",");
-        let mut st = conn.prepare(&format!("SELECT returned, grep, read FROM token_log WHERE tool IN ({marks})"))?;
-        let rows: Vec<(i64, Option<i64>, Option<i64>)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+        // The counterfactual as the ledger credits it (#218): capped per answer.
+        let credit = crate::tokens::credit_sql(crate::tokens::lookup_cap(conn)?);
+        let mut st = conn.prepare(&format!("SELECT returned, grep IS NOT NULL, {credit} FROM token_log WHERE tool IN ({marks})"))?;
+        let rows: Vec<(i64, bool, i64)> =
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
         let mut returned: Vec<f64> = rows.iter().map(|r| r.0 as f64).collect();
         returned.sort_by(f64::total_cmp);
-        let with: Vec<&(i64, Option<i64>, Option<i64>)> = rows.iter().filter(|r| r.1.is_some()).collect();
+        let with: Vec<&(i64, bool, i64)> = rows.iter().filter(|r| r.1).collect();
+        let mut ratios: Vec<f64> = with.iter().filter(|r| r.0 > 0).map(|r| r.2 as f64 / r.0 as f64).collect();
+        ratios.sort_by(f64::total_cmp);
         Ok(AtlasSide {
+            ratios,
             returned,
-            counterfactual: with.iter().map(|r| (r.1.unwrap_or(0) + r.2.unwrap_or(0)) as f64).sum(),
+            counterfactual: with.iter().map(|r| r.2 as f64).sum(),
             returned_comparable: with.iter().map(|r| r.0 as f64).sum(),
         })
     }
 
-    /// The upper-bound ratio (0 with no comparable answers).
-    pub fn upper(&self) -> f64 {
+    /// The ledger ratio: the counterfactual sum over the returned sum, rule
+    /// based and not a bound (0 with no comparable answers).
+    pub fn ledger(&self) -> f64 {
         if self.returned_comparable > 0.0 {
             self.counterfactual / self.returned_comparable
         } else {
             0.0
         }
+    }
+
+    /// The per-answer ledger median: the median of each answer's credit over
+    /// what it returned (0 with none).
+    pub fn ledger_median(&self) -> f64 {
+        median(&self.ratios)
     }
 
     /// The measured ratios (median, mean) against a baseline (0 when either

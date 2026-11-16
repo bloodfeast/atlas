@@ -280,6 +280,14 @@ CREATE TABLE IF NOT EXISTS handles(
 );
 CREATE INDEX IF NOT EXISTS handles_used ON handles(last_used);
 CREATE INDEX IF NOT EXISTS handles_sha ON handles(sha);
+CREATE INDEX IF NOT EXISTS handles_cmd ON handles(cmd);
+-- Every session or subagent a handle was stored for: the same bytes stored
+-- again by another session are the same row, whose `session` is the first.
+CREATE TABLE IF NOT EXISTS handle_sessions(
+    id TEXT NOT NULL,
+    session TEXT NOT NULL,
+    PRIMARY KEY(id, session)
+) WITHOUT ROWID;
 -- PR review rounds (`lean.pr_digest`, src/pr_digest.rs).
 CREATE TABLE IF NOT EXISTS pr_rounds(
     pr TEXT NOT NULL,

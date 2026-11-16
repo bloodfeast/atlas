@@ -47,6 +47,12 @@ said.
 `atlas queue` lists what waits, `atlas queue next` proposes a batch that keeps lanes and resources apart,
 and a task notification lists what waits when an agent finishes.
 
+An agent counts until it finishes: its meta file says so, its task notification arrives, or its SubagentStop
+fires. One that died with none of these (a full disk) is freed by `atlas queue release AGENT`, which records
+it finished in atlas's own file beside the meta file and refuses an agent that wrote in the last 5 minutes
+unless `--force`. One whose transcript ends in a disk-full tool error stops counting by itself after
+`orchestrate.disk_full_minutes` (default 10).
+
 ## Starter resources and caps
 
 On yes, setup writes starter values for the keys you did not answer and the configuration does not set. A

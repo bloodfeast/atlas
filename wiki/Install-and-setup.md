@@ -124,6 +124,13 @@ An older Claude Code is untested.
    Setup never asks about [[Memory and rule files]], which is experimental and off by default. Turning it
    on is a deliberate `atlas settings set memory-rules true`.
 
+   Last, when the folder setup runs in has no rules (no `CLAUDE.md`, `.claude/CLAUDE.md`, `CLAUDE.local.md`
+   up to its repository's root, no `.claude/atlas-rules.md` and no intent file), setup offers atlas's
+   **rules template**: a starter `CLAUDE.md` and `.claude/atlas-rules.md` with the token-saving rules and the
+   agent, build and safety rules (`[y/N]`; only yes writes). Where the folder has rules it prints one line
+   naming them and asks nothing; it never overwrites a file. `atlas settings rules-template [DIR] [--yes]`
+   offers the same any time. See [The rules template](Memory-and-rule-files#the-rules-template).
+
    `--yes` takes `--builders N`, `--reviewers N`, `--research N`, `--mode enforced|advisory|off`,
    `--handoff TOKENS`, `--limit TOKENS` and `--fresh auto|ask`; an option left out keeps the value in effect,
    and a handoff point above the hard limit is refused. A no writes nothing to the configuration.
@@ -141,6 +148,28 @@ An older Claude Code is untested.
 
    (`atlas settings on update` turns them back on), or pin a version in `atlas.json` with
    `"update": {"pin": "0.5.0"}`. A binary you build from source never updates itself.
+
+   A session can keep one atlas server for days, so a running server checks again every hour and stages a
+   newer release on disk (one download however many sessions run); it keeps serving the old one until you
+   run `/mcp` and reconnect atlas, and tells you so once, on your next prompt. atlas also tells you about
+   updates with one line at session start (shown to you, not added to the model's context, once per
+   version): a newer release when you are pinned or have updates off, or the release you were moved to with
+   its highlights. When the installed plugin is older than the release that last changed the plugin's hooks
+   or skills, the line says to run `/plugin` to update the plugin. For a status line badge while an update
+   is pending (a newer release, or this session's server older than the atlas on disk), `atlas settings`
+   offers to add `atlas --statusline` to your status line: it becomes the status line when you have none,
+   and follows your own status line command's output when you have one (`atlas settings off statusline`
+   puts your command back). The command it writes names atlas by its absolute path, which `/plugin` moves
+   to a new version folder; each session start points atlas's own badge at the atlas now installed,
+   changing that path and nothing else in `settings.json` (with a backup `atlas settings undo` restores).
+   The status line is run through `sh`, as Claude Code runs it (Git Bash on Windows). By hand: `"statusLine": {"type": "command", "command": "<plugin
+   folder>/bin/atlas --statusline"}`; it reads local files only and prints nothing when there is no news.
+   `"update": {"notify": false}` turns the notice off.
+
+   The reconnect line on your next prompt is the `systemMessage` of atlas's `UserPromptSubmit` hook, an
+   `mcp_tool` hook, whose answer Claude Code reads as the same JSON a command hook prints. That it shows
+   in the transcript has not been checked in a live session yet; the status line badge carries the same
+   news.
 
 5. Point atlas at your notes: edit `atlas.json` (see [[Configuration reference]]) to add vaults (folders atlas may add
    to) and read-only sources (folders it only indexes), then run `/mcp` and reconnect atlas, or restart

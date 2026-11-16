@@ -193,6 +193,10 @@ pub struct UpdateSpec {
     /// plain `http` to the loopback address. The signature check does not
     /// depend on where the manifest comes from.
     pub url: Option<String>,
+    /// Tell the user when an update is available, staged or installed (a
+    /// session start banner and a status line badge; default true). Off,
+    /// a pinned or off setup asks for no manifest at all.
+    pub notify: Option<bool>,
 }
 
 /// The self-calibration of the measured ratio (see `crate::calibrate`).
@@ -379,6 +383,11 @@ pub struct RecallSpec {
     pub pointer_anchors: Option<bool>,
     /// Context selection of what the hooks inject (`recall.select`).
     pub select: Option<SelectSpec>,
+    /// What a subagent is given at its start: `"recall"` (default),
+    /// `"binding"` or `"off"`.
+    pub subagent_context: Option<crate::memory::settings::SubagentContext>,
+    /// The bytes a main-session prompt's one lane view may take (0: no cap).
+    pub main_lane_bytes: Option<usize>,
 }
 
 /// Context selection (`recall.select`, see [`crate::memory::select`]).
@@ -405,8 +414,12 @@ pub struct CapSpec {
     pub block_tokens: Option<usize>,
     /// Warn again after this many more tokens (default 25000).
     pub warn_every: Option<usize>,
-    /// Apply to the main session too (default false: subagents only).
+    /// Apply to the main session too (default true; false: subagents only). The
+    /// main session is only ever told to ask the user for /compact (or
+    /// /clear), never blocked.
     pub main_session: Option<bool>,
+    /// The main session's compact point (default `warn_tokens`).
+    pub main_warn_tokens: Option<usize>,
 }
 
 /// The compaction settings (`docs/design/compaction.md`).
@@ -423,6 +436,19 @@ pub struct CompactSpec {
     pub window: Option<usize>,
     /// The checkpoint card's budget in tokens (default 400).
     pub card_tokens: Option<usize>,
+    /// Ask the main session for its checkpoint entry before Claude Code's
+    /// predicted automatic compaction, and defer that compaction once for it
+    /// (default true).
+    pub checkpoint_prompt: Option<bool>,
+    /// How far before the predicted point the checkpoint is asked for, in
+    /// tokens (default 40000).
+    pub checkpoint_margin: Option<usize>,
+    /// The context right after a compaction past which a clear is
+    /// recommended instead of another compaction (default 80000; 0: never).
+    pub clear_floor: Option<usize>,
+    /// Model id to context window in tokens, over the built-in table
+    /// ([`crate::autocompact::model_window`]).
+    pub model_windows: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// The configuration `atlas --setup` writes, and the one used when no
@@ -484,6 +510,9 @@ pub struct Config {
     /// The `backlog` section, passed through unparsed: `atlas backlog`
     /// reads its weights and cue lists (see [`crate::backlog::Settings`]).
     pub backlog: Option<Value>,
+    /// The `pr_events` section, passed through unparsed: `atlas pr-events
+    /// serve` reads its port and lane (see [`crate::pr_listen::Settings`]).
+    pub pr_events: Option<Value>,
     /// The projects, the user-level layer and the checkout map (see
     /// [`crate::project`]). Empty in a configuration without `projects`:
     /// the whole file is then one implicit project, as before projects.
@@ -493,7 +522,7 @@ pub struct Config {
 /// The keys of the configuration file's top level that are not about
 /// projects.
 pub const TOP_KEYS: &[&str] =
-    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "orchestrate", "models", "update", "lean", "calibrate", "backlog"];
+    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "orchestrate", "models", "update", "lean", "calibrate", "backlog", "pr_events"];
 
 pub(crate) fn absolute(base: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -635,7 +664,7 @@ fn parse_classifier(v: &Value) -> Result<crate::taskjudge::ClassifierSettings> {
 
 /// Reads the `orchestrate` section; an unknown kind, mode or choice is an
 /// error, so the hook never meets one.
-fn parse_orchestrate(v: &Value) -> Result<crate::orchestrate::OrchestrateSpec> {
+fn parse_orchestrate(v: &Value, base: &Path) -> Result<crate::orchestrate::OrchestrateSpec> {
     use crate::orchestrate::{Fresh, Kind, KindSpec, Mode, OrchestrateSpec};
     fn named<T>(f: &Fields<'_>, k: &str, parse: fn(&str) -> Option<T>, what: &str) -> Result<Option<T>> {
         match f.string(k)? {
@@ -646,16 +675,18 @@ fn parse_orchestrate(v: &Value) -> Result<crate::orchestrate::OrchestrateSpec> {
     const KINDS: &str = "builder, reviewer, research, brief-writer or none";
     const MODES: &str = "enforced, advisory or off";
     const FRESH: &str = "auto or ask";
-    let f = Fields::new("orchestrate", v, &["enabled", "window", "stale_minutes", "default_kind", "mode", "fresh", "types", "kinds", "resources", "aging_minutes", "bare_gpu_words", "reviews", "judge"])?;
+    let f = Fields::new("orchestrate", v, &["enabled", "window", "stale_minutes", "disk_full_minutes", "default_kind", "mode", "fresh", "types", "kinds", "resources", "aging_minutes", "bare_gpu_words", "reviews", "judge", "worktree_roots"])?;
     let mut o = OrchestrateSpec {
         enabled: f.boolean("enabled")?,
         window: f.uint("window")?,
         stale_minutes: f.uint("stale_minutes")?,
+        disk_full_minutes: f.uint("disk_full_minutes")?,
         default_kind: named(&f, "default_kind", Kind::parse, KINDS)?,
         mode: named(&f, "mode", Mode::parse, MODES)?,
         fresh: named(&f, "fresh", Fresh::parse, FRESH)?,
         aging_minutes: f.uint("aging_minutes")?,
         bare_gpu_words: f.boolean("bare_gpu_words")?,
+        worktree_roots: f.strings("worktree_roots")?.unwrap_or_default().iter().map(|p| absolute(base, Path::new(p))).collect(),
         ..OrchestrateSpec::default()
     };
     if let Some(rv) = f.get("resources") {
@@ -948,7 +979,7 @@ impl Config {
             c.models = Some(m);
         }
         if let Some(uv) = top.get("update") {
-            let f = Fields::new("update", uv, &["enabled", "pin", "url"])?;
+            let f = Fields::new("update", uv, &["enabled", "pin", "url", "notify"])?;
             let url = f.string("url")?;
             if let Some(u) = &url {
                 if !crate::models::url_allowed(u) {
@@ -961,7 +992,7 @@ impl Config {
                     return Err(f.bad("pin", "a version, MAJOR.MINOR.PATCH"));
                 }
             }
-            c.update = Some(UpdateSpec { enabled: f.boolean("enabled")?, pin, url });
+            c.update = Some(UpdateSpec { enabled: f.boolean("enabled")?, pin, url, notify: f.boolean("notify")? });
         }
         if let Some(cv) = top.get("calibrate") {
             let f = Fields::new("calibrate", cv, &["auto", "skip", "handoff"])?;
@@ -1048,7 +1079,7 @@ impl Config {
             c.memory = Some(m);
         }
         if let Some(rv) = top.get("recall") {
-            let f = Fields::new("recall", rv, &["budget_tokens", "lane_budget_tokens", "fts_floor", "min_terms", "cos_floor", "cos_alone", "query_tokens", "hybrid_fts_floor", "inject_floor", "session_budget_tokens", "prompt_pointers", "pointer_anchors", "select"])?;
+            let f = Fields::new("recall", rv, &["budget_tokens", "lane_budget_tokens", "fts_floor", "min_terms", "cos_floor", "cos_alone", "query_tokens", "hybrid_fts_floor", "inject_floor", "session_budget_tokens", "prompt_pointers", "pointer_anchors", "select", "subagent_context", "main_lane_bytes"])?;
             let num = |k: &str| -> Result<Option<f64>> {
                 match f.get(k) {
                     None => Ok(None),
@@ -1068,6 +1099,11 @@ impl Config {
                 session_budget_tokens: f.uint("session_budget_tokens")?,
                 prompt_pointers: f.uint("prompt_pointers")?,
                 pointer_anchors: f.boolean("pointer_anchors")?,
+                subagent_context: match f.string("subagent_context")? {
+                    None => None,
+                    Some(v) => Some(crate::memory::settings::SubagentContext::parse(&v).ok_or_else(|| f.bad("subagent_context", "\"recall\", \"binding\" or \"off\""))?),
+                },
+                main_lane_bytes: f.uint("main_lane_bytes")?,
                 select: match f.get("select") {
                     None => None,
                     Some(sv) => {
@@ -1084,20 +1120,47 @@ impl Config {
             });
         }
         if let Some(cv) = top.get("cap") {
-            let f = Fields::new("cap", cv, &["warn_tokens", "block_tokens", "warn_every", "main_session"])?;
+            let f = Fields::new("cap", cv, &["warn_tokens", "block_tokens", "warn_every", "main_session", "main_warn_tokens"])?;
             c.cap = Some(CapSpec {
                 warn_tokens: f.uint("warn_tokens")?,
                 block_tokens: f.uint("block_tokens")?,
                 warn_every: f.uint("warn_every")?,
                 main_session: f.boolean("main_session")?,
+                main_warn_tokens: f.uint("main_warn_tokens")?,
             });
         }
         if let Some(cv) = top.get("compact") {
-            let f = Fields::new("compact", cv, &["enabled", "defer", "window", "card_tokens"])?;
-            c.compact = Some(CompactSpec { enabled: f.boolean("enabled")?, defer: f.boolean("defer")?, window: f.uint("window")?, card_tokens: f.uint("card_tokens")? });
+            let f = Fields::new("compact", cv, &["enabled", "defer", "window", "card_tokens", "checkpoint_prompt", "checkpoint_margin", "clear_floor", "model_windows"])?;
+            let model_windows = match f.get("model_windows") {
+                None => None,
+                Some(v) => Some(
+                    v.as_object()
+                        .and_then(|m| {
+                            m.iter()
+                                .map(|(k, n)| {
+                                    let n = n.as_u64().filter(|n| *n > crate::autocompact::OUTPUT_RESERVE)?;
+                                    (!k.trim().is_empty()).then(|| (k.clone(), n))
+                                })
+                                .collect::<Option<_>>()
+                        })
+                        .ok_or_else(|| {
+                            f.bad("model_windows", &format!("an object of non-empty model ids to token counts above {}", crate::autocompact::OUTPUT_RESERVE))
+                        })?,
+                ),
+            };
+            c.compact = Some(CompactSpec {
+                model_windows,
+                enabled: f.boolean("enabled")?,
+                defer: f.boolean("defer")?,
+                window: f.uint("window")?,
+                card_tokens: f.uint("card_tokens")?,
+                checkpoint_prompt: f.boolean("checkpoint_prompt")?,
+                checkpoint_margin: f.uint("checkpoint_margin")?,
+                clear_floor: f.uint("clear_floor")?,
+            });
         }
         if let Some(ov) = top.get("orchestrate") {
-            c.orchestrate = Some(parse_orchestrate(ov)?);
+            c.orchestrate = Some(parse_orchestrate(ov, base)?);
         }
         if let Some(lv) = top.get("lean") {
             if lv.as_object().is_none() {
@@ -1108,6 +1171,10 @@ impl Config {
         if let Some(bv) = top.get("backlog") {
             crate::backlog::Settings::from_config(Some(bv)).map_err(Error::InvalidArgument)?;
             c.backlog = Some(bv.clone());
+        }
+        if let Some(pv) = top.get("pr_events") {
+            crate::pr_listen::Settings::from_config(Some(pv)).map_err(Error::InvalidArgument)?;
+            c.pr_events = Some(pv.clone());
         }
         let mut names: Vec<&str> = c
             .vaults

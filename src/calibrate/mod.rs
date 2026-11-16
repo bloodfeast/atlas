@@ -1,8 +1,8 @@
 //! Calibration: what agents actually spent on rule and handoff lookups
 //! before atlas, from real Claude Code transcripts.
 //!
-//! The token ledger's counterfactual (`atlas::tokens`) is an upper bound:
-//! the bytes a literal grep prints plus every file window a reader would
+//! The token ledger's counterfactual (`atlas::tokens`) is rule-based, not a
+//! bound (#209): the bytes a literal grep prints plus every file window a reader would
 //! open. Calibration measures the other side: the bytes of the tool results
 //! agents read when they looked something up in the files atlas now serves,
 //! in transcripts dated before atlas. Every number comes from a fixed rule
@@ -71,13 +71,14 @@
 //!    the comparable read tools (`atlas::baseline::COMPARABLE`), their
 //!    returned bytes, and their counterfactual (grep + read).
 //! 9. Enough history: at least [`MIN_EPISODES`] episodes from at least
-//!    [`MIN_TRANSCRIPTS`] transcripts, else the report gives the upper bound
+//!    [`MIN_TRANSCRIPTS`] transcripts, else the report gives the ledger ratio
 //!    only.
 //!
-//! Ratios per answer: the **measured** ratio is the median bytes of a
-//! pre-atlas episode over the median bytes atlas returned per answer (the
-//! means are printed beside it); the **upper bound** is the sum of the
-//! counterfactual over the sum returned, over answers that have one.
+//! Ratios per answer: the **measured** ratio is the mean bytes of a
+//! pre-atlas episode over the mean bytes atlas returned per answer, a ratio
+//! of sums (the medians' ratio is printed beside it, marked not additive);
+//! the **ledger ratio** is the sum of the counterfactual over the sum
+//! returned, over answers that have one: rule-based, not a bound.
 //!
 //! # Surviving transcript cleanup
 //!

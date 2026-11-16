@@ -1,0 +1,16 @@
+{
+  "action": "closed",
+  "number": 12,
+  "pull_request": {
+    "number": 12,
+    "state": "closed",
+    "title": "Add the widget parser",
+    "user": { "login": "octo-author", "id": 2002, "type": "User" },
+    "body": "This PR adds the widget parser.",
+    "head": { "ref": "widget-parser", "sha": "6e828cc0aa1b2c3d4e5f60718293a4b5c6d7e8f9" },
+    "merged": true,
+    "merged_by": { "login": "octo-maintainer", "id": 2004, "type": "User" }
+  },
+  "repository": { "id": 3001, "name": "widgets", "full_name": "octo-org/widgets" },
+  "sender": { "login": "octo-maintainer", "id": 2004, "type": "User" }
+}

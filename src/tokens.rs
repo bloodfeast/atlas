@@ -15,13 +15,17 @@
 //!    overlapping windows merged.
 //!
 //! Matching is ASCII case-insensitive, line by line, as `grep -i` on UTF-8
-//! text. The other read tools that have a grep equivalent use the same two
-//! parts ([`Probe`]):
+//! text. Grep prints at most [`GREP_LINES`] lines in all (the Grep tool's
+//! head_limit), and only the files among them are read. The other read
+//! tools that have a grep equivalent use the same two parts ([`Probe`]):
 //!
 //! * `section` greps its id (or heading) like `lookup`, over the same
 //!   source or file when the question names one.
 //! * `grep` is its own counterfactual: the pattern, matched by the same
 //!   regex engine per line (`grep -rnE`), plus the reads.
+//! * `symbol` greps its name over the code roots as a whole identifier,
+//!   case-sensitively, and reads only the files that define it (`fn`,
+//!   `struct`, `enum`, `trait`, `type`, `const`, `static` or `mod NAME`).
 //! * `read_note` reads the whole note (grep 0, read the file's bytes).
 //! * `recall {query}` greps the query over the export files (the files the
 //!   records are written to; the indexed files when there are no exports).
@@ -35,10 +39,18 @@
 //! `handoff`, `remember`, ...) logs its returned bytes with no
 //! counterfactual.
 //!
+//! The report caps each answer of the lookup tools ([`CAPPED`]) at the
+//! 90th-percentile pre-atlas lookup episode of the latest calibration
+//! ([`lookup_cap`]): one answer never saves more than a measured episode
+//! spent. With no calibration, or too little pre-atlas history, those
+//! tools are credited nothing (#218).
+//!
 //! Separately, each subagent start logs the "brief without atlas": the
 //! bytes of the rulebook a brief would otherwise tell the agent to read in
 //! full, at that moment (`brief_log`, see [`log_brief`]). It is reported on
-//! its own line and never enters a per-answer ratio.
+//! its own line, per agent ([`brief_report`]), beside the hooks' injections
+//! per agent ([`inject_report`]) and the two on the agents both tables hold
+//! ([`brief_vs_inject`]), and never enters a per-answer ratio.
 //!
 //! Bytes become tokens by one ratio, `bytes_per_token` in the configuration
 //! (default [`DEFAULT_BYTES_PER_TOKEN`]). The ratio is recalibrated by a
@@ -63,6 +75,64 @@ pub const DEFAULT_BYTES_PER_TOKEN: f64 = 4.0;
 
 /// Lines in the window a reader opens around a match.
 pub const READ_WINDOW: usize = 80;
+
+/// The most lines a grep counterfactual prints, over all files: the Grep
+/// tool's default head_limit.
+pub const GREP_LINES: usize = 250;
+
+/// The most characters of a shell output Claude Code puts into context (it
+/// stores a longer one aside): a routed output saves at most these (#215).
+/// Fixed, so the report reads the same on every machine.
+pub const SHOWN_CHARS: usize = 30_000;
+
+/// The bytes of the first [`SHOWN_CHARS`] characters of an output (all of
+/// it when shorter), cut on a character boundary: a routed output's credit.
+pub fn shown_bytes(full: &str) -> usize {
+    full.char_indices().nth(SHOWN_CHARS).map_or(full.len(), |(i, _)| i)
+}
+
+/// The tools whose counterfactual the report caps per answer at
+/// [`lookup_cap`] (#218, #210).
+pub const CAPPED: &[&str] = &["lookup", "search", "section", "grep", "symbol", "recall", "read_note", "ids"];
+
+/// The per-answer cap of the [`CAPPED`] tools, in bytes: the 90th
+/// percentile pre-atlas lookup episode of the latest calibration
+/// (`baseline_log`), read at report time. `None` when there is none, it
+/// measured no episode, or it had too little pre-atlas history: then those
+/// tools are credited nothing. A read: no table is made.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn lookup_cap(conn: &Connection) -> Result<Option<i64>> {
+    let has: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'baseline_log')", [], |r| r.get(0))?;
+    if !has {
+        return Ok(None);
+    }
+    let too_few = if crate::baseline::has_too_few(conn)? { "too_few" } else { "0" };
+    let mut st = conn.prepare(&format!("SELECT p90, episodes, {too_few} FROM baseline_log ORDER BY id DESC LIMIT 1"))?;
+    let row: Option<(f64, i64, i64)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.next().transpose()?;
+    Ok(row.filter(|(p90, episodes, too_few)| *episodes > 0 && *too_few == 0 && *p90 > 0.0).map(|(p90, _, _)| p90.round() as i64))
+}
+
+/// The SQL expression for one `token_log` row's credited counterfactual in
+/// bytes (0 for a row without one): `grep + read`, capped at `cap` for the
+/// [`CAPPED`] tools, and 0 for them with no cap; 0 for `route:Read` (the
+/// ledger cannot see the reads that follow it, #216); and at most
+/// [`SHOWN_CHARS`] bytes for any other `route:*` row (#215: a row logged
+/// before the cap holds the whole output's bytes, and the first 30,000
+/// characters are at least 30,000 bytes, so this errs low). A
+/// `hook:<event>` row credits 0 here: hooks are credited by hit only,
+/// added by [`add_hook_credit`] (#217).
+pub fn credit_sql(cap: Option<i64>) -> String {
+    let capped = CAPPED.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ");
+    let cap = cap.unwrap_or(0);
+    format!(
+        "(CASE WHEN grep IS NULL THEN 0 WHEN tool IN ({capped}) THEN min(grep + ifnull(read, 0), {cap}) WHEN tool = 'route:Read' THEN 0 WHEN tool LIKE 'hook:%' THEN 0 \
+         WHEN tool LIKE 'route:%' THEN min(grep + ifnull(read, 0), {SHOWN_CHARS}) ELSE grep + ifnull(read, 0) END)"
+    )
+}
 
 /// The table the ledger writes. Durable: never dropped with the derived
 /// tables.
@@ -197,6 +267,13 @@ pub fn measure_file(label: &str, text: &[u8], literal: &[u8]) -> Counterfactual 
 /// * `text` - the file's bytes.
 /// * `hit` - whether a line (without its `\n`) matches.
 pub fn measure_lines(label: &str, text: &[u8], hit: &dyn Fn(&[u8]) -> bool) -> Counterfactual {
+    measure_lines_upto(label, text, hit, usize::MAX).0
+}
+
+/// [`measure_lines`] for at most `max` matching lines (the rest of the
+/// file's matches are not printed, and not read around), with the number
+/// of lines it printed.
+fn measure_lines_upto(label: &str, text: &[u8], hit: &dyn Fn(&[u8]) -> bool, max: usize) -> (Counterfactual, usize) {
     let mut grep = 0usize;
     // (start byte, end byte) of every line, and which lines matched.
     let mut lines: Vec<(usize, usize)> = Vec::new();
@@ -208,7 +285,7 @@ pub fn measure_lines(label: &str, text: &[u8], hit: &dyn Fn(&[u8]) -> bool) -> C
             break;
         }
         lines.push((start, (end + 1).min(text.len())));
-        if hit(line) {
+        if hits.len() < max && hit(line) {
             let body = line.strip_suffix(b"\r").unwrap_or(line);
             grep += label.len() + 1 + (i + 1).to_string().len() + 1 + body.len() + 1;
             hits.push(i);
@@ -216,7 +293,7 @@ pub fn measure_lines(label: &str, text: &[u8], hit: &dyn Fn(&[u8]) -> bool) -> C
         start = end + 1;
     }
     if hits.is_empty() {
-        return Counterfactual::default();
+        return (Counterfactual::default(), 0);
     }
     let read = if lines.len() <= READ_WINDOW {
         text.len()
@@ -233,7 +310,41 @@ pub fn measure_lines(label: &str, text: &[u8], hit: &dyn Fn(&[u8]) -> bool) -> C
         }
         total
     };
-    Counterfactual { grep, read }
+    (Counterfactual { grep, read }, hits.len())
+}
+
+/// Whether a byte belongs to an identifier (non-ASCII counts, so a name is
+/// never cut out of a longer non-ASCII one).
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Where `name` stands in `line` as a whole identifier, case-sensitively.
+fn word_at(line: &[u8], name: &[u8]) -> Vec<usize> {
+    if name.is_empty() || line.len() < name.len() {
+        return Vec::new();
+    }
+    (0..=line.len() - name.len())
+        .filter(|&i| {
+            &line[i..i + name.len()] == name
+                && (i == 0 || !ident_byte(line[i - 1]))
+                && line.get(i + name.len()).is_none_or(|b| !ident_byte(*b))
+        })
+        .collect()
+}
+
+/// The keywords that define a name in Rust or WGSL code.
+const DEFINES: &[&str] = &["fn", "struct", "enum", "trait", "type", "const", "static", "mod"];
+
+/// Whether a line defines `name`: one of [`DEFINES`] as a word, whitespace,
+/// then the name as a whole identifier.
+fn defines(line: &[u8], name: &[u8]) -> bool {
+    word_at(line, name).into_iter().any(|i| {
+        let before = &line[..i];
+        let kw = before.trim_ascii_end();
+        kw.len() < before.len()
+            && DEFINES.iter().any(|d| kw.ends_with(d.as_bytes()) && kw[..kw.len() - d.len()].last().is_none_or(|b| !ident_byte(*b)))
+    })
 }
 
 /// The ledger: a channel into a worker thread that measures and logs.
@@ -288,16 +399,25 @@ impl Ledger {
                         Probe::Code(l) => Some(measure_code(&code_roots.lock().map(|g| g.clone()).unwrap_or_default(), l)),
                         Probe::Literal { text, source, path } => {
                             let lit = text.as_bytes();
-                            (!lit.is_empty()).then(|| measure_all(&conn, &roots, source.as_deref(), path.as_deref(), &|label, t| measure_file(label, t, lit)))
+                            (!lit.is_empty()).then(|| {
+                                measure_all(&conn, &roots, source.as_deref(), path.as_deref(), &|label, t, max| {
+                                    measure_literal_upto(label, t, lit, max)
+                                })
+                            })
                         }
                         Probe::Regex { pattern, source, path } => crate::regex::Regex::new(pattern).ok().map(|re| {
-                            let hit = |line: &[u8]| std::str::from_utf8(line.strip_suffix(b"\r").unwrap_or(line)).is_ok_and(|s| re.is_match(s));
-                            measure_all(&conn, &roots, source.as_deref(), path.as_deref(), &|label, t| measure_lines(label, t, &hit))
+                            let hit =
+                                |line: &[u8]| std::str::from_utf8(line.strip_suffix(b"\r").unwrap_or(line)).is_ok_and(|s| re.is_match(s));
+                            measure_all(&conn, &roots, source.as_deref(), path.as_deref(), &|label, t, max| {
+                                measure_lines_upto(label, t, &hit, max)
+                            })
                         }),
                         Probe::File { source, path } => roots.get(source).and_then(|root| std::fs::metadata(root.join(path)).ok()).map(|m| Counterfactual { grep: 0, read: m.len() as usize }),
                         Probe::Exports(text) => match paths().and_then(|p| p.export_dir) {
                             Some(dir) => Some(measure_exports(&dir, text)),
-                            None => Some(measure_all(&conn, &roots, None, None, &|label, t| measure_file(label, t, text.as_bytes()))),
+                            None => Some(measure_all(&conn, &roots, None, None, &|label, t, max| {
+                                measure_literal_upto(label, t, text.as_bytes(), max)
+                            })),
                         },
                         Probe::Records(keys) => match paths() {
                             None => None,
@@ -349,31 +469,70 @@ impl Drop for Ledger {
     }
 }
 
-/// The counterfactual of a literal over the `.rs` and `.wgsl` files of the
-/// code roots (what `grep -rniF` over them prints, plus the reads).
+/// [`measure_file`] for at most `max` matching lines.
+fn measure_literal_upto(label: &str, text: &[u8], literal: &[u8], max: usize) -> (Counterfactual, usize) {
+    if literal.is_empty() {
+        return (Counterfactual::default(), 0);
+    }
+    measure_lines_upto(
+        label,
+        text,
+        &|line: &[u8]| line.len() >= literal.len() && line.windows(literal.len()).any(|w| w.eq_ignore_ascii_case(literal)),
+        max,
+    )
+}
+
+/// The counterfactual of a symbol over the `.rs` and `.wgsl` files of the
+/// code roots (#210): grep for the name as a whole identifier,
+/// case-sensitively, at most [`GREP_LINES`] lines in all, then read only
+/// the files among them that define it (see [`DEFINES`]), by the usual
+/// read rule.
 ///
 /// # Arguments
 ///
 /// * `roots` - code root names and folders.
-/// * `literal` - the text sought.
-pub fn measure_code(roots: &[(String, PathBuf)], literal: &str) -> Counterfactual {
+/// * `name` - the identifier sought.
+pub fn measure_code(roots: &[(String, PathBuf)], name: &str) -> Counterfactual {
     let mut total = Counterfactual::default();
-    for (name, root) in roots {
+    let mut left = GREP_LINES;
+    let n = name.as_bytes();
+    for (root_name, root) in roots {
         let Ok(w) = crate::code::walk(root) else { continue };
         for f in w.rust.iter().chain(&w.wgsl) {
+            if left == 0 {
+                return total;
+            }
             let Ok(text) = std::fs::read(root.join(&f.path)) else { continue };
-            let c = measure_file(&format!("{name}/{}", f.path), &text, literal.as_bytes());
+            let (c, printed) =
+                measure_lines_upto(&format!("{root_name}/{}", f.path), &text, &|line: &[u8]| !word_at(line, n).is_empty(), left);
+            left -= printed;
             total.grep += c.grep;
-            total.read += c.read;
+            if printed > 0 && text.split(|&b| b == b'\n').any(|line| defines(line, n)) {
+                total.read += c.read;
+            }
         }
     }
     total
 }
 
+/// A per-file matcher for [`measure_all`]: the file's label, its text and
+/// the matching lines still left to print; its counterfactual and the
+/// lines it printed.
+type Matcher<'a> = dyn Fn(&str, &[u8], usize) -> (Counterfactual, usize) + 'a;
+
 /// The counterfactual of a matcher over every indexed file (the `docs`
-/// table), or those of one source, or those below one path prefix.
-fn measure_all(conn: &Connection, roots: &HashMap<String, PathBuf>, only: Option<&str>, prefix: Option<&str>, f: &dyn Fn(&str, &[u8]) -> Counterfactual) -> Counterfactual {
+/// table), or those of one source, or those below one path prefix: at most
+/// [`GREP_LINES`] matching lines in all (`f` gets the lines left, and says
+/// how many it printed).
+fn measure_all(
+    conn: &Connection,
+    roots: &HashMap<String, PathBuf>,
+    only: Option<&str>,
+    prefix: Option<&str>,
+    f: &Matcher,
+) -> Counterfactual {
     let mut total = Counterfactual::default();
+    let mut left = GREP_LINES;
     let Ok(mut st) = conn.prepare_cached("SELECT source, path FROM docs") else { return total };
     let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) else { return total };
     let prefix = prefix.map(|p| p.replace('\\', "/"));
@@ -381,9 +540,13 @@ fn measure_all(conn: &Connection, roots: &HashMap<String, PathBuf>, only: Option
         if only.is_some_and(|s| s != source) || prefix.as_deref().is_some_and(|p| !path.starts_with(p)) {
             continue;
         }
+        if left == 0 {
+            break;
+        }
         let Some(root) = roots.get(&source) else { continue };
         let Ok(text) = std::fs::read(root.join(&path)) else { continue };
-        let c = f(&format!("{source}/{path}"), &text);
+        let (c, printed) = f(&format!("{source}/{path}"), &text, left);
+        left -= printed;
         total.grep += c.grep;
         total.read += c.read;
     }
@@ -475,31 +638,117 @@ pub fn log_brief(conn: &Connection, session: &str, agent: &str, bytes: u64) -> R
     })
 }
 
-/// The "brief without atlas" totals: subagent starts, and the tokens
-/// reading the rulebook in full at each would have cost.
+/// The "brief without atlas" totals, per agent: the agents that started,
+/// and the tokens reading the rulebook in full once each would have cost.
+///
+/// The unit is the agent (a distinct session and agent id), and each agent
+/// reads the rulebook once, as it was at the agent's first start. Claude
+/// Code fires `SubagentStart` again each time an agent resumes (a
+/// `SendMessage` to it, or a background task waking it), and each firing
+/// logs a row; a resumed agent keeps its context, so it would not read the
+/// rulebook again. On the live store (2 to 16 Nov 2026) 1,598 agents logged
+/// 3,925 rows: the repeats came minutes to hours apart (one within a
+/// second), and the hooks injected anything on 10 of the 2,327 repeats
+/// against 1,486 of the 1,598 first starts. The rows themselves are kept
+/// as `starts`, a secondary figure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BriefRow {
-    /// Subagent starts logged.
+    /// Agents (distinct session and agent) with a logged start.
+    pub agents: i64,
+    /// `SubagentStart` rows logged: the first start of each agent and every
+    /// resume after it.
     pub starts: i64,
-    /// Tokens, summed over the starts.
+    /// Tokens, summed over the agents: the rulebook at each one's first
+    /// start.
     pub tokens: f64,
     /// The latest start's rulebook, in tokens.
     pub latest: f64,
 }
 
-/// The "brief without atlas" totals, or `None` when none are logged.
+impl BriefRow {
+    /// Tokens per agent.
+    #[must_use]
+    pub fn per_agent(&self) -> f64 {
+        self.tokens / self.agents.max(1) as f64
+    }
+
+    /// Starts that were resumes of an agent already counted.
+    #[must_use]
+    pub fn resumes(&self) -> i64 {
+        self.starts - self.agents
+    }
+}
+
+/// Each agent's first start in `brief_log`: (session, agent, bytes).
+const FIRST_BRIEF: &str = "SELECT b.session, b.agent, b.bytes FROM brief_log b JOIN (SELECT MIN(id) AS id FROM brief_log GROUP BY session, agent) f ON b.id = f.id";
+
+/// The "brief without atlas" totals ([`BriefRow`], per agent), or `None`
+/// when none are logged.
 ///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
 pub fn brief_report(conn: &Connection, bytes_per_token: f64) -> Result<Option<BriefRow>> {
     conn.execute_batch(TOKEN_TABLE)?;
-    let (n, sum): (i64, Option<i64>) = conn.query_row("SELECT COUNT(*), SUM(bytes) FROM brief_log", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    if n == 0 {
+    let starts: i64 = conn.query_row("SELECT COUNT(*) FROM brief_log", [], |r| r.get(0))?;
+    if starts == 0 {
         return Ok(None);
     }
+    let (agents, sum): (i64, Option<i64>) =
+        conn.query_row(&format!("SELECT COUNT(*), SUM(bytes) FROM ({FIRST_BRIEF})"), [], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let latest: i64 = conn.query_row("SELECT bytes FROM brief_log ORDER BY id DESC LIMIT 1", [], |r| r.get(0))?;
-    Ok(Some(BriefRow { starts: n, tokens: sum.unwrap_or(0) as f64 / bytes_per_token, latest: latest as f64 / bytes_per_token }))
+    Ok(Some(BriefRow { agents, starts, tokens: sum.unwrap_or(0) as f64 / bytes_per_token, latest: latest as f64 / bytes_per_token }))
+}
+
+/// The brief and the injections on the same agents: those with a row in
+/// both `brief_log` and `hook_inject` (a main session logs no brief, and a
+/// subagent the hooks never injected into has no injection).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchRow {
+    /// Agents in both tables.
+    pub agents: i64,
+    /// The rulebook at their first starts, in tokens, summed.
+    pub rulebook: f64,
+    /// What the hooks injected into them, in tokens, summed.
+    pub injected: f64,
+}
+
+impl MatchRow {
+    /// Rulebook tokens per injected token, or 0 with nothing injected.
+    #[must_use]
+    pub fn ratio(&self) -> f64 {
+        if self.injected > 0.0 {
+            self.rulebook / self.injected
+        } else {
+            0.0
+        }
+    }
+}
+
+/// [`MatchRow`]: the brief against the injections on the agents both
+/// tables hold, or `None` when no agent is in both.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn brief_vs_inject(conn: &Connection, bytes_per_token: f64) -> Result<Option<MatchRow>> {
+    conn.execute_batch(TOKEN_TABLE)?;
+    let (agents, rulebook, injected): (i64, Option<i64>, Option<i64>) = conn.query_row(
+        &format!(
+            "SELECT COUNT(*), SUM(f.bytes), SUM(i.bytes) FROM ({FIRST_BRIEF}) f
+             JOIN (SELECT session, agent, SUM(bytes) AS bytes FROM hook_inject GROUP BY session, agent) i ON i.session = f.session AND i.agent = f.agent"
+        ),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if agents == 0 {
+        return Ok(None);
+    }
+    Ok(Some(MatchRow {
+        agents,
+        rulebook: rulebook.unwrap_or(0) as f64 / bytes_per_token,
+        injected: injected.unwrap_or(0) as f64 / bytes_per_token,
+    }))
 }
 
 /// Logs one row whose counterfactual was computed by the caller (the hooks).
@@ -543,8 +792,8 @@ pub struct ReportRow {
     pub answers: i64,
     /// Tokens returned.
     pub returned: f64,
-    /// Counterfactual tokens (grep plus reading), over the answers that
-    /// have one.
+    /// Counterfactual tokens (grep plus reading, as credited: see
+    /// [`credit_sql`]), over the answers that have one.
     pub counterfactual: f64,
     /// Tokens returned by the answers that have a counterfactual.
     pub returned_comparable: f64,
@@ -562,9 +811,10 @@ pub struct ReportRow {
 /// [`crate::Error::Db`] on SQLite failure.
 pub fn report(conn: &Connection, bytes_per_token: f64) -> Result<(Vec<ReportRow>, Vec<ReportRow>)> {
     conn.execute_batch(TOKEN_TABLE)?;
+    let credit = credit_sql(lookup_cap(conn)?);
     let q = |col: &str| -> Result<Vec<ReportRow>> {
         let mut st = conn.prepare(&format!(
-            "SELECT {col}, COUNT(*), SUM(returned), SUM(ifnull(grep, 0) + ifnull(read, 0)), SUM(CASE WHEN grep IS NULL THEN 0 ELSE returned END)
+            "SELECT {col}, COUNT(*), SUM(returned), SUM({credit}), SUM(CASE WHEN grep IS NULL THEN 0 ELSE returned END)
              FROM token_log GROUP BY {col} ORDER BY {col}"
         ))?;
         let rows = st.query_map([], |r| {
@@ -581,19 +831,72 @@ pub fn report(conn: &Connection, bytes_per_token: f64) -> Result<(Vec<ReportRow>
     Ok((q("tool")?, q("day")?))
 }
 
+/// Adds the hooks' hit credit ([`crate::hook_hits::HitCredit::by`], bytes by
+/// `hook:<event>` and day) to report rows keyed by tool (`by_day` false) or
+/// by day (`by_day` true), in tokens.
+pub fn add_hook_credit(
+    rows: &mut [ReportRow],
+    credit: &std::collections::BTreeMap<(String, String), i64>,
+    by_day: bool,
+    bytes_per_token: f64,
+) {
+    for r in rows {
+        let sum: i64 = credit.iter().filter(|((tool, day), _)| if by_day { *day == r.key } else { *tool == r.key }).map(|(_, b)| *b).sum();
+        r.counterfactual += sum as f64 / bytes_per_token;
+    }
+}
+
+/// Totals by day, as [`report`] gives them, without the rows of the tools
+/// in `without`: the human report leaves out rows whose bytes another row
+/// already counts (see [`crate::token_report`]).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`] on SQLite failure.
+pub fn report_days_without(conn: &Connection, bytes_per_token: f64, without: &[&str]) -> Result<Vec<ReportRow>> {
+    conn.execute_batch(TOKEN_TABLE)?;
+    let marks = vec!["?"; without.len()].join(", ");
+    let filter = if without.is_empty() { String::new() } else { format!("WHERE tool NOT IN ({marks})") };
+    let credit = credit_sql(lookup_cap(conn)?);
+    let mut st = conn.prepare(&format!(
+        "SELECT day, COUNT(*), SUM(returned), SUM({credit}), SUM(CASE WHEN grep IS NULL THEN 0 ELSE returned END)
+         FROM token_log {filter} GROUP BY day ORDER BY day"
+    ))?;
+    let rows = st.query_map(rusqlite::params_from_iter(without), |r| {
+        Ok(ReportRow {
+            key: r.get(0)?,
+            answers: r.get(1)?,
+            returned: r.get::<_, i64>(2)? as f64 / bytes_per_token,
+            counterfactual: r.get::<_, i64>(3)? as f64 / bytes_per_token,
+            returned_comparable: r.get::<_, i64>(4)? as f64 / bytes_per_token,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// The recall hooks' injections, judged against the "brief without atlas"
-/// row: what the pointers cost in all, per prompt that got any, and the
-/// largest one session spent.
+/// row: what the pointers cost in all, per agent that got any, and the
+/// largest one agent got. The unit is the agent, as in [`BriefRow`]: a
+/// distinct session and agent id, so a main session (agent id empty) is
+/// one agent and each of its subagents another.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InjectRow {
     /// Keys injected.
     pub keys: i64,
-    /// Sessions (and subagents) injected into.
-    pub sessions: i64,
+    /// Agents (main sessions and subagents) injected into.
+    pub agents: i64,
     /// Tokens injected, summed.
     pub tokens: f64,
-    /// The most tokens one session or subagent was injected.
-    pub max_session: f64,
+    /// The most tokens one agent was injected.
+    pub max_agent: f64,
+}
+
+impl InjectRow {
+    /// Tokens per agent.
+    #[must_use]
+    pub fn per_agent(&self) -> f64 {
+        self.tokens / self.agents.max(1) as f64
+    }
 }
 
 /// The hooks' injection totals, or `None` when none are logged.
@@ -603,13 +906,18 @@ pub struct InjectRow {
 /// [`crate::Error::Db`].
 pub fn inject_report(conn: &Connection, bytes_per_token: f64) -> Result<Option<InjectRow>> {
     conn.execute_batch(TOKEN_TABLE)?;
-    let (keys, sessions, sum): (i64, i64, Option<i64>) =
+    let (keys, agents, sum): (i64, i64, Option<i64>) =
         conn.query_row("SELECT COUNT(*), COUNT(DISTINCT session || '/' || agent), SUM(bytes) FROM hook_inject", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     if keys == 0 {
         return Ok(None);
     }
     let max: Option<i64> = conn.query_row("SELECT MAX(b) FROM (SELECT SUM(bytes) AS b FROM hook_inject GROUP BY session, agent)", [], |r| r.get(0))?;
-    Ok(Some(InjectRow { keys, sessions, tokens: sum.unwrap_or(0) as f64 / bytes_per_token, max_session: max.unwrap_or(0) as f64 / bytes_per_token }))
+    Ok(Some(InjectRow {
+        keys,
+        agents,
+        tokens: sum.unwrap_or(0) as f64 / bytes_per_token,
+        max_agent: max.unwrap_or(0) as f64 / bytes_per_token,
+    }))
 }
 
 /// Logs what context selection did to one injected record (`inject_select`,
@@ -766,13 +1074,66 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(TOKEN_TABLE).unwrap();
         assert_eq!(brief_report(&conn, 4.0).unwrap(), None);
+        baseline_p90(&conn, 29_292.0);
         log_row(&conn, "recall", 400, Some(Counterfactual { grep: 0, read: 4000 })).unwrap();
         log_brief(&conn, "s", "a1", 8000).unwrap();
         log_brief(&conn, "s", "a2", 12000).unwrap();
         let (by_tool, _) = report(&conn, 4.0).unwrap();
         assert_eq!(by_tool.len(), 1);
         assert_eq!(by_tool[0].counterfactual, 1000.0);
-        assert_eq!(brief_report(&conn, 4.0).unwrap(), Some(BriefRow { starts: 2, tokens: 5000.0, latest: 3000.0 }));
+        assert_eq!(brief_report(&conn, 4.0).unwrap(), Some(BriefRow { agents: 2, starts: 2, tokens: 5000.0, latest: 3000.0 }));
+    }
+
+    /// One agent started and resumed twice (three rows), one started once,
+    /// and one main session the hooks injected into logs no brief: the
+    /// brief counts two agents, each rulebook once, and the comparison
+    /// holds only the agents in both tables.
+    #[test]
+    fn brief_and_injections_count_agents_and_a_resume_is_not_a_second_read() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        assert_eq!(brief_vs_inject(&conn, 4.0).unwrap(), None);
+        // a1: first start at 8000 bytes, then two resumes (the rulebook grew).
+        log_brief(&conn, "s", "a1", 8000).unwrap();
+        log_brief(&conn, "s", "a1", 8400).unwrap();
+        log_brief(&conn, "s", "a1", 8800).unwrap();
+        log_brief(&conn, "s", "a2", 12000).unwrap();
+        let inj = |s: &str, a: &str, b: i64| {
+            conn.execute(
+                "INSERT INTO hook_inject(time, session, agent, transcript, hook, key, fts, cos, bytes, read) VALUES('t', ?1, ?2, '', 'SubagentStart', 'k', NULL, NULL, ?3, 0)",
+                params![s, a, b],
+            )
+            .unwrap();
+        };
+        inj("s", "a1", 400);
+        inj("s", "a1", 400);
+        // The main session: injected into, no brief.
+        inj("s", "", 4000);
+        let b = brief_report(&conn, 4.0).unwrap().unwrap();
+        assert_eq!(b, BriefRow { agents: 2, starts: 4, tokens: 5000.0, latest: 3000.0 });
+        assert_eq!((b.per_agent(), b.resumes()), (2500.0, 2));
+        let i = inject_report(&conn, 4.0).unwrap().unwrap();
+        assert_eq!((i.keys, i.agents, i.tokens, i.max_agent, i.per_agent()), (3, 2, 1200.0, 1000.0, 600.0));
+        // Only a1 is in both: a2 got no injection, the main session no brief.
+        let m = brief_vs_inject(&conn, 4.0).unwrap().unwrap();
+        assert_eq!(m, MatchRow { agents: 1, rulebook: 2000.0, injected: 200.0 });
+        assert_eq!(m.ratio(), 10.0);
+    }
+
+    #[test]
+    fn days_without_leave_out_only_the_named_tools() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        baseline_p90(&conn, 29_292.0);
+        log_row(&conn, "recall", 400, Some(Counterfactual { grep: 0, read: 4000 })).unwrap();
+        log_row(&conn, "hook", 800, None).unwrap();
+        log_row(&conn, "hook:PostToolUse", 1200, None).unwrap();
+        let (_, all) = report(&conn, 4.0).unwrap();
+        assert_eq!((all[0].answers, all[0].returned), (3, 600.0));
+        assert_eq!(report_days_without(&conn, 4.0, &[]).unwrap(), all);
+        let net = report_days_without(&conn, 4.0, &["hook", "hook:PostToolUse"]).unwrap();
+        assert_eq!(net.len(), 1);
+        assert_eq!((net[0].answers, net[0].returned, net[0].counterfactual), (1, 100.0, 1000.0));
     }
 
     #[test]
@@ -789,6 +1150,156 @@ mod tests {
         assert_eq!(row("trim"), SelectRow { how: "trim".into(), n: 2, sent: 30.0, full: 50.0 });
         assert_eq!(row("collapse"), SelectRow { how: "collapse".into(), n: 1, sent: 5.0, full: 25.0 });
         assert_eq!(row("whole"), SelectRow { how: "whole".into(), n: 1, sent: 100.0, full: 100.0 });
+    }
+
+    /// A baseline whose pre-atlas p90 episode is `p90` bytes: the per-answer
+    /// cap of the lookup tools (#218).
+    fn baseline_p90(conn: &Connection, p90: f64) {
+        let b = crate::baseline::Baseline {
+            episodes: 96,
+            mean: p90 / 2.0,
+            median: p90 / 3.0,
+            p90,
+            rules: Some(1),
+            ..crate::baseline::Baseline::default()
+        };
+        crate::baseline::save(conn, &b).unwrap();
+    }
+
+    /// A folder of code files for the `symbol` counterfactual, fresh.
+    fn code_root(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atlas-symbol-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        dir
+    }
+
+    /// #210 (a): a name that is part of another identifier, or differs in
+    /// case, is no match.
+    #[test]
+    fn a_symbol_matches_whole_identifiers_with_case() {
+        let dir = code_root(
+            "words",
+            &[(
+                "a.rs",
+                "fn cover() {}
+let overlap = 1;
+fn override_x() {}
+let Over = overflow;
+",
+            )],
+        );
+        let roots = vec![("r".to_string(), dir.clone())];
+        assert_eq!(measure_code(&roots, "over"), Counterfactual::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #210 (b): grep prints every file that mentions the name, but only the
+    /// file that defines it is read.
+    #[test]
+    fn a_symbol_reads_only_the_defining_file() {
+        let def = "pub struct Widget {
+    n: u32,
+}
+";
+        let user = "fn f() -> Widget {
+    todo!()
+}
+";
+        let dir = code_root("def", &[("def.rs", def), ("user.rs", user)]);
+        let roots = vec![("r".to_string(), dir.clone())];
+        let c = measure_code(&roots, "Widget");
+        assert_eq!(
+            c.grep,
+            "r/def.rs:1:pub struct Widget {
+"
+            .len()
+                + "r/user.rs:1:fn f() -> Widget {
+"
+                .len()
+        );
+        assert_eq!(c.read, def.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The grep counterfactual prints at most [`GREP_LINES`] lines, as the
+    /// Grep tool's head_limit does.
+    #[test]
+    fn grep_output_stops_at_the_head_limit() {
+        let text: String = (0..300)
+            .map(|_| {
+                "hit
+"
+            })
+            .collect();
+        let dir = code_root("limit", &[("a.rs", &text)]);
+        let roots = vec![("r".to_string(), dir.clone())];
+        let c = measure_code(&roots, "hit");
+        assert_eq!(
+            c.grep,
+            250 * "r/a.rs:1:hit
+"
+            .len()
+                + (250 - 9)
+                + (250 - 99)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #218 (c): a lookup answer whose window would be megabytes is credited
+    /// at most the pre-atlas p90 episode; a tool with no cap keeps its own.
+    #[test]
+    fn a_lookup_answer_is_credited_at_most_the_baseline_p90() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        baseline_p90(&conn, 29_292.0);
+        log_row(&conn, "search", 245, Some(Counterfactual { grep: 0, read: 6_660_000 })).unwrap();
+        log_row(&conn, "search", 100, Some(Counterfactual { grep: 400, read: 0 })).unwrap();
+        let (by_tool, by_day) = report(&conn, 1.0).unwrap();
+        assert_eq!(by_tool[0].counterfactual, 29_292.0 + 400.0);
+        assert_eq!(by_day[0].counterfactual, 29_292.0 + 400.0);
+        assert_eq!(report_days_without(&conn, 1.0, &[]).unwrap()[0].counterfactual, 29_292.0 + 400.0);
+        assert_eq!(crate::baseline::AtlasSide::read(&conn).unwrap().counterfactual, 29_292.0 + 400.0);
+    }
+
+    /// #218 (d): with no pre-atlas baseline the capped lookup tools are
+    /// credited nothing.
+    #[test]
+    fn with_no_baseline_lookup_credit_is_not_counted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        log_row(&conn, "search", 245, Some(Counterfactual { grep: 0, read: 6_660_000 })).unwrap();
+        log_row(&conn, "route:Bash", 100, Some(Counterfactual { grep: 0, read: 4000 })).unwrap();
+        let (by_tool, _) = report(&conn, 1.0).unwrap();
+        let cf = |t: &str| by_tool.iter().find(|r| r.key == t).unwrap().counterfactual;
+        assert_eq!((cf("search"), cf("route:Bash")), (0.0, 4000.0));
+        assert_eq!(crate::baseline::AtlasSide::read(&conn).unwrap().counterfactual, 0.0);
+    }
+
+    /// #215 and #216 in the report: a stored routed shell credit over the
+    /// cap counts at most 30,000 bytes (what the cap can be at most, read
+    /// back without the text), and a route:Read row credits nothing while
+    /// its calls and returned bytes still count.
+    #[test]
+    fn routed_rows_are_capped_and_route_read_credits_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        log_row(&conn, "route:Bash", 100, Some(Counterfactual { grep: 0, read: 67_108_864 })).unwrap();
+        log_row(&conn, "route:gh-pr", 100, Some(Counterfactual { grep: 0, read: 40_000 })).unwrap();
+        log_row(&conn, "route:PowerShell", 100, Some(Counterfactual { grep: 0, read: 2_000 })).unwrap();
+        log_row(&conn, "route:Read", 300, Some(Counterfactual { grep: 0, read: 90_000 })).unwrap();
+        let (by_tool, by_day) = report(&conn, 1.0).unwrap();
+        let row = |t: &str| by_tool.iter().find(|r| r.key == t).unwrap().clone();
+        assert_eq!(row("route:Bash").counterfactual, 30_000.0);
+        assert_eq!(row("route:gh-pr").counterfactual, 30_000.0);
+        assert_eq!(row("route:PowerShell").counterfactual, 2_000.0);
+        let read = row("route:Read");
+        assert_eq!((read.answers, read.returned, read.counterfactual), (1, 300.0, 0.0));
+        assert_eq!((by_day[0].returned, by_day[0].counterfactual), (600.0, 62_000.0));
+        assert_eq!(report_days_without(&conn, 1.0, &[]).unwrap()[0].counterfactual, 62_000.0);
     }
 
     #[test]
@@ -825,6 +1336,6 @@ mod tests {
         assert_eq!(k.iter().map(|r| (r.query.as_str(), r.count)).collect::<Vec<_>>(), vec![("big", 2), ("small", 1)]);
         assert_eq!(k[0].tokens, 200.0);
         let i = inject_report(&conn, 4.0).unwrap().unwrap();
-        assert_eq!((i.keys, i.sessions, i.tokens, i.max_session), (3, 2, 210.0, 110.0));
+        assert_eq!((i.keys, i.agents, i.tokens, i.max_agent), (3, 2, 210.0, 110.0));
     }
 }

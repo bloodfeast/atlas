@@ -3,6 +3,10 @@
     "SessionStart": [
       {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook", "timeout": 10}]}
     ],
+    "SessionEnd": [
+      {"matcher": "clear",
+       "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook", "timeout": 10}]}
+    ],
     "UserPromptSubmit": [
       {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
                   "input": {"event": "UserPromptSubmit", "session_id": "${session_id}", "prompt": "${prompt}", "transcript_path": "${transcript_path}"}}]}
@@ -31,7 +35,7 @@
     ],
     "PreCompact": [
       {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
-                  "input": {"event": "PreCompact", "session_id": "${session_id}", "trigger": "${trigger}", "transcript_path": "${transcript_path}"}}]}
+                  "input": {"event": "PreCompact", "session_id": "${session_id}", "agent_id": "${agent_id}", "agent_type": "${agent_type}", "trigger": "${trigger}", "transcript_path": "${transcript_path}"}}]}
     ]
   }
 }

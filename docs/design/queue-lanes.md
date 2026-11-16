@@ -99,7 +99,24 @@ declared, and a declared lane is never replaced by an inferred one.
 ### 3.1 Lanes
 
 A lane is a conflict domain. An item holds its lane while it runs: a second item on the same lane waits. Items
-on different lanes run in parallel. An item with no lane holds none.
+on different lanes run in parallel. An item with no lane holds none. This is the proposed batch's rule (section
+5); at launch a lane name is a label, never a lock (section 6.2, ruled 2026-11-14).
+
+**Read-only launches (2026-11-14).** A launch is read-only when it declares `Uses: read-only`, or when its kind
+is `research` or `reviewer` and it declares nothing it uses (`Uses: none`, an empty `Uses:`, or no line; an
+inferred `compile` or worktree path does not count, nor does a word no limit names). Research and reviewer are the only kinds that can be read-only; `builder`, `brief-writer` and
+`none` are writers whatever their `Uses:` says, and a writer with no `Uses:` line is classified as before. A
+read-only launch never takes or tests a lane.
+
+**Sub-lanes (2026-11-14).** A writer launch whose declared lane has no `brief` journal entry of its own (under
+any spelling of the lane), while a running writer holds that lane, runs as the first free sub-lane `NAME/2`,
+`NAME/3`, ...; read-only launches neither take nor make one. The hook never rewrites the prompt (a changed
+input with no permission decision can be denied in auto mode): it records the sub-lane by the launch's tool
+use id, tells the orchestrator in one context line, and tells the agent at its SubagentStart, where its lane
+becomes the sub-lane. The next launch reads the recorded sub-lane, not the brief's `Lane:` line, so it takes
+the next number. The record lives in the hook's process, so a command hook (a process per event) does not
+keep it. A lane with a brief is planned work that continues there and keeps its lane. Records filed under a sub-lane show under the parent in `recall
+lane=NAME` and in `atlas queue --lane NAME`.
 
 An item whose brief declares `Uses: read-only` does not hold its lane: it shares the lane with whatever runs
 there (a reviewer reading the branch a builder pushed) and serializes only on resources. Read-only is declared,
@@ -127,16 +144,22 @@ A capacity of 0 means "never serialize this resource". This is how a user turns 
 **Only a limit denies or queues (atlas-dev #150).** A resource is a limit when it has its own entry, its class
 has one (`sqlport` for `sqlport:15126`), or it is `gpu`, `compile` or a `worktree:NAME`. Any other word on a
 `Uses:` line (a repository name such as `db` or `react`) is not a limit: the hook never denies a launch for it
-and the proposal never holds an item back for it. When a running agent uses the same word, the launch is let
-through with one note naming the word and the holder (`shares db with Build ES1-1663`), whether the word was
-declared or inferred. An entry with capacity N >= 1 makes a word a limit; capacity 0 turns it off, with no
-note. `Uses:` is for exclusive resources: the gpu, the compile slots, one worktree, one port or one database,
-not the repositories an agent touches in its own worktree.
+and the proposal never holds an item back for it. Since 2026-11-14 such a word is not a token at all: it is
+dropped when the `Uses:` line is read, so it never adds a note either. An entry with capacity N >= 1 makes a
+word a limit; capacity 0 turns it off. `Uses:` is for exclusive resources: the gpu, the compile slots, one
+worktree, one port or one database, not the repositories an agent touches in its own worktree. Write the
+token to be counted: a `Uses:` line of free text alone (`Uses: cargo in the crate`) declares nothing, so
+nothing is inferred either; a builder then holds no compile slot, and research or a review is read-only.
 
-**Parsing.** A `Uses:` value is split on commas into pieces, and each piece on spaces into words. Backticks,
-quotes and a trailing `.` are trimmed and every word is lowercased. A word made only of digits joins the word
-before it in the same piece as its value, so `sqlport 15126`, `sqlport: 15126`, `sqlport  15126` and
-`sqlport:15126` are all `sqlport:15126`. Any other word is its own resource (`Uses: gpu compile` is gpu and
+**Parsing.** A `Uses:` line is read as tokens (2026-11-14): text in parentheses is dropped first, `;` separates
+like a comma, and of the words below only the limits are kept (`gpu`, `compile`, `worktree:NAME` and the
+names and classes the configuration lists); every other word is free text. So `compile (the vault_mcp crate;
+one heavy compile at a time through runq)` is `compile` alone, and two prompts that share only free text share
+nothing. The words are split as follows. A value is split on commas into pieces, and each piece on spaces
+into words. Backticks, quotes and a trailing `.` are trimmed and every word is lowercased. A word made only
+of digits joins the word before it in the same piece as its value, so `sqlport 15126`, `sqlport: 15126`,
+`sqlport  15126` and `sqlport:15126` are all `sqlport:15126`; likewise `worktree: NAME` is `worktree:NAME`.
+Any other word is its own resource (`Uses: gpu compile` is gpu and
 compile), and a number after a comma stays its own resource (`sqlport, 15126` is two). `none` and `and` are
 dropped, `read-only` sets read-only, and the list is sorted with duplicates removed. A queued item's `uses:`
 meta, written by the hook or by hand in a planned item, is read the same way.
@@ -205,19 +228,39 @@ Unchanged: a launch past its kind's cap is denied and queued (Q-QU1).
 A launch whose lane or resources conflict with a running agent is the case the proposal exists to avoid, but
 the orchestrator may still try one (Q-QL2):
 
-- **Declared on both sides** (the launch's brief declares the lane or resource, and the holders that declared
-  it alone fill it: one for a lane, the capacity for a resource): the launch is denied and queued, like a
-  launch past its cap. A declaration is the user's word. An inferred holder beside them does not soften this.
-- **Otherwise** (the launch inferred the field, or the holders fill it only with inferred ones counted): the
-  launch is let through with a one-line warning naming the holders, since an inference may be wrong. A `Lane:`
-  or `Uses:` line corrects it.
-- **A word that is not a limit** (section 3.2), shared with running work, declared or inferred: the launch is
-  let through with a one-line note naming the word and its holders. It is never denied or queued for it.
+Ruled 2026-11-14: writers conflict on what they touch, not on the lane label. The check is one pure function,
+`lanes::decide(running, launch) -> allow | conflict(reason) | queue(reason)`, with no model judgement:
+
+| The launch | Decision |
+|---|---|
+| Its kind's slots are full (the agent cap, section 6.1) | queue |
+| Read-only (section 3.1) | allow |
+| A writer sharing a declared `worktree:NAME`, or one `Repo:` and `Branch:`, with a running writer | conflict: queue |
+| A declared capped resource (section 3.2) its declared holders fill | queue: denied and queued |
+| Any of these resting on an inference | allow, with a one-line note naming the holders |
+| Anything else, a shared lane name included | allow |
+
+- **Declared on both sides** means the launch's brief declares the field, and the holders that declared it
+  alone fill it (the capacity for a resource; one for a worktree or a branch). A declaration is the user's
+  word. An inferred holder beside them does not soften this.
+- **A conflict is queued** ("Queue them", 2026-11-14): the second writer in one worktree or on one branch is
+  denied and filed like any other refused launch, and told to start when that work finishes. The entry keeps
+  its `repo:` and `branch:` (and `uses:`), so the proposal holds it while a running writer holds that branch
+  or worktree, instead of offering it, seeing it denied and filing it again.
+- `Repo:` takes a path (compared lowercase, with `/` for `\` and no trailing `/` or `.git`); `Branch:` takes
+  a branch name. Both are read among the brief's first lines, like `Lane:`. Each is its first word, so a
+  path with a space in it is cut there, and branch names compare with case.
+- Launches admitted in one message see each other: a launch holds what it declares (and its sub-lane) from
+  its admission until its agent starts.
 
 A launch that starts takes its waiting entry off the queue: the item its `Queue: KEY` line names, else the
-waiting launch with the same description and brief, else (a reworded brief, #150) the oldest waiting launch
-with the same declared `Lane:` and the same kind. The hook names the key it took off. A planned item leaves
-only by its `Queue:` key, and a launch with an inferred or no lane retires nothing by lane.
+waiting launch with the same description and brief, else every waiting launch with the same brief by content
+under any lane (its `content_sha`: the brief without its `Kind:`, `Lane:`, `Priority:` and `Uses:` lines,
+the first of each among the declaration lines, whitespace normalised; 2026-11-14), else (a reworded brief,
+#150) the oldest waiting launch with the same declared `Lane:` and the same kind. The hook names the key it
+took off. A planned item leaves only by its `Queue:` key, and a launch with an inferred or no lane retires
+nothing by lane. Filing matches by content too: a refused launch whose brief is already waiting by content,
+under any lane, description or priority, with the same kind and uses, is that entry, not a second one.
 
 Lanes compare without case (`Lane: parser` and `PARSER` are one lane), as resources do.
 
@@ -347,8 +390,15 @@ planned: true
   no queued item; one filed by hand is shown as `(no such queued item)`, and items that wait on each other as
   `(a cycle)`, so neither waits silently. The proposal never offers an item with an unmet condition, whatever
   its `order`. The marks are read once per proposal (two queries over journal notes, no bodies).
+  A wait on a review is written `review pr#N` (or `review OWNER/NAME#N`): a submitted GitHub review of that PR
+  marks it met with the same text, and the session is told at its next turn (`pr-events.md`).
 - **Listing.** `atlas queue` lists refused launches oldest first, then planned items by priority and order,
   each condition marked met, waiting, missing or a cycle. A kind atlas does not know is shown with `?` and
   named in a closing line (a tool such as `blender` is a resource: `kind: builder`, `uses: blender`); such an
   item is scheduled as a builder. `atlas queue done KEY` retires a planned item finished without a
   matching launch.
+- **KEY.** `show`, `drop`, `done` and `met` take an item's full key (`journal:LANE:NNNN`) or a bare lane key
+  (`ES1-1981`, any case). For `show` and `drop` it names the lane's one waiting item; for `done` and
+  `met` the lane's one open item, waiting or started and not yet marked done. A lane with several is refused
+  with each full key listed; a key that resolves to nothing is refused with the waiting keys that contain it as
+  suggestions. `--help` or `-h` in KEY's place prints the usage.

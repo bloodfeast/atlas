@@ -900,6 +900,7 @@ fn open(s: &Ship, reexport: Option<&PrInfo>) -> R<Done> {
     if format!("v{version}") != *tag {
         return Err(format!("asked to ship {tag}, but this checkout is v{version} (Cargo.toml)"));
     }
+    crate::version::refuse_pending(&s.root)?;
     let last = State::read(&s.state_file())?.filter(|st| st.tag == *tag);
     let moved = last.as_ref().filter(|st| st.commit != head);
     let key = crate::release_check::current_key(&s.root, &s.denylist, s.accepted.as_deref())?.1;
@@ -1477,6 +1478,17 @@ mod tests {
         assert!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err().starts_with("plugin.json version 1.2.3 is not Cargo.toml's 1.2.4"));
         commit_files(&w.dev, &[(".claude-plugin/plugin.json", "{\n  \"version\": \"1.2.4\"\n}\n")], "bump");
         assert_eq!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err(), "asked to ship v1.2.3, but this checkout is v1.2.4 (Cargo.toml)");
+        assert_eq!(w.hub.count("dispatch"), 0);
+        w.done();
+    }
+
+    #[test]
+    fn run_1_refuses_pending_changelog_fragments() {
+        let w = world("ship-r1-fragments");
+        w.no_draft();
+        commit_files(&w.dev, &[("changes/7.md", "---\nbump: patch\nsection: fix\n---\n- a\n")], "fragment");
+        let e = w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err();
+        assert!(e.contains("not in a release yet") && e.contains("cargo xtask version"), "{e}");
         assert_eq!(w.hub.count("dispatch"), 0);
         w.done();
     }

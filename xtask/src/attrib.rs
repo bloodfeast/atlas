@@ -121,7 +121,11 @@ fn is_build(c: &str) -> bool {
 /// The source a tool call's result is counted under.
 fn category(name: &str, inp: &Value) -> String {
     if name.starts_with("mcp__atlas") || name.starts_with("mcp__plugin_atlas") {
-        return if name.ends_with("__slice") { "atlas:slice" } else { "atlas" }.into();
+        // A slice of a stored output: the old `slice` tool, or `recall`
+        // with an `h:` key (the form every hint names now).
+        let handle =
+            name.ends_with("__recall") && matches!(inp.get("key"), Some(Value::String(k)) if atlas::handles::handle_key(k).is_some());
+        return if name.ends_with("__slice") || handle { "atlas:slice" } else { "atlas" }.into();
     }
     match name {
         "Read" => return "read".into(),
@@ -313,6 +317,11 @@ mod tests {
         assert_eq!(category("Bash", &cmd("x.shell")), "shell-other");
         assert_eq!(category("Bash", &cmd("grep -n x")), "shell-read");
         assert_eq!(category("mcp__atlas__slice", &Value::Null), "atlas:slice");
+        let key = |k: &str| atlas::json::parse(&format!("{{\"key\": {}}}", atlas::json::to_string(&k.to_string()))).unwrap();
+        assert_eq!(category("mcp__atlas__recall", &key("h:0123456789 lines=1-5")), "atlas:slice");
+        assert_eq!(category("mcp__plugin_atlas_atlas__recall", &key("h:")), "atlas:slice");
+        assert_eq!(category("mcp__atlas__recall", &key("rules:r1")), "atlas");
+        assert_eq!(category("mcp__atlas__recall", &Value::Null), "atlas");
         assert_eq!(category("Task", &Value::Null), "other:Task");
     }
 }

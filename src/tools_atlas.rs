@@ -436,8 +436,17 @@ impl Server {
     /// Section ids for a semantic or hybrid search, best first. Loads the
     /// model and the vectors on first use, embeds a few missing sections
     /// inline and leaves the rest to the background embedder; `note` says
-    /// how many sections still have no vector.
-    fn semantic_ids(&mut self, query: &str, mode: &str, source: Option<&str>, folder: Option<&str>, want: usize, note: &mut String) -> Result<Vec<i64>> {
+    /// how many sections still have no vector and how many windows are
+    /// still pending.
+    fn semantic_ids(
+        &mut self,
+        query: &str,
+        mode: &str,
+        source: Option<&str>,
+        folder: Option<&str>,
+        want: usize,
+        note: &mut String,
+    ) -> Result<Vec<i64>> {
         let Some(sem) = self.semantic.as_mut() else {
             return Err(Error::InvalidArgument("semantic search is not set up".into()));
         };
@@ -455,14 +464,19 @@ impl Server {
         };
         if stale {
             let mut ix = crate::semantic::VecIndex::load(conn, &model.id, model.dim)?;
-            if ix.missing > 0 && sem.embedder.as_ref().is_none_or(|e| e.done()) {
+            if ix.pending() > 0 && sem.embedder.as_ref().is_none_or(|e| e.done()) {
                 // A few on this thread (an edit or two), the rest in the
-                // background.
-                if ix.missing <= crate::semantic::INLINE_BUDGET {
+                // background. Pending windows, not sections, are counted.
+                if ix.pending() <= crate::semantic::INLINE_BUDGET {
                     let mut c = crate::store::open_raw(&sem.db)?;
                     c.busy_timeout(std::time::Duration::from_secs(30))?;
                     crate::semantic::embed_pending(&mut c, &model, crate::semantic::INLINE_BUDGET, 1)?;
                     ix = crate::semantic::VecIndex::load(conn, &model.id, model.dim)?;
+                    // A section just split can have more windows than the
+                    // budget: the rest go to the background.
+                    if ix.pending() > 0 {
+                        sem.embedder = Some(crate::semantic::Embedder::start(sem.db.clone(), model.clone(), sem.threads));
+                    }
                 } else {
                     sem.embedder = Some(crate::semantic::Embedder::start(sem.db.clone(), model.clone(), sem.threads));
                 }
@@ -475,6 +489,17 @@ impl Server {
             if let Some(e) = sem.embedder.as_ref().and_then(|e| e.error()) {
                 *note = format!("missing for {} sections; embedding failed: {e}", ix.missing);
             }
+        } else if ix.unsplit + ix.windows_pending > 0 {
+            // Every section scores by the windows it has meanwhile.
+            *note = match sem.embedder.as_ref().and_then(|e| e.error()) {
+                Some(e) => {
+                    format!("windows pending: {} windows, {} sections not yet split; embedding failed: {e}", ix.windows_pending, ix.unsplit)
+                }
+                None => format!(
+                    "windows pending: {} windows, {} sections not yet split (embedding in the background)",
+                    ix.windows_pending, ix.unsplit
+                ),
+            };
         }
         let mut s = crate::embed::bert::Scratch::default();
         let qv = model.embed_query(query, &mut s);

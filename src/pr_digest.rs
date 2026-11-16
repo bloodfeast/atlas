@@ -10,7 +10,7 @@
 //! end of file` included) and the text between files (a `--patch` commit
 //! header, a trailing signature). Each part is stored as its own handle, the
 //! whole output as one more, so [`Handles::text`] of the parts in order is the
-//! stored output exactly (the model's view, `atlas slice`, numbers the lines
+//! stored output exactly (the model's view, `recall h:ID`, numbers the lines
 //! and caps a slice, so exactness is defined on the stored bytes).
 //!
 //! A file's row gives its status, `+`/`-` lines, its handle and each hunk's
@@ -32,10 +32,11 @@
 //! modification, [`row_backed`]), and an edited line paired
 //! with its old line shown once as a word diff (`~`, [`wd_line`]). A read
 //! over the slice cap breaks between hunks and ends with a counted `next
-//! page: atlas slice ID --page K` line. Every hidden line is reachable from
+//! page: recall h:ID page=K` line. Every hidden line is reachable from
 //! a handle the digest names: the read decodes back to the stored bytes, and
-//! `--lines A-B` reads them as stored. Context collapse (C1) is in the code
-//! for measurement only and is off in every shipped build ([`levers`]).
+//! `lines=A-B` reads them as stored. Context collapse (C1) is on in shipped
+//! builds ([`levers`]): a context run more than one line from a change sits
+//! behind a marker naming its hunk lines, read as stored by `lines=A-B`.
 //!
 //! `gh pr view` (the default text view, `--comments`, and `--json` with
 //! `body`, `comments` or `reviews`) becomes the short fields verbatim and one
@@ -690,7 +691,7 @@ pub fn row_header(f: &FileDiff) -> [String; 3] {
 
 /// How a file part is read: `View(k)` is the default read from line `k`
 /// (the presentation levers on, paged on the bytes shown), `Raw(a, b)` lines
-/// `a..=b` as stored (a hunk read, `--lines`).
+/// `a..=b` as stored (a hunk read, `lines=A-B`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSel {
     /// The default read, from this 1-based line of the part.
@@ -701,14 +702,14 @@ pub enum FileSel {
 
 /// One page of a PR diff file part, diff-native: no line numbers. A page
 /// breaks only between hunks, unless one hunk alone is over `cap`; a cut
-/// page ends with one `next page: atlas slice ID ...` line, which is not
+/// page ends with one `next page: recall h:ID ...` line, which is not
 /// counted in the cap.
 ///
 /// * [`FileSel::Raw`] gives the stored bytes, and a cut page continues with
-///   `--lines K-B`.
+///   `lines=K-B`.
 /// * [`FileSel::View`] applies the [`Levers`] ([`view`]) and, when
 ///   `row_backed` (the handle is named only by a row that reproduces them),
-///   leaves out the header lines; a cut page continues with `--page K`.
+///   leaves out the header lines; a cut page continues with `page=K`.
 ///
 /// `None` when `text` is not one file of a diff.
 pub fn file_slice(id: &str, text: &str, sel: FileSel, cap: usize, row_backed: bool) -> Option<String> {
@@ -759,16 +760,31 @@ pub fn file_slice(id: &str, text: &str, sel: FileSel, cap: usize, row_backed: bo
             // One hunk over the cap is cut between lines anyway: it starts on
             // this page, with at least one line on it.
             while k <= e && (out.is_empty() || out.len() + size(k) <= cap) {
-                out.push_str(&text[lines[k - 1].0..lines[k - 1].1]);
+                let line = &text[lines[k - 1].0..lines[k - 1].1];
+                if line.len() > cap {
+                    // One line alone over the cap: cut it, and say so.
+                    out.push_str(&clip_long_line(id, k, line, cap));
+                    k += 1;
+                    break;
+                }
+                out.push_str(line);
                 k += 1;
             }
         }
         break;
     }
     if k <= b {
-        out.push_str(&format!("next page: atlas slice {id} --lines {k}-{b}\n"));
+        out.push_str(&format!("next page: recall {id} lines={k}-{b}\n"));
     }
     Some(out)
+}
+
+/// One line of a file part over the cap: its first `cap` bytes and the
+/// handle store's note naming its size and how to see another part.
+fn clip_long_line(id: &str, k: usize, line: &str, cap: usize) -> String {
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    let (s, e) = crate::handles::clip_line(body, cap, None);
+    format!("{}\n{}", &body[s..e], crate::handles::long_line_note(id, k, body.len(), (s, e), false))
 }
 
 /// Pages a default read from line `from`: whole units (the header, then
@@ -794,6 +810,11 @@ fn page_view(id: &str, units: &[Vec<Piece>], from: usize, cap: usize) -> Option<
                     next = Some(p.first);
                     break 'units;
                 }
+                if p.text.len() > cap {
+                    // One line alone over the cap: cut it, and say so.
+                    out.push_str(&clip_long_line(id, p.first, &p.text, cap));
+                    continue;
+                }
                 out.push_str(&p.text);
             }
             continue;
@@ -802,7 +823,7 @@ fn page_view(id: &str, units: &[Vec<Piece>], from: usize, cap: usize) -> Option<
         break;
     }
     if let Some(k) = next {
-        out.push_str(&format!("next page: atlas slice {id} --page {k}\n"));
+        out.push_str(&format!("next page: recall {id} page={k}\n"));
     }
     Some(out)
 }
@@ -823,11 +844,11 @@ pub struct Levers {
     pub del: bool,
 }
 
-/// The shipped levers: WD and DEL on, C1 off (it hides lines a reader can
-/// only get back by a second slice, and has no fidelity eval yet). In a
-/// `dev` build `ATLAS_PRDIGEST_LEVERS` (a comma list of `wd`, `c1`, `del`)
-/// names the ones to keep instead, for measurement only; no configuration
-/// key reaches C1.
+/// The shipped levers: WD, C1 and DEL on. Under C1 a context run more than
+/// one line from a change sits behind a marker naming its hunk lines, read
+/// as stored by `lines=A-B`. In a `dev` build `ATLAS_PRDIGEST_LEVERS` (a
+/// comma list of `wd`, `c1`, `del`) names the ones to keep instead, as a
+/// measurement override only; no configuration key reaches C1.
 pub fn levers() -> Levers {
     #[cfg(feature = "dev")]
     if let Ok(v) = std::env::var("ATLAS_PRDIGEST_LEVERS") {
@@ -838,7 +859,7 @@ pub fn levers() -> Levers {
 }
 
 /// What [`levers`] returns outside measurement.
-pub const SHIPPED: Levers = Levers { wd: true, c1: false, del: true };
+pub const SHIPPED: Levers = Levers { wd: true, c1: true, del: true };
 
 /// Lines of the default read standing for original lines `first..=last`
 /// (1-based in the part).
@@ -890,24 +911,26 @@ fn cls(l: &str) -> Cls {
 ///
 /// * Header lines the row reproduces ([`row_header`]) show as nothing.
 /// * C1: a run of context lines each more than one line from the nearest
-///   change of its hunk is one marker line, `= N hidden --lines A-B`, where
+///   change of its hunk is one marker line, `= N hidden lines=A-B`, where
 ///   N is the exact count and `A-B` the hidden lines themselves (one slice
 ///   of the file's handle holds them all; a whole hunk's slice can page).
 ///   A run is hidden only when the marker is shorter than the run.
 /// * WD: in a change block (a run of `-` lines then a run of `+` lines,
-///   with no other change line on either side), the k-th `-` and k-th `+`
-///   lines are one [`wd_line`] when their [`similarity`] is at least 0.6.
-///   A line with no newline, one followed by `\ No newline at end of
-///   file`, or one over [`WD_MAX_LINE`] bytes, is never paired. A block with
-///   a word diff shows, position by position, the word diff or the `-` line
-///   then the `+` line; one over `cap` is shown as stored.
+///   with no other change line on either side), `-` and `+` lines are
+///   paired in order ([`wd_block`]) and each pair is one [`wd_line`]: only
+///   a pair whose [`similarity`] is at least 0.6 and whose word diff is
+///   shorter than its two stored lines. A line with no newline, one
+///   followed by `\ No newline at end of file`, or one over [`WD_MAX_LINE`]
+///   bytes, is never paired. A block with a word diff shows each pair's
+///   word diff after the unpaired `-` lines, then the unpaired `+` lines,
+///   that come before it; one over `cap` is shown as stored.
 pub fn view(text: &str, f: &FileDiff, lv: Levers, cap: usize) -> Vec<Vec<Piece>> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let n = lines.len();
     let hide = row_header(f);
     let header_end = f.hunks.first().map_or(n, |h| h.0 - 1);
     let mut units: Vec<Vec<Piece>> = Vec::new();
-    let mut budget = WD_READ_STEPS;
+    let (mut budget, mut align) = (WD_READ_STEPS, WD_ALIGN_STEPS);
     let header: Vec<Piece> = (1..=header_end)
         .map(|k| {
             let l = lines[k - 1];
@@ -943,7 +966,7 @@ pub fn view(text: &str, f: &FileDiff, lv: Levers, cap: usize) -> Vec<Vec<Piece>>
                     k += 1;
                 }
                 let run: usize = body[j..k].iter().map(|l| l.len()).sum();
-                let marker = format!("= {} hidden --lines {at}-{}\n", k - j, s + k);
+                let marker = format!("= {} hidden lines={at}-{}\n", k - j, s + k);
                 if marker.len() < run {
                     u.push(Piece { first: at, last: s + k, text: marker, hidden: true });
                 } else {
@@ -962,13 +985,16 @@ pub fn view(text: &str, f: &FileDiff, lv: Levers, cap: usize) -> Vec<Vec<Piece>>
                 if nn > 0 && closed {
                     let marked = body.get(end).is_some_and(|l| l.starts_with('\\'));
                     // A word-diff line is at least as long as the longer of its
-                    // two stored lines, and an unpaired position shows both, so
-                    // this is a floor on the block's length: over `cap`, the
-                    // block would be shown as stored anyway. Checked first, so
-                    // a huge block is never word-diffed.
-                    let floor: usize = (0..m.max(nn)).map(|q| body[j..j + m].get(q).map_or(0, |l| l.len()).max(body[j + m..end].get(q).map_or(0, |l| l.len()))).sum();
+                    // two stored lines, so the block is at least as long as its
+                    // `-` lines and as its `+` lines: over `cap`, it would be
+                    // shown as stored anyway. Checked first, so a huge block is
+                    // never word-diffed.
+                    let total = |ls: &[&str]| ls.iter().map(|l| l.len()).sum::<usize>();
+                    let floor = total(&body[j..j + m]).max(total(&body[j + m..end]));
                     if floor <= cap {
-                        if let Some(t) = wd_block(&body[j..j + m], &body[j + m..end], marked, &mut budget).filter(|t| t.len() <= cap) {
+                        if let Some(t) =
+                            wd_block(&body[j..j + m], &body[j + m..end], marked, &mut budget, &mut align).filter(|t| t.len() <= cap)
+                        {
                             u.push(Piece { first: at, last: s + end, text: t, hidden: false });
                             j = end;
                             continue;
@@ -1007,40 +1033,112 @@ pub fn shown_lines(text: &str, lv: Levers, cap: usize) -> Option<Vec<bool>> {
     Some(v)
 }
 
+/// The most `-` lines times `+` lines of a change block whose pairs are
+/// aligned ([`wd_block`]); a larger block pairs its k-th `-` line with its
+/// k-th `+` line.
+pub const WD_ALIGN_CELLS: usize = 4096;
+/// The most matcher steps one read ([`view`]) spends aligning change blocks,
+/// apart from [`WD_READ_STEPS`]: an aligned block tries every `-` line with
+/// every `+` line, so it has its own budget, and once that is spent a block
+/// pairs by position on the read's budget, as it did before alignment.
+pub const WD_ALIGN_STEPS: usize = 1 << 24;
+
 /// A change block with at least one pair shown as a word diff, else `None`.
-/// Its pairs spend the read's `budget` of matcher steps.
-fn wd_block(dels: &[&str], adds: &[&str], marked: bool, budget: &mut usize) -> Option<String> {
-    let pairs = dels.len().min(adds.len());
-    let mut wd: Vec<Option<String>> = vec![None; pairs];
-    for (i, w) in wd.iter_mut().enumerate() {
-        let (a, b) = (dels[i], adds[i]);
-        let last_add = i + 1 == adds.len();
-        if !a.ends_with('\n') || !b.ends_with('\n') || (marked && last_add) {
-            continue;
+/// An aligned block's pairs spend the read's `align` steps; pairs taken by
+/// position (a block of one `-` and one `+` line, one over
+/// [`WD_ALIGN_CELLS`], and every block once `align` is spent) spend its
+/// `budget`.
+///
+/// A pair is a `-` line and a `+` line whose [`wd_line`] is shorter than the
+/// two stored lines. Pairs keep the order of both sides (the i-th pair's
+/// lines come before the next pair's on each side), and among such sets the
+/// one that saves the most bytes is shown: a line inserted or removed in the
+/// middle of a block no longer unpairs every line after it. Each pair's word
+/// diff follows the unpaired `-` lines, then the unpaired `+` lines, before
+/// it, so the block reads back as its old sides in order, then its new.
+fn wd_block(dels: &[&str], adds: &[&str], marked: bool, budget: &mut usize, align: &mut usize) -> Option<String> {
+    let (m, n) = (dels.len(), adds.len());
+    // Each line's tokens, once: an aligned block tries a line against every
+    // line of the other side. `None` for a line that never pairs: one with
+    // no newline, or a long one (the word diff is quadratic in tokens or
+    // worse, so it is shown as stored).
+    let pairs = |l: &str| l.ends_with('\n') && l.len() <= WD_MAX_LINE;
+    let td: Vec<Option<Vec<&str>>> = dels.iter().map(|l| pairs(l).then(|| tokens(&l[1..l.len() - 1]))).collect();
+    let ta: Vec<Option<Vec<&str>>> = adds.iter().map(|l| pairs(l).then(|| tokens(&l[1..l.len() - 1]))).collect();
+    let pair = |i: usize, j: usize, budget: &mut usize| -> Option<(usize, String)> {
+        if marked && j + 1 == n {
+            return None;
         }
-        // The word diff is quadratic in tokens or worse: a long line is shown
-        // as stored.
-        if a.len() > WD_MAX_LINE || b.len() > WD_MAX_LINE {
-            continue;
+        let w = wd_tokens_within(td[i].as_ref()?, ta[j].as_ref()?, budget)?;
+        let stored = dels[i].len() + adds[j].len();
+        (w.len() < stored).then(|| (stored - w.len(), w))
+    };
+    // The pairs shown, in order: (i, j, word diff).
+    let mut shown: Vec<(usize, usize, String)> = Vec::new();
+    let mut aligned = false;
+    let cells = m.saturating_mul(n);
+    if cells > 1 && cells <= WD_ALIGN_CELLS && *align > 0 {
+        let mut cand: Vec<Option<(usize, String)>> = Vec::with_capacity(m * n);
+        for i in 0..m {
+            for j in 0..n {
+                cand.push(pair(i, j, align));
+            }
         }
-        *w = wd_line_within(&a[1..a.len() - 1], &b[1..b.len() - 1], budget);
+        // A spent budget leaves candidates untried: the block pairs by
+        // position instead.
+        aligned = *align > 0;
+        if aligned {
+            // best[i][j]: the most bytes saved pairing the first i `-` lines
+            // with the first j `+` lines.
+            let w = n + 1;
+            let mut best = vec![0usize; (m + 1) * w];
+            for i in 1..=m {
+                for j in 1..=n {
+                    let mut v = best[(i - 1) * w + j].max(best[i * w + j - 1]);
+                    if let Some((s, _)) = &cand[(i - 1) * n + j - 1] {
+                        v = v.max(best[(i - 1) * w + j - 1] + s);
+                    }
+                    best[i * w + j] = v;
+                }
+            }
+            let (mut i, mut j) = (m, n);
+            while i > 0 && j > 0 {
+                let here = best[i * w + j];
+                let saved = cand[(i - 1) * n + j - 1].as_ref().map(|c| c.0);
+                if saved.is_some_and(|s| here == best[(i - 1) * w + j - 1] + s) {
+                    let (_, t) = cand[(i - 1) * n + j - 1].take().unwrap();
+                    shown.push((i - 1, j - 1, t));
+                    i -= 1;
+                    j -= 1;
+                } else if here == best[(i - 1) * w + j] {
+                    i -= 1;
+                } else {
+                    j -= 1;
+                }
+            }
+            shown.reverse();
+        }
     }
-    if wd.iter().all(Option::is_none) {
+    if !aligned {
+        for i in 0..m.min(n) {
+            if let Some((_, w)) = pair(i, i, budget) {
+                shown.push((i, i, w));
+            }
+        }
+    }
+    if shown.is_empty() {
         return None;
     }
     let mut out = String::new();
-    for i in 0..dels.len().max(adds.len()) {
-        if let Some(Some(w)) = wd.get(i) {
-            out.push_str(w);
-            continue;
-        }
-        if let Some(a) = dels.get(i) {
-            out.push_str(a);
-        }
-        if let Some(b) = adds.get(i) {
-            out.push_str(b);
-        }
+    let (mut i, mut j) = (0, 0);
+    for (pi, pj, t) in &shown {
+        dels[i..*pi].iter().for_each(|l| out.push_str(l));
+        adds[j..*pj].iter().for_each(|l| out.push_str(l));
+        out.push_str(t);
+        (i, j) = (pi + 1, pj + 1);
     }
+    dels[i..].iter().for_each(|l| out.push_str(l));
+    adds[j..].iter().for_each(|l| out.push_str(l));
     Some(out)
 }
 
@@ -1186,32 +1284,93 @@ fn wd_line_within(old: &str, new: &str, budget: &mut usize) -> Option<String> {
     if *budget == 0 {
         return None;
     }
-    let (ta, tb) = (tokens(old), tokens(new));
+    wd_tokens_within(&tokens(old), &tokens(new), budget)
+}
+
+/// The bytes [`wd_escape`] writes for `s`.
+fn wd_escaped_len(s: &str) -> usize {
+    let mut out = String::with_capacity(s.len());
+    wd_escape(&mut out, s);
+    out.len()
+}
+
+/// The one more byte [`wd_escape`] writes for `l` then `r` as one text than
+/// for the two apart: `l`'s last character is escaped when it forms a mark
+/// with `r`'s first.
+fn wd_seam(l: &str, r: &str) -> usize {
+    let pair = (l.chars().next_back(), r.chars().next());
+    usize::from(matches!(pair, (Some('['), Some('-')) | (Some('-'), Some(']')) | (Some('{'), Some('+')) | (Some('+'), Some('}'))))
+}
+
+/// [`wd_line_within`] over the two lines' word tokens.
+fn wd_tokens_within(ta: &[&str], tb: &[&str], budget: &mut usize) -> Option<String> {
+    if *budget == 0 {
+        return None;
+    }
+    let total = ta.len() + tb.len();
+    // The ratio is at most twice the shorter side over both: a pair that
+    // cannot reach the similarity spends no matcher step.
+    if total == 0 || ((2 * ta.len().min(tb.len())) as f64) / (total as f64) < WD_SIMILARITY {
+        return None;
+    }
     let limit = WD_MAX_STEPS.min(*budget);
     let mut pair = limit;
-    let blocks = matching_blocks_within(&ta, &tb, &mut pair);
+    let blocks = matching_blocks_within(ta, tb, &mut pair);
     *budget -= limit - pair;
     let blocks = blocks?;
     let m: usize = blocks.iter().map(|x| x.2).sum();
-    let total = ta.len() + tb.len();
-    if total == 0 || (2 * m) as f64 / (total as f64) < WD_SIMILARITY {
+    if (2 * m) as f64 / (total as f64) < WD_SIMILARITY {
         return None;
     }
-    let mut out = String::from("~");
+    // Segments: deleted text, added text, then the common text after them;
+    // and the escaped lengths of each segment's deleted and added text.
+    let mut segs: Vec<(String, String, String)> = Vec::new();
+    let mut lens: Vec<(usize, usize)> = Vec::new();
+    let marks = |text: &str, escaped: usize| if text.is_empty() { 0 } else { 4 + escaped };
     let (mut i, mut j) = (0, 0);
     for (bi, bj, k) in blocks.into_iter().chain(std::iter::once((ta.len(), tb.len(), 0))) {
-        if i < bi {
+        let seg = (ta[i..bi].concat(), tb[j..bj].concat(), ta[bi..bi + k].concat());
+        let (sd, sa) = (wd_escaped_len(&seg.0), wd_escaped_len(&seg.1));
+        (i, j) = (bi + k, bj + k);
+        // Common text shorter than the marks it stands between is cheaper
+        // inside them: `[-a-]{+b+} [-c-]{+d+}` is `[-a c-]{+b d+}`. Joining
+        // two changes leaves one `[-..-]` and one `{+..+}` (8 bytes) and
+        // writes the common text twice, so they join only when the bytes
+        // written, escapes included, are fewer.
+        if let (Some(prev), Some(pl)) = (segs.last_mut(), lens.last_mut()) {
+            if (!prev.0.is_empty() || !prev.1.is_empty()) && (!seg.0.is_empty() || !seg.1.is_empty()) {
+                let common = wd_escaped_len(&prev.2);
+                let apart = marks(&prev.0, pl.0) + marks(&prev.1, pl.1) + common + marks(&seg.0, sd) + marks(&seg.1, sa);
+                let jd = pl.0 + common + sd + wd_seam(&prev.0, &prev.2) + wd_seam(&prev.2, &seg.0);
+                let ja = pl.1 + common + sa + wd_seam(&prev.1, &prev.2) + wd_seam(&prev.2, &seg.1);
+                if 8 + jd + ja < apart {
+                    let common = std::mem::take(&mut prev.2);
+                    prev.0.push_str(&common);
+                    prev.0.push_str(&seg.0);
+                    prev.1.push_str(&common);
+                    prev.1.push_str(&seg.1);
+                    prev.2 = seg.2;
+                    *pl = (jd, ja);
+                    continue;
+                }
+            }
+        }
+        segs.push(seg);
+        lens.push((sd, sa));
+    }
+    let mut out = String::from("~");
+    for (d, a, common) in &segs {
+        if !d.is_empty() {
             out.push_str("[-");
-            wd_escape(&mut out, &ta[i..bi].concat());
+            wd_escape(&mut out, d);
             out.push_str("-]");
         }
-        if j < bj {
+        if !a.is_empty() {
             out.push_str("{+");
-            wd_escape(&mut out, &tb[j..bj].concat());
+            wd_escape(&mut out, a);
             out.push_str("+}");
         }
-        wd_escape(&mut out, &ta[bi..bi + k].concat());
-        (i, j) = (bi + k, bj + k);
+        wd_escape(&mut out, common);
     }
     out.push('\n');
     Some(out)
@@ -1755,7 +1914,7 @@ fn hunk_list(f: &FileDiff) -> String {
         s.push_str(&format!(" {a}-{b}"));
     }
     if f.hunks.len() > MAX_HUNKS_SHOWN {
-        s.push_str(&format!(" +{} more (--grep ^@@)", f.hunks.len() - MAX_HUNKS_SHOWN));
+        s.push_str(&format!(" +{} more (grep=^@@)", f.hunks.len() - MAX_HUNKS_SHOWN));
     }
     s
 }
@@ -1918,7 +2077,7 @@ pub fn diff(h: &mut Handles, w: &Where, text: &str, whole: &Meta) -> Result<Dige
     let listed = files.iter().filter(|(i, _)| collapsed[*i].is_none()).count();
     let rest = listed - unchanged.len() - shown;
     if rest > 0 {
-        out.push_str(&format!("{rest} more files: atlas slice {} --grep \"^diff --git\"\n", whole_row.id));
+        out.push_str(&format!("{rest} more files: recall {} grep=\"^diff --git\"\n", whole_row.id));
     }
     if !unchanged.is_empty() {
         let more = unchanged.len().saturating_sub(MAX_ROWS);
@@ -1962,12 +2121,12 @@ pub fn diff(h: &mut Handles, w: &Where, text: &str, whole: &Meta) -> Result<Dige
         out.push_str(&format!("vendored {root} {} files +{a} -{d} {}{state}\n", idx.len(), g.id));
     }
     let legend = match (lv.wd, lv.c1) {
-        (true, true) => "; in a file read ~ is an edited line as [-old-]{+new+}, and = N hidden --lines A-B is context left out",
+        (true, true) => "; in a file read ~ is an edited line as [-old-]{+new+}, and = N hidden lines=A-B is context left out",
         (true, false) => "; in a file read ~ is an edited line as [-old-]{+new+}",
-        (false, true) => "; in a file read = N hidden --lines A-B is context left out",
+        (false, true) => "; in a file read = N hidden lines=A-B is context left out",
         (false, false) => "",
     };
-    out.push_str(&format!("a file: atlas slice h:F; a hunk: atlas slice h:F --lines A-B{legend}; whole output {}\n", whole_row.id));
+    out.push_str(&format!("a file: recall h:F; a hunk: recall h:F lines=A-B{legend}; whole output {}\n", whole_row.id));
     let parts_ids = rows.iter().map(|e| e.handle.clone()).collect();
     Ok(Digested { digest: out, round, whole: whole_row.id, parts: parts_ids })
 }
@@ -2086,7 +2245,7 @@ pub fn view_text(h: &mut Handles, w: &Where, text: &str, whole: &Meta, comments:
         }
         ids.push(row.id);
     }
-    out.push_str(&format!("a part: atlas slice h:P; whole output {}\n", whole_row.id));
+    out.push_str(&format!("a part: recall h:P; whole output {}\n", whole_row.id));
     Ok(Digested { digest: out, round: 0, whole: whole_row.id, parts: ids })
 }
 
@@ -2158,7 +2317,7 @@ pub fn view_json(h: &mut Handles, w: &Where, text: &str, whole: &Meta) -> Result
             _ => out.push_str(&format!("{k}: {}\n", clip(&val.to_string(), QUOTE))),
         }
     }
-    out.push_str(&format!("a text: atlas slice h:T; whole output {}\n", whole_row.id));
+    out.push_str(&format!("a text: recall h:T; whole output {}\n", whole_row.id));
     Ok(Some(Digested { digest: out, round: 0, whole: whole_row.id, parts: ids }))
 }
 
@@ -2330,6 +2489,18 @@ mod tests {
         let mut budget = took - 1;
         assert_eq!(wd_line_within(old, new, &mut budget), None);
         assert_eq!(budget, 0);
+    }
+
+    /// A pair whose token counts alone put it under the similarity (the
+    /// ratio is at most twice the shorter side over both) spends no matcher
+    /// step; one that could reach it does.
+    #[test]
+    fn a_pair_too_uneven_to_be_similar_spends_no_step() {
+        let mut budget = WD_READ_STEPS;
+        assert_eq!(wd_line_within("a b", "a b c d e f g h", &mut budget), None, "3 tokens against 15: at most 6 of 18");
+        assert_eq!(budget, WD_READ_STEPS);
+        assert_eq!(wd_line_within("a b c d", "e f g h", &mut budget), None, "even sides, nothing in common");
+        assert!(budget < WD_READ_STEPS);
     }
 }
 

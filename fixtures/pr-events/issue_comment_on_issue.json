@@ -1,0 +1,11 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 40,
+    "title": "A plain issue, not a PR",
+    "user": { "login": "octo-author", "id": 2002, "type": "User" }
+  },
+  "comment": { "id": 1004, "user": { "login": "octo-author", "id": 2002, "type": "User" }, "body": "Still seeing this." },
+  "repository": { "id": 3001, "name": "widgets", "full_name": "octo-org/widgets" },
+  "sender": { "login": "octo-author", "id": 2002, "type": "User" }
+}

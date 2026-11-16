@@ -1,7 +1,8 @@
 //! SHA-256 (FIPS 180-4), hand-rolled so the crate needs no hashing dependency.
 //!
 //! Used for the `sha256` of every note (stale-edit checks, the audit log and
-//! the rescan's change test). It is not used for anything secret.
+//! the rescan's change test), and under [`hmac`] for the signature on a
+//! GitHub webhook delivery (`crate::pr_listen`).
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be,
@@ -112,7 +113,17 @@ impl Hasher {
     }
 
     /// The digest of everything added, as 64 lowercase hex characters.
-    pub fn hex(mut self) -> String {
+    pub fn hex(self) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in self.finish() {
+            out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+            out.push(char::from_digit(u32::from(byte & 0xf), 16).unwrap_or('0'));
+        }
+        out
+    }
+
+    /// The digest of everything added, as 32 bytes.
+    pub fn finish(mut self) -> [u8; 32] {
         let mut tail = [0u8; 128];
         tail[..self.fill].copy_from_slice(&self.buf[..self.fill]);
         tail[self.fill] = 0x80;
@@ -122,20 +133,50 @@ impl Hasher {
         for block in tail[..tail_len].as_chunks::<64>().0 {
             compress(&mut self.state, block);
         }
-        let mut out = String::with_capacity(64);
-        for word in self.state {
-            for byte in word.to_be_bytes() {
-                out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-                out.push(char::from_digit(u32::from(byte & 0xf), 16).unwrap_or('0'));
-            }
+        let mut out = [0u8; 32];
+        for (o, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *o = word.to_be_bytes();
         }
         out
     }
 }
 
+/// HMAC-SHA256 (RFC 2104) of `msg` under `key`: a 64-byte block, a key
+/// longer than the block hashed first. Used to check the signature GitHub
+/// puts on a webhook delivery (`X-Hub-Signature-256`).
+pub fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let mut h = Hasher::new();
+        h.update(key);
+        k[..32].copy_from_slice(&h.finish());
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| k.map(|x| x ^ b);
+    let mut inner = Hasher::new();
+    inner.update(&pad(0x36));
+    inner.update(msg);
+    let mut outer = Hasher::new();
+    outer.update(&pad(0x5c));
+    outer.update(&inner.finish());
+    outer.finish()
+}
+
+/// Whether two byte strings are equal, in time that depends only on their
+/// lengths (never on where they first differ).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| std::hint::black_box(d | (x ^ y)));
+    // `black_box` keeps the fold from being turned into an early exit.
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hex, Hasher};
+    use super::{ct_eq, hex, hmac, Hasher};
 
     #[test]
     fn known_vectors() {
@@ -164,5 +205,44 @@ mod tests {
             }
             assert_eq!(h.hex(), whole, "pieces of {step}");
         }
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231_and_githubs_example() {
+        let cases: [(&[u8], &[u8], &str); 4] = [
+            (&[0x0b; 20], b"Hi There", "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+            (b"Jefe", b"what do ya want for nothing?", "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+            // A key longer than the block is hashed first.
+            (
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First",
+                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            ),
+            // GitHub's documented example for X-Hub-Signature-256.
+            (b"It's a Secret to Everybody", b"Hello, World!", "757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"),
+        ];
+        for (key, msg, want) in cases {
+            assert_eq!(hmac(key, msg).to_vec(), unhex(want));
+        }
+    }
+
+    #[test]
+    fn ct_eq_compares_whole_strings() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"xbc"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn finish_is_hex_as_bytes() {
+        let mut h = Hasher::new();
+        h.update(b"abc");
+        assert_eq!(h.clone().finish().to_vec(), unhex(&h.hex()));
     }
 }

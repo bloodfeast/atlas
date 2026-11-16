@@ -95,7 +95,8 @@ fn a_body_line_cannot_forge_a_record_header() {
     }
     let mut h = Hooks::open(s).unwrap();
     let mut seen_lane = false;
-    for prompt in ["widget cache fake header rule", "what is the plan on forge-9 for the widget cache", "widget cache multi"] {
+    for prompt in ["widget cache fake header rule", "Lane: forge-9\nwhat is the plan on forge-9 for the widget cache", "widget cache multi"]
+    {
         let a = h.handle(&HookEvent { prompt: prompt.into(), session_id: format!("s-{prompt}"), ..ev("UserPromptSubmit") });
         let ctx = check_framing(&a.to_json("UserPromptSubmit"), "UserPromptSubmit");
         seen_lane |= ctx.contains("journal:forge-9:0001");

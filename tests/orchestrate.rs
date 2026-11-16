@@ -211,17 +211,17 @@ fn a_relaunch_with_a_kind_line_keeps_and_rekinds_its_queue_entry() {
     assert_eq!(m.head(key).unwrap().unwrap().status, "retired");
 }
 
-/// A lane refusal is not caused by the kind: it gets no advice on
+/// A queue refusal is not caused by the kind: it gets no advice on
 /// `Kind:` lines, even for a launch no `Kind:` line classified.
 #[test]
-fn a_lane_refusal_gives_no_kind_advice() {
+fn a_queue_refusal_gives_no_kind_advice() {
     let t = Temp::new("orch-cap-no-kind-advice");
     let s = Session::new(t.path());
     let on = OrchestrateSpec { enabled: Some(true), ..Default::default() };
     let mut h = Hooks::open(settings(t.path(), &on, &[])).unwrap();
     h.set_command_hook();
-    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: parser\n\nFix the reader.", 1000, false);
-    let r = launch(&mut h, &s, "t1", "general-purpose", "Lane: parser\n\nFix the writer.").deny.unwrap();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: parser\nUses: compile\n\nFix the reader.", 1000, false);
+    let r = launch(&mut h, &s, "t1", "general-purpose", "Lane: parser\nUses: compile\n\nFix the writer.").deny.unwrap();
     assert!(r.starts_with("atlas queue") && r.contains("atlas queued it as") && !r.contains("add `Queue:") && !r.contains("Kind:"), "{r}");
 }
 
@@ -237,10 +237,10 @@ fn a_denied_launch_never_holds_a_slot() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     // One reviewer of two running, and a builder holding lane parser.
     s.agent("r1", "general-purpose", "t-r1", "Kind: reviewer\nReview it.", 1000, false);
-    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: parser\n\nFix the reader.", 1000, false);
-    // A builder the queue denies (a declared lane conflict) after the cap
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: parser\nUses: compile\n\nFix the reader.", 1000, false);
+    // A builder the queue denies (compile declared on both sides) after the cap
     // let it through ...
-    let q = launch(&mut h, &s, "t1", "general-purpose", "Kind: builder\nLane: parser\n\nFix the writer.");
+    let q = launch(&mut h, &s, "t1", "general-purpose", "Kind: builder\nLane: parser\nUses: compile\n\nFix the writer.");
     assert!(q.deny.as_deref().is_some_and(|r| r.starts_with("atlas queue")), "{q:?}");
     // ... holds no slot: the next builder takes the second one.
     let a = launch(&mut h, &s, "t0", "general-purpose", "Kind: builder\nLane: printer\n\nFix the printer.");
@@ -311,7 +311,7 @@ fn the_agent_cap_is_off_by_default_and_clamped_to_claude_codes_limit() {
         tool_name: "Agent".into(),
         tool_use_id: "z".into(),
         transcript_path: t.path().join("nowhere.jsonl").to_string_lossy().into_owned(),
-        tool_input: json!({"prompt": "Build."}),
+        tool_input: json!({"prompt": "Build the other one."}),
         ..ev("PreToolUse")
     };
     let a = h.handle(&none);
@@ -601,29 +601,102 @@ fn lanes_and_resources_shape_the_batch_and_the_launch() {
     let mut h = Hooks::open(st).unwrap();
     h.set_command_hook();
     s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: parser\nUses: gpu\n\nFix the reader.", 1000, false);
-    // Declared on both sides: the lane is held, so it is denied and queued.
-    let r = launch(&mut h, &s, "t1", "general-purpose", "Kind: builder\nLane: parser\nUses: none\n\nFix the writer.").deny.expect("a declared lane conflict is denied");
-    assert!(r.contains("lane parser held by job b1 (b1)") && r.contains("atlas queued it as journal:parser:0001"), "{r}");
-    // A declared read-only reviewer shares the lane.
+    // 2026-11-14: a lane name is a label, not a lock. A second builder in
+    // the lane with disjoint uses starts, as the first free sub-lane; its
+    // prompt is never rewritten, and its agent is told at its start.
+    let a = launch(&mut h, &s, "t1", "general-purpose", "Kind: builder\nLane: parser\nUses: none\n\nFix the writer.");
+    assert!(a.deny.is_none() && a.context.contains("this launch runs as sub-lane parser/2") && a.updated_input.is_none(), "{a:?}");
+    s.agent("w1", "general-purpose", "t1", "Kind: builder\nLane: parser\nUses: none\n\nFix the writer.", 1000, false);
+    let st = h.handle(&HookEvent { agent_id: "w1".into(), agent_type: "general-purpose".into(), transcript_path: s.tp(), ..ev("SubagentStart") });
+    assert!(st.context.contains("you run as sub-lane parser/2 of parser"), "{st:?}");
+    // A declared read-only reviewer shares the lane: no context, no rewrite.
     let a = launch(&mut h, &s, "t2", "general-purpose", "Kind: reviewer\nLane: parser\nUses: read-only\n\nReview the reader.");
-    assert!(a.deny.is_none() && a.context.is_empty(), "{a:?}");
+    assert!(a.deny.is_none() && a.context.is_empty() && a.updated_input.is_none(), "{a:?}");
     // An inferred resource conflict is a warning.
     let a = launch(&mut h, &s, "t3", "general-purpose", "Kind: builder\nLane: docs\n\nTake a frame capture of the menu.");
     assert!(a.deny.is_none() && a.context.contains("may conflict with running work (gpu held by job b1 (b1))"), "{a:?}");
     // A queued gpu item waits while b1 holds the gpu; after b1 finishes the
-    // finish line proposes both queued items together.
-    let r = launch(&mut h, &s, "t4", "general-purpose", "Kind: builder\nLane: render\nUses: gpu\n\nRender the wreck.").deny.expect("declared gpu on both sides");
-    assert!(r.contains("gpu held by job b1 (b1)"), "{r}");
+    // finish line proposes it.
+    let r = launch(&mut h, &s, "t4", "general-purpose", "Kind: builder\nLane: render\nUses: gpu\n\nRender the wreck.")
+        .deny
+        .expect("declared gpu on both sides");
+    assert!(r.contains("gpu held by job b1 (b1)") && r.contains("atlas queued it as journal:render:0001"), "{r}");
     let n = finished(&mut h, &s, "b1");
-    assert!(n.contains("start together: journal:parser:0001 (builder, lane parser, d); journal:render:0001 (builder, lane render, d)"), "{n}");
+    assert!(n.contains("start together: journal:render:0001 (builder, lane render, d)"), "{n}");
 }
 
-/// atlas-dev #150: words on a `Uses:` line that the policy does not list
-/// (repos) never deny or queue a launch, only note what it shares; gpu,
-/// compile, worktrees and configured words still deny, and a configured
-/// class limits each `name value` on its own.
+/// The defect of 2026-11-14, replayed: a builder runs in lane ATLAS-TOOLING
+/// and a read-only research launch declares the same lane. It is let through
+/// (it was refused and queued for the lane name alone), it takes the copy
+/// the old rule queued off the queue, and the same brief relaunched under
+/// another lane takes a waiting copy off by content.
 #[test]
-fn unlisted_uses_words_only_warn_through_the_hook() {
+fn a_read_only_research_launch_beside_a_builder_in_its_lane_is_allowed() {
+    let t = Temp::new("orch-ro-lane");
+    let s = Session::new(t.path());
+    let o = OrchestrateSpec {
+        enabled: Some(true),
+        kinds: vec![
+            (Kind::Builder, KindSpec { max: Some(6), ..Default::default() }),
+            (Kind::Research, KindSpec { max: Some(2), ..Default::default() }),
+        ],
+        ..Default::default()
+    };
+    let st = settings(t.path(), &o, &[]);
+    let store_path = st.store.clone();
+    let mut h = Hooks::open(st).unwrap();
+    h.set_command_hook();
+    s.agent(
+        "b1",
+        "general-purpose",
+        "t-b1",
+        "Kind: builder\nLane: ATLAS-TOOLING\nPriority: normal\nUses: compile (the atlas crate; one heavy compile at a time through runq)\n\n# atlas queue: no more false lane collisions\n\nRepo: D:/src/tools/atlas. Make a fresh worktree and run cargo test through runq.",
+        1000,
+        false,
+    );
+    let research = "Kind: research\nLane: ATLAS-TOOLING\nPriority: normal\nUses: none (read-only analysis; no cargo, no builds)\n\n# Do atlas's hooks earn their tokens?\n\nMeasure whether the hooks earn their tokens, one at a time through the logs. Read the hook logs; build nothing.";
+    let file = |prompt: &str| {
+        let mut m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+        let meta = atlas::lanes::classify(prompt, &[]).meta();
+        let l = atlas::queue::Launch {
+            kind: Kind::Research,
+            lane: Some("ATLAS-TOOLING"),
+            description: "Measure hook injection value",
+            subagent_type: "general-purpose",
+            prompt,
+            session: "s1",
+            class_meta: &meta,
+        };
+        atlas::queue::add(&mut m, &l).unwrap().0
+    };
+    // The copy the old rule queued.
+    let queued = file(research);
+    let a = launch(&mut h, &s, "t1", "general-purpose", research);
+    assert!(a.deny.is_none(), "a read-only launch is never refused for its lane: {a:?}");
+    assert!(!a.context.contains("conflict") && !a.context.contains("shares"), "{a:?}");
+    assert!(a.context.contains(&format!("the same brief as waiting {queued} (lane ATLAS-TOOLING)")), "{a:?}");
+    // Relaunched under another lane, its header and wrapping changed: the
+    // waiting copy leaves by content, and the hook says so.
+    let again = file(research);
+    let moved = research.replace("Lane: ATLAS-TOOLING", "Lane: ATLAS-HOOK-VALUE").replace("Priority: normal", "Priority:   normal");
+    let moved = moved.replace("Read the hook logs; build nothing.", "Read the hook logs;\n  build nothing.");
+    let a = launch(&mut h, &s, "t2", "general-purpose", &moved);
+    assert!(a.deny.is_none(), "{a:?}");
+    assert!(
+        a.context.contains(&format!("the same brief as waiting {again} (lane ATLAS-TOOLING), so atlas took it off the queue")),
+        "{a:?}"
+    );
+    let m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+    assert!(atlas::queue::waiting(&m).unwrap().is_empty());
+}
+
+/// atlas-dev #150 and the 2026-11-14 report: words on a `Uses:` line that
+/// the policy does not list (repos, free text) are not tokens: they never
+/// deny, queue or note anything; gpu, compile, worktrees and configured
+/// words still deny, and a configured class limits each `name value` on
+/// its own.
+#[test]
+fn unlisted_uses_words_are_not_tokens_through_the_hook() {
     let t = Temp::new("orch-uses150");
     let s = Session::new(t.path());
     let o = OrchestrateSpec {
@@ -636,11 +709,24 @@ fn unlisted_uses_words_only_warn_through_the_hook() {
     let store_path = st.store.clone();
     let mut h = Hooks::open(st).unwrap();
     h.set_command_hook();
-    s.agent("a1", "general-purpose", "t-a1", "Kind: build\nLane: ES1-1663\nUses: db, contracts, api, react, sqlport 15126, cache, license\n\nBuild it.", 1000, false);
-    // The issue's second header: let through, with a note naming the words.
-    let a = launch(&mut h, &s, "t1", "general-purpose", "Kind: build\nLane: ES1-1415\nUses: db, contracts, api, react, sqlport 15127\n\nBuild it.");
+    s.agent(
+        "a1",
+        "general-purpose",
+        "t-a1",
+        "Kind: build\nLane: ES1-1663\nUses: db, contracts, api, react, sqlport 15126, cache, license\n\nBuild it.",
+        1000,
+        false,
+    );
+    // The issue's second header: let through, with no note about the words.
+    let a = launch(
+        &mut h,
+        &s,
+        "t1",
+        "general-purpose",
+        "Kind: build\nLane: ES1-1415\nUses: db, contracts, api, react, sqlport 15127\n\nBuild it.",
+    );
     assert!(a.deny.is_none(), "{a:?}");
-    assert!(a.context.contains("shares api with job a1 (a1); contracts with job a1 (a1); db with job a1 (a1); react with job a1 (a1) with running work"), "{a:?}");
+    assert!(!a.context.contains("shares") && !a.context.contains("api"), "{a:?}");
     assert!(!a.context.contains("atlas inferred it"), "{a:?}");
     // A word at capacity 0 gives no note.
     let a = launch(&mut h, &s, "t2", "general-purpose", "Kind: build\nLane: L2\nUses: cache\n\nBuild it.");
@@ -668,9 +754,12 @@ fn a_reworded_start_in_the_lane_takes_its_oldest_launch_off_the_queue() {
     let store_path = st.store.clone();
     let mut h = Hooks::open(st).unwrap();
     h.set_command_hook();
-    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: ES1-1415\n\nHold the lane.", 1000, false);
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: ES1-1415\nUses: compile\n\nHold the lane.", 1000, false);
+    // A lane is no lock (2026-11-14): compile, declared on both sides, holds them.
     for (id, what) in [("t1", "tariff pricing"), ("t2", "pricing tests"), ("t3", "pricing docs")] {
-        let r = launch(&mut h, &s, id, "general-purpose", &format!("Kind: builder\nLane: ES1-1415\nUses: sqlport 15127\n\nBuild the {what}.")).deny.expect("the lane is held");
+        let r = launch(&mut h, &s, id, "general-purpose", &format!("Kind: builder\nLane: ES1-1415\nUses: compile\n\nBuild the {what}."))
+            .deny
+            .expect("compile is held");
         assert!(r.contains("atlas queued it"), "{r}");
     }
     let planned = {
@@ -742,10 +831,11 @@ fn planned_items_wait_on_done_keys_and_leave_by_their_key() {
     // Started is not done: the dependent still waits.
     assert_eq!(start(&m).1, [(fire.clone(), format!("after {budget}"))]);
     let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    atlas::queue::cli(&args(&["done", &budget]), &mut m, &orch).unwrap();
+    atlas::queue::cli(&args(&["done", &budget]), &mut m, &orch, &[]).unwrap();
     assert_eq!(start(&m).0, std::slice::from_ref(&fire));
     // `plan` refuses a key that names no queued item.
-    let e = atlas::queue::cli(&args(&["plan", "--lane", "X", "--title", "t", "--after", "journal:NOPE:0009"]), &mut m, &orch).unwrap_err();
+    let e =
+        atlas::queue::cli(&args(&["plan", "--lane", "X", "--title", "t", "--after", "journal:NOPE:0009"]), &mut m, &orch, &[]).unwrap_err();
     assert!(e.contains("no such queued item"), "{e}");
     // Filed by hand: a missing key and a cycle are named.
     let gone = plan(&mut m, "LOST", "lost", None, &["journal:NOPE:0009"]);
@@ -763,7 +853,7 @@ fn planned_items_wait_on_done_keys_and_leave_by_their_key() {
     // A dependency on a dropped item says so, instead of waiting.
     let doomed = plan(&mut m, "DROP", "doomed", None, &[]);
     let orphan = plan(&mut m, "DROP", "orphan", None, &[&doomed]);
-    atlas::queue::cli(&args(&["drop", &doomed]), &mut m, &orch).unwrap();
+    atlas::queue::cli(&args(&["drop", &doomed]), &mut m, &orch, &[]).unwrap();
     assert!(start(&m).1.contains(&(orphan, format!("after {doomed} (dropped from the queue)"))));
     // A dependency on a replaced item names its replacement.
     let old = plan(&mut m, "SUP", "old", None, &[]);
@@ -878,6 +968,73 @@ fn a_long_report_is_sent_back_once_without_a_draft() {
     assert!(stop(&mut off, "a4", &long, false).block.is_none());
 }
 
+/// #182: `met`, `done`, `show` and `drop` take a bare lane key (as
+/// `atlas queue` shows each item's lane): its one waiting item is used,
+/// several are listed with their full keys, and `--help` prints usage.
+#[test]
+fn queue_commands_take_a_bare_lane_key() {
+    use atlas::queue::{add_planned, Planned};
+    let t = Temp::new("orch-lane-key");
+    let mut m = atlas::memory::MemoryStore::open(&t.path().join("memory.sqlite")).unwrap();
+    let orch = atlas::orchestrate::OrchSettings::default();
+    let plan = |m: &mut atlas::memory::MemoryStore, lane: &str, title: &str, after: &[&str]| {
+        add_planned(m, &Planned { lane: lane.into(), kind: "builder".into(), uses: vec!["none".into()], after: after.iter().map(|s| s.to_string()).collect(), title: title.into(), ..Planned::default() }).unwrap()
+    };
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let one = plan(&mut m, "ES1-1981", "geo dal", &["api#876 merged"]);
+    // The bare lane key resolves to its one item, any case.
+    atlas::queue::cli(&args(&["met", "ES1-1981", "api#876", "merged"]), &mut m, &orch, &[]).unwrap();
+    atlas::queue::cli(&args(&["show", "es1-1981"]), &mut m, &orch, &[]).unwrap();
+    // Two items on a lane: listed with their full keys, nothing done.
+    let a = plan(&mut m, "ES1-2000", "a", &[]);
+    let b = plan(&mut m, "ES1-2000", "b", &[]);
+    let e = atlas::queue::cli(&args(&["done", "ES1-2000"]), &mut m, &orch, &[]).unwrap_err();
+    assert!(e.contains(&a) && e.contains(&b) && e.contains("full key"), "{e}");
+    // Nothing on the lane: says so, and suggests a key that contains it.
+    let e = atlas::queue::cli(&args(&["drop", "1981"]), &mut m, &orch, &[]).unwrap_err();
+    assert!(e.contains("no queued item keyed 1981") && e.contains(&format!("did you mean {one}")), "{e}");
+    // A bare key works for drop and done too.
+    atlas::queue::cli(&args(&["drop", "ES1-1981"]), &mut m, &orch, &[]).unwrap();
+    assert!(!atlas::queue::waiting(&m).unwrap().iter().any(|h| h.key == one));
+    // `--help` is usage on every subcommand, never a key.
+    for w in ["met", "done", "show", "drop"] {
+        atlas::queue::cli(&args(&[w, "--help"]), &mut m, &orch, &[]).unwrap();
+        atlas::queue::cli(&args(&[w, "-h"]), &mut m, &orch, &[]).unwrap();
+    }
+    assert_eq!(atlas::queue::waiting(&m).unwrap().len(), 2);
+}
+
+/// Review M1 on #201: `done` and `met` act on started items too, so a bare
+/// lane key counts the lane's started (not yet done) items: one started
+/// item and one waiting follow-up are listed by full key, and nothing is
+/// marked; once the started one is done, the lane key names the follow-up.
+#[test]
+fn a_bare_lane_key_counts_the_lane_s_started_items() {
+    use atlas::queue::{add_planned, started, Marks, Planned, Started};
+    let t = Temp::new("orch-lane-key-started");
+    let mut m = atlas::memory::MemoryStore::open(&t.path().join("memory.sqlite")).unwrap();
+    let orch = atlas::orchestrate::OrchSettings::default();
+    let plan = |m: &mut atlas::memory::MemoryStore, title: &str, after: &[&str]| {
+        add_planned(m, &Planned { lane: "ES1-1981".into(), kind: "builder".into(), uses: vec!["none".into()], after: after.iter().map(|s| s.to_string()).collect(), title: title.into(), ..Planned::default() }).unwrap()
+    };
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let first = plan(&mut m, "geo dal", &[]);
+    assert_eq!(started(&mut m, "geo dal", &format!("Queue: {first}\nLane: ES1-1981\nDo it."), Some("ES1-1981"), Kind::Builder).unwrap(), Started::Retired(first.clone()));
+    let follow = plan(&mut m, "geo dal follow-up", &[first.as_str()]);
+    for w in [&["done", "ES1-1981"][..], &["met", "es1-1981", "x"][..]] {
+        let e = atlas::queue::cli(&args(w), &mut m, &orch, &[]).unwrap_err();
+        assert!(e.contains(&first) && e.contains(&follow) && e.contains("full key"), "{e}");
+    }
+    let marks = Marks::read(&m).unwrap();
+    assert!(marks.done.is_empty() && marks.met.is_empty(), "{marks:?}");
+    assert!(atlas::queue::waiting(&m).unwrap().iter().any(|h| h.key == follow));
+    // The started one, done by its full key, no longer counts.
+    atlas::queue::cli(&args(&["done", &first]), &mut m, &orch, &[]).unwrap();
+    atlas::queue::cli(&args(&["done", "ES1-1981"]), &mut m, &orch, &[]).unwrap();
+    assert!(Marks::read(&m).unwrap().done.contains(&follow));
+    assert!(atlas::queue::waiting(&m).unwrap().is_empty());
+}
+
 /// The required-reviews merge gate: `gh pr merge` waits for a passing
 /// review of the PR's head from each role, filed as a `review` entry or
 /// as a note with `review:` meta; a request for changes on that head
@@ -897,9 +1054,10 @@ fn a_merge_waits_for_each_role_s_review_of_its_head() {
         w.create(&key, "journal", sub, "L", &d, None).unwrap();
         w.commit().unwrap();
     };
-    fn head(m: &atlas::reviews::Merge, _cwd: &str) -> Result<(u64, String), String> {
+    use atlas::reviews::Pr;
+    fn head(m: &atlas::reviews::Merge, _cwd: &str) -> Result<(Pr, String), String> {
         match m.selector.as_deref() {
-            Some("99") => Ok((99, "6e828cc0123456789abcdef".into())),
+            Some("99") => Ok((Pr { repo: None, number: 99 }, "6e828cc0123456789abcdef".into())),
             other => Err(format!("no PR {other:?}")),
         }
     }
@@ -929,12 +1087,48 @@ fn a_merge_waits_for_each_role_s_review_of_its_head() {
     // A PR whose head cannot be read is not merged blind.
     assert!(bash(&mut h, "gh pr merge https://github.com/o/r/pull/5").deny.expect("unreadable").contains("cannot be checked"));
     // A newer head that both roles pass merges.
-    fn newer(_m: &atlas::reviews::Merge, _cwd: &str) -> Result<(u64, String), String> {
-        Ok((99, "abcdef0123".into()))
+    fn newer(_m: &atlas::reviews::Merge, _cwd: &str) -> Result<(Pr, String), String> {
+        Ok((Pr { repo: None, number: 99 }, "abcdef0123".into()))
     }
     h.set_pr_head(newer);
     file("review", "role: simplicity, cost\npr: 99\nhead: abcdef0\nverdict: pass");
     assert!(passes(&bash(&mut h, "gh pr merge 99")));
+
+    // #183: one PR number in two repos. A review of react#784 does not
+    // pass api#784, even at a matching head prefix; api's own review does.
+    fn in_api(_m: &atlas::reviews::Merge, _cwd: &str) -> Result<(Pr, String), String> {
+        Ok((Pr { repo: Some("o/api".into()), number: 784 }, "7840000aaaa".into()))
+    }
+    h.set_pr_head(in_api);
+    file("review", "role: simplicity, cost\npr: o/react#784\nhead: 7840000\nverdict: pass");
+    let d = bash(&mut h, "gh pr merge 784 --repo o/api").deny.expect("only react's review");
+    assert!(d.contains("PR o/api#784 is missing: simplicity review; cost review"), "{d}");
+    file("review", "role: simplicity, cost\npr: api#784\nhead: 7840000\nverdict: pass");
+    assert!(passes(&bash(&mut h, "gh pr merge 784 --repo o/api")));
+
+    // Review S1 on #201: a repo is read as lowercase owner/repo whatever
+    // its form, so `--repo` given with a host or a scheme matches a review
+    // filed as `O/Api#786`; a `--repo` that lists several is refused.
+    fn api_any(m: &atlas::reviews::Merge, _cwd: &str) -> Result<(Pr, String), String> {
+        let number = m.selector.as_deref().and_then(|s| s.parse().ok()).ok_or("no number")?;
+        Ok((Pr { repo: Some("o/api".into()), number }, "7840000aaaa".into()))
+    }
+    h.set_pr_head(api_any);
+    file("review", "role: simplicity, cost\npr: O/Api#786\nhead: 7840000\nverdict: pass");
+    for repo in ["github.com/o/api", "https://github.com/o/api", "https://github.com/O/api.git", "O/API"] {
+        let a = bash(&mut h, &format!("gh pr merge 786 --repo {repo}"));
+        assert!(passes(&a), "{repo}: {:?}", a.deny);
+    }
+    let d = bash(&mut h, "gh pr merge 786 --repo o/api,o/react").deny.expect("two repos");
+    assert!(d.contains("several repos"), "{d}");
+    // Review nit on #201: with no `--repo`, every repo's reviews of the
+    // number pass the precheck, and gh's answer narrows them: react's
+    // review of 787 does not pass api's 787.
+    file("review", "role: simplicity, cost\npr: o/react#787\nhead: 7840000\nverdict: pass");
+    let d = bash(&mut h, "gh pr merge 787").deny.expect("only react's review of 787");
+    assert!(d.contains("PR o/api#787 is missing: simplicity review for head 7840000; cost review for head 7840000"), "{d}");
+    file("review", "role: simplicity, cost\npr: o/api#787\nhead: 7840000\nverdict: pass");
+    assert!(passes(&bash(&mut h, "gh pr merge 787")));
 
     // Advisory warns; no roles is off.
     let mut a = Hooks::open(settings(t.path(), &spec(Mode::Advisory, &["security"]), &[])).unwrap();
@@ -1027,9 +1221,229 @@ fn both_reviews_of_one_pr_run_beside_the_lane_builder() {
     assert!(cost.deny.is_none() && !cost.context.contains("conflict"), "{cost:?}");
     let third = launch(&mut h, &s, "t3", "general-purpose", "Kind: reviewer\nLane: ATLAS-V03\n\nCost review of PR 114.").deny.expect("the reviewer cap");
     assert!(third.starts_with("atlas agent cap: 2 of 2 reviewer"), "{third}");
-    // A builder in the lane still conflicts with the lane's builder.
-    let builder = launch(&mut h, &s, "t4", "general-purpose", "Kind: builder\nLane: ATLAS-V03\n\nBuild more.").deny.expect("the lane");
-    assert!(builder.contains("lane ATLAS-V03 held by job b1"), "{builder}");
+    // A builder in the lane no longer conflicts with the lane's builder
+    // (2026-11-14): it touches nothing b1 holds, so it runs as a sub-lane.
+    let builder = launch(&mut h, &s, "t4", "general-purpose", "Kind: builder\nLane: ATLAS-V03\n\nBuild more.");
+    assert!(builder.deny.is_none() && builder.context.contains("sub-lane ATLAS-V03/2"), "{builder:?}");
+}
+
+/// Automatic sub-lanes: a lane in use by running work, with no `brief`
+/// entry of its own, gives a launch the first free `NAME/N`; a lane with a
+/// brief keeps its lane; records in a sub-lane read under the parent.
+#[test]
+fn a_held_lane_without_a_brief_gives_the_first_free_sub_lane() {
+    let t = Temp::new("orch-sublane");
+    let s = Session::new(t.path());
+    let o = OrchestrateSpec {
+        enabled: Some(true),
+        kinds: vec![(Kind::Builder, KindSpec { max: Some(12), ..Default::default() })],
+        ..Default::default()
+    };
+    let st = settings(t.path(), &o, &[]);
+    let store_path = st.store.clone();
+    let mut h = Hooks::open(st).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    s.agent("b2", "general-purpose", "t-b2", "Kind: builder\nLane: TOOLS/2\n\nBuild two.", 1000, false);
+    s.agent("p1", "general-purpose", "t-p1", "Kind: builder\nLane: PLANNED\n\nBuild the plan.", 1000, false);
+    let a = launch(&mut h, &s, "t1", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild three.");
+    assert!(a.deny.is_none() && a.context.contains("this launch runs as sub-lane TOOLS/3") && a.updated_input.is_none(), "{a:?}");
+    // A second launch of the same message sees the first one's sub-lane.
+    let a = launch(&mut h, &s, "t1b", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild four.");
+    assert!(a.deny.is_none() && a.context.contains("this launch runs as sub-lane TOOLS/4"), "{a:?}");
+    // Both start; their briefs still say TOOLS. Each is told its sub-lane,
+    // and a later launch does not take either again.
+    s.agent("b3", "general-purpose", "t1", "Kind: builder\nLane: TOOLS\n\nBuild three.", 1000, false);
+    s.agent("b4", "general-purpose", "t1b", "Kind: builder\nLane: TOOLS\n\nBuild four.", 1000, false);
+    for (id, sub) in [("b3", "TOOLS/3"), ("b4", "TOOLS/4")] {
+        let st = h.handle(&HookEvent { agent_id: id.into(), agent_type: "general-purpose".into(), transcript_path: s.tp(), ..ev("SubagentStart") });
+        assert!(st.context.contains(&format!("you run as sub-lane {sub} of TOOLS")), "{st:?}");
+    }
+    let a = launch(&mut h, &s, "t1c", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild five.");
+    assert!(a.deny.is_none() && a.context.contains("this launch runs as sub-lane TOOLS/5"), "{a:?}");
+    // A running reviewer makes no sub-lane, and a read-only launch takes none.
+    s.agent("r1", "general-purpose", "t-r1", "Kind: reviewer\nLane: REVIEWED\n\nReview it.", 1000, false);
+    let a = launch(&mut h, &s, "t1d", "general-purpose", "Kind: builder\nLane: REVIEWED\n\nBuild it.");
+    assert!(a.deny.is_none() && !a.context.contains("sub-lane"), "{a:?}");
+    let a = launch(&mut h, &s, "t1e", "general-purpose", "Kind: research\nLane: TOOLS\n\nRead the parser.");
+    assert!(a.deny.is_none() && a.context.is_empty() && a.updated_input.is_none(), "{a:?}");
+    let d = |title: &str, body: &str| atlas::memory::Draft {
+        title: title.into(),
+        meta: String::new(),
+        body: body.into(),
+        reason: "test".into(),
+        author: "test".into(),
+        client: "test".into(),
+        provenance: None,
+        time: None,
+    };
+    {
+        let mut m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+        let mut w = m.writer().unwrap();
+        w.create("journal:PLANNED:0001", "journal", "brief", "PLANNED", &d("the plan", "Kind: builder\nLane: PLANNED"), None).unwrap();
+        w.create("journal:TOOLS/2:0001", "journal", "decision", "TOOLS/2", &d("sub-lane walrus decision", "kept"), None).unwrap();
+        w.create("journal:TOOLSET:0001", "journal", "decision", "TOOLSET", &d("another lane yak decision", "kept"), None).unwrap();
+        w.create("journal:TOOLS/notes:0001", "journal", "decision", "TOOLS/notes", &d("another lane yak notes", "kept"), None).unwrap();
+        w.commit().unwrap();
+    }
+    // A lane with a brief of its own is planned work: no sub-lane.
+    let a = launch(&mut h, &s, "t2", "general-purpose", "Kind: builder\nLane: PLANNED\n\nBuild more of the plan.");
+    assert!(a.deny.is_none() && !a.context.contains("sub-lane") && a.updated_input.is_none(), "{a:?}");
+    // The parent's recall shows the sub-lane's record, not another lane's.
+    let m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+    let text = atlas::memory::recall::lane(&m, "TOOLS", 1 << 20).unwrap();
+    assert!(text.contains("sub-lane walrus decision") && !text.contains("another lane yak"), "{text}");
+    drop(m);
+    // A brief filed under another spelling of the lane keeps it too.
+    {
+        let mut m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+        let mut w = m.writer().unwrap();
+        w.create("journal:lowbrief:0001", "journal", "brief", "lowbrief", &d("the low plan", "Kind: builder\nLane: lowbrief"), None).unwrap();
+        w.commit().unwrap();
+    }
+    s.agent("l1", "general-purpose", "t-l1", "Kind: builder\nLane: LOWBRIEF\n\nBuild the low plan.", 1000, false);
+    let a = launch(&mut h, &s, "t3", "general-purpose", "Kind: builder\nLane: LOWBRIEF\n\nBuild more of it.");
+    assert!(a.deny.is_none() && !a.context.contains("sub-lane"), "{a:?}");
+}
+
+/// The 2026-11-14 defect in auto mode: a changed tool input with no
+/// permission decision can be denied there, so no Agent launch is ever
+/// rewritten, the sub-lane case and the read-only research case included.
+#[test]
+fn no_agent_launch_is_rewritten_in_auto_mode() {
+    let t = Temp::new("orch-auto");
+    let s = Session::new(t.path());
+    let o = OrchestrateSpec {
+        enabled: Some(true),
+        kinds: vec![(Kind::Builder, KindSpec { max: Some(6), ..Default::default() }), (Kind::Research, KindSpec { max: Some(2), ..Default::default() })],
+        ..Default::default()
+    };
+    let mut h = Hooks::open(settings(t.path(), &o, &[])).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: ATLAS-TOOLING\nUses: compile\n\nBuild it.", 1000, false);
+    for (id, prompt) in [
+        ("t1", "Kind: builder\nLane: ATLAS-TOOLING\nUses: none\n\nBuild another part."),
+        ("t2", "Kind: research\nLane: ATLAS-TOOLING\nUses: none\n\nRead the hook logs."),
+    ] {
+        let input = json!({"description": "d", "subagent_type": "general-purpose", "prompt": prompt});
+        let a = h.handle(&HookEvent {
+            tool_name: "Agent".into(),
+            tool_use_id: id.into(),
+            transcript_path: s.tp(),
+            permission_mode: "auto".into(),
+            tool_prompt: prompt.into(),
+            tool_input: input,
+            ..ev("PreToolUse")
+        });
+        assert!(a.deny.is_none() && a.updated_input.is_none(), "{a:?}");
+        assert!(!a.to_json("PreToolUse").contains("updatedInput"), "{}", a.to_json("PreToolUse"));
+    }
+}
+
+/// "Queue them" (2026-11-14): a writer on a branch a running writer holds
+/// is denied and queued, not refused for good. The batch holds it while
+/// the branch is held, so it is not offered, denied and filed again; a
+/// relaunch meanwhile files nothing new; once the holder finishes it is
+/// proposed. Two writers on one worktree sent in one message: the second
+/// is queued as well.
+#[test]
+fn a_writer_on_a_held_branch_or_worktree_is_queued_and_waits() {
+    let t = Temp::new("orch-branch");
+    let s = Session::new(t.path());
+    let o = OrchestrateSpec { enabled: Some(true), kinds: vec![(Kind::Builder, KindSpec { max: Some(6), ..Default::default() })], ..Default::default() };
+    let st = settings(t.path(), &o, &[]);
+    let store_path = st.store.clone();
+    let mut h = Hooks::open(st).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: A\nRepo: D:/src/x\nBranch: feat\n\nBuild it.", 1000, false);
+    let brief = "Kind: builder\nLane: B\nRepo: d:\\src\\x\\\nBranch: feat\n\nFix it.";
+    let r = launch(&mut h, &s, "t1", "general-purpose", brief).deny.expect("one branch, two writers");
+    assert!(r.contains("branch feat of d:/src/x held by job b1 (b1)") && r.contains("Do not retry now") && r.contains("atlas queued it as journal:B:0001"), "{r}");
+    // Another agent finishes while b1 runs: the item waits on the branch.
+    let n = finished(&mut h, &s, "other");
+    assert!(n.contains("journal:B:0001 (branch feat of d:/src/x, after job b1 (b1))") && !n.contains("start together"), "{n}");
+    // Relaunched too soon: denied again, and still the one entry.
+    let r = launch(&mut h, &s, "t2", "general-purpose", brief).deny.expect("still held");
+    assert!(r.contains("has already queued it as journal:B:0001"), "{r}");
+    let m = atlas::memory::MemoryStore::open(&store_path).unwrap();
+    assert_eq!(atlas::queue::waiting(&m).unwrap().len(), 1);
+    drop(m);
+    let n = finished(&mut h, &s, "b1");
+    assert!(n.contains("start together: journal:B:0001"), "{n}");
+    // Two writers on one worktree in one message: the first holds it until
+    // its agent starts, so the second is queued.
+    let a = launch(&mut h, &s, "t3", "general-purpose", "Kind: builder\nLane: C\nUses: worktree:w\n\nBuild one.");
+    assert!(a.deny.is_none(), "{a:?}");
+    let r = launch(&mut h, &s, "t4", "general-purpose", "Kind: builder\nLane: D\nUses: worktree:w\n\nBuild two.").deny.expect("the worktree is taken");
+    assert!(r.contains("worktree:w held by a launch moments ago (t3)") && r.contains("atlas queued it as journal:D:0001"), "{r}");
+}
+
+/// Rule 3, at filing as well as at the start: a refused brief filed again
+/// under another lane, description or header is the one entry.
+#[test]
+fn the_queue_files_one_brief_once_by_content() {
+    let t = Temp::new("orch-dedupe");
+    let st = settings(t.path(), &OrchestrateSpec { enabled: Some(true), ..Default::default() }, &[]);
+    let mut m = atlas::memory::MemoryStore::open(&st.store).unwrap();
+    let file = |m: &mut atlas::memory::MemoryStore, lane: &str, description: &str, prompt: &str| {
+        let meta = atlas::lanes::classify(prompt, &[]).meta();
+        let l = atlas::queue::Launch { kind: Kind::Builder, lane: Some(lane), description, subagent_type: "general-purpose", prompt, session: "s1", class_meta: &meta };
+        atlas::queue::add(m, &l).unwrap()
+    };
+    let (k, new) = file(&mut m, "A", "Render the wreck", "Kind: builder\nLane: A\nUses: gpu\n\nRender the wreck.");
+    assert!(new);
+    let again = file(&mut m, "B", "Render the wreck again", "Kind: builder\nLane: B\nPriority: urgent\nUses: gpu\n\nRender   the\nwreck.");
+    assert_eq!(again, (k.clone(), false));
+    // Another brief is another entry.
+    assert!(file(&mut m, "A", "Render the ship", "Kind: builder\nLane: A\nUses: gpu\n\nRender the ship.").1);
+    // Only the header lines are left out: a body line that repeats one counts.
+    let one = atlas::queue::content_sha("Kind: builder\nUses: gpu\n\n- Uses: gpu for the capture\nRender it.");
+    let two = atlas::queue::content_sha("Kind: builder\nUses: gpu\n\nRender it.");
+    assert_ne!(one, two);
+}
+
+/// S2 and S5 of the #180 review: only a declared use makes research or a
+/// review a writer, and a word no policy limits (free text kept in a queued
+/// item's `uses:` meta) never does; a builder queued behind read-only
+/// research in its lane starts with it.
+#[test]
+fn read_only_research_never_holds_its_lane_in_the_batch() {
+    use atlas::lanes::{classify, held_lane, propose, read_only, Class, Item, Policy, Source};
+    let pol = Policy::default();
+    // An inferred worktree or compile is no declared use.
+    let inferred = classify("Kind: research\nLane: X\n\nRead D:/src/atlas-worktrees/x and report; run cargo test there.", &[]);
+    assert!(!inferred.uses.is_empty(), "{inferred:?}");
+    assert!(read_only(Kind::Research, &inferred) && held_lane(Kind::Research, &inferred).is_none());
+    assert!(!read_only(Kind::Research, &classify("Kind: research\nLane: X\nUses: compile\n\nRun the tests.", &[])));
+    let item = |key: &str, kind: Kind, class: Class| Item { key: key.into(), kind, class, waited_minutes: 10, order: None, takes_slot: true, unmet: Vec::new() };
+    let lane = |uses: Vec<(String, Source)>| Class {
+        lane: Some("X".into()),
+        lane_src: Source::Declared,
+        priority: atlas::lanes::Priority::Normal,
+        priority_src: Source::Default,
+        uses,
+        read_only: false,
+        repo: None,
+        branch: None,
+    };
+    for uses in [
+        Vec::new(),
+        vec![("worktree:x".to_string(), Source::Inferred("filed".into()))],
+        vec![("the".to_string(), Source::Declared), ("runq".to_string(), Source::Declared)],
+    ] {
+        let items = [item("r", Kind::Research, lane(uses.clone())), item("b", Kind::Builder, lane(Vec::new()))];
+        let p = propose(&items, &[], &|_| 5, 10, &pol);
+        assert_eq!(p.start, [0, 1], "{uses:?}: {p:?}");
+    }
+}
+
+/// S4 of the #180 review: `Uses: worktree: NAME`, with a space, is the
+/// worktree.
+#[test]
+fn a_spaced_worktree_use_keeps_its_name() {
+    let pol = atlas::lanes::Policy::default();
+    assert_eq!(atlas::lanes::parse_uses("worktree: queue-lanes", &pol).0, ["worktree:queue-lanes"]);
+    assert_eq!(atlas::lanes::parse_uses("compile, worktree: a, gpu", &pol).0, ["compile", "gpu", "worktree:a"]);
 }
 
 /// Review holes A and B of #115 (journal ATLAS-V03:0141, 0142), through
@@ -1182,4 +1596,752 @@ fn the_docs_state_the_send_back_bound_and_no_draft() {
         assert_eq!(backstop_bytes(&s), atlas::report::SEND_BACK_OVER, "{name}: {s}");
         assert!(!s.contains("draft"), "{name} promises a draft: {s}");
     }
+}
+
+fn start(h: &mut Hooks, s: &Session, id: &str) -> HookAnswer {
+    h.handle(&HookEvent { agent_id: id.into(), agent_type: "general-purpose".into(), transcript_path: s.tp(), ..ev("SubagentStart") })
+}
+
+fn builders(max: usize) -> OrchestrateSpec {
+    OrchestrateSpec { enabled: Some(true), kinds: vec![(Kind::Builder, KindSpec { max: Some(max), ..Default::default() })], ..Default::default() }
+}
+
+/// R1 of the #180 re-review: an agent whose meta file names its launch is
+/// told that launch's sub-lane or none, whatever order the launches of one
+/// message start in; the oldest let-through launch is the answer only when
+/// no meta file names a launch yet.
+#[test]
+fn a_sub_lane_goes_to_its_own_launch_whatever_the_start_order() {
+    let t = Temp::new("orch-sublane-order");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(12), &[])).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    // One message: a builder into the held lane, then a reviewer.
+    let a = launch(&mut h, &s, "tA", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild two.");
+    assert!(a.deny.is_none() && a.context.contains("this launch runs as sub-lane TOOLS/2"), "{a:?}");
+    let b = launch(&mut h, &s, "tB", "general-purpose", "Kind: reviewer\nLane: REVIEWS\n\nReview it.");
+    assert!(b.deny.is_none() && !b.context.contains("sub-lane"), "{b:?}");
+    // The reviewer starts first, its meta file written.
+    s.agent("r", "general-purpose", "tB", "Kind: reviewer\nLane: REVIEWS\n\nReview it.", 1000, false);
+    let st = start(&mut h, &s, "r");
+    assert!(!st.context.contains("sub-lane"), "the reviewer was given the builder's sub-lane: {st:?}");
+    s.agent("b2", "general-purpose", "tA", "Kind: builder\nLane: TOOLS\n\nBuild two.", 1000, false);
+    let st = start(&mut h, &s, "b2");
+    assert!(st.context.contains("you run as sub-lane TOOLS/2 of TOOLS"), "{st:?}");
+    // With no meta file yet and one launch waiting, that launch is the
+    // answer (journal:ATLAS-HOOK-VALUE:0006); the first tool call, by when
+    // the meta file confirms it, adds nothing.
+    let c = launch(&mut h, &s, "tC", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild three.");
+    assert!(c.context.contains("this launch runs as sub-lane TOOLS/3"), "{c:?}");
+    let st = start(&mut h, &s, "c-no-meta");
+    assert!(st.context.contains("you run as sub-lane TOOLS/3 of TOOLS"), "{st:?}");
+    s.agent("c-no-meta", "general-purpose", "tC", "Kind: builder\nLane: TOOLS\n\nBuild three.", 1000, false);
+    let first = tool_call(&mut h, &s, "c-no-meta");
+    assert!(!first.context.contains("sub-lane") && !first.context.contains("correction"), "{first:?}");
+}
+
+fn tool_call(h: &mut Hooks, s: &Session, id: &str) -> HookAnswer {
+    h.handle(&HookEvent { agent_id: id.into(), tool_name: "Bash".into(), transcript_path: s.tp(), ..ev("PreToolUse") })
+}
+
+/// N3 of the #180 re-review: a start with no meta file yet takes no launch
+/// blindly, so a launch let through and then refused at the permission
+/// prompt (a ghost) gives its brief and sub-lane to no one; each agent is
+/// matched at its first tool call, by the meta file written by then.
+#[test]
+fn a_start_with_no_meta_file_never_takes_a_ghosts_launch() {
+    let t = Temp::new("orch-ghost-nometa");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(12), &[])).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    // Let through as TOOLS/2, then refused at the prompt: no agent.
+    let g = launch(&mut h, &s, "tG", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild the ghost.");
+    assert!(g.context.contains("this launch runs as sub-lane TOOLS/2"), "{g:?}");
+    let r = launch(&mut h, &s, "tR", "general-purpose", "Kind: reviewer\nLane: REVIEWS\n\nReview it.");
+    assert!(r.deny.is_none(), "{r:?}");
+    // The reviewer starts before its meta file exists.
+    let st = start(&mut h, &s, "r");
+    assert!(!st.context.contains("sub-lane"), "the reviewer was given the ghost's sub-lane: {st:?}");
+    s.agent("r", "general-purpose", "tR", "Kind: reviewer\nLane: REVIEWS\n\nReview it.", 1000, false);
+    let first = tool_call(&mut h, &s, "r");
+    assert!(!first.context.contains("sub-lane"), "{first:?}");
+    // A later builder is still matched to its own launch.
+    let c = launch(&mut h, &s, "tC", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild three.");
+    assert!(c.context.contains("this launch runs as sub-lane TOOLS/3"), "{c:?}");
+    s.agent("c", "general-purpose", "tC", "Kind: builder\nLane: TOOLS\n\nBuild three.", 1000, false);
+    let st = start(&mut h, &s, "c");
+    assert!(st.context.contains("you run as sub-lane TOOLS/3 of TOOLS") && !st.context.contains("TOOLS/2"), "{st:?}");
+}
+
+/// R1 of the #180 re-review, the ghost case: a launch atlas let through and
+/// Claude Code then refused (the permission prompt) never starts, and its
+/// entry must not shift the starts after it.
+#[test]
+fn a_launch_refused_after_atlas_answered_never_shifts_a_later_start() {
+    let t = Temp::new("orch-sublane-ghost");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(12), &[])).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    // Let through as sub-lane TOOLS/2, then refused at the prompt: no agent.
+    let g = launch(&mut h, &s, "tG", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild the ghost.");
+    assert!(g.context.contains("this launch runs as sub-lane TOOLS/2"), "{g:?}");
+    let b = launch(&mut h, &s, "tR", "general-purpose", "Kind: reviewer\nLane: REVIEWS\n\nReview it.");
+    assert!(b.deny.is_none(), "{b:?}");
+    s.agent("r", "general-purpose", "tR", "Kind: reviewer\nLane: REVIEWS\n\nReview it.", 1000, false);
+    let st = start(&mut h, &s, "r");
+    assert!(!st.context.contains("sub-lane"), "the reviewer was given the refused launch's sub-lane: {st:?}");
+    let c = launch(&mut h, &s, "tC", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild three.");
+    assert!(c.context.contains("this launch runs as sub-lane TOOLS/3"), "{c:?}");
+    s.agent("c", "general-purpose", "tC", "Kind: builder\nLane: TOOLS\n\nBuild three.", 1000, false);
+    let st = start(&mut h, &s, "c");
+    assert!(st.context.contains("you run as sub-lane TOOLS/3 of TOOLS") && !st.context.contains("TOOLS/2"), "{st:?}");
+}
+
+/// S6 of the #180 re-review: a launch that never starts holds its class
+/// (here its worktree) for later launches and the queue only briefly, and
+/// its cap slot for the longer pending TTL. And a launch's sub-lane record
+/// is pruned once it is neither pending nor running.
+#[test]
+fn a_pending_launch_holds_its_class_briefly_and_its_slot_longer() {
+    use atlas::orchestrate::{Agents, Launch};
+    use std::time::{Duration, Instant, SystemTime};
+    let t = Temp::new("orch-class-hold");
+    let s = Session::new(t.path());
+    let o = atlas::orchestrate::resolve(Some(&builders(1)), None, None, |_| None);
+    let tp = s.tp();
+    let input = json!({"description": "d", "subagent_type": "general-purpose"});
+    let brief = "Kind: builder\nLane: W\nUses: worktree:w\n\nBuild it.";
+    let at = |id: &'static str| Launch { transcript: &tp, tool_use_id: id, input: &input, brief };
+    let now = Instant::now();
+    let held = |ago: u64| {
+        let mut agents = Agents::new(None);
+        assert!(agents.admit(&o, &at("tG"), SystemTime::now(), now.checked_sub(Duration::from_secs(ago)).unwrap()).is_none());
+        agents.hold_last(atlas::lanes::classify(brief, &[]), None);
+        agents
+    };
+    // Just admitted: it holds the worktree.
+    assert_eq!(held(1).pending_holders(&[]).len(), 1);
+    // Twenty seconds on, never started: the worktree is free again, so a
+    // relaunch is not queued behind it, but its cap slot still counts.
+    let mut agents = held(20);
+    assert!(agents.pending_holders(&[]).is_empty(), "a refused launch held its worktree for 20 s");
+    let r = agents.admit(&o, &at("tH"), SystemTime::now(), Instant::now()).expect("the slot is still held");
+    assert!(r.contains("1 launched moments ago"), "{r}");
+    // A sub-lane is kept while its agent runs and dropped once it ends.
+    let mut agents = Agents::new(None);
+    assert!(agents.admit(&o, &at("tA"), SystemTime::now(), Instant::now()).is_none());
+    agents.hold_last(atlas::lanes::classify("Kind: builder\nLane: W\n\nBuild it.", &[]), Some("W/2".into()));
+    s.agent("a", "general-purpose", "tA", brief, 1000, false);
+    agents.started(&s.dir, "a");
+    let _ = agents.running(&o, &s.dir, SystemTime::now()).unwrap();
+    assert_eq!(agents.sub_lane("tA"), Some("W/2"));
+    s.agent("a", "general-purpose", "tA", brief, 1000, true);
+    let _ = agents.running(&o, &s.dir, SystemTime::now()).unwrap();
+    assert_eq!(agents.sub_lane("tA"), None, "an ended agent's sub-lane was kept");
+}
+
+/// S7 of the #180 re-review: a command hook keeps no record between events,
+/// so the line for the orchestrator does not promise that the agent is told
+/// its sub-lane; a resident server does tell it.
+#[test]
+fn the_sub_lane_line_promises_a_telling_only_where_one_comes() {
+    let line = |command_hook: bool| {
+        let t = Temp::new(if command_hook { "orch-sublane-cmd" } else { "orch-sublane-res" });
+        let s = Session::new(t.path());
+        let mut h = Hooks::open(settings(t.path(), &builders(12), &[])).unwrap();
+        if command_hook {
+            h.set_command_hook();
+        }
+        s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+        // Written after the process started, whatever the file clock reads.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        for f in ["agent-b1.meta.json", "agent-b1.jsonl"] {
+            std::fs::File::options().write(true).open(s.dir.join(f)).unwrap().set_modified(later).unwrap();
+        }
+        let a = launch(&mut h, &s, "t1", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild two.");
+        assert!(a.context.contains("this launch runs as sub-lane TOOLS/2"), "{a:?}");
+        a.context
+    };
+    let resident = line(false);
+    assert!(resident.contains("its agent is told so when it starts"), "{resident}");
+    let command = line(true);
+    assert!(command.contains("its agent is not told") && !command.contains("is told so"), "{command}");
+}
+
+/// A nit of the #180 re-review: a re-file of a waiting brief by content at
+/// a higher priority raises the entry's priority, keeping its brief; a
+/// lower one leaves it.
+#[test]
+fn a_re_file_at_a_higher_priority_raises_the_waiting_entry() {
+    let t = Temp::new("orch-dedupe-priority");
+    let st = settings(t.path(), &OrchestrateSpec { enabled: Some(true), ..Default::default() }, &[]);
+    let mut m = atlas::memory::MemoryStore::open(&st.store).unwrap();
+    let file = |m: &mut atlas::memory::MemoryStore, description: &str, prompt: &str| {
+        let meta = atlas::lanes::classify(prompt, &[]).meta();
+        let l = atlas::queue::Launch { kind: Kind::Builder, lane: Some("A"), description, subagent_type: "general-purpose", prompt, session: "s1", class_meta: &meta };
+        atlas::queue::add(m, &l).unwrap()
+    };
+    let prompt = "Kind: builder\nLane: A\n\nRender the wreck.";
+    let (key, new) = file(&mut m, "Render the wreck", prompt);
+    assert!(new);
+    let priority = |m: &atlas::memory::MemoryStore| atlas::queue::qmeta(&m.head(&key).unwrap().unwrap().meta).priority.map(|p| p.0);
+    assert_eq!(priority(&m), Some(atlas::lanes::Priority::Normal));
+    let waited = m.head(&key).unwrap().unwrap().time;
+    assert_eq!(file(&mut m, "Render it now", "Kind: builder\nLane: B\nPriority: urgent\n\nRender the wreck."), (key.clone(), false));
+    assert_eq!(priority(&m), Some(atlas::lanes::Priority::Urgent));
+    let h = m.head(&key).unwrap().unwrap();
+    assert_eq!((h.body.as_str(), h.time.as_str()), (prompt, waited.as_str()), "the brief or the wait changed");
+    assert_eq!(file(&mut m, "Render it later", "Kind: builder\nLane: B\nPriority: background\n\nRender the wreck."), (key.clone(), false));
+    assert_eq!(priority(&m), Some(atlas::lanes::Priority::Urgent));
+}
+
+/// S3 of the #185 review: an agent in sub-lane `X/2` whose brief names `X`
+/// gets the parent's view (which holds its own records) and, like an agent
+/// given its own lane's view, no pointers beside it.
+#[test]
+fn a_sub_lane_agent_given_its_parent_view_gets_no_pointers() {
+    let t = Temp::new("orch-sublane-own-view");
+    let s = Session::new(t.path());
+    let mut st = settings(t.path(), &builders(12), &[]);
+    st.recall.fts_floor = 0.0;
+    st.recall.hybrid_fts_floor = 0.0;
+    {
+        let mut m = atlas::memory::MemoryStore::open(&st.store).unwrap();
+        let mut w = m.writer().unwrap();
+        let mut add = |key: &str, kind: &str, sub: &str, scope: &str, title: &str, body: &str| {
+            let d = atlas::memory::Draft { title: title.into(), body: body.into(), reason: "test".into(), author: "t".into(), client: "t".into(), ..Default::default() };
+            w.create(key, kind, sub, scope, &d, None).unwrap();
+        };
+        add("journal:TOOLS:0001", "journal", "next", "TOOLS", "Wire the walrus parser", "");
+        add("rules:r00001", "rule", "", "rules", "walrus parser rule", "- the walrus parser caches tokens in the walrus table.\n");
+        w.commit().unwrap();
+    }
+    let mut h = Hooks::open(st).unwrap();
+    h.set_command_hook();
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    let brief = "Kind: builder\nLane: TOOLS\n\nFix how the walrus parser caches tokens in the walrus table.";
+    let a = launch(&mut h, &s, "tA", "general-purpose", brief);
+    assert!(a.context.contains("this launch runs as sub-lane TOOLS/2"), "{a:?}");
+    s.agent("b2", "general-purpose", "tA", brief, 1000, false);
+    let st = start(&mut h, &s, "b2");
+    assert!(st.context.contains("you run as sub-lane TOOLS/2") && st.context.contains("Wire the walrus parser"), "{st:?}");
+    assert!(!st.context.contains("atlas recall (related"), "pointers beside the parent's view: {}", st.context);
+}
+
+// ---- #188 review: the harness order (start, then the meta file, then the
+// first tool call; journal:ATLAS-HOOK-VALUE:0006)
+
+use atlas::memory::settings::SubagentContext;
+
+impl Session {
+    /// Records in the session transcript that launch `id` was refused at
+    /// the permission prompt, as Claude Code writes it.
+    fn refuse(&self, id: &str) {
+        let r = json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "The user doesn't want to proceed with this tool use. The tool use was rejected.", "is_error": true, "tool_use_id": id}]}});
+        let mut f = std::fs::File::options().append(true).open(&self.parent).unwrap();
+        std::io::Write::write_all(&mut f, format!("{r}\n").as_bytes()).unwrap();
+    }
+}
+
+/// A start that guessed wrong is told at its first tool call that the
+/// sub-lane its start named was another launch's; that launch's own agent
+/// is then told it.
+#[test]
+fn a_wrong_guess_s_sub_lane_is_corrected_at_the_first_tool_call() {
+    let t = Temp::new("orch-wrong-guess");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(12), &[])).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    let a = launch(&mut h, &s, "tA", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild two.");
+    assert!(a.context.contains("this launch runs as sub-lane TOOLS/2"), "{a:?}");
+    // A reviewer whose launch this server never saw (let through before a
+    // restart) starts first, while tA is the one launch waiting.
+    let st = start(&mut h, &s, "r");
+    assert!(st.context.contains("you run as sub-lane TOOLS/2 of TOOLS"), "{st:?}");
+    s.agent("r", "general-purpose", "tR", "Kind: reviewer\nLane: REVIEWS\n\nReview it.", 1000, false);
+    let first = tool_call(&mut h, &s, "r");
+    assert!(first.context.starts_with("atlas: correction:") && first.context.contains("the sub-lane it named"), "{first:?}");
+    assert!(!first.context.contains("you run as sub-lane"), "{first:?}");
+    // tA goes back to the queue, for its own agent.
+    let st = start(&mut h, &s, "b2");
+    assert!(st.context.contains("you run as sub-lane TOOLS/2 of TOOLS"), "{st:?}");
+    s.agent("b2", "general-purpose", "tA", "Kind: builder\nLane: TOOLS\n\nBuild two.", 1000, false);
+    let first = tool_call(&mut h, &s, "b2");
+    assert!(!first.context.contains("correction") && !first.context.contains("sub-lane"), "{first:?}");
+}
+
+/// A launch refused at the permission prompt, once the refusal is in the
+/// session transcript, no longer makes a start ambiguous: the real launch
+/// beside it is answered at its start, with its own sub-lane.
+#[test]
+fn a_refusal_in_the_transcript_leaves_the_real_launch_unambiguous() {
+    let t = Temp::new("orch-refused-real");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(12), &[])).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    let g = launch(&mut h, &s, "tG", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild the ghost.");
+    assert!(g.context.contains("this launch runs as sub-lane TOOLS/2"), "{g:?}");
+    s.refuse("tG");
+    let c = launch(&mut h, &s, "tC", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild three.");
+    assert!(c.context.contains("this launch runs as sub-lane TOOLS/3"), "{c:?}");
+    let st = start(&mut h, &s, "c");
+    assert!(st.context.contains("you run as sub-lane TOOLS/3 of TOOLS") && !st.context.contains("TOOLS/2"), "{st:?}");
+    s.agent("c", "general-purpose", "tC", "Kind: builder\nLane: TOOLS\n\nBuild three.", 1000, false);
+    assert!(!tool_call(&mut h, &s, "c").context.contains("sub-lane"));
+}
+
+/// A Binding compiler that numbers its blocks, so a test can tell a block
+/// stored at let-through from one compiled later.
+fn numbered_binding() -> atlas::hooks::BindingFn {
+    let n = std::sync::atomic::AtomicUsize::new(0);
+    Box::new(move |_, brief, lane| Ok(format!("block {} of {lane}: {}\n", n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1, brief.lines().last().unwrap_or(""))))
+}
+
+/// S2 of the #188 review: launches held at the permission prompt for five
+/// minutes (past the 120 s pending TTL) keep their stored Binding blocks and
+/// their sub-lanes until their agents' first tool calls.
+#[test]
+fn a_launch_held_at_the_prompt_past_the_pending_ttl_keeps_its_brief_and_sub_lane() {
+    let t = Temp::new("orch-held-prompt");
+    let s = Session::new(t.path());
+    let mut st = settings(t.path(), &builders(12), &[]);
+    st.recall.subagent_context = SubagentContext::Binding;
+    let mut h = Hooks::open(st).unwrap();
+    h.set_binding(Some(numbered_binding()));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    let a = launch(&mut h, &s, "tA", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild two.");
+    assert!(a.context.contains("this launch runs as sub-lane TOOLS/2"), "{a:?}");
+    let b = launch(&mut h, &s, "tB", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild three.");
+    assert!(b.context.contains("this launch runs as sub-lane TOOLS/3"), "{b:?}");
+    h.age_launches(std::time::Duration::from_secs(300));
+    // Later launches prune what has lapsed.
+    launch(&mut h, &s, "tC", "general-purpose", "Kind: reviewer\nLane: REVIEWS\n\nReview one.");
+    launch(&mut h, &s, "tD", "general-purpose", "Kind: reviewer\nLane: REVIEWS\n\nReview two.");
+    // Both are approved, and both start before their meta files.
+    assert_eq!(start(&mut h, &s, "x").context, "");
+    assert_eq!(start(&mut h, &s, "y").context, "");
+    s.agent("x", "general-purpose", "tA", "Kind: builder\nLane: TOOLS\n\nBuild two.", 1000, false);
+    s.agent("y", "general-purpose", "tB", "Kind: builder\nLane: TOOLS\n\nBuild three.", 1000, false);
+    let x = tool_call(&mut h, &s, "x").context;
+    assert!(x.contains("block 1 of TOOLS: Build two.") && x.contains("you run as sub-lane TOOLS/2 of TOOLS"), "{x}");
+    let y = tool_call(&mut h, &s, "y").context;
+    assert!(y.contains("block 2 of TOOLS: Build three.") && y.contains("you run as sub-lane TOOLS/3 of TOOLS"), "{y}");
+}
+
+/// N1 of the #188 review: in binding mode the first tool call's whole
+/// answer, its other lines included, stays under the 9,000-character cap.
+#[test]
+fn a_first_tool_call_answer_stays_under_the_cap_beside_other_lines() {
+    let t = Temp::new("orch-carrier-cap");
+    let s = Session::new(t.path());
+    let mut st = settings(t.path(), &builders(12), &[]);
+    st.recall.subagent_context = SubagentContext::Binding;
+    let mut h = Hooks::open(st).unwrap();
+    let line = |i: usize| format!("- L{i:02} {}\n", "x".repeat(993));
+    h.set_binding(Some(Box::new(move |_, _, _| Ok((0..20).map(line).collect()))));
+    launch(&mut h, &s, "tA", "general-purpose", "Kind: reviewer\nLane: ALPHA\n\nReview alpha.");
+    launch(&mut h, &s, "tB", "general-purpose", "Kind: reviewer\nLane: BETA\n\nReview beta.");
+    assert_eq!(start(&mut h, &s, "x").context, "");
+    // Past its handoff point by its first tool call: the cap adds a line.
+    s.agent("x", "general-purpose", "tA", "Kind: reviewer\nLane: ALPHA\n\nReview alpha.", 300_000, false);
+    let c = tool_call(&mut h, &s, "x").context;
+    assert!(c.contains("handoff point") && c.contains("- L00 "), "{c}");
+    assert!(c.chars().count() <= atlas::hooks::SUBAGENT_CONTEXT_CHARS, "{} characters", c.chars().count());
+}
+
+/// N2 of the #188 review: the sub-lane line follows a body that ends in a
+/// newline with no blank line between.
+#[test]
+fn the_sub_lane_line_follows_its_body_with_no_blank_line() {
+    let t = Temp::new("orch-sub-line-gap");
+    let s = Session::new(t.path());
+    let mut st = settings(t.path(), &builders(12), &[]);
+    st.recall.subagent_context = SubagentContext::Binding;
+    let mut h = Hooks::open(st).unwrap();
+    h.set_binding(Some(Box::new(|_, brief, lane| Ok(format!("atlas binding: lane {lane}\n- task: {}\n", brief.lines().last().unwrap_or(""))))));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    launch(&mut h, &s, "tA", "general-purpose", "Kind: builder\nLane: TOOLS\n\nBuild two.");
+    s.agent("b2", "general-purpose", "tA", "Kind: builder\nLane: TOOLS\n\nBuild two.", 1000, false);
+    let st = start(&mut h, &s, "b2").context;
+    assert!(st.starts_with("atlas binding: lane TOOLS\n- task: Build two.\natlas: you run as sub-lane TOOLS/2 of TOOLS"), "{st}");
+}
+
+// ---- #188 review, round 2
+
+impl Session {
+    /// Agent `id`'s transcript (its brief) with no meta file yet.
+    fn transcript_only(&self, id: &str, brief: &str) {
+        let user = json!({"type": "user", "message": {"role": "user", "content": brief}});
+        std::fs::write(self.dir.join(format!("agent-{id}.jsonl")), format!("{user}\n")).unwrap();
+    }
+
+    /// Appends `bytes` of other turns to the session transcript.
+    fn pad(&self, bytes: usize) {
+        let line = json!({"type": "assistant", "message": {"role": "assistant", "content": "x".repeat(1000)}}).to_string();
+        let n = bytes / (line.len() + 1) + 1;
+        let mut f = std::fs::File::options().append(true).open(&self.parent).unwrap();
+        std::io::Write::write_all(&mut f, format!("{line}\n").repeat(n).as_bytes()).unwrap();
+    }
+}
+
+/// A Binding compiler that names the lane and the brief's last line.
+fn lane_binding() -> atlas::hooks::BindingFn {
+    Box::new(|_, brief, lane| Ok(format!("atlas binding: lane {lane}\n- task: {}\n", brief.lines().last().unwrap_or(""))))
+}
+
+/// Binding-mode hooks with one builder already running in TOOLS, so the
+/// next launches run as TOOLS/2, TOOLS/3 and so on.
+fn binding_hooks(t: &Temp, s: &Session) -> Hooks {
+    let mut st = settings(t.path(), &builders(12), &[]);
+    st.recall.subagent_context = SubagentContext::Binding;
+    let mut h = Hooks::open(st).unwrap();
+    h.set_binding(Some(lane_binding()));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: TOOLS\n\nBuild one.", 1000, false);
+    h
+}
+
+const TWO: &str = "Kind: builder\nLane: TOOLS\n\nBuild two.";
+const THREE: &str = "Kind: builder\nLane: TOOLS\n\nBuild three.";
+
+/// M1: an ambiguous start whose agent's first tool call comes before its
+/// meta file (and transcript) is answered at the next tool call, with its
+/// block and its sub-lane, and its launch leaves the queue.
+#[test]
+fn a_first_tool_call_before_the_meta_file_is_answered_at_the_next_one() {
+    let t = Temp::new("orch-m1-deferred");
+    let s = Session::new(t.path());
+    let mut h = binding_hooks(&t, &s);
+    assert!(launch(&mut h, &s, "tA", "general-purpose", TWO).context.contains("sub-lane TOOLS/2"));
+    assert!(launch(&mut h, &s, "tB", "general-purpose", THREE).context.contains("sub-lane TOOLS/3"));
+    assert_eq!(start(&mut h, &s, "x").context, "");
+    assert_eq!(start(&mut h, &s, "y").context, "");
+    // x's first tool call beats Claude Code's write of its meta file.
+    assert_eq!(tool_call(&mut h, &s, "x").context, "");
+    s.agent("x", "general-purpose", "tA", TWO, 1000, false);
+    let c = tool_call(&mut h, &s, "x").context;
+    assert!(c.contains("atlas binding: lane TOOLS\n- task: Build two.\n") && c.contains("you run as sub-lane TOOLS/2 of TOOLS"), "{c}");
+    assert!(!tool_call(&mut h, &s, "x").context.contains("atlas binding"));
+    // tA has left the queue: y is answered with its own.
+    s.agent("y", "general-purpose", "tB", THREE, 1000, false);
+    let c = tool_call(&mut h, &s, "y").context;
+    assert!(c.contains("- task: Build three.") && c.contains("you run as sub-lane TOOLS/3 of TOOLS"), "{c}");
+}
+
+/// M1, the guessed case: a guess whose agent's first tool call comes before
+/// its meta file is checked once the meta file is there, not left to stand.
+#[test]
+fn a_guess_whose_first_tool_call_beats_its_meta_file_is_checked_later() {
+    let t = Temp::new("orch-m1-guess");
+    let s = Session::new(t.path());
+    let mut h = binding_hooks(&t, &s);
+    launch(&mut h, &s, "tA", "general-purpose", TWO);
+    // r's launch was let through before a restart: tA is the one waiting.
+    let st = start(&mut h, &s, "r").context;
+    assert!(st.contains("- task: Build two.") && st.contains("sub-lane TOOLS/2"), "{st}");
+    assert_eq!(tool_call(&mut h, &s, "r").context, "");
+    s.agent("r", "general-purpose", "tR", "Kind: reviewer\nLane: REVIEWS\n\nReview it.", 1000, false);
+    let c = tool_call(&mut h, &s, "r").context;
+    assert!(c.starts_with("atlas: correction:") && c.contains("the sub-lane it named"), "{c}");
+    assert!(c.contains("lane REVIEWS\n- task: Review it.") && !c.contains("Build two"), "{c}");
+    // tA waits again for its own agent.
+    let st = start(&mut h, &s, "b2").context;
+    assert!(st.contains("- task: Build two.") && st.contains("sub-lane TOOLS/2 of TOOLS"), "{st}");
+}
+
+/// M1, the bound: an agent whose meta file never comes is retried for
+/// FIRST_CALL_TRIES tool calls, then answered from its transcript; a launch
+/// whose brief is that transcript's is released, not stranded.
+#[test]
+fn a_meta_file_that_never_comes_releases_the_launch_after_the_retries() {
+    let t = Temp::new("orch-m1-bound");
+    let s = Session::new(t.path());
+    let mut h = binding_hooks(&t, &s);
+    launch(&mut h, &s, "tA", "general-purpose", TWO);
+    launch(&mut h, &s, "tB", "general-purpose", THREE);
+    assert_eq!(start(&mut h, &s, "x").context, "");
+    assert_eq!(start(&mut h, &s, "y").context, "");
+    for _ in 0..atlas::hooks::FIRST_CALL_TRIES {
+        assert_eq!(tool_call(&mut h, &s, "x").context, "");
+    }
+    s.transcript_only("x", TWO);
+    let c = tool_call(&mut h, &s, "x").context;
+    assert!(c.contains("- task: Build two.") && c.contains("you run as sub-lane TOOLS/2 of TOOLS"), "{c}");
+    assert!(!tool_call(&mut h, &s, "x").context.contains("atlas binding"));
+    // tA is gone: tB is the one launch waiting, so a start takes it.
+    let st = start(&mut h, &s, "z").context;
+    assert!(st.contains("- task: Build three."), "{st}");
+}
+
+/// S1: a refusal written more than 1 MiB of transcript ago is still seen.
+#[test]
+fn a_refusal_older_than_a_mebibyte_of_transcript_is_seen() {
+    let t = Temp::new("orch-s1-old");
+    let s = Session::new(t.path());
+    let mut h = binding_hooks(&t, &s);
+    launch(&mut h, &s, "tG", "general-purpose", TWO);
+    s.refuse("tG");
+    s.pad(3 << 20);
+    launch(&mut h, &s, "tC", "general-purpose", THREE);
+    let st = start(&mut h, &s, "c").context;
+    assert!(st.contains("- task: Build three.") && st.contains("sub-lane TOOLS/3 of TOOLS") && !st.contains("TOOLS/2"), "{st}");
+}
+
+/// S1: a refused launch waiting alone is scanned too: a start whose own
+/// launch this server never saw is not given the ghost's context.
+#[test]
+fn a_lone_refused_launch_is_given_to_no_one() {
+    let t = Temp::new("orch-s1-lone");
+    let s = Session::new(t.path());
+    let mut h = binding_hooks(&t, &s);
+    launch(&mut h, &s, "tG", "general-purpose", TWO);
+    s.refuse("tG");
+    assert_eq!(start(&mut h, &s, "r").context, "");
+}
+
+/// N4: a SubagentStart with no agent type (compaction's summariser) takes
+/// no launch; the launch stays for its own agent.
+#[test]
+fn a_start_with_no_agent_type_takes_no_launch() {
+    let t = Temp::new("orch-n4-type");
+    let s = Session::new(t.path());
+    let mut h = binding_hooks(&t, &s);
+    launch(&mut h, &s, "tA", "general-purpose", TWO);
+    let st = h.handle(&HookEvent { agent_id: "summ".into(), transcript_path: s.tp(), ..ev("SubagentStart") });
+    assert_eq!(st.context, "");
+    let st = start(&mut h, &s, "a").context;
+    assert!(st.contains("- task: Build two.") && st.contains("sub-lane TOOLS/2 of TOOLS"), "{st}");
+}
+
+/// #204: a dead agent's files, last written `ago` before now.
+fn written(s: &Session, id: &str, at: std::time::SystemTime) {
+    for f in [format!("agent-{id}.meta.json"), format!("agent-{id}.jsonl")] {
+        std::fs::File::options().write(true).open(s.dir.join(f)).unwrap().set_modified(at).unwrap();
+    }
+}
+
+/// #204: appends a tool error to agent `id`'s transcript, its last line.
+fn tool_error(s: &Session, id: &str, text: &str) {
+    use std::io::Write;
+    let line = json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": text}]}});
+    let mut f = std::fs::File::options().append(true).open(s.dir.join(format!("agent-{id}.jsonl"))).unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+fn running_ids(o: &atlas::orchestrate::OrchSettings, s: &Session, now: std::time::SystemTime) -> Vec<String> {
+    atlas::orchestrate::Agents::new(None).running(o, &s.dir, now).unwrap().into_iter().map(|r| r.id).collect()
+}
+
+/// #204 (2): a SubagentStop is atlas's own record of a finish, so an agent
+/// whose meta file never got `"finished": true` (the disk was full) gives
+/// its slot up at its stop, not `stale_minutes` later.
+#[test]
+fn a_subagent_stop_frees_the_slot_when_the_meta_was_never_finished() {
+    let t = Temp::new("orch-204-stop");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(1), &[])).unwrap();
+    // File times are coarser than the process clock (see the first cap test).
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: DISK\n\nBuild one.", 1000, false);
+    let d = launch(&mut h, &s, "t2", "general-purpose", "Kind: builder\nLane: OTHER\n\nBuild two.");
+    assert!(d.deny.as_deref().is_some_and(|r| r.contains("1 of 1 builder")), "{d:?}");
+    let stop = h.handle(&HookEvent { agent_id: "b1".into(), agent_type: "general-purpose".into(), last_message: "done".into(), transcript_path: s.tp(), ..ev("SubagentStop") });
+    assert!(stop.block.is_none(), "{stop:?}");
+    let a = launch(&mut h, &s, "t3", "general-purpose", "Kind: builder\nLane: OTHER\n\nBuild two.");
+    assert!(a.deny.is_none(), "{a:?}");
+    // #207 review S2: the finish is on disk too, so another process (atlas
+    // queue next, atlas backlog, a command hook) sees the slot free.
+    assert!(s.dir.join("agent-b1.atlas-released").is_file());
+    let o = atlas::orchestrate::resolve(Some(&builders(1)), None, None, |_| None);
+    assert!(running_ids(&o, &s, std::time::SystemTime::now()).is_empty());
+}
+
+/// #204 (3): an agent whose transcript ends in a tool error that says the
+/// disk is full stops counting after `orchestrate.disk_full_minutes`
+/// (default 10), not `stale_minutes`; any other last line keeps the long window.
+#[test]
+fn a_transcript_ending_in_enospc_stops_counting_after_the_short_window() {
+    let t = Temp::new("orch-204-enospc");
+    let s = Session::new(t.path());
+    let o = atlas::orchestrate::resolve(Some(&builders(4)), None, None, |_| None);
+    s.agent("full", "general-purpose", "t-full", "Build one.", 1000, false);
+    tool_error(&s, "full", "Error: ENOSPC: no space left on device, write");
+    s.agent("lower", "general-purpose", "t-lower", "Build two.", 1000, false);
+    tool_error(&s, "lower", "bash: echo: write error: No space left on device");
+    s.agent("other", "general-purpose", "t-other", "Build three.", 1000, false);
+    tool_error(&s, "other", "Exit code 101: test failed");
+    s.agent("fine", "general-purpose", "t-fine", "Build four.", 1000, false);
+    let now = std::time::SystemTime::now();
+    let min = |m: u64| now + std::time::Duration::from_secs(m * 60);
+    assert_eq!(running_ids(&o, &s, min(5)), ["fine", "full", "lower", "other"]);
+    assert_eq!(running_ids(&o, &s, min(11)), ["fine", "other"]);
+    // The window is a setting; 0 turns the rule off.
+    let c = atlas::config::Config::parse(r#"{"orchestrate": {"enabled": true, "disk_full_minutes": 3}}"#, Path::new(".")).unwrap();
+    let o3 = atlas::orchestrate::resolve(c.orchestrate.as_ref(), None, None, |_| None);
+    assert_eq!(running_ids(&o3, &s, min(5)), ["fine", "other"]);
+    let off = OrchestrateSpec { disk_full_minutes: Some(0), ..builders(4) };
+    let o0 = atlas::orchestrate::resolve(Some(&off), None, None, |_| None);
+    assert_eq!(running_ids(&o0, &s, min(30)), ["fine", "full", "lower", "other"]);
+}
+
+/// #204 (1): `atlas queue release AGENT` records a dead agent finished, so
+/// its lane, slot and resources are free at once. It refuses an agent that
+/// wrote in the last few minutes unless `--force`; a release is undone by
+/// the agent writing again.
+#[test]
+fn queue_release_frees_a_dead_holder_and_refuses_a_live_one() {
+    let t = Temp::new("orch-204-release");
+    let home = t.path().join("home");
+    let claude = home.join("claude");
+    let s = Session::new(&claude.join("projects"));
+    let run = |args: &[&str]| -> (bool, String) {
+        let o = std::process::Command::new(bin())
+            .arg("queue")
+            .args(args)
+            .env("ATLAS_HOME", &home)
+            .env_remove("ATLAS_CONFIG")
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .output()
+            .unwrap();
+        (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+    };
+    let o = atlas::orchestrate::resolve(Some(&builders(4)), None, None, |_| None);
+    let now = std::time::SystemTime::now();
+    s.agent("dead1", "general-purpose", "t-dead1", "Kind: builder\nLane: ES1\n\nBuild one.", 1000, false);
+    written(&s, "dead1", now - std::time::Duration::from_secs(20 * 60));
+    s.agent("live1", "general-purpose", "t-live1", "Kind: builder\nLane: ES2\n\nBuild two.", 1000, false);
+    assert_eq!(running_ids(&o, &s, now), ["dead1", "live1"]);
+
+    // The folder is found from Claude Code's projects folder without --transcript.
+    let (ok, out) = run(&["release", "dead1"]);
+    assert!(ok && out.contains("released agent dead1") && out.contains("job dead1"), "{out}");
+    assert_eq!(running_ids(&o, &s, std::time::SystemTime::now()), ["live1"]);
+    // Claude Code's meta file is never edited.
+    assert!(!std::fs::read_to_string(s.dir.join("agent-dead1.meta.json")).unwrap().contains("finished"));
+
+    // A live agent is refused unless --force, here through --transcript.
+    let (ok, out) = run(&["release", "agent-live1", "--transcript", &s.tp()]);
+    assert!(!ok && out.contains("wrote") && out.contains("--force"), "{out}");
+    assert_eq!(running_ids(&o, &s, std::time::SystemTime::now()), ["live1"]);
+    let (ok, out) = run(&["release", "live1", "--force", "--transcript", &s.tp()]);
+    assert!(ok && out.contains("released agent live1"), "{out}");
+    assert!(running_ids(&o, &s, std::time::SystemTime::now()).is_empty());
+
+    // An agent that writes again after its release counts again.
+    written(&s, "dead1", std::time::SystemTime::now() + std::time::Duration::from_secs(5));
+    assert_eq!(running_ids(&o, &s, std::time::SystemTime::now() + std::time::Duration::from_secs(6)), ["dead1"]);
+
+    // #207 review N4: an agent's own transcript is not the session's.
+    let own = s.dir.join("agent-live1.jsonl").to_string_lossy().into_owned();
+    let (ok, out) = run(&["release", "live1", "--transcript", &own]);
+    assert!(!ok && out.contains("the session transcript"), "{out}");
+    let (ok, out) = run(&["release", "nosuch"]);
+    assert!(!ok && out.contains("no agent nosuch"), "{out}");
+    let (ok, out) = run(&["release"]);
+    assert!(!ok && out.contains("usage: atlas queue"), "{out}");
+    let (ok, out) = run(&["release", "--help"]);
+    assert!(ok && out.contains("release AGENT [--force] [--transcript PATH]"), "{out}");
+}
+
+/// #207 review M1-M3: the lines Claude Code writes after a tool result, read
+/// from real 2.1.322 transcripts (their structure only): a PostToolUse hook
+/// attachment, then the next request's `api-request` line, both before the
+/// model answers. A dead agent's last line is one of these, never the result.
+fn hook_line(id: &str, event: &str) -> Value {
+    json!({"type": "attachment", "isSidechain": true, "agentId": id, "uuid": "u-hook", "parentUuid": "u-result", "timestamp": "2026-11-14T10:00:01.000Z",
+        "attachment": {"type": "hook_success", "hookEvent": event, "hookName": format!("{event}:Bash"), "toolUseID": "toolu_1", "command": "atlas hook", "content": "", "stdout": "", "stderr": "", "durationMs": 12}})
+}
+
+fn request_line(id: &str) -> Value {
+    json!({"type": "api-request", "id": "req-1", "agentId": id, "sessionId": "s1", "querySource": "agent", "params": {}, "tail": [], "timestamp": "2026-11-14T10:00:02.000Z"})
+}
+
+/// Appends a tool error `text` for agent `id`, then `after`, each a line,
+/// to its transcript.
+fn tail_lines(s: &Session, id: &str, text: &str, after: &[Value]) {
+    use std::io::Write;
+    let result = json!({"type": "user", "isSidechain": true, "agentId": id, "uuid": "u-result", "timestamp": "2026-11-14T10:00:00.000Z",
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": text}]},
+        "toolUseResult": format!("Error: {text}"), "sourceToolAssistantUUID": "u-call"});
+    let mut f = std::fs::File::options().append(true).open(s.dir.join(format!("agent-{id}.jsonl"))).unwrap();
+    writeln!(f, "{result}").unwrap();
+    for l in after {
+        writeln!(f, "{l}").unwrap();
+    }
+}
+
+/// #207 review M1-M3, N2: the disk-full rule reads the last message line,
+/// past the hook and request lines that follow a tool result, matches the
+/// Windows text, reads further back for a line longer than the first read,
+/// and keeps counting an agent that answered the error.
+#[test]
+fn a_disk_full_error_under_real_tail_lines_still_stops_counting() {
+    use std::io::Write;
+    let t = Temp::new("orch-207-tail");
+    let s = Session::new(t.path());
+    let o = atlas::orchestrate::resolve(Some(&builders(9)), None, None, |_| None);
+    let enospc = "Error: ENOSPC: no space left on device, write";
+    // A successful result is followed by its PostToolUse hook, then a request.
+    s.agent("hooked", "general-purpose", "t1", "Build.", 1000, false);
+    tail_lines(&s, "hooked", enospc, &[hook_line("hooked", "PostToolUse"), request_line("hooked")]);
+    // An error result is followed by the request at once.
+    s.agent("errored", "general-purpose", "t2", "Build.", 1000, false);
+    tail_lines(&s, "errored", "bash: echo: write error: No space left on device", &[request_line("errored")]);
+    // Windows: Rust std, cargo, rustc and linkers report os error 112.
+    s.agent("win", "general-purpose", "t3", "Build.", 1000, false);
+    tail_lines(&s, "win", "error: failed to write `target/debug/deps/x.rlib`: There is not enough space on the disk. (os error 112)", &[request_line("win")]);
+    s.agent("win112", "general-purpose", "t4", "Build.", 1000, false);
+    tail_lines(&s, "win112", "LINK : fatal error LNK1180: insufficient disk space (os error 112)", &[request_line("win112")]);
+    s.agent("wincase", "general-purpose", "t5", "Build.", 1000, false);
+    tail_lines(&s, "wincase", "THERE IS NOT ENOUGH SPACE ON THE DISK.", &[request_line("wincase")]);
+    // A result line longer than the first tail read (stdout carried twice).
+    s.agent("long", "general-purpose", "t6", "Build.", 1000, false);
+    tail_lines(&s, "long", &format!("{}\n{enospc}", "x".repeat(100 * 1024)), &[request_line("long")]);
+    // A last line torn by the full disk does not hide the error.
+    s.agent("torn", "general-purpose", "t7", "Build.", 1000, false);
+    tail_lines(&s, "torn", enospc, &[request_line("torn")]);
+    std::fs::OpenOptions::new().append(true).open(s.dir.join("agent-torn.jsonl")).unwrap().write_all(b"{\"type\":\"attachm").unwrap();
+    // An agent that answered the error is alive: it keeps the long window.
+    s.agent("answered", "general-purpose", "t8", "Build.", 1000, false);
+    let reply = json!({"type": "assistant", "agentId": "answered", "message": {"role": "assistant", "content": [{"type": "text", "text": "Freeing space."}]}});
+    tail_lines(&s, "answered", enospc, &[request_line("answered"), reply, hook_line("answered", "PreToolUse")]);
+    // Any other error keeps the long window too.
+    s.agent("other", "general-purpose", "t9", "Build.", 1000, false);
+    tail_lines(&s, "other", "Exit code 101: test failed", &[request_line("other")]);
+    let now = std::time::SystemTime::now();
+    let min = |m: u64| now + std::time::Duration::from_secs(m * 60);
+    assert_eq!(running_ids(&o, &s, min(5)), ["answered", "errored", "hooked", "long", "other", "torn", "win", "win112", "wincase"]);
+    assert_eq!(running_ids(&o, &s, min(11)), ["answered", "other"]);
+}
+
+/// #207 review S1: an interim stop (the agent waits on its own background
+/// work) fires SubagentStop too, and its notification undoes the finish
+/// the stop recorded, in memory and on disk, whether or not Claude Code
+/// writes to the transcript after the stop.
+#[test]
+fn an_interim_stop_keeps_the_agent_counted() {
+    let t = Temp::new("orch-207-interim");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(1), &[])).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b1", "general-purpose", "t-b1", "Kind: builder\nLane: WAIT\n\nBuild one.", 1000, false);
+    let o = atlas::orchestrate::resolve(Some(&builders(1)), None, None, |_| None);
+    let stop = h.handle(&HookEvent { agent_id: "b1".into(), agent_type: "general-purpose".into(), last_message: "waiting".into(), transcript_path: s.tp(), ..ev("SubagentStop") });
+    assert!(stop.block.is_none(), "{stop:?}");
+    let note = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Agent \"x\" is waiting on its own background work</summary>\n<note>This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.</note>\n<result>r</result>\n</task-notification>";
+    let _ = h.handle(&HookEvent { prompt: note.into(), transcript_path: s.tp(), ..ev("UserPromptSubmit") });
+    let d = launch(&mut h, &s, "t2", "general-purpose", "Kind: builder\nLane: OTHER\n\nBuild two.");
+    assert!(d.deny.as_deref().is_some_and(|r| r.contains("1 of 1 builder") && r.contains("job b1")), "{d:?}");
+    // Another process (atlas queue next, a command hook) counts it too.
+    assert_eq!(running_ids(&o, &s, std::time::SystemTime::now()), ["b1"]);
+    // Its real finish frees it.
+    let _ = finished(&mut h, &s, "b1");
+    assert!(launch(&mut h, &s, "t3", "general-purpose", "Kind: builder\nLane: OTHER\n\nBuild two.").deny.is_none());
 }

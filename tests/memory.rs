@@ -1042,8 +1042,23 @@ fn an_amended_hook_launch_keeps_its_queue_identity() {
     assert!(h.title.chars().count() <= atlas::memory::TITLE_CHARS && h.meta.contains(&format!("description: {long}")), "{h:?}");
     assert_eq!(atlas::queue::add(&mut store, &long_launch(long, "Lane: P\nLong brief.")).unwrap(), (lkey.clone(), false));
     let other: &'static str = Box::leak(format!("{long} too").into_boxed_str());
-    assert!(atlas::queue::add(&mut store, &long_launch(other, "Lane: P\nLong brief.")).unwrap().1, "a different long description is another launch");
-    // Amended with a first line past a title: the brief alone is hashed,
+    // Rule 3 (2026-11-14): another description with the same brief is the
+    // same launch by content, filed once.
+    assert_eq!(atlas::queue::add(&mut store, &long_launch(other, "Lane: P\nLong brief.")).unwrap(), (lkey.clone(), false));
+    // S8 of the #180 re-review: both identity matches compare the kind the
+    // prompt declares, never one an agent type gave, so the same brief
+    // classified as another kind by its type is the same entry either way.
+    let review = |description: &'static str| atlas::queue::Launch { kind: atlas::orchestrate::Kind::Reviewer, ..long_launch(description, "Lane: P\nLong brief.") };
+    assert_eq!(atlas::queue::add(&mut store, &review(long)).unwrap(), (lkey.clone(), false));
+    assert_eq!(atlas::queue::add(&mut store, &review(other)).unwrap(), (lkey.clone(), false));
+    // With the content path refused (another use), the whole description
+    // still tells the two long launches apart: a new entry, and each is
+    // found again by its own description.
+    let gpu = |description: &'static str| atlas::queue::Launch { class_meta: "uses: gpu (declared)", ..long_launch(description, "Lane: P\nLong brief.") };
+    let (gkey, new) = atlas::queue::add(&mut store, &gpu(other)).unwrap();
+    assert!(new && gkey != lkey, "{gkey}");
+    assert_eq!(atlas::queue::add(&mut store, &gpu(other)).unwrap(), (gkey.clone(), false));
+    assert_eq!(atlas::queue::add(&mut store, &long_launch(long, "Lane: P\nLong brief.")).unwrap(), (lkey.clone(), false));    // Amended with a first line past a title: the brief alone is hashed,
     // so the amended launch made again is still known.
     let sha = store.head(&lkey).unwrap().unwrap().sha;
     drop(store);
@@ -1078,7 +1093,14 @@ fn a_queued_journal_entry_is_filed_as_planned_work() {
     }
     s.answer("journal", &json!({"lane": "DOCS", "entry": "queued", "text": "Write the guide", "meta": "after: journal:PARSER:0001, the release"})).unwrap();
     s.answer("journal", &json!({"lane": "FRAC", "entry": "queued", "text": "A fractional place", "meta": "order: 9.5"})).unwrap();
-    s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": "role: cost\npr: 9\nhead: abcdef0\nverdict: Merge-With-Follow-Ups"})).unwrap();
+    // Review nit on #201: a bare `pr: N` with no repo is filed, with a
+    // warning that it counts for that number in every repo.
+    let out = s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": "role: cost\npr: 9\nhead: abcdef0\nverdict: Merge-With-Follow-Ups"})).unwrap().into_text();
+    assert!(out.contains("warning: `pr: 9` names no repo"), "{out}");
+    for meta in ["role: cost\npr: o/api#9\nhead: abcdef0\nverdict: pass", "role: cost\npr: 9\nrepo: o/api\nhead: abcdef0\nverdict: pass"] {
+        let out = s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": meta})).unwrap().into_text();
+        assert!(!out.contains("names no repo"), "{out}");
+    }
     drop(s);
     let store = MemoryStore::open(&f.settings.store).unwrap();
     let h = store.head("journal:PARSER:0001").unwrap().unwrap();

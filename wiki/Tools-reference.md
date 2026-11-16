@@ -69,13 +69,32 @@ another record's text plus 40 lines either side in its export; a lane's every re
 Writes, `journal` among them, log no counterfactual.
 
 Each subagent start also logs the "brief without atlas": the bytes of the rulebook (`memory.brief_reference`)
-at that moment, what a brief that says "read it in full" costs. `--token-report` prints it on its own line;
-it never enters a per-answer ratio. Beside it, `hook injections` sums what the recall hooks injected (keys,
-sessions, tokens, per session and the largest session): the pointers a session gets in place of that brief.
+at that moment, what a brief that says "read it in full" costs. `--token-report` prints it on its own line,
+per agent (a distinct session and agent id): agents, tokens, tokens per agent, and the raw start count. Each
+agent is counted once, at the rulebook of its first start: Claude Code fires `SubagentStart` again whenever an
+agent resumes (a `SendMessage`, or a background task waking it), and a resumed agent keeps its context, so the
+report gives those repeats as `resumes` and does not count them as reads. It never enters a per-answer ratio.
+Beside it, `hook injections` sums what the recall hooks injected, in the same unit (keys, agents, tokens, per
+agent and the largest agent; a main session is one agent): the pointers an agent gets in place of that brief.
+`brief vs injections` then compares the two on the agents both tables hold: the rulebook they would have read,
+what the hooks injected into them, and the ratio.
 `recall.inject_floor` (a cosine threshold) and `recall.session_budget_tokens` (a cap per session) bound it.
 Then a `context selection` line says what `recall.select` did to those injections: how many were sent whole,
 trimmed to their matching clauses or collapsed into a ref to a near-duplicate, the tokens each would have taken
 whole against what was sent, and the share saved.
+
+The report also measures what atlas itself costs, from bytes, with no model estimate. A: the tool list and
+instructions sent at every session or subagent start the store shows, plus each atlas tool schema loaded later
+through tool search. B: the hook injections as sent, by event, plus their re-reads: an injection stays in
+context for every later request up to the next compaction. C: every tool's returned bytes, one total for all
+sessions (the ledger has no session column). A `Net` block after the headline gives credited savings minus that
+cost, and a net table gives it by tool. Each re-read is priced from its request's `usage` block: cache reads,
+5-minute and 1-hour cache writes and uncached input by their proportions, at the ratios of one price table by
+model (`src/token_cost.rs`); a request with no usage block or an unknown model is priced at the full rate and
+counted. Tool search loads and re-reads are seen only with `--token-report --transcripts DIR` (Claude Code's
+`projects` folder, read only); without it, or for a session whose transcript is gone, the net line says it counts
+only the costs atlas can see and that the true net is lower. A turn is a distinct second of a main session's
+UserPromptSubmit rows, so a prompt that injected nothing is not counted and the cost per turn errs high.
 
 `recall {key: "KEY@HASH"}` reads one exact version: `HASH` is 8 to 64 hex digits of the version's SHA-256 (a
 ref is written with 12, the start of the `sha` line a recalled record shows). The answer is that version
@@ -109,9 +128,9 @@ messages: the key in a tool input (a `recall key=`, a lookup, a grep), its sourc
 per hook. `--transcripts DIR --since TIME` adds injections reconstructed from past transcripts (rescored by the
 hook's own gate), `--rows` lists every key, and `--tune-floor SCALE` prints the relevance-floor curve and the
 floor that maximises the bytes the kept hits save net of the bytes injected (SCALE is the share of a hit's
-counterfactual credited: 1 for the upper bound).
+counterfactual credited: 1 for the full ledger credit).
 
-The counterfactual is an upper bound. atlas measures the other side itself, from your own Claude Code
+The counterfactual is rule-based, not a bound: some rows overcount and others score 0. atlas measures the other side itself, from your own Claude Code
 transcripts: the bytes of the Grep, Read and shell-read results agents read when they looked something up in the
 files atlas serves, before atlas, grouped into one episode per question. The server does it in the background,
 never on a hook's path, at its first start and again when the lookup rules or the configured targets change;
@@ -121,9 +140,10 @@ session ran in one of the project's folders (every one without projects), less t
 replay folders (`calibrate.skip`); a call another transcript already holds (a replay, a resumed session) counts
 once. What the rules read of each pre-cutoff call (never a result's text) is kept in the store, so a later
 recalibration does not lose history Claude Code has since deleted. `--token-report` then heads its output with
-the measured ratio (median pre-atlas episode over median atlas answer), when it was measured, from how many
-episodes and transcripts and with which rules version, and the upper bound, labelled as such. With fewer than 30
-episodes from 5 transcripts it gives the upper bound alone and says why. The rules are in `src/calibrate/`.
+the measured ratio (mean pre-atlas episode over mean atlas answer, a ratio of sums; the medians' ratio beside it,
+marked not additive), when it was measured, from how many episodes and transcripts and with which rules version,
+and the ledger ratio with its per-answer median, labelled rule-based, not a bound. With fewer than 30 episodes
+from 5 transcripts it gives the ledger ratio alone and says why. The rules are in `src/calibrate/`.
 
 | Tool | Writes | What it does |
 |---|---|---|

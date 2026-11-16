@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::json::Value;
 
@@ -31,9 +31,36 @@ pub const DEFAULT_HANDOFF: u64 = 285_000;
 /// How long an admitted launch whose agent never starts counts: a launch
 /// refused after atlas answered (a permission prompt, another hook) has no
 /// SubagentStart and no meta file to retire it.
-const PENDING_TTL: Duration = Duration::from_secs(120);
+pub const PENDING_TTL: Duration = Duration::from_secs(120);
+/// How long a launch whose agent has not been seen yet keeps its brief, its
+/// Binding block and its sub-lane, as a backstop only: they go when its agent
+/// is confirmed (its meta file names the launch) or its refusal is seen in
+/// the session transcript. A launch can wait at the permission prompt far
+/// past [`PENDING_TTL`]; one kept too long only makes a later start
+/// ambiguous (answered at its first tool call), never wrong.
+pub const LAUNCH_HOLD_TTL: Duration = Duration::from_secs(3600);
+/// How long an admitted launch whose agent has not started holds its class
+/// (its lane, worktree, branch and resources) for later launches and the
+/// queue: the launches of one message reach the hook within seconds, and a
+/// launch refused after atlas answered must not hold its worktree against
+/// its own relaunch for the cap slot's whole [`PENDING_TTL`].
+pub const CLASS_HOLD_TTL: Duration = Duration::from_secs(15);
 /// How much earlier than the process clock a file time may read.
 const FILE_CLOCK_SLACK: Duration = Duration::from_secs(1);
+/// `atlas queue release` refuses, without `--force`, an agent that wrote its
+/// transcript or meta file this recently: it may still be alive.
+pub const RELEASE_QUIET: Duration = Duration::from_secs(5 * 60);
+/// The suffix of atlas's own release record beside an agent's meta file,
+/// `agent-<id>.atlas-released` (#204): its time is when the agent was
+/// released, and the agent counts again once it writes after that. Claude
+/// Code's meta file is never edited.
+pub const RELEASED_SUFFIX: &str = ".atlas-released";
+/// How much of a transcript's end is read first for its last message line.
+const TAIL_BYTES: u64 = 64 * 1024;
+/// The most of a transcript's end read for its last message line: a tool
+/// result line carries its output twice (`content` and `toolUseResult`), so
+/// one line may be far longer than [`TAIL_BYTES`].
+const TAIL_MAX_BYTES: u64 = 4 << 20;
 /// Lines of an Agent launch prompt a `Kind:` line is looked for in (a
 /// brief file the prompt names is never read).
 const KIND_LINES: usize = 40;
@@ -157,6 +184,9 @@ pub struct OrchestrateSpec {
     /// Minutes after which an unfinished agent that wrote nothing is not
     /// counted (default 360).
     pub stale_minutes: Option<usize>,
+    /// Minutes after which an unfinished agent whose transcript ends in a
+    /// disk-full tool error is not counted (default 10; 0: off).
+    pub disk_full_minutes: Option<usize>,
     /// The kind of an agent no rule classifies (default builder).
     pub default_kind: Option<Kind>,
     /// The mode of a kind that sets none (default enforced).
@@ -184,6 +214,9 @@ pub struct OrchestrateSpec {
     pub judge_cells: Option<std::path::PathBuf>,
     /// The work classifier (`orchestrate.judge.classifier`).
     pub judge_classifier: crate::taskjudge::ClassifierSettings,
+    /// The folders a `worktree:NAME` resolves under (`orchestrate.worktree_roots`;
+    /// none: every linked worktree of the project's repositories).
+    pub worktree_roots: Vec<std::path::PathBuf>,
 }
 
 /// One kind's resolved settings.
@@ -212,6 +245,9 @@ pub struct OrchSettings {
     pub claude_limit: usize,
     /// An unfinished agent that wrote nothing for this long is not counted.
     pub stale: Duration,
+    /// An unfinished agent whose transcript ends in a disk-full tool error
+    /// and that wrote nothing for this long is not counted (zero: off).
+    pub disk_full: Duration,
     /// The kind of an agent no rule classifies.
     pub default_kind: Kind,
     /// `subagent_type` to kind (configured entries first, then built-in).
@@ -232,6 +268,8 @@ pub struct OrchSettings {
     pub reviews: crate::reviews::ReviewSettings,
     /// The task judge (see [`crate::taskjudge`]).
     pub judge: crate::taskjudge::JudgeSettings,
+    /// The worktree ledger's roots (`orchestrate.worktree_roots`).
+    pub worktree_roots: Vec<std::path::PathBuf>,
 }
 
 impl Default for OrchSettings {
@@ -265,12 +303,11 @@ const BUILT_IN_TYPES: &[(&str, Kind)] = &[
     ("brief-writer", Kind::BriefWriter),
 ];
 
-/// The window inferred from Claude Code's environment: the auto-compact
-/// window, else 200k when the 1M context is turned off, else 1M.
+/// The model's window inferred from Claude Code's environment: 200k when
+/// the 1M context is turned off, else 1M. `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+/// is where Claude Code compacts, not the model's window (atlas writes it
+/// from its hard limit, ATLAS-CLEAR 0006), so it is never read here.
 pub fn inferred_window(env: &dyn Fn(&str) -> Option<String>) -> u64 {
-    if let Some(w) = env("CLAUDE_CODE_AUTO_COMPACT_WINDOW").and_then(|v| v.trim().parse::<u64>().ok()).filter(|w| *w > 0) {
-        return w;
-    }
     let off = env("CLAUDE_CODE_DISABLE_1M_CONTEXT").is_some_and(|v| !matches!(v.trim(), "" | "0" | "false"));
     if off {
         200_000
@@ -325,6 +362,7 @@ pub fn resolve(
         enabled: o.enabled.unwrap_or(false),
         claude_limit,
         stale: Duration::from_secs(o.stale_minutes.unwrap_or(360) as u64 * 60),
+        disk_full: Duration::from_secs(o.disk_full_minutes.unwrap_or(10) as u64 * 60),
         default_kind: o.default_kind.unwrap_or(Kind::Builder),
         types,
         builder: resolve_kind(Kind::Builder, 2),
@@ -356,6 +394,7 @@ pub fn resolve(
             cells: o.judge_cells.clone(),
             classifier: o.judge_classifier.clone(),
         },
+        worktree_roots: o.worktree_roots.clone(),
     }
 }
 
@@ -397,12 +436,15 @@ pub enum KindSource {
     Type,
     /// `isolation: "worktree"`.
     Worktree,
+    /// No `subagent_type` and an empty brief: `other`.
+    Empty,
     /// `orchestrate.default_kind`.
     Default,
 }
 
 /// An agent's kind: its brief's `Kind:` line, else its `subagent_type` in
-/// the map, else a worktree agent is a builder, else the default kind. The
+/// the map, else a worktree agent is a builder, else an agent with no type
+/// and an empty brief is `other`, else the default kind. The
 /// brief is the Agent launch prompt, not a file it names.
 pub fn classify(s: &OrchSettings, brief: &str, subagent_type: &str, isolation: &str) -> Kind {
     classify_source(s, brief, subagent_type, isolation).0
@@ -410,6 +452,7 @@ pub fn classify(s: &OrchSettings, brief: &str, subagent_type: &str, isolation: &
 
 /// [`classify`], and which rule decided it.
 pub fn classify_source(s: &OrchSettings, brief: &str, subagent_type: &str, isolation: &str) -> (Kind, KindSource) {
+    let subagent_type = subagent_type.trim();
     if let Some(k) = brief_kind(brief) {
         return (k, KindSource::Line);
     }
@@ -418,6 +461,10 @@ pub fn classify_source(s: &OrchSettings, brief: &str, subagent_type: &str, isola
     }
     if isolation.eq_ignore_ascii_case("worktree") {
         return (Kind::Builder, KindSource::Worktree);
+    }
+    // #196: nothing to go on (a hook input with only an agent_id) is `other`.
+    if subagent_type.is_empty() && brief.trim().is_empty() {
+        return (Kind::None, KindSource::Empty);
     }
     (s.default_kind, KindSource::Default)
 }
@@ -430,6 +477,7 @@ pub fn kind_reason(kind: Kind, source: KindSource, subagent_type: &str) -> Strin
         KindSource::Line => return format!("This launch counts as a {}: its prompt's `Kind:` line says so.", noun(kind)),
         KindSource::Type => format!("{none}, and the agent-type map (orchestrate.types) gives its subagent_type `{subagent_type}` the kind {}", kind.name()),
         KindSource::Worktree => format!("{none}, and an agent with isolation: \"worktree\" counts as a builder"),
+        KindSource::Empty => "its prompt is empty and it has no subagent_type, so it counts as other".to_string(),
         KindSource::Default => format!("{none} and no other rule classifies it, so orchestrate.default_kind ({}) applies", kind.name()),
     };
     format!(
@@ -452,6 +500,200 @@ fn noun(kind: Kind) -> &'static str {
 /// transcript path (a subagent's hook input names the parent's).
 pub fn subagents_dir(transcript: &str) -> PathBuf {
     Path::new(transcript.strip_suffix(".jsonl").unwrap_or(transcript)).join("subagents")
+}
+
+/// Whether a transcript's last message line (`user` or `assistant`) is a
+/// tool error that says the disk is full: `ENOSPC`, "no space left" (Node,
+/// Git Bash), or Windows' "not enough space on the disk" / "os error 112"
+/// (Rust std, cargo, rustc, linkers), in any case. The lines Claude Code
+/// writes after a tool result and before the model answers (a hook's
+/// `attachment`, the next `api-request`, `system` lines) and a torn last
+/// line are passed over (#207 review). The end is read from [`TAIL_BYTES`],
+/// further back up to [`TAIL_MAX_BYTES`] while no message line is whole in
+/// it; a missing or unreadable file is no.
+pub fn ends_in_disk_full(transcript: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(transcript) else { return false };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut window = TAIL_BYTES;
+    loop {
+        let start = len.saturating_sub(window);
+        if f.seek(SeekFrom::Start(start)).is_err() {
+            return false;
+        }
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_err() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        // A read from mid-file starts mid-line: its first piece is no line.
+        for line in text.split('\n').skip(usize::from(start > 0)).collect::<Vec<_>>().into_iter().rev() {
+            let Ok(v) = crate::json::parse(line.trim()) else { continue };
+            match v.get("type").and_then(Value::as_str) {
+                Some("assistant") => return false,
+                Some("user") => return is_disk_full_error(&v),
+                _ => {}
+            }
+        }
+        if start == 0 || window >= TAIL_MAX_BYTES {
+            return false;
+        }
+        window = (window * 4).min(TAIL_MAX_BYTES);
+    }
+}
+
+/// Whether a `user` transcript line holds a tool error that says the disk
+/// is full (see [`ends_in_disk_full`]).
+fn is_disk_full_error(v: &Value) -> bool {
+    let Some(Value::Array(content)) = v.get("message").and_then(|m| m.get("content")) else { return false };
+    let full = |t: &str| {
+        let t = t.to_ascii_lowercase();
+        ["enospc", "no space left", "not enough space on the disk", "os error 112"].iter().any(|w| t.contains(w))
+    };
+    content.iter().any(|c| {
+        if c.get("type").and_then(Value::as_str) != Some("tool_result") || c.get("is_error").and_then(Value::as_bool) != Some(true) {
+            return false;
+        }
+        match c.get("content") {
+            Some(Value::String(t)) => full(t),
+            Some(Value::Array(parts)) => parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).any(full),
+            _ => false,
+        }
+    })
+}
+
+/// The agents folder (`<session>/subagents`) under Claude Code's projects
+/// folder that holds agent `id`'s meta file, if any.
+pub fn find_agent_dir(projects: &Path, id: &str) -> Option<PathBuf> {
+    let meta = format!("agent-{id}.meta.json");
+    std::fs::read_dir(projects).ok()?.flatten().find_map(|p| {
+        std::fs::read_dir(p.path()).ok()?.flatten().map(|s| s.path().join("subagents")).find(|d| d.join(&meta).is_file())
+    })
+}
+
+/// Records agent `id` (in the agents folder `dir`) finished in atlas's own
+/// release record (#204), for an agent whose finish Claude Code never wrote
+/// (a full disk): its lane, cap slot and resources are free at once, until
+/// it writes again. An agent that wrote in the last [`RELEASE_QUIET`] is
+/// refused unless `force`. Claude Code's meta file is never edited.
+///
+/// # Errors
+///
+/// A message: no such agent, one that may be alive, or a failed write.
+pub fn release(dir: &Path, id: &str, force: bool, now: SystemTime) -> std::result::Result<String, String> {
+    let id = id.strip_prefix("agent-").unwrap_or(id);
+    let meta_path = dir.join(format!("agent-{id}.meta.json"));
+    let Ok(text) = std::fs::read_to_string(&meta_path) else {
+        return Err(format!("no agent {id} in {}", dir.display()));
+    };
+    let meta = crate::json::parse(&text).ok();
+    let field = |k: &str| meta.as_ref().and_then(|m| m.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
+    let name = match field("description") {
+        d if d.is_empty() => id.to_string(),
+        d => d,
+    };
+    if meta.as_ref().and_then(|m| m.get("finished")).and_then(Value::as_bool) == Some(true) {
+        return Ok(format!("agent {id} ({name}) already finished: it holds nothing"));
+    }
+    let last = [modified(&meta_path), modified(&dir.join(format!("agent-{id}.jsonl")))].into_iter().flatten().max().unwrap_or(UNIX_EPOCH);
+    let quiet = now.duration_since(last).unwrap_or_default();
+    if !force && quiet < RELEASE_QUIET {
+        return Err(format!(
+            "agent {id} ({name}) wrote {} s ago and may still be running; stop it first, or pass --force to release it anyway",
+            quiet.as_secs()
+        ));
+    }
+    // Never older than its last write, whatever the file clock reads.
+    record_finish(dir, id, now.max(last)).map_err(|e| format!("{}: {e}", dir.join(format!("agent-{id}{RELEASED_SUFFIX}")).display()))?;
+    Ok(format!(
+        "released agent {id} ({name}): atlas counts it finished, so its lane, cap slot and resources are free. It counts again if it writes again."
+    ))
+}
+
+/// Writes atlas's release record for agent `id` in the agents folder `dir`,
+/// timed `at`: by `atlas queue release`, and at a SubagentStop so that
+/// another process (`atlas queue next`, `atlas backlog`, a command hook)
+/// sees that finish too (#207 review S2).
+///
+/// # Errors
+///
+/// I/O errors creating the file or setting its time (a full disk).
+pub fn record_finish(dir: &Path, id: &str, at: SystemTime) -> std::io::Result<()> {
+    let id = id.strip_prefix("agent-").unwrap_or(id);
+    std::fs::File::create(dir.join(format!("agent-{id}{RELEASED_SUFFIX}")))?.set_modified(at)
+}
+
+/// Removes agent `id`'s release record from the agents folder `dir`, if
+/// any: the agent only waits on its own background work (an interim stop),
+/// so it still holds what it held (#207 review S1).
+pub fn clear_finish(dir: &Path, id: &str) {
+    let id = id.strip_prefix("agent-").unwrap_or(id);
+    // No record is the usual case, and nothing more can be done on an error.
+    let _ = std::fs::remove_file(dir.join(format!("agent-{id}{RELEASED_SUFFIX}")));
+}
+
+/// The tool use id of the launch that started agent `id` (in the session
+/// folder `dir`): its meta file's `toolUseId`. None when the meta file is
+/// not written yet or names no id.
+pub fn launch_id_of(dir: &Path, id: &str) -> Option<String> {
+    meta_str(dir, id, "toolUseId")
+}
+
+/// The model alias agent `id` was launched with: its meta file's `model`
+/// (`haiku`, `sonnet`, `opus`, or `inherit`). Not `pickedEffortModel`:
+/// Claude Code writes the parent's model there (ruling ATLAS-VERSION 0016).
+pub fn model_alias_of(dir: &Path, id: &str) -> Option<String> {
+    meta_str(dir, id, "model")
+}
+
+/// A non-empty string field of agent `id`'s meta file.
+fn meta_str(dir: &Path, id: &str, key: &str) -> Option<String> {
+    let id = id.strip_prefix("agent-").unwrap_or(id);
+    let meta = std::fs::read_to_string(dir.join(format!("agent-{id}.meta.json"))).ok().and_then(|t| crate::json::parse(&t).ok())?;
+    meta.get(key).and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string)
+}
+
+/// Whether agent `id`'s meta file (in the session folder `dir`) is written.
+pub fn meta_written(dir: &Path, id: &str) -> bool {
+    let id = id.strip_prefix("agent-").unwrap_or(id);
+    dir.join(format!("agent-{id}.meta.json")).is_file()
+}
+
+/// The launches among `ids` that the session transcript `transcript`
+/// records as refused: a tool result with `is_error` for the launch's tool
+/// use id, as Claude Code writes a refusal at the permission prompt. The
+/// transcript is read from byte `from` (where the launches were let
+/// through, or the last scan ended). Also the offset to scan from next
+/// time: just past the last whole line read. A refused launch never starts.
+pub fn refused_launches(transcript: &Path, from: u64, ids: &[&str]) -> (Vec<String>, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut out: Vec<String> = Vec::new();
+    if ids.is_empty() {
+        return (out, from);
+    }
+    let Ok(mut f) = std::fs::File::open(transcript) else { return (out, from) };
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return (out, from);
+    }
+    // A line still being written is read again next time.
+    let whole = buf.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1);
+    buf.truncate(whole);
+    for line in String::from_utf8_lossy(&buf).lines() {
+        if !line.contains("\"is_error\"") || !line.contains("tool_result") || !ids.iter().any(|i| line.contains(i)) {
+            continue;
+        }
+        let Ok(v) = crate::json::parse(line) else { continue };
+        let Some(items) = v.pointer("/message/content").and_then(Value::as_array) else { continue };
+        for it in items {
+            let refused = it.get("type").and_then(Value::as_str) == Some("tool_result") && it.get("is_error").and_then(Value::as_bool) == Some(true);
+            match it.get("tool_use_id").and_then(Value::as_str) {
+                Some(t) if refused && ids.contains(&t) && !out.iter().any(|o| o == t) => out.push(t.to_string()),
+                _ => {}
+            }
+        }
+    }
+    (out, from + whole as u64)
 }
 
 /// The first user message of a transcript (an agent's brief), read line by
@@ -523,6 +765,13 @@ pub struct Agents {
     paired: HashSet<String>,
     /// The kind each admitted launch was given, by tool use id.
     admitted: HashMap<String, Kind>,
+    /// The sub-lane each admitted launch runs as, by tool use id
+    /// ([`Agents::hold_last`]): told to its agent at SubagentStart and read
+    /// for its lane while it runs, never written into its prompt. Pruned in
+    /// [`Agents::running`] once its agent was seen running and is no longer,
+    /// or after [`LAUNCH_HOLD_TTL`] unseen; or when its refusal is seen
+    /// ([`Agents::forget_launch`]).
+    sub_lanes: HashMap<String, SubLane>,
     /// Each agent's kind, once known.
     kinds: HashMap<String, Kind>,
     /// When a real finish was seen for each agent.
@@ -537,6 +786,16 @@ pub struct Agents {
     kind_refused: bool,
 }
 
+/// The sub-lane an admitted launch runs as.
+#[derive(Debug, Clone)]
+struct SubLane {
+    name: String,
+    /// When it was admitted.
+    at: Instant,
+    /// Whether its agent has been seen running.
+    started: bool,
+}
+
 /// A launch admitted and not yet started.
 #[derive(Debug, Clone)]
 struct Pending {
@@ -549,6 +808,10 @@ struct Pending {
     /// clock (meta files created since are its agent's candidates).
     at: Instant,
     wall: SystemTime,
+    /// What it holds until its agent starts: its classification, its lane
+    /// already its sub-lane, once the queue check set it
+    /// ([`Agents::hold_last`]). Two launches of one message see each other.
+    class: Option<crate::lanes::Class>,
 }
 
 impl Default for Agents {
@@ -571,6 +834,7 @@ impl Agents {
             last: None,
             paired: HashSet::new(),
             admitted: HashMap::new(),
+            sub_lanes: HashMap::new(),
             kinds: HashMap::new(),
             finished: HashMap::new(),
             passed: HashMap::new(),
@@ -592,6 +856,69 @@ impl Agents {
         if let Some(n) = self.last.take() {
             self.pending.retain(|p| p.seq != n);
         }
+    }
+
+    /// Records what the launch `admit` just let through holds until its
+    /// agent starts: its class, and the sub-lane it runs as (the class's lane
+    /// is then that sub-lane). A later launch of the same message counts it
+    /// ([`Agents::pending_holders`]); its agent learns the sub-lane at its
+    /// start, by its meta file's `toolUseId` ([`launch_id_of`]).
+    pub fn hold_last(&mut self, mut class: crate::lanes::Class, sub_lane: Option<String>) {
+        let Some(n) = self.last else { return };
+        let Some(p) = self.pending.iter_mut().find(|p| p.seq == n) else { return };
+        if let Some(sub) = sub_lane {
+            if !p.tool_use_id.is_empty() {
+                self.sub_lanes.insert(p.tool_use_id.clone(), SubLane { name: sub.clone(), at: Instant::now(), started: false });
+            }
+            class.lane = Some(sub);
+        }
+        p.class = Some(class);
+    }
+
+    /// Moves every launch admitted so far `by` into the past (tests: a
+    /// launch held at the permission prompt).
+    #[doc(hidden)]
+    pub fn age(&mut self, by: Duration) {
+        for p in &mut self.pending {
+            p.at = p.at.checked_sub(by).unwrap_or(p.at);
+            p.wall = p.wall.checked_sub(by).unwrap_or(p.wall);
+        }
+        for s in self.sub_lanes.values_mut() {
+            s.at = s.at.checked_sub(by).unwrap_or(s.at);
+        }
+    }
+
+    /// Forgets launch `tool_use_id`, refused at the permission prompt: it
+    /// starts no agent, so it holds no slot and no sub-lane.
+    pub fn forget_launch(&mut self, tool_use_id: &str) {
+        self.sub_lanes.remove(tool_use_id);
+        self.pending.retain(|p| p.tool_use_id != tool_use_id);
+    }
+
+    /// The sub-lane the launch with tool use id `tool_use_id` runs as.
+    pub fn sub_lane(&self, tool_use_id: &str) -> Option<&str> {
+        self.sub_lanes.get(tool_use_id).map(|s| s.name.as_str())
+    }
+
+    /// The launches admitted and not yet started, as holders of what their
+    /// class declares (those [`Agents::hold_last`] classified), less any
+    /// whose agent is already in `running` and any admitted
+    /// [`CLASS_HOLD_TTL`] or longer ago.
+    pub fn pending_holders(&self, running: &[Running]) -> Vec<crate::lanes::Holder> {
+        let clock = Instant::now();
+        self.pending
+            .iter()
+            .filter(|p| clock.saturating_duration_since(p.at) < CLASS_HOLD_TTL)
+            .filter(|p| p.tool_use_id.is_empty() || !running.iter().any(|r| r.tool_use_id == p.tool_use_id))
+            .filter_map(|p| {
+                let name = if p.tool_use_id.is_empty() {
+                    "a launch moments ago".to_string()
+                } else {
+                    format!("a launch moments ago ({})", p.tool_use_id)
+                };
+                Some(crate::lanes::Holder { name, kind: p.kind, class: p.class.clone()? })
+            })
+            .collect()
     }
 
     /// Pairs a started agent with the pending record of its launch and
@@ -623,11 +950,7 @@ impl Agents {
         if id.is_empty() {
             return;
         }
-        let tool_use_id = std::fs::read_to_string(dir.join(format!("agent-{id}.meta.json")))
-            .ok()
-            .and_then(|t| crate::json::parse(&t).ok())
-            .and_then(|m| m.get("toolUseId").and_then(Value::as_str).map(str::to_string))
-            .unwrap_or_default();
+        let tool_use_id = launch_id_of(dir, id).unwrap_or_default();
         self.pair(id, &tool_use_id);
     }
 
@@ -654,6 +977,12 @@ impl Agents {
         self.finished.insert(id.to_string(), at);
     }
 
+    /// Forgets the finish recorded for an agent that only waits on its own
+    /// background work (an interim stop): it counts again at once.
+    pub fn unfinished(&mut self, id: &str) {
+        self.finished.remove(id);
+    }
+
     /// Records that an agent passed its handoff point.
     pub fn passed(&mut self, id: &str, lane: &str, kind: Kind) {
         self.passed.entry(id.to_string()).or_insert_with(|| (lane.to_string(), kind));
@@ -666,7 +995,8 @@ impl Agents {
     }
 
     /// An agent's kind: as admitted, else classified from its meta file and
-    /// brief (`agent_type` when the meta file is missing). Cached.
+    /// brief (`agent_type` when the meta file is missing). Cached, unless
+    /// there was nothing to classify it by (an empty brief and no type).
     pub fn kind_of(&mut self, s: &OrchSettings, dir: &Path, id: &str, agent_type: &str) -> Kind {
         let id = id.strip_prefix("agent-").unwrap_or(id);
         if let Some(k) = self.kinds.get(id) {
@@ -674,18 +1004,22 @@ impl Agents {
         }
         let meta = std::fs::read_to_string(dir.join(format!("agent-{id}.meta.json"))).ok().and_then(|t| crate::json::parse(&t).ok());
         let field = |k: &str| meta.as_ref().and_then(|m| m.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
-        let k = match self.admitted.get(&field("toolUseId")) {
-            Some(k) => *k,
+        let (k, source) = match self.admitted.get(&field("toolUseId")) {
+            Some(k) => (*k, KindSource::Line),
             None => {
                 let ty = match field("agentType") {
                     t if t.is_empty() => agent_type.to_string(),
                     t => t,
                 };
                 let brief = brief_of(&dir.join(format!("agent-{id}.jsonl"))).unwrap_or_default();
-                classify(s, &brief, &ty, "")
+                classify_source(s, &brief, &ty, "")
             }
         };
-        self.kinds.insert(id.to_string(), k);
+        // Nothing to go on yet (no meta file, no transcript): not cached, so
+        // a later hook reads them once they exist.
+        if source != KindSource::Empty {
+            self.kinds.insert(id.to_string(), k);
+        }
         k
     }
 
@@ -711,7 +1045,17 @@ impl Agents {
         let read = |p: &Path| std::fs::read_to_string(p).ok().and_then(|t| crate::json::parse(&t).ok());
         let mut out = Vec::new();
         let mut started: Vec<(SystemTime, String, String)> = Vec::new();
-        for e in rd.flatten() {
+        let entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
+        // atlas's own release records (`atlas queue release`), by agent id.
+        let released: HashMap<String, SystemTime> = entries
+            .iter()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let id = name.strip_prefix("agent-")?.strip_suffix(RELEASED_SUFFIX)?.to_string();
+                Some((id, e.metadata().and_then(|m| m.modified()).ok()?))
+            })
+            .collect();
+        for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_prefix("agent-").and_then(|n| n.strip_suffix(".meta.json")) else { continue };
             // The listing's own times (free on Windows); a meta is read only
@@ -734,11 +1078,17 @@ impl Agents {
             if idle > s.stale {
                 continue;
             }
-            if self.finished.get(id).is_some_and(|f| *f >= last) {
+            if [self.finished.get(id), released.get(id)].into_iter().flatten().any(|f| *f >= last) {
                 continue;
             }
             let Some(meta) = meta.or_else(|| read(&e.path())) else { continue };
             if meta.get("finished").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            // An agent that died on a full disk never gets its finish written
+            // (#204): its last message line says so, and a short idle window
+            // ends it. After the meta, so a finished agent costs no tail read.
+            if !s.disk_full.is_zero() && idle > s.disk_full && ends_in_disk_full(&transcript) {
                 continue;
             }
             let kind = self.kind_of(s, dir, id, "");
@@ -748,6 +1098,19 @@ impl Agents {
         started.sort();
         for (_, id, t) in started {
             self.pair(&id, &t);
+        }
+        // A sub-lane is kept while its launch is pending or its agent runs,
+        // and, until LAUNCH_HOLD_TTL, while its agent has not been seen (a
+        // launch held at the permission prompt past PENDING_TTL): an agent
+        // that ran and ended (or went stale) gives its record up.
+        if !self.sub_lanes.is_empty() {
+            let pending = &self.pending;
+            let clock = Instant::now();
+            self.sub_lanes.retain(|t, s| {
+                let running = out.iter().any(|r| r.tool_use_id == *t);
+                s.started |= running;
+                running || pending.iter().any(|p| p.tool_use_id == *t) || (!s.started && clock.saturating_duration_since(s.at) < LAUNCH_HOLD_TTL)
+            });
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
@@ -822,7 +1185,7 @@ impl Agents {
         }
         self.seq += 1;
         self.last = Some(self.seq);
-        self.pending.push(Pending { seq: self.seq, tool_use_id: tool_use_id.to_string(), kind, at: clock, wall: now });
+        self.pending.push(Pending { seq: self.seq, tool_use_id: tool_use_id.to_string(), kind, at: clock, wall: now, class: None });
         self.seen = Some((dir, running));
         None
     }
@@ -845,8 +1208,11 @@ mod tests {
         assert_eq!((s.builder.mode, s.builder.fresh), (Mode::Enforced, Fresh::Auto));
         let small = resolve(None, None, None, env(&[("CLAUDE_CODE_DISABLE_1M_CONTEXT", "1")]));
         assert_eq!((small.research.handoff, small.research.limit), (57_000, 90_000));
-        let ac = resolve(None, None, None, env(&[("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "500000")]));
-        assert_eq!((ac.reviewer.handoff, ac.reviewer.limit), (142_500, 225_000));
+        // ATLAS-CLEAR 0006: the auto-compact window is where Claude Code
+        // compacts (atlas may write it from the hard limit), not the model's
+        // window, so the limits never scale to it.
+        let ac = resolve(None, None, None, env(&[("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "483000")]));
+        assert_eq!((ac.reviewer.handoff, ac.reviewer.limit, ac.reviewer.window), (285_000, 450_000, 1_000_000));
         // A configured window wins over the environment.
         let o = OrchestrateSpec { window: Some(2_000_000), ..Default::default() };
         let w = resolve(Some(&o), None, None, env(&[("CLAUDE_CODE_DISABLE_1M_CONTEXT", "1")]));
@@ -910,6 +1276,46 @@ mod tests {
         assert_eq!(classify_source(&s, "Kind: whatever", "critic", "worktree"), (Kind::Reviewer, KindSource::Type));
         assert_eq!(classify_source(&s, "x", "general-purpose", "Worktree"), (Kind::Builder, KindSource::Worktree));
         assert_eq!(classify_source(&s, "x", "", ""), (Kind::Research, KindSource::Default));
+    }
+
+    /// #196: a subagent with no type and no brief (a PreCompact or
+    /// PreToolUse input with only its agent_id) is `other`, whatever the
+    /// default kind, so `orchestrate.other`'s limits apply to it.
+    #[test]
+    fn an_agent_with_no_type_and_no_brief_is_other() {
+        let o = OrchestrateSpec { default_kind: Some(Kind::Research), ..Default::default() };
+        for s in [resolve(None, None, None, env(&[])), resolve(Some(&o), None, None, env(&[]))] {
+            assert_eq!(classify(&s, "", "", ""), Kind::None);
+            assert_eq!(classify(&s, " \n", "", ""), Kind::None);
+            // A brief or a type still decides as before.
+            assert_eq!(classify(&s, "x", "", ""), s.default_kind);
+            assert_eq!(classify(&s, "", "builder", ""), Kind::Builder);
+            assert_eq!(classify(&s, "", "", "worktree"), Kind::Builder);
+            // No meta file and no transcript: the hook input alone.
+            let t = std::env::temp_dir().join("atlas-no-such-subagents-196");
+            assert_eq!(Agents::new(None).kind_of(&s, &t, "a1", ""), Kind::None);
+            // A blank subagent_type is no type.
+            assert_eq!(classify(&s, "", " ", ""), Kind::None);
+            assert_eq!(classify(&s, " ", "\t", ""), Kind::None);
+        }
+    }
+
+    /// Review S2 on #201: `other` from nothing to go on is not cached, so a
+    /// later hook reclassifies the agent once its meta file exists.
+    #[test]
+    fn an_empty_classification_is_not_cached() {
+        let s = resolve(None, None, None, env(&[]));
+        let t = std::env::temp_dir().join(format!("atlas-kind-not-cached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        let mut a = Agents::new(None);
+        assert_eq!(a.kind_of(&s, &t, "a1", ""), Kind::None);
+        std::fs::write(t.join("agent-a1.meta.json"), r#"{"agentType": "builder"}"#).unwrap();
+        assert_eq!(a.kind_of(&s, &t, "a1", ""), Kind::Builder);
+        // A real classification is cached: the meta file going away changes nothing.
+        std::fs::remove_file(t.join("agent-a1.meta.json")).unwrap();
+        assert_eq!(a.kind_of(&s, &t, "a1", ""), Kind::Builder);
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     /// The built-in map gives agent type `t` the kind `k`; a `Kind:` line still wins.

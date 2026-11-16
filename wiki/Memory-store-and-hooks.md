@@ -102,6 +102,17 @@ brief (the Agent call's prompt) is held by the server between the `PreToolUse` t
 `SubagentStart` that injects its recall, so as a command hook `SubagentStart` has no brief and injects no lane
 recall. Use the `mcp_tool` hooks for subagent recall.
 
+A subagent's launch is named by the tool use id in its meta file (`agent-<id>.meta.json`), but Claude Code writes
+that file only after `SubagentStart` answers. So the start takes a launch only when that is unambiguous: exactly one
+launch waiting in the session, or exactly one waiting launch whose `subagent_type` is the start's `agent_type`
+(a launch whose refusal at the permission prompt is in the session transcript is not waiting). The agent's first
+tool call checks that launch against the meta file; a wrong guess is told so and given its own launch's context
+and sub-lane. An ambiguous start is answered at that first tool call instead, from the launch its meta file names,
+else from its own transcript, so parallel launches never trade briefs. `recall.subagent_context`
+picks what a subagent is given: `"recall"` (the default, as below), `"binding"` (only the Binding block of the lane
+its brief declares, compiled when the launch is let through, at most 9,000 characters, no lane view and no pointers)
+or `"off"`.
+
 - **Recall** (`UserPromptSubmit` in the main session; `SubagentStart` for subagents, whose brief is taken from the
   parent's `Agent` tool call): a lane the text names gets its journal first; then the gated records, whole, in
   fused order (reciprocal rank over FTS5 and the vectors), within `recall.budget_tokens` (600; with the 0.53 floor below, chosen by the cos_floor sweep on the off-topic set and the hook replay). A record passes
@@ -126,7 +137,7 @@ recall. Use the `mcp_tool` hooks for subagent recall.
   it whole. A record the lane brief shows is not pointed to again. Clauses are chosen by the prompt's words, not
   by embedding each clause: with the bge int8 model, the cosines did not separate the answer from an off-topic
   clause.
-- **Context cap** (`PreToolUse`, subagents only unless `cap.main_session`): the size is the last assistant
+- **Context cap** (`PreToolUse`; the main session too while `cap.main_session` is on, the default, as advice only): the size is the last assistant
   message's input, cache and output tokens in the subagent's own transcript
   (`<parent>/subagents/agent-<id>.jsonl`). Each agent kind (builder, reviewer, research) has its own limits;
   by default, on a 1M window and scaled to the window, at 285,000 the agent is told to wrap up and write its

@@ -11,7 +11,11 @@
 //! cargo xtask release --pr --remote URL [--expect vX.Y.Z] [--dry-run]
 //! cargo xtask release assets --dir DIR --notes FILE [--expect vX.Y.Z]
 //! cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
+//! cargo xtask version [--dry-run] [--release | --set X.Y.Z]
+//! cargo xtask skill [--check]
 //! cargo xtask verify-macos
+//! cargo xtask linux-test [--debug] [--no-clippy] [--image IMAGE] [-- TEST_ARGS...]
+//! cargo xtask linux-test --clean [--all]
 //! cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
 //! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--rows] [--show QID ...]
 //! cargo xtask memory-tree-check --config CONFIG [--dir DIR]
@@ -26,7 +30,7 @@
 //! * `calibrate-baseline` measures what agents spent on lookups in the
 //!   transcripts below DIR before TIME (read only), saves it to the
 //!   configuration's database for `atlas --token-report`, and prints the
-//!   measured ratio beside the upper bound (see `atlas::calibrate`).
+//!   measured ratio beside the ledger ratio (see `atlas::calibrate`).
 //! * `token-use --config CONFIG --transcripts DIR --since TIME` breaks down
 //!   atlas's answers after TIME by tool and mode: sizes, how much of each was
 //!   used later, and episodes by the baseline's rule (see `usage.rs`);
@@ -61,10 +65,16 @@
 //!   and `sign` are the CI release (see `release_ci.rs`).
 //! * `verify-macos` runs the suite, the fixture checks and the benches and
 //!   prints what to paste back (see `verify_macos.rs`).
+//! * `linux-test` runs the tests and both clippy runs of the public CI in a
+//!   Docker Linux container, the gate before a pull request (see
+//!   `linux_test.rs`).
 //! * `langs-bench` measures a language of the code index's language table
 //!   on a pinned public corpus: scanner recall and item ends against the
 //!   language's SCIP indexer, and SCIP rows against the grep truth (see
 //!   `langs_bench.rs`).
+//! * `skill` writes the atlas skill's generated reference,
+//!   `skills/atlas/reference.md`, from the code (`--check`: fail when it
+//!   differs; see `skill.rs`).
 //! * `coverage` runs the tests with rustc's coverage instrumentation and
 //!   prints line and region coverage per module (see `coverage.rs`).
 
@@ -74,11 +84,13 @@ mod bpe;
 use atlas::calibrate;
 mod calibrate_recall;
 mod compact_live;
+mod config_keys;
 mod coverage;
 mod digest_eval;
 mod hook_bench;
 mod langs_bench;
 mod leak;
+mod linux_test;
 mod memory_eval;
 mod rules_eval;
 mod memory_tree;
@@ -94,10 +106,12 @@ mod release_check;
 mod release_ci;
 mod release_ship;
 mod secret_scan;
+mod skill;
 mod tar;
 mod ucd;
 mod usage;
 mod verify_macos;
+mod version;
 mod wiki;
 
 use std::path::PathBuf;
@@ -113,7 +127,11 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
        cargo xtask release --pr --remote URL [--expect vX.Y.Z] [--dry-run]
        cargo xtask release assets --dir DIR --notes FILE [--expect vX.Y.Z]
        cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
+       cargo xtask version [--dry-run] [--release | --set X.Y.Z]
+       cargo xtask skill [--check]
        cargo xtask verify-macos
+       cargo xtask linux-test [--debug] [--no-clippy] [--image IMAGE] [-- TEST_ARGS...]
+       cargo xtask linux-test --clean [--all]
        cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
        cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--rows] [--show QID ...]
        cargo xtask rules-eval --config CONFIG --holds FILE [--project NAME] [--cwd DIR] [--rows] [--dump DIR]
@@ -169,6 +187,8 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
+        "version" => version::run(args),
+        "skill" => skill::run(args),
         "coverage" => coverage::run(args),
         "compact-live" => compact_live::run(args),
         "hook-time" => match compact_live::hook_time(args) {
@@ -177,6 +197,7 @@ fn main() -> ExitCode {
         },
         "langs-bench" => langs_bench::run(args),
         "hook-bench" => hook_bench::run(args),
+        "linux-test" => linux_test::run(args),
         "verify-macos" => match verify_macos::run() {
             Ok(0) => Ok(()),
             Ok(code) => return ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -401,7 +422,7 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
         atlas::baseline::median(&side.returned) / bpt
     );
     println!("ratio per answer, measured (pre-atlas episode / atlas answer): median {med:.1}x, mean {mean:.1}x");
-    println!("ratio per answer, upper bound (grep + read counterfactual / returned): {:.1}x", side.upper());
+    println!("ratio per answer, ledger (rule-based, not a bound; grep + read counterfactual / returned): {:.1}x", side.ledger());
     println!("saved to {}", db.display());
     Ok(())
 }

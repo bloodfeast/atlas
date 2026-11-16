@@ -110,3 +110,33 @@ The feature ships with these. They need the flag on, apart from the first three 
 - **The hook lifts more than rules and memories.** A superseded record of any recallable kind can be lifted, a handoff included, despite "Not touched" above.
 - **A query's budget does not bind kept rulings.** Every replaced or linked ruling holding enough of the query's words is returned, whatever `budget_tokens` says, and each synced edit adds one.
 - **A partial answer cannot be undone.** `atlas rules unmark` takes back a whole mark only; a wrong `--partial` stays, and its question is not asked again.
+
+## The rules template
+
+Separate from the experimental feature above, and not gated by it: atlas ships a starter set of rules for a
+project that has none. It is two files, written into the project:
+
+| Template | Lands at | Holds |
+| --- | --- | --- |
+| `templates/CLAUDE.md` | `CLAUDE.md` | The token-saving rules (compaction summaries as keys, recall before asking, lean briefs, cheap drafting with one review, fewer and larger shell calls, no sleep polling, a fresh agent at each handoff, purging finished worktrees), then the journal, handoff and multiple-choice habits. Its last line, `@.claude/atlas-rules.md`, imports the second file. |
+| `templates/atlas-rules.md` | `.claude/atlas-rules.md` | Agent rules (the caps `atlas settings orchestrate` sets, the context limits, read-only reviewers), worktree and git rules, build rules, and safety rules. |
+
+Each rule is one line to follow and one line on why. Nothing in them names a person, a path or a project:
+edit them to suit yours.
+
+While atlas's compaction features are on (the default), the `CLAUDE.md` carries no Compact instructions
+block: atlas's PreCompact hook already returns that text, and a copy would cost its tokens every session.
+With them off (`"compact": {"enabled": false}`), the block `atlas settings compact-md` writes goes in, markers
+included, so `compact-md` sees it as present.
+
+**The offer.** `atlas --setup` offers the template for the folder it runs in, and `atlas settings
+rules-template [DIR] [--yes]` offers it for any folder (`--yes` writes without asking). Either writes
+nothing, and asks nothing, when the folder already has rules: a `CLAUDE.md`, `.claude/CLAUDE.md` or
+`CLAUDE.local.md` in the folder or a folder above it inside its repository, a `.claude/atlas-rules.md`, the
+`intent` file the configuration names for the folder's project, or an `INTENT.md` at the repository's top
+level; it prints one line naming the file it found. Otherwise it names the two paths and asks once
+(`[y/N]`; only `y` or `yes` writes). Without a terminal it writes nothing and says so, unless `--yes` is
+given. Each file is created only if it does not exist, so a file that appears in the meantime is left as it
+is: atlas never truncates, appends to or replaces a rules file. `atlas settings undo` removes the files it
+wrote, each only while its bytes are still the ones atlas wrote; an edited file is left, with a line saying
+so.

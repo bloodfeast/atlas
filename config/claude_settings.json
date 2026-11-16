@@ -33,6 +33,18 @@
       "default_note": "Claude Code default: 30"
     },
     {
+      "id": "statusline",
+      "kind": "setting",
+      "key": "statusLine",
+      "short": "update badge",
+      "title": "Show atlas's update badge in the status line",
+      "what": "Adds `atlas --statusline` (by this atlas's full path) to Claude Code's status line. It prints `atlas X.Y.Z available` while a pinned or turned-off atlas has a newer release, `atlas X.Y.Z: /mcp to reconnect` while this session's server is older than the atlas on disk, and nothing otherwise. With no status line, it becomes the status line; a status line command you already have is kept and the badge follows its output after ` | `.",
+      "cost": "One local file read each time the status line refreshes: no network, no index. A plugin update that moves atlas to a new folder leaves the old path; run this offer again then.",
+      "basis": "Claude Code plugins cannot set the status line themselves, so it is offered here (issue #190).",
+      "docs": "https://code.claude.com/docs/en/statusline.md",
+      "default_note": "Claude Code default: no status line; `atlas settings off statusline` puts back the command it wrapped"
+    },
+    {
       "id": "routing",
       "kind": "flag",
       "key": "routing",
@@ -203,6 +215,68 @@
       "cost": "Higher lets GPU runs overlap, so their timings disturb each other.",
       "basis": "gpu is a lock and atlas assigns no device, so a second holder on a two-GPU machine would still land on device 0. Setup writes 1 and probes nothing.",
       "default_note": "atlas default: 1"
+    },
+    {
+      "id": "main-session-compact",
+      "kind": "atlas",
+      "key": "cap.main_session",
+      "type": "bool",
+      "value": true,
+      "short": "main-session compact prompt",
+      "title": "Tell the main session when to ask for /compact",
+      "what": "Past the main session's compact point the PreToolUse hook tells it to ask the user to run /compact (or /clear, once the session restarts high after each compaction), again every 25,000 tokens and more urgently past the hard limit. It is only ever advice: the main session is never blocked, whatever context-mode says.",
+      "cost": "A line of context at each repeat; the user is asked to compact sooner than they might.",
+      "basis": "An orchestrator session reached about 735k tokens on 2026-11-14 before anyone asked for a /compact (atlas#9). On by default since it is only advice (ATLAS-CLEAR 0006).",
+      "default_note": "atlas default: on"
+    },
+    {
+      "id": "main-compact-point",
+      "kind": "atlas",
+      "key": "cap.main_warn_tokens",
+      "range": {"min": 10000, "max": 10000000, "integer": true},
+      "short": "main compact point",
+      "title": "Where the main session is told to ask for /compact",
+      "what": "The context size, in tokens, from which the main session is told to ask the user for /compact, while main-session-compact is on.",
+      "cost": "Lower compacts sooner: smaller turns, more summaries.",
+      "basis": "Defaults to the handoff point, so the main session and the agents wrap up at the same size.",
+      "default_note": "atlas default: the handoff point (context-handoff)"
+    },
+    {
+      "id": "checkpoint-prompt",
+      "kind": "atlas",
+      "key": "compact.checkpoint_prompt",
+      "type": "bool",
+      "value": true,
+      "short": "checkpoint prompt",
+      "title": "Ask for a checkpoint before Claude Code compacts on its own",
+      "what": "atlas predicts where Claude Code will compact the main session on its own (its window, clamped by CLAUDE_CODE_AUTO_COMPACT_WINDOW, less its buffers, and lowered by CLAUDE_AUTOCOMPACT_PCT_OVERRIDE when set) and, from checkpoint-margin tokens before it, asks the session once to write its checkpoint journal entry. An automatic compaction that comes before the entry is written waits once for it; the checkpoint atlas writes names the entry, or says it is missing.",
+      "cost": "One line of context a compaction, one journal entry, and at most one deferred compaction a segment (never within a margin of the window's end).",
+      "basis": "Hooks speak only on a tool call or a prompt, so the request comes a step ahead; Claude Code 2.1.323 skips a proactive automatic compaction a PreCompact hook blocks.",
+      "default_note": "atlas default: on"
+    },
+    {
+      "id": "checkpoint-margin",
+      "kind": "atlas",
+      "key": "compact.checkpoint_margin",
+      "range": {"min": 0, "max": 1000000, "integer": true},
+      "short": "checkpoint margin",
+      "title": "How far before the predicted compaction the checkpoint is asked for",
+      "what": "In tokens. It has to cover one large step, since the request can only come on the next tool call or prompt.",
+      "cost": "Larger asks earlier, so more work after the checkpoint goes unrecorded in it.",
+      "basis": "A starting value (ATLAS-CLEAR), to be tuned from the largest per-step context jumps in the logs.",
+      "default_note": "atlas default: 40,000"
+    },
+    {
+      "id": "clear-floor",
+      "kind": "atlas",
+      "key": "compact.clear_floor",
+      "range": {"min": 0, "max": 10000000, "integer": true},
+      "short": "clear floor",
+      "title": "When to recommend a clear instead of another compaction",
+      "what": "The context of the first request after the newest compaction. Past it, the main session's prompts recommend /clear over /compact: atlas writes the session's checkpoint from its own transcript as the clear ends it (SessionEnd), and the cleared session's first hook gives its card (key, rulings, owed work) beside the resume card. 0 never recommends a clear.",
+      "cost": "A clear drops the summary and whatever was injected again after each compaction; the card and the store carry the state instead.",
+      "basis": "A long session restarted at 62k, 63k and 69k tokens after its last three compactions, re-injected skill bodies included (ATLAS-CLEAR).",
+      "default_note": "atlas default: 80,000"
     }
   ]
 }

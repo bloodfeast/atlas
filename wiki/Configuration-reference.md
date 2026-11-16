@@ -110,6 +110,7 @@ See [[Semantic search]].
 | `update` | the update check's settings |
 | `update.enabled` | check for a newer signed release at session start (default true; `atlas settings off update` writes false). Builds from source never check |
 | `update.pin` | a version (`MAJOR.MINOR.PATCH`): atlas stays on what is installed |
+| `update.notify` | tell you about updates (default true): a line at session start, once per version, and `atlas --statusline` for a status line badge while one is pending. Pinned or off, atlas still reads the signed manifest (at most hourly, never the binary) for it; false turns the notice off and, for a pinned or off setup, every update network call |
 | `update.url` | where the release manifest is read (default the public repository's latest release; `https`, or `http` to loopback). The signature is checked against the built-in key wherever it comes from |
 
 ## Calibration
@@ -194,6 +195,8 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `recall.inject_floor` | the cosine below which a hook injects a record not at all (records without a vector are not held to it); tuned on hit data by `atlas --hook-report --tune-floor 1` |
 | `recall.session_budget_tokens` | the tokens one session's (or one subagent's) recall injections may use in all, lanes and pointers together; past it the hooks inject nothing more, and `recall {query}` still answers. 0 (the default) is no cap. Judge it against the "brief without atlas" row of `--token-report`, which now has a `hook injections` line beside it |
 | `recall.prompt_pointers` | the most pointers one main-session prompt gets (2); the rest are counted in the `+N more` line, and a subagent's brief is not capped. 0 is no cap. On the 70 hook questions of the memory eval, 2 against no cap cost 2 informed passes and 1 strict at floor 0 for 22% fewer injected tokens |
+| `recall.subagent_context` | what a subagent is given at its start: `"recall"` (the default, today's lane views and pointers), `"binding"` (only the Binding block of the lane its brief declares by a `Lane:` line or an exact upper-case id after "lane", matched to the agent by its launch's tool use id, no lane view and no pointers, the whole answer at most 9,000 characters) or `"off"` (nothing from the store; orchestration lines stay). The AB-2 toggle of the brief-only design |
+| `recall.main_lane_bytes` | the bytes the one lane view a main-session prompt gets may take: the prompt's `Lane:` lane, else the first lane it names; every other named lane is a one-line head. 0 (the default) is no cap: every named lane's view, each up to `recall.lane_budget_tokens` |
 | `recall.pointer_anchors` | whether each `recall {query}` pointer ends with `@src:path:line`, the vault or source, file and line its record's text starts at, so a follow-up can `read_note {vault: src, path, lines}` instead of `recall {key}` (default off; see the anchors rows of `cargo xtask memory-eval`) |
 | `recall.select` | context selection of what the hooks inject (on by default): near-duplicates sent as refs, pointers and older lane entries trimmed to the clauses that match the prompt, each excerpt the record's own text. Measured by the hook rows of `cargo xtask memory-eval` (each floor with selection off, then on) and the `context selection` line of `--token-report` |
 | `recall.select.enabled` | `false` sends every pointer and lane entry whole, as before (the gate and budgets still apply) |
@@ -205,16 +208,19 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `cap.warn_tokens` | the handoff point: an agent past this is told to wrap up and write its handoff at its next clean stopping point. It applies to every agent kind without its own `handoff`, and to the main session (default 285,000 scaled to the context window) |
 | `cap.block_tokens` | the hard limit: past this every tool but `handoff` is denied. It applies to every agent kind without its own `limit`, and to the main session (default 450,000 scaled to the context window) |
 | `cap.warn_every` | the warning repeats after this many more tokens (default 25,000) |
-| `cap.main_session` | apply the cap to the main session too (default false) |
+| `cap.main_session` | tell the main session to ask the user for /compact (or /clear) past its compact point; advice only, never blocked (default true) |
+| `cap.main_warn_tokens` | the main session's compact point: from this many context tokens it is told to ask the user for /compact while `cap.main_session` is on (default 0: `cap.warn_tokens`) |
 | `orchestrate` | orchestrator mode: caps on how many agents of each kind run at once, and per-kind context limits (see [[Orchestration]], the `orchestrate` skill and `docs/design/orchestrate.md`) |
 | `orchestrate.enabled` | turn the agent caps on (default false). Context limits apply without it. `atlas --setup` and `atlas settings orchestrate` ask for it and store the answers |
-| `orchestrate.window` | the context window the limits scale to (default 0: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else 200,000 when `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set, else 1,000,000) |
+| `orchestrate.window` | the context window the limits scale to (default 0: 200,000 when `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set, else 1,000,000; `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is where Claude Code compacts, never read as the window) |
 | `orchestrate.stale_minutes` | an unfinished agent whose transcript has not changed for this long is not counted (default 360) |
+| `orchestrate.disk_full_minutes` | an unfinished agent whose transcript ends in a disk-full tool error (`ENOSPC`, "no space left", "not enough space on the disk", "os error 112") and has not changed for this long is not counted, so it stops holding its lane, slot and resources (default 10; 0 turns it off). `atlas queue release AGENT` frees one at once |
 | `orchestrate.resources` | the work queue's shared resources and how many items may hold each at once, e.g. `{"gpu": 1, "compile": 1}` (the default). `worktree:NAME` allows 1; any other name not listed is not a limit and only warns at launch; 0 never serializes |
 | `orchestrate.resources.compile` | compile slots (default 1). On yes, setup writes max(1, hardware threads / 16), at most 4, unless you answer `--compile N` or it is set |
 | `orchestrate.resources.gpu` | gpu slots (default 1). Setup writes 1: `gpu` is a lock and atlas assigns no device, so nothing is probed |
 | `orchestrate.aging_minutes` | minutes a queued item waits before it rises one priority class (default 60; 0 turns aging off) |
 | `orchestrate.bare_gpu_words` | the bare words capture, screenshot, bench, benchmark and bake in a brief infer the gpu (default false). A project file (`atlas.project.json`) may set it for its project, and sets no other `orchestrate` key |
+| `orchestrate.worktree_roots` | folders, made absolute against the configuration's folder, that a `Uses: worktree:NAME` resolves under for the worktree ownership ledger (`atlas worktrees`). Unset: every linked worktree that `git worktree list` gives for the project's repositories. A name that matches no worktree, or more than one, writes no row. A user configuration key: a project file does not set it |
 | `orchestrate.reviews` | the required-reviews merge gate: a `gh pr merge` in a shell command needs a passing review of the PR's head from each role (see `docs/design/reviews.md`) |
 | `orchestrate.reviews.roles` | the review roles every PR needs, named by job, e.g. `["simplicity", "cost"]` (default none: the gate is off) |
 | `orchestrate.reviews.mode` | `enforced` denies the merge, `advisory` adds a warning, `off` does nothing (default `advisory`) |
@@ -254,8 +260,12 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `compact` | compaction: the checkpoint card and deferral (see `docs/design/compaction.md`). On by default |
 | `compact.enabled` | the compaction features: the PreCompact checkpoint with its chain card and the instructions it returns for the summary, the SessionStart(compact) card and ref report, `atlas settings compact-md`, and `compact.defer` (default true; `false`, or `atlas settings off compact`, turns them off). Off, PreCompact only forgets the session's repeated answers (and, with `memory.transcripts`, indexes the transcript) and returns no text, and `recall` refuses a chain key unless `memory.transcripts` is on |
 | `compact.card_tokens` | the budget of the checkpoint PreCompact writes and SessionStart(compact) injects, not counting the chain card appended to it (default 400) |
+| `compact.checkpoint_prompt` | predict where Claude Code compacts the main session on its own (its window, clamped by `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, less 33,000) and ask the session once, `compact.checkpoint_margin` tokens before it, for its checkpoint journal entry; an automatic compaction that comes first waits once for it (default true; needs `compact.enabled`) |
+| `compact.checkpoint_margin` | how many tokens before the predicted automatic compaction the checkpoint is asked for (default 40,000) |
+| `compact.clear_floor` | past this many context tokens on the first request after a compaction, the main-session prompts recommend /clear over /compact; the checkpoint is written at SessionEnd (reason clear) from the ending transcript and its card given at the cleared session's start (default 80,000; 0 never recommends a clear) |
 | `compact.defer` | block a proactive automatic compaction while a tool chain is running, until the next quiet point, never past the ceiling (the window less three times the largest per-request growth, at least 40,000 tokens); a manual `/compact` is never blocked (default false, pending a live check that a blocked compaction is offered again; needs `compact.enabled`) |
-| `compact.window` | the context window `compact.defer` measures against (default 0: 1,000,000 once the session has held more than 200,000 tokens, else 200,000) |
+| `compact.window` | the context window `compact.defer` measures against (default 0: 1,000,000 once the session has held more than 200,000 tokens, else 200,000). For a subagent's automatic compaction it is only the fallback for an unknown or unrecorded model: a known model's window (below) beats it |
+| `compact.model_windows` | an object of model ids or family aliases to context windows in tokens, for example `{"claude-opus-5-5": 200000, "haiku": 200000}`. When a subagent past its handoff point compacts on its own, atlas blocks it (so it hands off) only if its hard limit comes before Claude Code's own limit on the subagent's window. The window comes from the subagent's model: its transcript's last real assistant `message.model` (skipping `<synthetic>` and empty ones), else its meta file's `model` alias (`haiku`, `sonnet`, `opus`). The meta file's `pickedEffortModel` is not read: Claude Code writes the parent's model there. Keys and ids are matched lowercased with a `[1m]` suffix stripped. An exact id key wins, then a family alias key (`haiku`, `opus`, `sonnet` or `fable`), which matches any id of that family, such as `us.anthropic.claude-opus-5-5-v1:0`; else a model id containing `haiku` is 200,000 and one containing `opus`, `sonnet` or `fable` is 1,000,000 (200,000 when `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set). Older ids that only have a 200,000 window, such as `claude-sonnet-4-5` or `claude-sonnet-4-6` without `[1m]` and `claude-opus-4-1`, classify as 1,000,000 by family: list them here to set their window. A key must be non-empty and a window above 20,000 (Claude Code's output reserve). An unknown or unrecorded model uses `compact.window`, else that same inferred window (default empty) |
 
 ## The backlog comb (`backlog`)
 
@@ -276,6 +286,23 @@ proposes only and never changes the queue's order. The section is optional; ever
 | `backlog.stop` | ID-shaped words that are never work |
 | `backlog.asker` | the name that leads a line in the user's own words (`- 2026-11-04 Name:` or `Name 2026-11-10:`); only such lines (and ideas) count as asks. Default none: no lead counts, so set it to your own name to rank asks |
 
+## PR events (`pr_events`)
+
+`atlas pr-events serve [--port N] [--lane LANE]` listens on `127.0.0.1` only for the deliveries `gh webhook forward`
+posts, checks each `X-Hub-Signature-256` against its repository's secret (one per repository in the project's
+`repos` list, generated at start and held only in memory), and files one journal note per event in the lane of the
+item that waits on the PR (`atlas queue plan --after "review OWNER/NAME#N"`). A bare `review pr#N` is accepted only
+while the project lists exactly one repository, and keeps that repository (`pr_repo:`) for good. It also runs one
+`gh webhook forward` (the gh-webhook extension) per repository, with a new secret at each start, restarted with
+backoff; Ctrl-C stops them and deletes only the `cli` hooks atlas saw them make. A flag wins over the section.
+Older builds refuse the unknown key, so add it only once a build with it is installed.
+
+| Key | Meaning |
+|---|---|
+| `pr_events` | the section, optional |
+| `pr_events.port` | the port to listen on (1 to 65535; no default) |
+| `pr_events.lane` | the lane for an event no item waits on (default `pr-events`) |
+
 ## Routing, handles and records (`lean`)
 
 `lean` is an object read by the hooks, `atlas run`, `atlas slice` and the record commands. See
@@ -286,6 +313,8 @@ proposes only and never changes the queue's order. The section is optional; ever
 | `lean` | the object below |
 | `lean.routing` | false turns routing off (default true; `atlas settings off routing` writes a flag with the same effect) |
 | `lean.pr_digest` | digests `gh pr diff` and `gh pr view` output per file and per comment, with rounds; false sends it the ordinary route, as before v0.4.0 (default true; see [[Handles and digests]]) |
+| `lean.route_read` | which whole-file Reads become a digest: `outputs` (the default) digests only a tool's or a background task's saved output (a path under `tool-results/`, or a `.output` file under `tasks/`) from `lean.handles.threshold_bytes`; `tuned` digests any file from `lean.route_read_min_kb`; `all` digests any file from `lean.handles.threshold_bytes`, as before v0.5.0; `off` passes every Read whole. In every mode a ranged Read (`offset` or `limit`) and a second whole Read of a file the session already holds a read handle for pass whole. The old boolean still works: true is `tuned`, false is `off` |
+| `lean.route_read_min_kb` | the smallest file `tuned` digests, in KB (default 32; used by `tuned` only) |
 | `lean.annotate` | false stops the code-range annotations on Grep, Read and shell reads (default true) |
 | `lean.handles` | the handle store's settings, below |
 | `lean.digests` | the digests' settings, below |

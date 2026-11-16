@@ -22,8 +22,10 @@
 // scan).
 #![deny(unsafe_code)]
 
+pub mod autocompact;
 pub mod backlog;
 pub mod baseline;
+pub mod binding;
 pub mod calibrate;
 pub mod chain;
 pub mod checkpoint;
@@ -61,6 +63,9 @@ pub mod paths;
 pub mod picture;
 mod platform;
 pub mod pr_digest;
+pub mod pr_events;
+pub mod pr_listen;
+pub mod pr_supervise;
 pub mod project;
 pub mod proto;
 pub mod protobuf;
@@ -80,16 +85,20 @@ pub mod scan;
 pub mod scanner;
 pub mod scip;
 pub mod semantic;
+pub mod serve_log;
 pub mod sha256;
 pub mod sources;
 pub mod store;
 pub mod taskjudge;
 pub mod text;
+pub mod token_cost;
+pub mod token_report;
 pub mod tokens;
 pub mod update;
 pub mod watch;
 pub mod wgsl;
 pub mod tools;
 pub mod transcripts;
+pub mod worktree_ledger;
 
 pub use error::{Error, Result};

@@ -1,0 +1,593 @@
+{
+ "rule": "Pick and fetch the PR digest held-out set 3 (lane B17-FR).\n\nThe rule, fixed before any lever of this lane lands:\n\n* The same rule as set 2 (heldout2.py) and set 1 (heldout.py): repos\n  BurntSushi/ripgrep, astral-sh/ruff and cli/cli; merged before\n  2026-11-08T00:00Z; no bot authors; additions + deletions >= 150; final\n  diff >= 12 KB; rounds = distinct reviews[].commit.oid in order of first\n  review, at most the first two and the last, a round diffed against another\n  base dropped; per repo 4 picks, at least 2 with 2+ rounds (the oldest\n  one-round picks give way); at most 9 diff fetches per repo.\n* Set 3 looks back, not forward: it continues the rule into PRs no earlier\n  set fetched. Candidates: one `gh pr list --state merged --limit 300` call\n  per repo, newest merge first, after excluding every PR number that appears\n  (a) in any file name under the dev folder and the set 1 folder (dropped/,\n  under/ and unpicked/ included), and (b) anywhere in the set 2 manifest.json\n  (excluded, picks, log) or in any file name under the set 2 folder. A number\n  that only appears inside a *.list.json was listed, never fetched, and stays\n  a candidate.\n* \"2+ rounds\" counts the rounds a pick keeps: a candidate whose listing shows\n  2+ reviewed commits has its round diffs fetched when it qualifies, and a\n  round dropped for another base does not count. (Sets 1 and 2 counted the\n  listing; two set 2 picks kept one round of three.) Round fetches are not\n  diff fetches: the cap of 9 is on `gh pr diff` calls, as before.\n* No list is widened and no rule relaxed when a repo runs dry: the shortfall\n  is recorded in the manifest (\"shortfalls\"). ripgrep's is expected (set 2\n  found no multi-round ripgrep PR in its 200 most recent).\n* Each pick keeps its `gh pr view --json` and inline review comments, its\n  per-round diffs, and heads/STEM/ (heads.py: the base .gitattributes and\n  first lines of every modified or deleted file, from a blobless clone, no gh\n  call).",
+ "cutoff": "2026-11-08T00:00:00Z",
+ "list_limit": 300,
+ "excluded": [
+  "gh14951",
+  "gh14952",
+  "gh14953",
+  "gh14954",
+  "gh14955",
+  "gh14956",
+  "gh14957",
+  "gh14960",
+  "gh14976",
+  "rg2702",
+  "rg3149",
+  "rg3153",
+  "rg3189",
+  "rg3420",
+  "rg3452",
+  "rg3468",
+  "rg3472",
+  "rg3482",
+  "rg3483",
+  "rg3487",
+  "rg3554",
+  "rg3558",
+  "rg3560",
+  "rg3573",
+  "ruff27081",
+  "ruff29944",
+  "ruff29955",
+  "ruff29956",
+  "ruff29975",
+  "ruff30052",
+  "ruff30054",
+  "ruff30062",
+  "ruff30066",
+  "ruff30074",
+  "ruff30077",
+  "ruff30090",
+  "ruff30095",
+  "ruff30129",
+  "ruff30135"
+ ],
+ "repos": {
+  "BurntSushi/ripgrep": {
+   "listed": 300,
+   "candidates": 29,
+   "candidates_listed_2plus": 0,
+   "candidate_numbers": [
+    2684,
+    2649,
+    2648,
+    2626,
+    2614,
+    2610,
+    2609,
+    2560,
+    2601,
+    2555,
+    2554,
+    2549,
+    2167,
+    1887,
+    1884,
+    1722,
+    1576,
+    1517,
+    1516,
+    1491,
+    1489,
+    1486,
+    1457,
+    1245,
+    1238,
+    1237,
+    1236,
+    1168,
+    1038
+   ],
+   "log": [],
+   "diff_fetches": 4,
+   "picks": 4,
+   "picks_2plus_rounds": 0
+  },
+  "astral-sh/ruff": {
+   "listed": 300,
+   "candidates": 36,
+   "candidates_listed_2plus": 10,
+   "candidate_numbers": [
+    29932,
+    29791,
+    29803,
+    29927,
+    30061,
+    29987,
+    29921,
+    29920,
+    30018,
+    29922,
+    30019,
+    29972,
+    30028,
+    30026,
+    30023,
+    29793,
+    29988,
+    29875,
+    29986,
+    29960,
+    29916,
+    29897,
+    29915,
+    29909,
+    29898,
+    29885,
+    29879,
+    29877,
+    29864,
+    29867,
+    29806,
+    29856,
+    29830,
+    29801,
+    29824,
+    29834
+   ],
+   "log": [
+    "29932: no round kept",
+    "29791: listed with 2+ reviewed commits, keeps 1 round(s)",
+    "29803: listed with 2+ reviewed commits, keeps 1 round(s)",
+    "29927: listed with 2+ reviewed commits, keeps 0 round(s)",
+    "29927: no round kept",
+    "29987: 9003 B, under the floor",
+    "30028: listed with 2+ reviewed commits, keeps 1 round(s)",
+    "29988: diff fetch cap reached",
+    "29921: qualified, not picked",
+    "30028: qualified, not picked"
+   ],
+   "diff_fetches": 9,
+   "picks": 4,
+   "picks_2plus_rounds": 1
+  },
+  "cli/cli": {
+   "listed": 300,
+   "candidates": 88,
+   "candidates_listed_2plus": 59,
+   "candidate_numbers": [
+    14910,
+    14355,
+    14351,
+    14350,
+    14349,
+    14348,
+    14858,
+    14805,
+    14752,
+    14745,
+    14717,
+    14673,
+    14672,
+    14665,
+    14663,
+    14456,
+    14454,
+    14453,
+    14452,
+    14451,
+    14450,
+    14750,
+    14720,
+    14678,
+    14640,
+    14580,
+    14571,
+    14570,
+    14569,
+    14568,
+    14567,
+    14566,
+    14565,
+    14564,
+    14682,
+    14578,
+    14507,
+    14475,
+    14416,
+    14356,
+    14390,
+    14360,
+    14354,
+    14320,
+    14388,
+    14334,
+    14345,
+    14327,
+    14104,
+    14318,
+    14198,
+    14278,
+    14273,
+    14060,
+    14255,
+    14200,
+    14184,
+    14183,
+    14182,
+    14181,
+    14180,
+    14179,
+    14178,
+    14177,
+    14136,
+    14007,
+    14210,
+    14141,
+    14006,
+    14128,
+    14095,
+    14088,
+    14087,
+    14077,
+    14079,
+    14076,
+    14062,
+    14059,
+    14013,
+    13946,
+    13997,
+    13994,
+    13989,
+    13988,
+    14027,
+    14019,
+    13985,
+    13949
+   ],
+   "log": [
+    "14355: listed with 2+ reviewed commits, keeps 1 round(s)"
+   ],
+   "diff_fetches": 4,
+   "picks": 4,
+   "picks_2plus_rounds": 3
+  }
+ },
+ "picks": [
+  {
+   "repo": "BurntSushi/ripgrep",
+   "number": 2684,
+   "name": "rg2684",
+   "mergedAt": "2024-01-06T15:39:35Z",
+   "bytes": 13311,
+   "head": "c93d62c62f07b59df6c772b83f8f9a14e4a71f4f",
+   "base": "23af5fb043f8e625294e210446090f17dbd7e3bf",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "c93d62c62f07b59df6c772b83f8f9a14e4a71f4f",
+     "file": "rg2684.diff"
+    }
+   ],
+   "dropped": [],
+   "heads": {
+    "files": 7,
+    "not_at_base": 0,
+    "gitattributes": false
+   }
+  },
+  {
+   "repo": "BurntSushi/ripgrep",
+   "number": 2649,
+   "name": "rg2649",
+   "mergedAt": "2023-11-25T20:03:53Z",
+   "bytes": 50235,
+   "head": "b53ee8849ec54d196a622b38942d1f9bcb0995ff",
+   "base": "a2907db2de20fd33b0bf02d9bd1375da06218865",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "b53ee8849ec54d196a622b38942d1f9bcb0995ff",
+     "file": "rg2649.diff"
+    }
+   ],
+   "dropped": [],
+   "heads": {
+    "files": 23,
+    "not_at_base": 0,
+    "gitattributes": false
+   }
+  },
+  {
+   "repo": "BurntSushi/ripgrep",
+   "number": 2648,
+   "name": "rg2648",
+   "mergedAt": "2023-11-21T23:39:32Z",
+   "bytes": 34179,
+   "head": "1eaee3482505f8887cca8919bcb79f2195c333f5",
+   "base": "082245dadb3854238e62b91aa95a46018cf16ef1",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "1eaee3482505f8887cca8919bcb79f2195c333f5",
+     "file": "rg2648.diff"
+    }
+   ],
+   "dropped": [],
+   "heads": {
+    "files": 18,
+    "not_at_base": 0,
+    "gitattributes": false
+   }
+  },
+  {
+   "repo": "BurntSushi/ripgrep",
+   "number": 2626,
+   "name": "rg2626",
+   "mergedAt": "2023-11-21T04:51:53Z",
+   "bytes": 705538,
+   "head": "3b9f44671e3a60ef0cc9b4b3a1e61f59b36f5342",
+   "base": "7099e174acbcbd940f57e4ab4913fee4040c826e",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "3b9f44671e3a60ef0cc9b4b3a1e61f59b36f5342",
+     "file": "rg2626.diff"
+    }
+   ],
+   "dropped": [],
+   "heads": {
+    "files": 34,
+    "not_at_base": 0,
+    "gitattributes": false
+   }
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "number": 29791,
+   "name": "ruff29791",
+   "mergedAt": "2026-11-05T22:29:38Z",
+   "bytes": 47058,
+   "head": "a320af54576228e99f948dac3105b93c1320bb76",
+   "base": "454ff791c129ca43fe2c4a6512ab725bbb0b3565",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "a60656e1b0c0660c76c68bcb6628950a01bffa39",
+     "file": "ruff29791.r1.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 2,
+     "oid": "6e400341cfc22a09ad7013a11a4e9a73ee427ce3",
+     "why": "another base"
+    }
+   ],
+   "heads": {
+    "files": 7,
+    "not_at_base": 0,
+    "gitattributes": true
+   }
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "number": 29803,
+   "name": "ruff29803",
+   "mergedAt": "2026-11-05T21:32:23Z",
+   "bytes": 56916,
+   "head": "239ddb9970301a223bd7ce8fb3a50fdd89ca60d2",
+   "base": "d017c82cf34810209d5bb402aa0118f4ee2e7a45",
+   "rounds": [
+    {
+     "round": 2,
+     "oid": "cb84a37a5db1d7500e567b23ae01f36660adc005",
+     "file": "ruff29803.r2.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 1,
+     "oid": "7d65658cf45c661c45175f1f0bdb541e78fa7b57",
+     "why": "another base"
+    },
+    {
+     "round": 3,
+     "oid": "c67e33d6ea0e0429a2799d4d208f2b0bb91664ea",
+     "why": "another base"
+    }
+   ],
+   "heads": {
+    "files": 17,
+    "not_at_base": 0,
+    "gitattributes": true
+   }
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "number": 30061,
+   "name": "ruff30061",
+   "mergedAt": "2026-11-05T14:57:31Z",
+   "bytes": 23868,
+   "head": "d7ab1db59fe41b90bc9aa5006f10206f2df7f8db",
+   "base": "818a60839912b332879b59e079bc3fcbce4a83d2",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "d7ab1db59fe41b90bc9aa5006f10206f2df7f8db",
+     "file": "ruff30061.diff"
+    }
+   ],
+   "dropped": [],
+   "heads": {
+    "files": 7,
+    "not_at_base": 0,
+    "gitattributes": true
+   }
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "number": 29922,
+   "name": "ruff29922",
+   "mergedAt": "2026-11-04T17:45:56Z",
+   "bytes": 53214,
+   "head": "f6a70709c54ea94f29fd5ce617c0a7f8f24f797d",
+   "base": "1a0f6a3a5e49c42f9194e026afa5d0b19310bae6",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "1ad1d7d25b4413e125c40213679b52a3cdf82ef1",
+     "file": "ruff29922.r1.diff"
+    },
+    {
+     "round": 2,
+     "oid": "f6a70709c54ea94f29fd5ce617c0a7f8f24f797d",
+     "file": "ruff29922.diff"
+    }
+   ],
+   "dropped": [],
+   "heads": {
+    "files": 21,
+    "not_at_base": 0,
+    "gitattributes": true
+   }
+  },
+  {
+   "repo": "cli/cli",
+   "number": 14910,
+   "name": "gh14910",
+   "mergedAt": "2026-11-03T00:25:42Z",
+   "bytes": 282248,
+   "head": "6a79004e03cf5efc85a8d27dca55937e745f8b20",
+   "base": "9c399f1520a45f1bffb968d7d6565ea4112937fa",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "287907632527bf0a138569cb0eaa8f744d6f336d",
+     "file": "gh14910.r1.diff"
+    },
+    {
+     "round": 2,
+     "oid": "d7ef60c60e9590daf94022f95ebf2b72f5306c5e",
+     "file": "gh14910.r2.diff"
+    }
+   ],
+   "dropped": [],
+   "heads": {
+    "files": 5,
+    "not_at_base": 0,
+    "gitattributes": true
+   }
+  },
+  {
+   "repo": "cli/cli",
+   "number": 14355,
+   "name": "gh14355",
+   "mergedAt": "2026-10-30T17:30:35Z",
+   "bytes": 23214,
+   "head": "934db7e6623e7b5c7a3ccb6a26e91ec4eb1a9002",
+   "base": "5714558c97ab317e32e319ebb75e6d1ea9761e68",
+   "rounds": [
+    {
+     "round": 3,
+     "oid": "934db7e6623e7b5c7a3ccb6a26e91ec4eb1a9002",
+     "file": "gh14355.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 1,
+     "oid": "0b08575c22fb07c0821a6f0d64187235e6a810b2",
+     "why": "another base"
+    },
+    {
+     "round": 2,
+     "oid": "b71a7e2c0b9f57e6d5235d5c5c6007ada1ccafd5",
+     "why": "another base"
+    }
+   ],
+   "heads": {
+    "files": 4,
+    "not_at_base": 0,
+    "gitattributes": true
+   }
+  },
+  {
+   "repo": "cli/cli",
+   "number": 14351,
+   "name": "gh14351",
+   "mergedAt": "2026-10-30T17:30:33Z",
+   "bytes": 31126,
+   "head": "5714558c97ab317e32e319ebb75e6d1ea9761e68",
+   "base": "2720566f305f87dd99bbede991511994612d37ef",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "00d139a81a4b8b5e42de1729e28c643421086ba6",
+     "file": "gh14351.r1.diff"
+    },
+    {
+     "round": 3,
+     "oid": "5714558c97ab317e32e319ebb75e6d1ea9761e68",
+     "file": "gh14351.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 2,
+     "oid": "37640028eeecc375ea1fa326fdbd5ddf68d8ad99",
+     "why": "another base"
+    }
+   ],
+   "heads": {
+    "files": 3,
+    "not_at_base": 0,
+    "gitattributes": true
+   }
+  },
+  {
+   "repo": "cli/cli",
+   "number": 14350,
+   "name": "gh14350",
+   "mergedAt": "2026-10-30T17:30:32Z",
+   "bytes": 33514,
+   "head": "2720566f305f87dd99bbede991511994612d37ef",
+   "base": "ebb46dabbb6a7b9190f3c2644f7a2e66226f66d2",
+   "rounds": [
+    {
+     "round": 1,
+     "oid": "4210ec67d69d7dd7128cb663b6a0b015928aab74",
+     "file": "gh14350.r1.diff"
+    },
+    {
+     "round": 3,
+     "oid": "2720566f305f87dd99bbede991511994612d37ef",
+     "file": "gh14350.diff"
+    }
+   ],
+   "dropped": [
+    {
+     "round": 2,
+     "oid": "0a2e9b4ab0a76ad8c2692579756facc7df9a53cd",
+     "why": "another base"
+    }
+   ],
+   "heads": {
+    "files": 2,
+    "not_at_base": 0,
+    "gitattributes": true
+   }
+  }
+ ],
+ "shortfalls": [
+  {
+   "repo": "BurntSushi/ripgrep",
+   "picks": 4,
+   "want_picks": 4,
+   "picks_2plus_rounds": 0,
+   "want_2plus_rounds": 2,
+   "why": "every candidate tried"
+  },
+  {
+   "repo": "astral-sh/ruff",
+   "picks": 4,
+   "want_picks": 4,
+   "picks_2plus_rounds": 1,
+   "want_2plus_rounds": 2,
+   "why": "diff fetch cap reached"
+  }
+ ],
+ "set_sha256": "25742ce0a7dd6496ff37b7e573d77b4d8eaf8a7fbdbee8656513bd5eb040602c",
+ "gh_calls": 64
+}

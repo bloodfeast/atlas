@@ -7,11 +7,35 @@ them, not how the work was organised. Its parts, in order, each left out when em
 
 - `### Highlights`: what a user notices, with measured numbers where there are any. Required.
 - `### Breaking changes` and `### Upgrade notes`: what a user must do when updating.
-- `### Features`, `### Security hardening`, `### Known limits`: everything else.
+- `### Features`, `### Fixes`, `### Security hardening`, `### Known limits`: everything else.
 
 `cargo xtask release` refuses a version whose section is missing, empty (blank lines, headings and HTML comments
-only) or has no `### Highlights` with text, before anything is built. The section is the source of three things:
+only) or has no `### Highlights` with text, before anything is built. It also refuses a section that, outside a
+fenced block, has a line starting with `<` (HTML comments included), a control character but a tab, a heading
+after an indent or a list marker, or a setext underline, since each can change or hide what the notes show. The section is the source of three things:
 the release notes, the release commit's message, and this wiki's [[Changelog]] page.
+
+## Versioning
+
+Releases are batched, and the version comes from changelog fragments. Every pull request that changes what a
+user gets adds `changes/<pr>.md`: front matter naming its bump (`patch`, `feature` or `breaking`) and its section
+(`highlight`, `breaking`, `upgrade`, `feature`, `fix`, `security` or `known-limit`), then its lines for users.
+A docs, CI or test-only pull request that touches a build path adds an empty `changes/<pr>.none` instead; the
+development repository's `dev-pr` check fails one with neither (`changes/README.md` has the format).
+
+When a release is wanted, `cargo xtask version` (`--dry-run` to preview) replays the pending fragments in merge
+order, folds them into one section for the release at the top of `CHANGELOG.md` (refusing a malformed
+fragment, a stray or untracked file, an empty set, or a section with no Highlights), writes the version into
+`Cargo.toml`, `Cargo.lock` and `.claude-plugin/plugin.json`, and deletes the fragments, all in one commit,
+merged like any other; a failed step puts every file back. The version is Release.Feature.Patch, the same
+above and below 1.0.0: a `patch` fragment raises the last number, a `feature` the middle one and a `breaking`
+the first, each resetting the numbers below it, so 0.6.0 with patch, patch, feature, patch is 0.7.1.
+Otherwise the release number goes up only by hand, with `--release` ((X+1).0.0). The one-off override,
+`--set X.Y.Z`, folds every pending fragment into one section at that version and ignores the replay; it must
+be strictly above the current version and cannot go with `--release` (first use: v0.6.0 for the batch since
+v0.5.0, the replay counting from there). Merge order is each
+fragment's adding commit on the first-parent history. `release ship` refuses to start while fragments are
+still pending. Neither reads a tag.
 
 ## Release notes
 
@@ -33,6 +57,17 @@ both pass, the development repository's `dev-pr` workflow runs them on its pull 
 unrelated release; `rust-toolchain.toml` pins the same version, so the shipped binary is built by it too. To bump
 it, change `channel` in `rust-toolchain.toml`, `CLIPPY_TOOLCHAIN` in `xtask/src/release.rs` and every `1.99.0` in
 `.github/workflows/ci.yml` and `.github/workflows/dev-pr.yml`, and clear what the new lints find.
+
+## Before a pull request
+
+Every pull request passes, on the machine that made it and on its committed head: `cargo fmt` on the files it
+touches; both clippy runs above; `cargo test`; and `cargo xtask linux-test`, the public CI's Linux tests (in
+release, going on past a failure) and both clippy runs in a Docker Linux container (see [[Testing and coverage]]).
+The last is there because a Windows or macOS machine never compiles the `cfg(target_os = "linux")` code and the
+development repository's CI builds and lints but runs no tests, so before it a Linux-only failure first showed on
+the public repository's release pull request. Commit first, since it tests the working tree as it is; its last
+line is the result to quote, for example `linux-test: PASS in 396s; test ok (1473 passed, 0 failed) 394s; clippy
+all-targets dev ok 1s; clippy default ok 0s`.
 
 ## The release
 
@@ -75,19 +110,21 @@ request closed without a merge gives way to run 1 again once its branch is gone 
 holds another commit than the closed pull request's head; while the branch still holds that head, ship refuses
 and says to delete the branch by hand, then run ship again.
 
-**The pull request** (development repository, workflow `release-pr`). It checks out the commit ship sent (the
-tag's commit for a tag push) and refuses one that is not on `main`. `cargo xtask release --pr` makes the early
-checks (the changelog section with its highlights, `Cargo.toml` and `plugin.json` on the same version, the links
-naming the public repository, the public-repository guard as far as the release app can see it), exports the
-tracked tree with `git archive`, and checks every exported file and every wiki page against the private denylist.
-Before that job runs, job `linux-leak` builds the Linux x86_64 binary exactly as the public `release` workflow's
-`linux` job does (in `debian:bullseye`, in the release environment, with the same remaps), and runs the binary
-leak check (accepted hits honoured) and the secret scan on it; it uploads nothing, and a hit stops the release
-before anything reaches the public repository. The denylist comes from a secret, written to a temporary file that
-only the job can read and removed after it; every term is masked in the log and none is ever printed. It then
-pushes branch `release/vX.Y.Z` to the public repository, the exported tree on top of its `main` with `bin/` left
-as it is, and opens a pull request into `main` whose body is the release notes. No tests run and nothing else is
-built there: the public repository's CI tests the pull request.
+**The pull request** (development repository, workflow `release-pr`, which only ship's dispatch starts). Each of
+its two jobs checks out the commit ship sent and refuses one that is not on `main`. Job `linux-leak` builds the
+Linux x86_64 binary exactly as the public `release` workflow's `linux` job does (in `debian:bullseye`, in the
+release environment, with the same remaps), runs the binary leak check (accepted hits honoured) and the secret scan
+on it, exports the tracked tree with `git archive` and checks every exported file and every wiki page against the
+private denylist; it uploads nothing, a hit stops the release before anything reaches the public repository, and
+only when every check passed does it name the commit it checked. The denylist comes from a secret, written to a
+temporary file that only the job can read and removed after it; every term is masked in the log and none is ever
+printed. Job `pr` never holds the denylist: `cargo xtask release --pr` makes the early checks (the changelog
+section with its highlights, `Cargo.toml` and `plugin.json` on the same version, the links naming the public
+repository, the public-repository guard as far as the release app can see it), exports the same commit again and
+refuses any other than the one `linux-leak` checked, then pushes branch `release/vX.Y.Z` to the public
+repository, the exported tree on top of its `main` with `bin/` left as it is, and opens a pull request into `main`
+whose body is the release notes. Each job's secrets are its own, in an Environment that only `main` may use. No tests
+run and nothing else is built there: the public repository's CI tests the pull request.
 
 **Review** (public repository). The pull request comes from the release GitHub App, so the owner can give it
 the code-owner approval the `main` ruleset requires. Approve it on its head commit once the CI checks pass; do
@@ -137,22 +174,29 @@ with no tag builds the five binaries on GitHub's hosted runners: Windows x86_64 
 aarch64 inside `debian:bullseye` (glibc 2.31) on x86_64 and Arm runners, and both macOS targets on an Apple Silicon
 runner. Each Linux job checks that the binary needs no glibc symbol newer than 2.31. The builds use the release's
 environment: `--locked`, symbols stripped, `ATLAS_RELEASE_BUILD` set (only release builds check for updates), and
-every build-machine path remapped (`/PDBALTPATH` too on Windows). `cargo xtask release assets` then writes
-`manifest.json` and the notes with each binary's SHA-256, and the job creates a **draft** release `vX.Y.Z` on the
-merge commit with the notes, the binaries and the manifest. A draft makes no tag; the job checks that none
-appeared.
+every build-machine path remapped (`/PDBALTPATH` too on Windows). Each build job then attests its binaries'
+build provenance (GitHub's `attest-build-provenance`: a signed statement that this workflow built these bytes from
+this commit). A job with a read-only token runs `cargo xtask release assets`, which writes `manifest.json` and the
+notes with each binary's SHA-256, and a last job, which runs none of the repository's code, creates a **draft**
+release `vX.Y.Z` on the merge commit with the notes, the binaries and the manifest. A draft makes no tag; the job
+checks that none appeared. A build started by hand builds `main` only.
 
 **The sign step** (`cargo xtask release sign vX.Y.Z`, run by ship, or alone to resume; alone, it reads the denylist, the accepted-hits file and the key from
 `ATLAS_LEAK_DENYLIST`, `ATLAS_LEAK_ACCEPTED` and `ATLAS_SIGN_KEY` only, not from the private config). It downloads the draft's
 manifest and binaries, checks each file's size and SHA-256 against the manifest (and the manifest's version,
 targets, names and download URLs), checks every downloaded file against the local denylist (accepted hits pass
-in the binaries only) and for secret-shaped runs, and makes the full public-repository guard as the owner. It then
+in the binaries only) and for secret-shaped runs, and checks each binary's build provenance with `gh attestation
+verify`: it must have been built by the public repository's `release.yml` on `main` at the draft's commit (the
+release pull request's merge commit), on a GitHub-hosted runner, so binaries swapped into the draft after the
+build, manifest and all, are refused. It makes the full public-repository guard as the owner. It then
 commits the binaries to `main` as `bin/` beside the launcher (the plugin install is a git clone of `main`) and
 prepares the wiki commit, both locally. Only then does it check the signing key: openssl on `PATH` and a file at
 the key's path, which is not opened; openssl alone opens it, to sign. Then `publish vX.Y.Z`, and only after it: it
 signs the manifest, uploads `manifest.json.sig`, pushes `main` and the wiki, and publishes the draft on the
-binaries commit, which creates the tag. It refuses on any mismatch and names each one: a hash, a size, an asset
-the manifest lists that the draft lacks, a file the manifest does not list, a leak, or a `main` that moved past
+binaries commit, which creates the tag. No attestation covers the draft's notes, so the publish replaces them with
+notes the sign step makes again from the changelog at the draft's commit and the verified binaries (a dry run
+writes them to its stage folder to read). It refuses on any mismatch and names each one: a hash, a size, an asset
+the manifest lists that the draft lacks, a file the manifest does not list, a leak, a binary without that provenance, or a `main` that moved past
 the draft's commit. A run stopped after the binaries commit was pushed can be run again: it finds that commit and
 goes on, behind the same prompt. `--dry-run` makes every check and stops before the key.
 
@@ -213,8 +257,7 @@ cargo xtask release accept-hit PATH/TO/BINARY...           # type `accept N` to 
 cargo xtask release accept-hit PATH/TO/BINARY... --print   # the entries, nothing written
 ```
 
-Without a terminal it refuses. Then copy the file to the `ATLAS_LEAK_ACCEPTED` secret (the owner's steps, at the
-end). An entry holds only while the same literals sit side by side again, on every target, so a new release may
+Without a terminal it refuses. Then copy the file to the `ATLAS_LEAK_ACCEPTED` secret. An entry holds only while the same literals sit side by side again, on every target, so a new release may
 need new entries.
 
 ## The checkout guard
@@ -303,7 +346,7 @@ private repository. Before anything is merged or pushed the release asks GitHub 
 - no collaborator but the owner has admin permission;
 - an active branch ruleset covers `main` with the `deletion`, `non_fast_forward`, `required_linear_history`
   and `pull_request` rules, and an active tag ruleset covers `refs/tags/v*` with `deletion`, `update` and
-  `creation` (the two rulesets below).
+  `creation`.
 
 GitHub shows a ruleset's bypass list, and may show the collaborator list, only to an admin. The release app is
 not one, so `--pr` reports those two parts as unseen and checks the rest; run 2 and `release sign` run as the
@@ -317,44 +360,10 @@ A refusal names what it found, for example `bloodfeast/atlas resolves to bloodfe
 the public repo first`. A step that reaches GitHub stops on it; a dry run and a local remote report it and go on.
 The tests use saved answers (`ATLAS_GITHUB_STUB`) and stubbed GitHub calls, and never reach the network.
 
-## The public repository's setup
+## The repositories' setup
 
-Applied by hand before the first release; the guard checks the parts that decide who can bypass what.
-
-**Ruleset `main`** (the default branch):
-
-- no deletion, no force-push, linear history;
-- pull requests required, with 1 approving review from a code owner (`.github/CODEOWNERS`), stale approvals
-  dismissed on a new push, approval of the most recent push, and every conversation resolved;
-- squash merge only;
-- the CI checks required (see the owner's steps);
-- bypass: the admin role only.
-
-**Ruleset `tags`** (`v*`):
-
-- no update, no deletion, creation restricted;
-- bypass: the admin role only, so only the owner's publish can make a tag.
-
-**The release app** (a GitHub App owned by the owner's account):
-
-- repository permissions: Contents read and write, Pull requests read and write, Workflows read and write
-  (GitHub refuses an app's push that changes `.github/workflows/` without it), Metadata read; nothing else, no
-  webhook;
-- installed on the public repository only;
-- in no ruleset's bypass list: it pushes only `release/*` branches, which no ruleset covers, and its pull
-  requests need the owner's approval like anyone's;
-- its Client ID and a private key are the development repository's secrets `ATLAS_RELEASE_APP_ID` and
-  `ATLAS_RELEASE_APP_KEY`, beside `ATLAS_LEAK_DENYLIST` (the denylist's text) and `ATLAS_LEAK_ACCEPTED`.
-
-**Settings:**
-
-- secret scanning with push protection;
-- private vulnerability reporting (see `SECURITY.md`);
-- Dependabot alerts;
-- Actions: the default token read-only (the release workflow's draft job asks for `contents: write` itself), and
-  approval required for workflows from outside contributors;
-- the wiki editable only by people with push access;
-- squash merge the only merge method.
+The rulesets, settings, release app and secrets the release depends on are set by the owner by hand; nothing in
+the release changes them, and the guard above checks the parts that decide who can bypass what.
 
 ## macOS
 
@@ -362,93 +371,3 @@ On macOS, `cargo xtask verify-macos` runs the whole suite in release with the `d
 watcher test included), then the recall check and the bench on `fixtures/generic`, a small corpus shipped for
 that purpose (its database goes to a temporary folder). Paste its whole output back.
 
-## The owner's steps
-
-Applied by hand by the owner; nothing in the release changes a ruleset, a required check or a secret. Rulesets on
-a private repository need a paid GitHub plan; if the ruleset page says rulesets are not enforced, they are not.
-
-**1. Ruleset `v-tags` on the development repository** (a tag ruleset). A `v*` tag pushed there starts the
-release-pr workflow, which opens the public pull request, so no one may make one, the owner included: agents push
-with the owner's identity, and a bypass for the admin role would let theirs through too.
-
-1. `bloodfeast/atlas-dev`: Settings, Rules, Rulesets, New ruleset, New tag ruleset.
-2. Name `v-tags`; Enforcement status Active; Bypass list empty.
-3. Target tags: Add target, Include by pattern, `v*`.
-4. Rules: Restrict creations, Restrict updates, Restrict deletions. Create.
-
-Or, as one command:
-
-```sh
-gh api -X POST repos/bloodfeast/atlas-dev/rulesets --input - <<'JSON'
-{"name": "v-tags", "target": "tag", "enforcement": "active", "bypass_actors": [],
- "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
- "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}]}
-JSON
-```
-
-To push a tag on purpose, set the ruleset's Enforcement status to Disabled, push the tag, and set it back to
-Active. Ship starts the workflow with the version and needs no tag.
-
-**2. Ruleset `main checks` on the development repository** (a branch ruleset). The `dev-pr` workflow's
-`release-check` job (a release-target build of the Linux x86_64 binary in `debian:bullseye`, nothing uploaded,
-and both clippy runs) must pass before a pull request merges. It runs when a pull request touches what the build
-or clippy reads (`Cargo.*`, `rust-toolchain.toml`, `src/`, `xtask/`, `tests/`, `config/`, `hooks/`, `vocab/`,
-`.cargo/`, `.github/`); on any other pull request it is skipped, which counts as passed. It costs about 12
-private Actions minutes a run.
-
-1. Open a pull request that touches `src/` once, so GitHub has seen the check.
-2. `bloodfeast/atlas-dev`: Settings, Rules, Rulesets, New ruleset, New branch ruleset.
-3. Name `main checks`; Enforcement status Active; Bypass list empty.
-4. Target branches: Add target, Include default branch.
-5. Rules: Require status checks to pass; Add checks, `release-check`. Create.
-
-Or:
-
-```sh
-gh api -X POST repos/bloodfeast/atlas-dev/rulesets --input - <<'JSON'
-{"name": "main checks", "target": "branch", "enforcement": "active", "bypass_actors": [],
- "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
- "rules": [{"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": false,
-   "do_not_enforce_on_create": false, "required_status_checks": [{"context": "release-check"}]}}]}
-JSON
-```
-
-With no bypass, a commit pushed straight to `main` without the check is refused too: everything reaches `main`
-through a pull request.
-
-**3. The required checks of the public `main` ruleset.** Ship refuses to merge until these five have passed on
-the pull request's head; the ruleset should require the same, so a merge on GitHub's page cannot skip them either.
-GitHub offers a check for this list once it has run, so add them after the first release pull request:
-
-1. `bloodfeast/atlas`: Settings, Rules, Rulesets, `main`.
-2. Require status checks to pass: Add checks, `test (ubuntu-latest)`, `test (windows-latest)`,
-   `test (macos-latest)`, `clippy (windows-latest)`, `clippy (ubuntu-latest)`. Save.
-
-**4. The denylist secret.** `ATLAS_LEAK_DENYLIST` is a copy of the local denylist file; after any change to the
-file, replace the copy with the file's whole text (gh reads it from standard input and never prints it):
-
-```sh
-gh secret set ATLAS_LEAK_DENYLIST --repo bloodfeast/atlas-dev < PATH/TO/leak-denylist.txt
-gh secret list --repo bloodfeast/atlas-dev        # ATLAS_LEAK_DENYLIST shows the new date
-```
-
-GitHub never shows a secret's value, but the release-pr job's `linux-leak` step "Leak and secret gates" prints
-the copy's term count and SHA-256 (carriage returns removed, one final newline); `cargo xtask release check`
-prints the same for the local file. If they differ, set the secret again. The release-pr job drops carriage
-returns, so a file with Windows line endings is fine.
-
-The file holds one term per line; blank lines and lines starting with `#` are skipped. A term matches anywhere,
-inside longer words too, unless the line right before it is exactly `#[word]`: then it matches only as a whole word,
-with no letter, digit or `_` right before or after it (`-` is not a word character, so `x-term` still matches). The
-marker is a comment to everything else that reads the list (the log masking above, idea-capture redaction), which
-still treat the term below it as a plain term, and term numbers do not change. `xtask/src/leak.rs` has the details.
-
-**5. The accepted-hits secret.** `ATLAS_LEAK_ACCEPTED` is a copy of the accepted-hits file (term numbers and
-digests only), read by the `linux-leak` job; unset means no accepted hits there. After any change to the file:
-
-```sh
-gh secret set ATLAS_LEAK_ACCEPTED --repo bloodfeast/atlas-dev < PATH/TO/leak-accepted.txt
-```
-
-**6. The private configuration.** Write `%USERPROFILE%/.atlas-release.json` as shown above, with the paths of the
-denylist, the accepted-hits file and the signing key, outside every repository (or in one that ignores them).

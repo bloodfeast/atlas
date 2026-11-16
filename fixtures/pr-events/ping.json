@@ -1,0 +1,7 @@
+{
+  "zen": "Keep it logically awesome.",
+  "hook_id": 4001,
+  "hook": { "type": "Repository", "id": 4001, "name": "cli", "active": true, "events": ["pull_request_review"], "config": { "content_type": "json", "insecure_ssl": "0" } },
+  "repository": { "id": 3001, "name": "widgets", "full_name": "octo-org/widgets" },
+  "sender": { "login": "octo-author", "id": 2002, "type": "User" }
+}

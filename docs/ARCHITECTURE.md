@@ -6,6 +6,30 @@ One Rust binary, one dependency (SQLite, bundled), no network at query time.
 
 - **The MCP server** (`atlas`, started by Claude Code from `.mcp.json`). It serves the tools over
   stdio. It answers `hook` calls on their own worker thread, so a hook never waits behind a slow tool call.
+  It keeps its own log, `atlas-server.log` in the folder of the database it opened (`src/serve_log.rs`),
+  meant to be attached to a bug report. It is safe to attach to a public GitHub issue, and its first line
+  says so, because no free text is ever written: the log is an allowlist, enforced by the types its API
+  takes (enums, integers, `io::ErrorKind`, `&'static Location` and constants), so no error text, path,
+  name, argument or request content can reach it. One line per event, each with the UTC time, pid and
+  atlas version (`TIME pid=N v=VERSION`):
+  - `start mode=serve os=OS arch=ARCH`;
+  - `panic thread=NAME at=LOCATION` and then `msg="..."` or `payload omitted`. NAME is one of atlas's
+    own thread names (`main`, `atlas-hooks`, `atlas-reader`, `atlas-watch-N` and the others in
+    `serve_log::THREADS`) or `other`. LOCATION is `src/FILE.rs:LINE` in atlas's source, else `external`.
+    The message is written only when the payload is a `&'static str` and the location is in atlas's
+    `src/`, which makes it a literal there;
+  - `exit reason=eof|reexec|refused`, or `exit reason=io site=SITE kind=KIND at=src/FILE.rs:LINE`, or
+    `exit reason=failed site=SITE at=src/FILE.rs:LINE`, each followed by `uptime=N.Ns responses=N`.
+    `eof`: the client closed stdin; `reexec`: an updated binary served the session; `refused`: the store
+    was too new and every call was refused; `io`: a read or write error, by its `io::ErrorKind` name;
+    `failed`: any other error, by its site code (`vaults-new`, `store-open`, `serve-refused`, `serve`).
+    The error's own text still goes to stderr, where the user sees it.
+
+  A `start` line with no `exit` line after it for the same pid means the process was killed without
+  unwinding (TerminateProcess, SIGKILL, an abort, a stack overflow, a power loss); a `panic` line just
+  before that gap is the panic that ended it. At 1 MiB the file is renamed to `atlas-server.log.1`, by one
+  appender at a time (under `atlas-server.log.lock`; a lock older than 10 s is taken over). `atlas --hook`
+  and the CLI modes do not write to it.
 - **Hooks** (`hooks/hooks.json`). Each is an `mcp_tool` hook that calls the running server's `hook`
   tool, so no process starts per hook. Claude Code substitutes `${tool_input}` and `${tool_response}`
   into the call as JSON text. Plugin hooks also fire inside subagents, with `agent_id` set (measured).
@@ -28,6 +52,20 @@ One Rust binary, one dependency (SQLite, bundled), no network at query time.
   handoffs and decisions. Markdown files such as `MEMORY.md` are exports of it, not its source.
 
 Both use WAL mode. Writes are serialised across processes by the database write lock.
+
+The memory store also holds the worktree ownership ledger, `worktree_owners` (schema version 3,
+`src/worktree_ledger.rs`). It has one row per ownership span of a git worktree: path, a normalised
+`path_key`, repository, branch, lane, the launch's description, tool call id and session, `created_at`
+and `last_modified`. An admitted Agent launch whose brief declares `Uses: worktree:NAME` writes or bumps a
+row; a launch of another lane closes the span and opens a new one, while a review or a `read-only` launch
+only bumps it. The table is a ledger: triggers refuse a delete and any change but `last_modified` and two
+stamps, each set once from NULL and never cleared. `removed_at` means the folder is gone (NULL while it
+exists); `ended_at` means another lane took the worktree over while it still exists. A row is open while
+both stamps are NULL, and that one predicate is used by the partial unique index (one open row per path),
+the handover, `atlas worktrees list` and the removal code that will read the ledger. Nothing in atlas
+removes a worktree from it. Opening a store at version 2 copies it to `memory.sqlite.v2.bak` with
+`VACUUM INTO` under the write lock, then adds the table in the same transaction as the version bump, so a
+crash leaves the v2 store; an atlas built for version 2 refuses a store at 3.
 
 ## Routing and the handle store
 
@@ -72,7 +110,7 @@ Routing is deterministic: hooks decide, not the model. It is on by default; `lea
 - **The store.** Bytes live in `<data dir>/handles/<sha[0..2]>/<sha>`, written as `.part` then renamed.
   The id is `h:` plus 10 hex characters of a hash over the bytes, the kind and the command. The same
   output is therefore the same handle, and a hook's answer is a pure function of its input.
-  - Slices (`atlas slice h:ID --item NAME | --failures | --lines A-B | --grep RE`) are capped at 8 KB and
+  - Slices (`recall key=h:ID` with `item`, `failures`, `lines` or `grep`; `atlas slice h:ID --item NAME` in a terminal) are capped at 8 KB and
     say where to continue.
   - Items (tests, failure blocks, compiler messages, files of a grep, items of an outline) are recomputed
     from the stored text on each slice.

@@ -1,0 +1,16 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 12,
+    "title": "Add the widget parser",
+    "user": { "login": "octo-author", "id": 2002, "type": "User" },
+    "pull_request": { "url": "https://api.github.com/repos/octo-org/widgets/pulls/12", "merged_at": null }
+  },
+  "comment": {
+    "id": 1003,
+    "user": { "login": "octo-bot[bot]", "id": 2003, "type": "Bot" },
+    "body": "Coverage: 91%. Contact maintainer@example.com for access."
+  },
+  "repository": { "id": 3001, "name": "widgets", "full_name": "octo-org/widgets" },
+  "sender": { "login": "octo-bot[bot]", "id": 2003, "type": "Bot" }
+}

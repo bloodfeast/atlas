@@ -40,7 +40,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "grep",
-        description: "Regex search over the indexed vaults and sources, with context lines. A large result comes back as a digest plus a handle for atlas slice.",
+        description: "Regex search over the indexed vaults and sources, with context lines. A large result comes back as a digest plus a handle (recall key=h:ID).",
         read_only: true,
         schema: || {
             obj(
@@ -68,6 +68,88 @@ impl Server {
             "section" => Some(self.section(a, f)),
             "grep" => Some(self.grep_sources(a, f)),
             _ => None,
+        }
+    }
+
+    /// `recall` with an `h:` key: one slice of a stored output (a digest's
+    /// handle), as `atlas slice` gives it; `h:` alone lists the newest.
+    /// `None` for any other key that carries no selector argument.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for a selector argument on another key, or
+    /// a malformed one; [`Error::NotFound`] for an unknown handle.
+    pub(super) fn recall_handle(&mut self, a: &Map) -> Result<Option<String>> {
+        use crate::handles::{self, Ask, HandleCfg, Handles, SLICE_ARGS};
+        let raw = super::opt_str(a, "key")?.map(str::trim).unwrap_or("");
+        // A hint line pasted whole (`recall h:ID ...`) is its key.
+        let Some(key) = handles::handle_key(raw) else {
+            return match SLICE_ARGS.iter().find(|k| a.contains_key(k)) {
+                Some(k) => Err(Error::InvalidArgument(format!("{k} applies only to key h:ID (a stored output), as do {}", SLICE_ARGS.join(", ")))),
+                None => Ok(None),
+            };
+        };
+        if let Some(k) = ["query", "lane", "history", "kind", "scope", "budget_tokens"].iter().find(|k| a.contains_key(k)) {
+            return Err(Error::InvalidArgument(format!("{k} does not apply to key h:ID (a stored output)")));
+        }
+        let (id, mut pairs) = handles::split_key(key).map_err(Error::InvalidArgument)?;
+        for k in SLICE_ARGS {
+            let v = match a.get(k) {
+                None | Some(Value::Null) => continue,
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                Some(Value::Bool(b)) if matches!(*k, "failures" | "digest") => b.to_string(),
+                Some(Value::Bool(_)) => return Err(Error::InvalidArgument(format!("{k} takes a value, not true or false"))),
+                Some(_) => return Err(Error::InvalidArgument(format!("{k} must be a string, a number or a boolean"))),
+            };
+            pairs.push(((*k).to_string(), v));
+        }
+        // The handles the hooks and `atlas run` keep: beside the index the
+        // memory settings name, else beside this server's database.
+        let (db, cfg, projects) = match self.memory.as_ref() {
+            Some(m) => (m.settings.index_db.clone(), HandleCfg::from_lean(m.settings.lean.as_ref()), m.settings.user_state.clone()),
+            None => {
+                let p = self.store.conn().path().filter(|p| !p.is_empty()).ok_or_else(|| Error::NotFound("no database file: stored outputs are kept beside it".into()))?;
+                (Path::new(p).to_path_buf(), HandleCfg::default(), None)
+            }
+        };
+        let h = Handles::open(&db, cfg)?;
+        if id == "h:" {
+            if !pairs.is_empty() {
+                return Err(Error::InvalidArgument("key h: lists the newest stored outputs; a selector needs key h:ID".into()));
+            }
+            let mut out = String::new();
+            for r in h.list(opt_uint(a, "limit", 20, 200)?)? {
+                let label: String = r.meta.label.chars().take(80).collect();
+                out.push_str(&format!("{} {} {} lines {} B {label}\n", r.id, r.meta.kind, r.lines, r.bytes));
+            }
+            return Ok(Some(if out.is_empty() { "no stored outputs\n".into() } else { out }));
+        }
+        let ask = handles::parse_args(&pairs).map_err(Error::InvalidArgument)?;
+        let answer = |h: &Handles| match &ask {
+            Ask::Digest => h.digest(&id),
+            Ask::Slice(sel) => h.slice(&id, sel),
+        };
+        match answer(&h) {
+            Err(Error::NotFound(m)) if h.row(&id).is_err() => {
+                // Under projects the hooks store by the event's folder, which
+                // can name another project than this server's: each project's
+                // default state folder is looked in.
+                let Some(dir) = projects else { return Err(Error::NotFound(format!("{m}; recall key=h: lists the newest"))) };
+                for other in other_handle_stores(&dir, &db) {
+                    if let Ok(o) = Handles::open(&other, cfg) {
+                        if o.row(&id).is_ok() {
+                            return answer(&o).map(Some);
+                        }
+                    }
+                }
+                Err(Error::NotFound(format!(
+                    "{m}; under projects each project keeps its own stored outputs: this server reads {}, and no other project's folder under {} has it; recall key=h: lists this project's newest",
+                    db.display(),
+                    dir.display()
+                )))
+            }
+            r => r.map(Some),
         }
     }
 
@@ -270,6 +352,25 @@ fn grep_docs(docs: &[(String, String)], re: &crate::regex::Regex, ctx: usize, re
         }
     }
     Ok((out, matches, files))
+}
+
+/// The index databases under the projects folder `dir` (each project's
+/// default state folder, `<dir>/<name>/atlas.sqlite`) other than `db` that
+/// hold a handle store: a `handles` folder beside them. Sorted, for one
+/// answer.
+fn other_handle_stores(dir: &Path, db: &Path) -> Vec<std::path::PathBuf> {
+    let same = |p: &Path| p == db || std::fs::canonicalize(p).ok().zip(std::fs::canonicalize(db).ok()).is_some_and(|(a, b)| a == b);
+    let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|d| d.join("handles").is_dir())
+        .map(|d| d.join("atlas.sqlite"))
+        .filter(|p| p.is_file() && !same(p))
+        .collect();
+    v.sort();
+    v
 }
 
 #[cfg(test)]

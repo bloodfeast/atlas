@@ -49,6 +49,42 @@ pub struct RecallSettings {
     /// `memory.rules`, experimental and off by default: what recall does with rules and memories (see
     /// [`super::rules::Mode`]).
     pub rules: super::rules::Mode,
+    /// What a subagent is given at its start (`recall.subagent_context`).
+    pub subagent_context: SubagentContext,
+    /// The bytes the one lane view a main-session prompt gets may take;
+    /// every other lane the prompt names is one [`super::recall::lane_head`]
+    /// line. 0 (the default) is today's: each named lane's view whole, up to
+    /// `lane_budget_tokens`.
+    pub main_lane_bytes: usize,
+}
+
+/// What a subagent is given at its start (`recall.subagent_context`, the
+/// AB-2 arms of the brief-only design).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubagentContext {
+    /// Today's (the default): the views of the lanes its brief names, the
+    /// project graph's lines for the repositories it names, and pointers.
+    #[default]
+    Recall,
+    /// Only the Binding block of the lane its brief declares, compiled at
+    /// launch and matched to the agent by its launch's tool use id; no lane
+    /// view and no pointers. The whole answer is at most
+    /// [`crate::hooks::SUBAGENT_CONTEXT_CHARS`] characters.
+    Binding,
+    /// Nothing of the lane or the store (orchestration lines stay).
+    Off,
+}
+
+impl SubagentContext {
+    /// The mode a `recall.subagent_context` value names.
+    pub fn parse(v: &str) -> Option<SubagentContext> {
+        match v {
+            "recall" => Some(SubagentContext::Recall),
+            "binding" => Some(SubagentContext::Binding),
+            "off" => Some(SubagentContext::Off),
+            _ => None,
+        }
+    }
 }
 
 impl RecallSettings {
@@ -74,8 +110,13 @@ pub struct CapSettings {
     pub block_tokens: u64,
     /// Warn again after this many more tokens.
     pub warn_every: u64,
-    /// Apply to the main session too.
+    /// Apply to the main session too (default on, ATLAS-CLEAR 0006): advisory
+    /// only, it is told to ask the user for /compact (or /clear) and is never
+    /// blocked.
     pub main_session: bool,
+    /// The main session's compact point (`cap.main_warn_tokens`; default
+    /// `warn_tokens`, which 0 stands for).
+    pub main_warn_tokens: u64,
 }
 
 /// The context cap of v0.2, kept with orchestrated mode off.
@@ -83,7 +124,7 @@ const V02_WARN: u64 = 450_000;
 const V02_BLOCK: u64 = 500_000;
 
 /// Compaction settings (see [`crate::checkpoint`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompactSettings {
     /// The compaction features are on (`compact.enabled`, default true; an
     /// explicit false turns them off). Off, the hooks do no checkpoint, card,
@@ -95,11 +136,35 @@ pub struct CompactSettings {
     pub window: u64,
     /// The checkpoint card's budget in tokens.
     pub card_tokens: usize,
+    /// Ask the main session for its checkpoint entry before the predicted
+    /// automatic compaction, and defer that compaction once for it
+    /// (`compact.checkpoint_prompt`).
+    pub checkpoint_prompt: bool,
+    /// How far before the predicted point it is asked, in tokens.
+    pub checkpoint_margin: u64,
+    /// The context right after a compaction past which a clear is
+    /// recommended instead of another (0: never).
+    pub clear_floor: u64,
+    /// Model id to context window (`compact.model_windows`), over the
+    /// built-in table, for the subagent compaction block.
+    pub model_windows: std::collections::BTreeMap<String, u64>,
+    /// Claude Code's own automatic-compaction inputs, from the environment.
+    pub claude: crate::autocompact::ClaudeCompact,
 }
 
 impl Default for CompactSettings {
     fn default() -> Self {
-        CompactSettings { enabled: true, defer: false, window: 0, card_tokens: 400 }
+        CompactSettings {
+            enabled: true,
+            defer: false,
+            window: 0,
+            card_tokens: 400,
+            checkpoint_prompt: true,
+            checkpoint_margin: crate::autocompact::DEFAULT_MARGIN,
+            clear_floor: crate::autocompact::DEFAULT_CLEAR_FLOOR,
+            model_windows: std::collections::BTreeMap::new(),
+            claude: crate::autocompact::ClaudeCompact::default(),
+        }
     }
 }
 
@@ -286,6 +351,8 @@ impl Settings {
                 prompt_pointers: r.prompt_pointers.unwrap_or(DEFAULT_PROMPT_POINTERS),
                 pointer_anchors: r.pointer_anchors.unwrap_or(DEFAULT_POINTER_ANCHORS),
                 rules: super::rules::Mode::of(m.rules),
+                subagent_context: r.subagent_context.unwrap_or_default(),
+                main_lane_bytes: r.main_lane_bytes.unwrap_or(0),
                 select: {
                     let d = super::select::Select::default();
                     let x = r.select.clone().unwrap_or_default();
@@ -304,13 +371,24 @@ impl Settings {
                 warn_tokens: if orchestrate.enabled { orchestrate.other.handoff } else { k.warn_tokens.map_or(V02_WARN, |w| w as u64) },
                 block_tokens: if orchestrate.enabled { orchestrate.other.limit } else { k.block_tokens.map_or(V02_BLOCK, |b| b as u64) },
                 warn_every: k.warn_every.unwrap_or(25_000) as u64,
-                main_session: k.main_session.unwrap_or(false),
+                main_session: k.main_session.unwrap_or(true),
+                main_warn_tokens: k.main_warn_tokens.map_or(0, |w| w as u64),
             },
             orchestrate,
             compact: {
                 let x = c.and_then(|c| c.compact.clone()).unwrap_or_default();
                 let d = CompactSettings::default();
-                CompactSettings { enabled: x.enabled.unwrap_or(d.enabled), defer: x.defer.unwrap_or(d.defer), window: x.window.map_or(d.window, |w| w as u64), card_tokens: x.card_tokens.unwrap_or(d.card_tokens) }
+                CompactSettings {
+                    enabled: x.enabled.unwrap_or(d.enabled),
+                    defer: x.defer.unwrap_or(d.defer),
+                    window: x.window.map_or(d.window, |w| w as u64),
+                    card_tokens: x.card_tokens.unwrap_or(d.card_tokens),
+                    checkpoint_prompt: x.checkpoint_prompt.unwrap_or(d.checkpoint_prompt),
+                    checkpoint_margin: x.checkpoint_margin.map_or(d.checkpoint_margin, |m| m as u64),
+                    clear_floor: x.clear_floor.map_or(d.clear_floor, |f| f as u64),
+                    model_windows: x.model_windows.unwrap_or_default(),
+                    claude: crate::autocompact::ClaudeCompact::from_sources(&|n| std::env::var(n).ok(), crate::claude_settings::Paths::user_settings().as_ref()),
+                }
             },
             bytes_per_token: c.and_then(|c| c.bytes_per_token).unwrap_or(crate::tokens::DEFAULT_BYTES_PER_TOKEN),
             index_db: db.to_path_buf(),

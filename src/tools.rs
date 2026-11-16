@@ -45,7 +45,7 @@ pub mod dedup;
 
 #[path = "tools_surface.rs"]
 mod surface;
-pub use surface::{help, ops, HELP_URI};
+pub use surface::{help, ops, GUIDE, HELP_URI};
 pub use memory_tools::MemState;
 use memory_tools::MEMORY_TOOLS;
 
@@ -436,9 +436,19 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "recall",
-        description: "Memory records by key (history: true for versions), by query (best whole, the rest as pointers), or a lane's journal (lane).",
+        description: "Memory records by key (history: true for versions), by query (best whole, the rest as pointers), or a lane's journal (lane). Key h:ID reads a stored output (a digest's handle): its first page, or one selector; key h: lists the newest.",
         read_only: true,
-        schema: || obj(json!({"key": s(""), "query": s(""), "lane": s(""), "kind": s(""), "scope": s(""), "history": b(""), "limit": n("Default 8."), "budget_tokens": n("")}), &[]),
+        schema: || {
+            obj(
+                json!({
+                    "key": s("A record key, or h:ID (a stored output), or h: (list them)."), "query": s(""), "lane": s(""), "kind": s(""), "scope": s(""), "history": b(""), "limit": n("Default 8 (20 for h:)."), "budget_tokens": n(""),
+                    "lines": s("h:ID only: lines A-B."), "item": s("h:ID only: one item by name (a test, error:2, a file, Type::fn)."), "failures": b("h:ID only: every failure block."),
+                    "grep": s("h:ID only: lines matching this regex."), "context": n("h:ID only, with grep: context lines (default 2)."), "head": n("h:ID only: the first N lines."),
+                    "tail": n("h:ID only: the last N lines."), "page": n("h:ID only: from line K (a PR file's next page)."), "digest": b("h:ID only: the digest again.")
+                }),
+                &[],
+            )
+        },
     },
     ToolDef {
         name: "supersede",
@@ -851,6 +861,8 @@ pub(crate) fn probe_of(name: &str, args: &Value) -> crate::tokens::Probe {
             _ => Probe::None,
         },
         "recall" => match (get("key"), get("lane"), get("query")) {
+            // A stored output's slice: what the shell would do is not known.
+            (Some(k), _, _) if crate::handles::handle_key(k).is_some() => Probe::None,
             (Some(k), _, _) => Probe::Records(vec![k.to_string()]),
             (None, Some(l), _) => Probe::Records(vec![format!("lane:{l}")]),
             (None, None, Some(q)) => Probe::Exports(phrase(q)),
@@ -878,6 +890,9 @@ pub struct Server {
     memory: Option<MemState>,
     /// Repeat answers per agent (see [`dedup`]).
     dedup: dedup::Dedup,
+    /// The `hook` call in progress came with a tool call's id in its
+    /// `_meta`: a model's call, not a hook.
+    hook_tool_use: bool,
     /// Whether a `symbol` answer this session has carried the code roots'
     /// coverage notes (definitions only, scan only); later ones leave them out.
     symbol_coverage_shown: bool,
@@ -927,7 +942,7 @@ pub struct CodeState {
 impl Server {
     /// Wraps a store.
     pub fn new(store: Store) -> Server {
-        Server { store, client: "unknown".to_string(), reason: String::new(), discussion: String::new(), ledger: None, code: None, semantic: None, memory: None, dedup: dedup::Dedup::default(), symbol_coverage_shown: false }
+        Server { store, client: "unknown".to_string(), reason: String::new(), discussion: String::new(), ledger: None, code: None, semantic: None, memory: None, dedup: dedup::Dedup::default(), hook_tool_use: false, symbol_coverage_shown: false }
     }
 
     fn actor(&self) -> Actor {
@@ -945,7 +960,9 @@ impl Server {
         &mut self.store
     }
 
-    /// One line naming the served vaults, for the `initialize` result.
+    /// The `initialize` instructions: one line naming the served vaults and
+    /// sources, then the habits paragraph ([`GUIDE`]). No user rule is
+    /// injected here; those stay in the user's own files.
     pub fn instructions(&self) -> String {
         let names: Vec<String> = self.store.vaults().all().iter().map(|v| format!("{} ({})", v.name, v.folder)).collect();
         let sources: Vec<&str> = self.store.sources().iter().map(|s| s.name.as_str()).collect();
@@ -954,7 +971,7 @@ impl Server {
         } else {
             format!("Markdown vaults served: {}. Read-only sources: {}.", names.join(", "), sources.join(", "))
         };
-        format!("{head} Every op and argument: resource {HELP_URI} or note op=help.")
+        format!("{head}\n{GUIDE}")
     }
 
     fn vault(&self, name: &str) -> Result<Vault> {
@@ -1036,6 +1053,10 @@ impl Server {
             self.dedup.hook(args);
         }
         let caller = if name == "hook" { None } else { self.dedup.caller(name, args, use_id) };
+        // A model's call of the `hook` tool is marked as one (see
+        // [`crate::hooks::HookEvent::tool_use`]); not as an argument, which
+        // the tool's schema refuses.
+        self.hook_tool_use = use_id.is_some_and(|u| !u.is_empty());
         // `fresh` is taken by every tool: the whole answer, never a reference.
         let (fresh, args) = match args.as_object().filter(|m| m.contains_key("fresh")) {
             Some(m) => {
@@ -1065,7 +1086,10 @@ impl Server {
                 a => a,
             };
         }
-        if let Some(l) = &self.ledger {
+        // A hook answer is logged once, by the hook itself: its
+        // `hook:<event>` row, with the keys it injected. A bare `hook` row
+        // here would count the same bytes twice.
+        if let Some(l) = self.ledger.as_ref().filter(|_| name != "hook") {
             let returned = match &answer {
                 Answer::Text(t) | Answer::JsonText(t) => t.len(),
                 Answer::Json(v) => v.to_string().len(),

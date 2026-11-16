@@ -47,8 +47,15 @@ head: d84126e
 verdict: request-changes (simplicity), merge-with-follow-ups (cost)
 ```
 
-- `pr:` and `head:` may list several. A review reads PR N at head H when N is listed and a listed head is a
-  prefix of H.
+- `pr:` and `head:` may list several. Each PR is `N`, `#N`, `repo#N` or `owner/repo#N`; a `repo:` line names
+  the repo of a bare `N`. A review reads PR N at head H when N is listed and a listed head is a prefix of H,
+  and, when both the review and the merge name a repo (the gate reads it from `gh pr view`'s URL), the repos
+  agree: by `owner/repo` when both give an owner, else by repo name. A PR with no repo (every review filed
+  before atlas-dev#183) reads that number in any repo, and filing one warns so. A repo is read as lowercase
+  `owner/repo` whatever its form: a scheme, a host (`github.com/`, `git@github.com:`), `.git` and a PR URL's
+  `/pull/N` tail are dropped, in `pr:`, in a `repo:` line, in `--repo` and in gh's URL alike. An old free-text
+  `repo:` line that lists several (`api, react`) names each; a `--repo` that lists several is refused. The
+  refusal at filing names the line it could not use.
 - `verdict:` is split on commas. A part ending in `(ROLE)` is that role's verdict; a part with no role in
   parentheses (`pass-with-fixes (both)`) applies to every role the review names.
 - Every verdict passes except a request for changes (it says "request" and "change"). This loose read is for

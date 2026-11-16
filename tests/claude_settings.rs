@@ -49,6 +49,10 @@ impl Home {
             .env("HOME", self.t.path())
             .env("USERPROFILE", self.t.path())
             .env_remove("ATLAS_CONFIG")
+            // Claude Code's window signals, whatever this machine's are.
+            .env_remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .env_remove("CLAUDE_CODE_DISABLE_1M_CONTEXT")
+            .env_remove("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
             .output()
             .unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1215,7 +1219,7 @@ fn the_first_session_offers_orchestrated_mode_once() {
     let h3 = Home::new("cs-orch-offer");
     let (ok, _) = h3.run(&["list"]);
     assert!(ok);
-    let (ok, out) = scripted(&h3.paths(), &["offer"], "n\nn\ny\n\n\n\n\n\n\n\n", Some((2, 1, 316)));
+    let (ok, out) = scripted(&h3.paths(), &["offer"], "n\nn\nn\ny\n\n\n\n\n\n\n\n", Some((2, 1, 316)));
     assert!(ok && out.contains("Work in orchestrated mode?"), "{out}");
     assert_eq!(config_at(&h3, "orchestrate.enabled").unwrap(), true);
     assert_eq!(cs::orchestrate_line(&h3.paths()), None);
@@ -1496,11 +1500,11 @@ fn memory_rules_is_never_asked() {
     let context = first_session_context(&h);
     assert!(!context.contains("memory folder") && !context.contains("memory-rules"), "{context}");
     assert!(!offered_ids(&h).contains("memory-rules"), "{}", offered_ids(&h));
-    // A terminal: two settings and orchestrated mode take their answers, the
+    // A terminal: three settings and orchestrated mode take their answers, the
     // next line is left for whatever pipes it, and nothing is written.
     let before = h.read(&cfg);
     let mut out = Vec::new();
-    let mut input: &[u8] = b"n\nn\nn\nleft alone\n";
+    let mut input: &[u8] = b"n\nn\nn\nn\nleft alone\n";
     let code = cs::run(&["offer".to_string()], &h.paths(), &mut Io { out: &mut out, input: &mut input, interactive: true, version: None, dry_run: false, machine: None }).unwrap();
     let out = String::from_utf8(out).unwrap();
     assert!(code == std::process::ExitCode::SUCCESS && !out.contains("Should atlas manage") && !out.contains("memory-rules"), "{out}");
@@ -1602,4 +1606,247 @@ fn off_on_a_config_with_no_memory_block_leaves_it_as_absent() {
         };
         assert_eq!(settings(&parsed), settings(&absent), "{after}");
     }
+}
+
+#[test]
+fn the_status_line_offer_writes_a_badge_or_wraps_the_command_there_is() {
+    let exe = "C:/Program Files/atlas/bin/atlas.exe";
+    // None: the badge alone, by atlas's absolute path.
+    let v = cs::statusline_offer(None, exe).unwrap();
+    assert_eq!(v.get("type").and_then(json::Value::as_str), Some("command"));
+    assert_eq!(v.get("command").and_then(json::Value::as_str), Some("\"C:/Program Files/atlas/bin/atlas.exe\" --statusline"));
+    assert_eq!(cs::statusline_without_badge(&v), Some(None), "taken out, the key goes");
+    // A command of the user's: kept, with its other keys, the badge after it.
+    let mine = json::parse("{\"type\": \"command\", \"command\": \"~/bin/line.sh # mine\", \"padding\": 0}").unwrap();
+    let w = cs::statusline_offer(Some(&mine), exe).unwrap();
+    let cmd = w.get("command").and_then(json::Value::as_str).unwrap();
+    assert!(cmd.contains("~/bin/line.sh # mine\n") && cmd.contains("\"C:/Program Files/atlas/bin/atlas.exe\" --statusline"), "{cmd}");
+    assert_eq!(w.get("padding"), mine.get("padding"));
+    assert_eq!(cs::statusline_without_badge(&w), Some(Some(mine.clone())), "put back exactly");
+    // Already there: offered as is (applied).
+    assert_eq!(cs::statusline_offer(Some(&w), exe), Some(w.clone()));
+    // Not a command: nothing atlas can write; no badge to take out.
+    let other = json::parse("{\"type\": \"static\", \"text\": \"hi\"}").unwrap();
+    assert_eq!(cs::statusline_offer(Some(&other), exe), None);
+    assert_eq!(cs::statusline_without_badge(&mine), None);
+    assert!(cs::badge_exe().is_some_and(|e| std::path::Path::new(&e).is_absolute()), "atlas names itself by its absolute path");
+}
+
+#[test]
+fn the_wrapped_status_line_prints_the_users_line_then_the_badge() {
+    // Run as Claude Code runs a status line command: through sh, with the
+    // status line JSON on stdin. A build from source prints no badge, so
+    // the user's line comes out alone and unchanged.
+    let mine = json::parse("{\"type\": \"command\", \"command\": \"read -r x; printf 'line:%s' \\\"$x\\\"\"}").unwrap();
+    let exe = bin().to_string_lossy().replace('\\', "/");
+    let w = cs::statusline_offer(Some(&mine), &exe).unwrap();
+    let cmd = w.get("command").and_then(json::Value::as_str).unwrap().to_string();
+    let run = |c: &str| -> Option<String> {
+        use std::io::Write;
+        let mut p = Command::new("sh").args(["-c", c]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().ok()?;
+        p.stdin.take().unwrap().write_all(b"{\"session_id\":\"s1\"}\n").unwrap();
+        let o = p.wait_with_output().ok()?;
+        Some(String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let Some(out) = run(&cmd) else {
+        eprintln!("skipped: no sh here");
+        return;
+    };
+    assert_eq!(out, "line:{\"session_id\":\"s1\"}", "both read the same input; no badge, no separator");
+    let alone = cs::statusline_offer(None, &exe).unwrap();
+    assert_eq!(run(alone.get("command").and_then(json::Value::as_str).unwrap()).unwrap(), "");
+}
+
+#[test]
+fn offer_yes_statusline_wraps_and_off_puts_the_command_back() {
+    let h = Home::new("cs-statusline");
+    std::fs::write(h.settings(), "{\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"echo mine\"\n  },\n  \"model\": \"opus\"\n}\n").unwrap();
+    let before = h.read(&h.settings());
+    let (ok, out) = h.run(&["offer", "--yes", "statusline"]);
+    assert!(ok, "{out}");
+    let v = json::parse(&h.read(&h.settings())).unwrap();
+    let cmd = v.pointer("/statusLine/command").and_then(json::Value::as_str).unwrap().to_string();
+    assert!(cmd.contains("echo mine") && cmd.contains("--statusline"), "{cmd}");
+    assert_eq!(v.get("model").and_then(json::Value::as_str), Some("opus"), "other keys kept");
+    let (ok, out) = h.run(&["offer", "--yes", "statusline"]);
+    assert!(ok && out.contains("[statusline] already applied"), "{out}");
+    let (ok, out) = h.run(&["set", "statusline", "x"]);
+    assert!(!ok && out.contains("offer --yes statusline"), "{out}");
+    let (ok, out) = h.run(&["off", "statusline"]);
+    assert!(ok, "{out}");
+    assert_eq!(h.read(&h.settings()), before, "the user's command is back as it was");
+    let (ok, out) = h.run(&["off", "statusline"]);
+    assert!(ok && out.contains("no atlas badge"), "{out}");
+    // A status line that is not a command is never offered or changed.
+    std::fs::write(h.settings(), "{\n  \"statusLine\": {\n    \"type\": \"static\"\n  }\n}\n").unwrap();
+    let (ok, out) = h.run(&["offer", "--yes", "statusline"]);
+    assert!(ok && out.contains("[statusline] skipped"), "{out}");
+    // None at all: the badge becomes the status line.
+    std::fs::remove_file(h.settings()).unwrap();
+    let (ok, out) = h.run(&["offer", "--yes", "statusline"]);
+    assert!(ok, "{out}");
+    let v = json::parse(&h.read(&h.settings())).unwrap();
+    assert!(v.pointer("/statusLine/command").and_then(json::Value::as_str).unwrap().ends_with("\" --statusline"));
+    let (ok, _) = h.run(&["off", "statusline"]);
+    assert!(ok);
+    assert!(json::parse(&h.read(&h.settings())).unwrap().get("statusLine").is_none(), "removed");
+}
+
+/// #194, Brandon's ruling (a): `/plugin` moves atlas to a new version folder,
+/// and the badge's absolute path goes stale. SessionStart points atlas's own
+/// badge (alone or wrapping the user's command) at this atlas, silently,
+/// changing that command and no other byte; a status line atlas did not
+/// write, or one already naming this atlas, is left as it is.
+#[test]
+fn session_start_points_a_stale_status_line_badge_at_this_atlas() {
+    use atlas::hooks::{HookEvent, Hooks};
+    let h = Home::new("cs-statusline-repair");
+    let s = atlas::memory::settings::Settings::from_config(None, &h.atlas().join("state").join("atlas.sqlite")).unwrap();
+    let mut hooks = Hooks::open(s).unwrap();
+    hooks.set_offer_paths(Some(h.paths()));
+    let exe = cs::badge_exe().unwrap();
+    // One old atlas is gone; the other is still on disk but is not this one.
+    let kept = h.t.path().join("old-atlas.exe");
+    std::fs::write(&kept, "").unwrap();
+    let kept = kept.to_string_lossy().replace('\\', "/");
+    let mine = json::parse("{\"type\": \"command\", \"command\": \"echo mine\", \"padding\": 0}").unwrap();
+    let base = "{\n  \"model\": \"opus\",\n  \"statusLine\": null,\n  \"env\": {\n    \"A\": \"1\"\n  }\n}\n";
+    let cmd = |v: &json::Value| v.get("command").cloned().unwrap();
+    for source in ["startup", "resume", "compact"] {
+        for old in ["C:/gone/atlas/0.9.0/bin/atlas.exe", kept.as_str()] {
+            for have in [None, Some(&mine)] {
+                let stale = cs::statusline_offer(have, old).unwrap();
+                let fresh = cs::statusline_offer(have, &exe).unwrap();
+                let text = cs::splice(base, &["statusLine"], Some(&stale)).unwrap();
+                std::fs::write(h.settings(), &text).unwrap();
+                let a = hooks.handle(&HookEvent { event: "SessionStart".into(), session_id: "s".into(), source: source.into(), ..HookEvent::default() }).to_json("SessionStart");
+                assert!(!a.contains("statusLine") && !a.contains("status line"), "silent: {a}");
+                let after = h.read(&h.settings());
+                assert_eq!(json::parse(&after).unwrap().get("statusLine"), Some(&fresh), "{source} {old} {have:?}: {after}");
+                assert_eq!(cs::splice(&after, &["statusLine", "command"], Some(&cmd(&stale))).unwrap(), text, "only the command changed");
+            }
+        }
+    }
+    // Already this atlas, the user's own line, and a line merely mentioning
+    // the flag: untouched, byte for byte.
+    let current = cs::statusline_offer(Some(&mine), &exe).unwrap();
+    let own = json::parse("{\"type\": \"command\", \"command\": \"\\\"C:/gone/x.exe\\\" --statusline; echo hi\"}").unwrap();
+    for v in [current, mine.clone(), own] {
+        let text = cs::splice(base, &["statusLine"], Some(&v)).unwrap();
+        std::fs::write(h.settings(), &text).unwrap();
+        let before = h.backups();
+        hooks.handle(&HookEvent { event: "SessionStart".into(), session_id: "s".into(), source: "startup".into(), ..HookEvent::default() });
+        assert_eq!(h.read(&h.settings()), text);
+        assert_eq!(h.backups(), before, "nothing written");
+    }
+}
+
+/// atlas#9 and ATLAS-CLEAR (atlas-dev#181): the main session's compaction
+/// settings are listed with their values.
+#[test]
+fn the_main_session_compaction_settings_are_listed() {
+    let h = Home::new("cs-main-compact");
+    let (ok, out) = h.run(&["list"]);
+    assert!(ok, "{out}");
+    for id in ["main-session-compact", "main-compact-point", "clear-floor", "checkpoint-prompt", "checkpoint-margin", "auto-compact"] {
+        assert!(out.contains(&format!("[{id}]")), "{id}: {out}");
+    }
+    // ATLAS-CLEAR 0006 Q2: on by default (it is only ever advice).
+    let line = |out: &str| out.lines().find(|l| l.contains("[main-session-compact]")).unwrap_or_default().to_string();
+    assert!(line(&out).contains("(on by default)"), "{out}");
+    let defaults = atlas::memory::settings::Settings::from_config(None, &h.t.path().join("x.sqlite")).unwrap();
+    assert!(defaults.cap.main_session, "cap.main_session defaults on");
+    let (ok, out) = h.run(&["off", "main-session-compact"]);
+    assert!(ok, "{out}");
+    assert_eq!(atlas::config::Config::load(&h.config()).unwrap().cap.unwrap().main_session, Some(false));
+    let (ok, out) = h.run(&["list"]);
+    assert!(ok && line(&out).contains("(off)"), "{out}");
+}
+
+/// ATLAS-CLEAR 0004 and 0006: `atlas settings auto-compact` writes Claude
+/// Code's auto-compact window (absolute tokens, which Claude Code clamps to
+/// each model's window) from atlas's hard limit, and a change of the hard
+/// limit moves it. The percentage override is never written.
+#[test]
+fn auto_compact_follows_atlas_hard_limit() {
+    let h = Home::new("cs-auto-compact");
+    let (ok, _) = h.run(&["list"]);
+    assert!(ok);
+    let (ok, out) = h.run(&["set", "context-limit", "450000"]);
+    assert!(ok, "{out}");
+    // Asked without a terminal: shown, nothing written.
+    let (ok, out) = h.run(&["auto-compact"]);
+    assert!(!ok && !h.settings().exists(), "{out}");
+    let (ok, out) = h.run(&["auto-compact", "--yes"]);
+    assert!(ok, "{out}");
+    // Claude Code compacts at the window less 20k output and 13k buffer.
+    let env = |k: &str| json::parse(&h.read(&h.settings())).unwrap()["env"][k].as_str().map(str::to_string);
+    let window = || env("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+    assert_eq!(window().as_deref(), Some("483000"), "{out}");
+    assert_eq!(env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"), None, "{out}");
+    assert!(out.contains("compacts at 450000 tokens"), "{out}");
+    // The hard limit moves it, and atlas's own window does not follow it:
+    // the limits stay those of the model's window.
+    let (ok, out) = h.run(&["set", "context-limit", "400000"]);
+    assert!(ok, "{out}");
+    assert_eq!(window().as_deref(), Some("433000"), "{out}");
+    let (ok, out) = h.run(&["set", "context-limit", "450000"]);
+    assert!(ok, "{out}");
+    assert_eq!(window().as_deref(), Some("483000"), "the written window is not the model's: {out}");
+    // Off removes it; the hard limit no longer touches settings.json.
+    let (ok, out) = h.run(&["auto-compact", "--off"]);
+    assert!(ok, "{out}");
+    assert_eq!(window(), None);
+    let (ok, out) = h.run(&["set", "context-limit", "300000"]);
+    assert!(ok, "{out}");
+    assert_eq!(window(), None);
+}
+
+/// Review S1 of #192: every command that moves atlas's hard limit moves the
+/// written window, not only `set` and `off`: `orchestrate` (the limit
+/// becomes orchestrate's), `undo` and the setup `offer`'s orchestrated
+/// question. The window's write joins the command's own change, so one
+/// undo reverts both.
+#[test]
+fn auto_compact_follows_the_limit_through_orchestrate_undo_and_offer() {
+    let h = Home::new("cs-auto-follow");
+    assert!(h.run(&["list"]).0);
+    // The v0.2 hard limit, 500k, with no context-limit set (a set one is
+    // also orchestrate's fallback limit).
+    let (ok, out) = h.run(&["auto-compact", "--yes"]);
+    assert!(ok, "{out}");
+    let window = || json::parse(&h.read(&h.settings())).unwrap()["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"].as_str().map(str::to_string);
+    assert_eq!(window().as_deref(), Some("533000"), "{out}");
+    // Orchestrated mode on: the limit is orchestrate's, 450k on a 1M window.
+    let (ok, out) = h.run(&["orchestrate", "--yes"]);
+    assert!(ok, "{out}");
+    assert_eq!(window().as_deref(), Some("483000"), "{out}");
+    assert!(out.contains("[auto-compact] follows the hard limit 450000"), "{out}");
+    // One undo reverts the change and the window it moved.
+    let (ok, out) = h.run(&["undo", "--yes"]);
+    assert!(ok, "{out}");
+    assert_eq!(config_at(&h, "orchestrate.enabled"), None, "{out}");
+    assert_eq!(window().as_deref(), Some("533000"), "{out}");
+    // The setup offer's orchestrated question moves it too.
+    let (ok, out) = scripted(&h.paths(), &["offer"], "n\nn\nn\ny\n\n\n\n\n\n\n\n", Some((2, 1, 316)));
+    assert!(ok && out.contains("Work in orchestrated mode?"), "{out}");
+    assert_eq!(config_at(&h, "orchestrate.enabled").unwrap(), true);
+    assert_eq!(window().as_deref(), Some("483000"), "{out}");
+    let (ok, out) = h.run(&["undo", "--yes"]);
+    assert!(ok, "{out}");
+    assert_eq!(window().as_deref(), Some("533000"), "{out}");
+    // An undo of a context-limit change restores the limit and its window
+    // together.
+    let (ok, out) = h.run(&["set", "context-limit", "400000"]);
+    assert!(ok, "{out}");
+    assert_eq!(window().as_deref(), Some("433000"), "{out}");
+    let (ok, out) = h.run(&["undo", "--yes"]);
+    assert!(ok, "{out}");
+    assert_eq!(config_at(&h, "cap.block_tokens"), None, "{out}");
+    assert_eq!(window().as_deref(), Some("533000"), "{out}");
+    // A key that does not move the limit leaves settings.json alone.
+    let before = h.read(&h.settings());
+    let (ok, out) = h.run(&["set", "checkpoint-margin", "30000"]);
+    assert!(ok && !out.contains("[auto-compact]"), "{out}");
+    assert_eq!(h.read(&h.settings()), before);
 }

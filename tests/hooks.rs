@@ -21,6 +21,10 @@ fn settings(dir: &Path) -> Settings {
     // The floor is calibrated on a real corpus; bm25 scale grows with corpus size.
     s.recall.fts_floor = 0.0;
     s.recall.hybrid_fts_floor = 0.0;
+    // Claude Code's compaction inputs as a 1M window with nothing set,
+    // whatever this machine's environment and settings.json say
+    // (CLAUDE_CODE_AUTO_COMPACT_WINDOW, DISABLE_AUTO_COMPACT, ...).
+    s.compact.claude = atlas::autocompact::ClaudeCompact { window: 1_000_000, ..Default::default() };
     s
 }
 
@@ -112,7 +116,7 @@ fn a_subagent_gets_recall_from_the_parents_brief_and_its_lane() {
     let s = settings(t.path());
     seed(&s);
     let mut h = Hooks::open(s).unwrap();
-    let brief = "You are build-7. Continue the gadget exporter: it writes with temp files and renames them into place.";
+    let brief = "Lane: build-7\nContinue the gadget exporter: it writes with temp files and renames them into place.";
     let pre = h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: brief.into(), ..ev("PreToolUse") });
     assert_eq!(pre, Default::default());
     let start = h.handle(&HookEvent { agent_id: "a1".into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") });
@@ -130,6 +134,8 @@ fn a_subagent_gets_recall_from_the_parents_brief_and_its_lane() {
         format!("{}\n", json!({"type": "user", "message": {"role": "user", "content": brief}})),
     )
     .unwrap();
+    // Its meta file names a launch this server never saw.
+    std::fs::write(dir.join("sess").join("subagents").join("agent-a2.meta.json"), json!({"agentType": "general-purpose", "toolUseId": "t-before-restart"}).to_string()).unwrap();
     let start = h.handle(&HookEvent { agent_id: "a2".into(), ..ev("SubagentStart") });
     assert!(start.context.is_empty());
     let first = h.handle(&HookEvent { agent_id: "a2".into(), tool_name: "Bash".into(), transcript_path: parent.to_string_lossy().into_owned(), ..ev("PreToolUse") });
@@ -198,6 +204,9 @@ fn a_restart_or_compaction_keeps_the_injected_set() {
     std::fs::write(&parent, "").unwrap();
     let brief = "Look into the gadget exporter: it writes with temp files and renames them into place.";
     std::fs::write(dir.join("sess").join("subagents").join("agent-a1.jsonl"), format!("{}\n", json!({"type": "user", "message": {"role": "user", "content": brief}}))).unwrap();
+    for id in ["a1", "a2"] {
+        std::fs::write(dir.join("sess").join("subagents").join(format!("agent-{id}.meta.json")), json!({"agentType": "general-purpose", "toolUseId": "t-before-restart"}).to_string()).unwrap();
+    }
     assert!(h.handle(&HookEvent { agent_id: "a1".into(), ..ev("SubagentStart") }).context.is_empty());
     let pre = h.handle(&HookEvent { agent_id: "a1".into(), tool_name: "Bash".into(), transcript_path: parent.to_string_lossy().into_owned(), ..ev("PreToolUse") });
     assert!(!pre.context.contains("rules:r00001"), "{}", pre.context);
@@ -248,7 +257,7 @@ fn a_subagent_start_with_an_own_lane_dump_gets_no_pointers() {
     seed(&s);
     let mut h = Hooks::open(s).unwrap();
     let topic = "Continue the gadget exporter: it writes with temp files and renames them into place.";
-    h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: format!("You are build-7. {topic}"), ..ev("PreToolUse") });
+    h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: format!("Lane: build-7\n{topic}"), ..ev("PreToolUse") });
     let own = h.handle(&HookEvent { agent_id: "a1".into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") });
     assert!(own.context.contains("lane build-7"), "{}", own.context);
     assert!(pointer_lines(&own.context).iter().all(|l| !l.contains("rules:r00001")), "{}", own.context);
@@ -375,11 +384,12 @@ fn an_agent_message_gets_one_head_line_per_lane_it_names() {
     let report = agent_message("Done on ALPHA-1 and build-7; GAMMA-3 is blocked. The gadget exporter writes with temp files and renames them into place; the widget cache evicts entries past sixty four widgets.");
     let a = h.handle(&HookEvent { prompt: report.clone(), ..ev("UserPromptSubmit") });
     let lines: Vec<&str> = a.context.lines().collect();
-    assert_eq!(lines.len(), 3, "{}", a.context);
+    assert_eq!(lines.len(), 2, "{}", a.context);
     assert!(a.context.len() < 400, "{} B: {}", a.context.len(), a.context);
     assert!(lines.contains(&"lane ALPHA-1: 4 entries, handoff 002 Exporter pushed, waits on review of the rename..., 0 open; recall lane=ALPHA-1"), "{}", a.context);
     assert!(lines.contains(&"lane GAMMA-3: 2 entries, 2 open; recall lane=GAMMA-3"), "{}", a.context);
-    assert!(lines.contains(&"lane build-7: 2 entries, 0 open; recall lane=build-7"), "{}", a.context);
+    // A lower-case lane mentioned in passing is not named: only an id or a `Lane:` line is.
+    assert!(!a.context.contains("build-7"), "{}", a.context);
     assert!(!a.context.contains("# brief") && !a.context.contains("==") && !a.context.contains("widget-cache"), "{}", a.context);
     // Again in the same session: the head lines again, and still no lane view.
     assert_eq!(h.handle(&HookEvent { prompt: report, ..ev("UserPromptSubmit") }).context, a.context);
@@ -438,8 +448,11 @@ fn the_cap_warns_then_blocks_all_but_handoff_in_subagents_only() {
     let call = |h: &mut Hooks, agent: &str, tool: &str| {
         h.handle(&HookEvent { agent_id: agent.into(), tool_name: tool.into(), transcript_path: parent.to_string_lossy().into_owned(), ..ev("PreToolUse") })
     };
-    // The main session is never capped by default, whatever its size.
-    assert_eq!(call(&mut h, "", "Bash"), Default::default());
+    // The main session is never capped, whatever its size: by default
+    // (cap.main_session, ATLAS-CLEAR 0006) it is only told to ask for
+    // /compact.
+    let main = call(&mut h, "", "Bash");
+    assert!(main.deny.is_none() && main.context.contains("Ask the user to run /compact now"), "{main:?}");
     std::fs::write(&sub, usage_line("m1", 100_000)).unwrap();
     assert_eq!(call(&mut h, "a9", "Bash"), Default::default());
     std::fs::write(&sub, usage_line("m1", 100_000) + &usage_line("m2", 286_000)).unwrap();
@@ -571,6 +584,65 @@ fn injected_keys_are_logged_and_judged_by_later_use() {
     write(&main, &text);
     let mut judge = atlas::hook_hits::Judge::new(&store, &s.exports);
     assert_eq!(verdict(&mut judge, "rules:r00001"), Some("quote"));
+}
+
+/// #217: a hook injection earns credit only when the `--hook-report`
+/// verdict marks it a hit. Two injections, one used later and one not:
+/// only the used one's counterfactual is credited, the ledger's own hook
+/// row credits nothing, and a judge bounded before the use finds no hit.
+#[test]
+fn only_a_hit_injection_earns_hook_credit() {
+    let t = Temp::new("hook-hit-credit");
+    let s = settings(t.path());
+    seed(&s);
+    let main = t.path().join("main.jsonl");
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&HookEvent {
+            prompt: "why does the widget cache evict entries past sixty four widgets".into(),
+            transcript_path: main.to_string_lossy().into(),
+            ..ev("UserPromptSubmit")
+        });
+        h.handle(&HookEvent {
+            prompt: "does the gadget exporter write with temp files and rename them".into(),
+            transcript_path: main.to_string_lossy().into(),
+            ..ev("UserPromptSubmit")
+        });
+    }
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        rows = atlas::hook_hits::logged(&conn, "").unwrap();
+        if rows.len() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let widget = rows.iter().find(|r| r.key == "widget-cache").unwrap().clone();
+    assert!(rows.iter().any(|r| r.key == "rules:r00001"), "{rows:?}");
+    let late = "2999-01-01T00:00:00.000Z";
+    write(&main, &assistant(late, json!({"type": "tool_use", "name": "mcp__atlas__recall", "input": {"key": "widget-cache"}})));
+    let store = MemoryStore::open(&s.store).unwrap();
+    let mut judge = atlas::hook_hits::Judge::new(&store, &s.exports);
+    let credit = atlas::hook_hits::hit_credit(&conn, &mut judge).unwrap();
+    assert_eq!((credit.injected, credit.hits), (rows.len(), 1));
+    let day = widget.time.get(..10).unwrap().to_string();
+    assert_eq!(credit.by.into_iter().collect::<Vec<_>>(), [(("hook:UserPromptSubmit".to_string(), day.clone()), widget.read as i64)]);
+    // The ledger's hook row credits nothing by itself; the hit credit is added.
+    let (mut by_tool, mut by_day) = atlas::tokens::report(&conn, 1.0).unwrap();
+    let ups = |rows: &[atlas::tokens::ReportRow]| rows.iter().find(|r| r.key == "hook:UserPromptSubmit").unwrap().counterfactual;
+    assert_eq!(ups(&by_tool), 0.0);
+    let mut judge = atlas::hook_hits::Judge::new(&store, &s.exports);
+    let credit = atlas::hook_hits::hit_credit(&conn, &mut judge).unwrap();
+    let day_cf = |rows: &[atlas::tokens::ReportRow]| rows.iter().find(|r| r.key == day).unwrap().counterfactual;
+    let before = day_cf(&by_day);
+    atlas::tokens::add_hook_credit(&mut by_tool, &credit.by, false, 1.0);
+    atlas::tokens::add_hook_credit(&mut by_day, &credit.by, true, 1.0);
+    assert_eq!(ups(&by_tool), widget.read as f64);
+    assert_eq!(day_cf(&by_day), before + widget.read as f64);
+    // Bounded before the use, the same injection is no hit.
+    let mut judge = atlas::hook_hits::Judge::new(&store, &s.exports).until("2998-01-01T00:00:00Z");
+    assert_eq!(atlas::hook_hits::hit_credit(&conn, &mut judge).unwrap().hits, 0);
 }
 
 /// A past injection is read back out of the transcript's `hook_success`
@@ -1232,6 +1304,50 @@ fn a_folder_search_repeat_is_changed_after_an_edit_or_a_shell_under_it() {
     assert_eq!(kinds, ["changed", "miss", "miss", "changed"]);
 }
 
+/// #211: a recall by query is stamped by the store's state, so a repeat of
+/// an unchanged store is a miss and one after any store write is changed;
+/// a journal write is no lookup at all.
+#[test]
+fn a_recall_by_query_is_stamped_by_the_store_and_a_write_is_no_lookup() {
+    let t = Temp::new("hook-compact-recall-query");
+    let s = compaction(t.path());
+    seed(&s);
+    let recall = HookEvent { tool_name: "mcp__atlas__recall".into(), tool_input: json!({"query": "widget"}), ..ev("PreToolUse") };
+    let journal = HookEvent {
+        tool_name: "mcp__atlas__journal".into(),
+        tool_input: json!({"lane": "L", "kind": "decision", "text": "x"}),
+        ..ev("PreToolUse")
+    };
+    {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        h.handle(&recall);
+        h.handle(&journal);
+        h.handle(&pre_compact());
+        h.handle(&recall);
+        h.handle(&journal);
+        h.handle(&pre_compact());
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let d = Draft {
+            title: "- [Widget cache](widget-cache.md) - bound".into(),
+            body: "
+Ninety widgets now.
+"
+            .into(),
+            reason: "miss test".into(),
+            author: "t".into(),
+            client: "t".into(),
+            ..Draft::default()
+        };
+        w.revise("widget-cache", None, &d).unwrap();
+        w.commit().unwrap();
+        drop(store);
+        h.handle(&recall);
+    }
+    let kinds: Vec<String> = miss_rows(&s.index_db).into_iter().map(|r| r.0).collect();
+    assert_eq!(kinds, ["miss", "changed"]);
+}
+
 /// A synthetic session segment: a prompt, a read with its result, an edit,
 /// then a running tool call (no result yet), the last of it at a time
 /// after anything a test seeds (the session is still running). Nothing here
@@ -1623,13 +1739,17 @@ fn context_selection_collapses_trims_and_keeps_lane_state_whole() {
     assert!(a.context.contains("- rules:r00012: 2026-11-02 Tess: the opening line of this rule is about the barn roof. The zebra quota ...
 "), "{}", a.context);
     let b = h0.handle(&HookEvent {
-        prompt: "what did zoo-3 count about the zebra quota per pen?".into(),
+        prompt: "Lane: zoo-3\nwhat did zoo-3 count about the zebra quota per pen?".into(),
         session_id: "s-off-lane".into(),
         ..ev("UserPromptSubmit")
     });
     assert!(b.context.contains("Fence posts were repainted"), "off, the lane entry is whole: {}", b.context);
     // A lane brief: the brief whole, the measurement cut to its matching clause.
-    let a = h.handle(&HookEvent { prompt: "what did zoo-3 count about the zebra quota per pen?".into(), session_id: "s-lane".into(), ..ev("UserPromptSubmit") });
+    let a = h.handle(&HookEvent {
+        prompt: "Lane: zoo-3\nwhat did zoo-3 count about the zebra quota per pen?".into(),
+        session_id: "s-lane".into(),
+        ..ev("UserPromptSubmit")
+    });
     assert!(a.context.contains("Brief body stays whole: every pen, every zebra.\n"), "{}", a.context);
     assert!(a.context.contains("pen census\n... The zebra quota held at twelve per pen in every census. ...\n"), "{}", a.context);
     assert!(!a.context.contains("Fence posts"), "{}", a.context);
@@ -1927,4 +2047,1218 @@ fn the_work_classifier_is_off_by_default_and_advisory_when_on() {
     bad.orchestrate.judge.classifier = ClassifierSettings { enabled: true, source: ScoreSource::Head, weights: Some(t.path().join("missing.f32")), ..Default::default() };
     let pre = run(&bad, "c3");
     assert!(pre.deny.is_none() && !pre.context.contains("Classifier:"), "{pre:?}");
+}
+
+/// A lane's view is injected only for its `Lane:` line or its exact id:
+/// the word "session" is not the `session` lane, and a lower-case mention
+/// names nothing. The same at SubagentStart, UserPromptSubmit and the
+/// PreToolUse that carries a deferred subagent recall.
+#[test]
+fn lanes_come_only_from_a_lane_line_or_an_exact_id() {
+    let t = Temp::new("hook-lane-ids");
+    let s = settings(t.path());
+    seed(&s);
+    {
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let mut add = |key: &str, scope: &str, sub: &str, title: &str| {
+            let d = Draft {
+                title: title.into(),
+                body: String::new(),
+                reason: "hook test".into(),
+                author: "t".into(),
+                client: "t".into(),
+                ..Draft::default()
+            };
+            w.create(key, "journal", sub, scope, &d, None).unwrap();
+        };
+        add("journal:session:0001", "session", "next", "Pick up the session work");
+        add("journal:ALPHA-1:0001", "ALPHA-1", "brief", "Build the alpha exporter");
+        w.commit().unwrap();
+    }
+    let mut h = Hooks::open(s).unwrap();
+    let has = |ctx: &str, lane: &str| ctx.contains(&format!("lane {lane}:"));
+    // SubagentStart, from the stashed brief.
+    let start = |h: &mut Hooks, id: &str, brief: &str| {
+        h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: brief.into(), ..ev("PreToolUse") });
+        h.handle(&HookEvent { agent_id: id.into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") }).context
+    };
+    let c = start(&mut h, "a1", "In this session, continue the alpha exporter.");
+    assert!(!has(&c, "session"), "{c}");
+    let c = start(&mut h, "a2", "Lane: build-7\nContinue the exporter.");
+    assert!(has(&c, "build-7"), "{c}");
+    let c = start(&mut h, "a3", "Pick up build-7 and alpha-1 where they stopped; ALPHA-10 is another lane.");
+    assert!(!has(&c, "build-7") && !has(&c, "ALPHA-1"), "{c}");
+    let c = start(&mut h, "a4", "Continue ALPHA-1: the exporter.");
+    assert!(has(&c, "ALPHA-1"), "{c}");
+    // UserPromptSubmit.
+    let prompt = |h: &mut Hooks, sid: &str, p: &str| {
+        h.handle(&HookEvent { prompt: p.into(), session_id: sid.into(), ..ev("UserPromptSubmit") }).context
+    };
+    let c = prompt(&mut h, "u1", "what is left in this session");
+    assert!(!has(&c, "session"), "{c}");
+    let c = prompt(&mut h, "u2", "what is left on alpha-1 and build-7");
+    assert!(!has(&c, "ALPHA-1") && !has(&c, "build-7"), "{c}");
+    let c = prompt(&mut h, "u3", "Lane: session\nwhat is left");
+    assert!(has(&c, "session"), "{c}");
+    // PreToolUse: a subagent whose brief was not stashed gets its recall
+    // from its own transcript on its first tool call.
+    let dir = t.path().join("proj");
+    let parent = dir.join("sess.jsonl");
+    std::fs::create_dir_all(dir.join("sess").join("subagents")).unwrap();
+    std::fs::write(&parent, "").unwrap();
+    let deferred = |h: &mut Hooks, id: &str, brief: &str| {
+        std::fs::write(
+            dir.join("sess").join("subagents").join(format!("agent-{id}.jsonl")),
+            format!("{}\n", json!({"type": "user", "message": {"role": "user", "content": brief}})),
+        )
+        .unwrap();
+        std::fs::write(dir.join("sess").join("subagents").join(format!("agent-{id}.meta.json")), json!({"agentType": "general-purpose", "toolUseId": "t-before-restart"}).to_string()).unwrap();
+        assert!(h.handle(&HookEvent { agent_id: id.into(), ..ev("SubagentStart") }).context.is_empty());
+        h.handle(&HookEvent {
+            agent_id: id.into(),
+            tool_name: "Bash".into(),
+            transcript_path: parent.to_string_lossy().into_owned(),
+            ..ev("PreToolUse")
+        })
+        .context
+    };
+    let c = deferred(&mut h, "d1", "This session's exporter needs its temp files renamed.");
+    assert!(!has(&c, "session"), "{c}");
+    let c = deferred(&mut h, "d2", "Kind: builder\nLane: build-7\n\nRename the temp files.");
+    assert!(has(&c, "build-7"), "{c}");
+    let c = deferred(&mut h, "d3", "see build-7 for the exporter");
+    assert!(!has(&c, "build-7"), "{c}");
+}
+
+/// One hook call through the tool server writes one token-log row, the
+/// `hook:<event>` row: the server's ledger does not log the answer again
+/// as a bare `hook` row.
+#[test]
+fn one_hook_call_writes_one_ledger_row() {
+    let t = Temp::new("hook-one-row");
+    let s = settings(t.path());
+    seed(&s);
+    let vault = t.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let mut server = server_with(&[("v".to_string(), vault)], &s.index_db);
+    server.set_ledger(atlas::tokens::Ledger::start(&s.index_db, Vec::new()).unwrap());
+    server.set_memory(s.clone());
+    server.answer("hook", &json!({"event": "UserPromptSubmit", "session_id": "s1", "prompt": WIDGET})).unwrap();
+    // Dropping the server joins the ledger thread; the hook writes its row on its own thread.
+    drop(server);
+    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    for _ in 0..200 {
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM token_log", [], |r| r.get(0)).unwrap_or(0);
+        if n > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // A late second row would show here too.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let rows: Vec<String> =
+        conn.prepare("SELECT tool FROM token_log ORDER BY id").and_then(|mut st| st.query_map([], |r| r.get(0))?.collect()).unwrap();
+    assert_eq!(rows, vec!["hook:UserPromptSubmit".to_string()]);
+}
+
+// ------------------------------------------------ atlas-dev#181 (ATLAS-CLEAR)
+
+/// Appends to a transcript, as Claude Code does (the usage cache is keyed by
+/// the file's length).
+fn append(path: &Path, text: &str) {
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    f.write_all(text.as_bytes()).unwrap();
+}
+
+/// A main-session transcript after a compaction: the boundary, the first
+/// request after it (`floor` context tokens), then the newest (`now`).
+fn after_compaction(path: &Path, floor: u64, now: u64) {
+    let boundary = json!({"type": "system", "subtype": "compact_boundary", "timestamp": "2020-01-01T00:00:00.000Z",
+        "compactMetadata": {"trigger": "manual", "preTokens": 300000, "postTokens": 14000, "durationMs": 12000}});
+    std::fs::write(path, format!("{boundary}\n") + &usage_line("a1", floor) + &usage_line("a2", now)).unwrap();
+}
+
+/// A main-session tool call against the transcript `tp`.
+fn main_call(h: &mut Hooks, tp: &Path, tool: &str) -> atlas::hooks::HookAnswer {
+    h.handle(&HookEvent { tool_name: tool.into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreToolUse") })
+}
+
+/// atlas#9: with `cap.main_session` on, the main session is told to ask the
+/// user for /compact past its point, never locked, whatever the mode says.
+#[test]
+fn the_main_session_cap_is_advisory_and_asks_the_user_to_compact() {
+    let t = Temp::new("hook-main-cap");
+    let mut s = settings(t.path());
+    // Orchestrated, so the main session's limits are `other`'s (enforced).
+    s.orchestrate = atlas::orchestrate::resolve(None, None, None, |_| None);
+    s.orchestrate.enabled = true;
+    s.cap.warn_tokens = s.orchestrate.other.handoff;
+    s.cap.block_tokens = s.orchestrate.other.limit;
+    s.cap.main_session = true;
+    s.compact.window = 1_000_000;
+    let mut h = Hooks::open(s).unwrap();
+    let tp = t.path().join("sess.jsonl");
+    append(&tp, &usage_line("p1", 200_000));
+    assert_eq!(main_call(&mut h, &tp, "Bash"), Default::default());
+    append(&tp, &usage_line("p2", 290_000));
+    let w = main_call(&mut h, &tp, "Bash");
+    assert!(w.deny.is_none(), "{w:?}");
+    assert!(w.context.contains("atlas context: the main session is at 290000 tokens (compact point 285000). Ask the user to run /compact now."), "{}", w.context);
+    assert!(!w.context.contains("handoff"), "no subagent wording: {}", w.context);
+    // Repeated every warn_every tokens, not before.
+    append(&tp, &usage_line("p3", 300_000));
+    assert!(main_call(&mut h, &tp, "Bash").context.is_empty());
+    append(&tp, &usage_line("p4", 316_000));
+    assert!(main_call(&mut h, &tp, "Bash").context.contains("at 316000 tokens"));
+    // Past the hard limit nothing is denied: the prompt repeats, more urgent.
+    append(&tp, &usage_line("p5", 460_000));
+    let b = main_call(&mut h, &tp, "Read");
+    assert!(b.deny.is_none(), "the main session is never locked: {b:?}");
+    assert!(b.context.contains("at 460000 tokens, past its hard limit 450000") && b.context.contains("Ask the user to run /compact now"), "{}", b.context);
+    append(&tp, &usage_line("p6", 486_000));
+    let again = main_call(&mut h, &tp, "Edit");
+    assert!(again.deny.is_none() && again.context.contains("at 486000 tokens"), "{again:?}");
+}
+
+/// ATLAS-CLEAR 0001: once the context right after the last compaction (the
+/// first request after its boundary) passes `compact.clear_floor` (80k by
+/// default), the main-session prompt recommends a /clear instead.
+#[test]
+fn a_high_floor_after_compaction_recommends_a_clear_instead() {
+    let t = Temp::new("hook-clear-floor");
+    let mut s = settings(t.path());
+    s.cap.warn_tokens = 285_000;
+    s.cap.block_tokens = 450_000;
+    s.cap.main_session = true;
+    s.compact.window = 1_000_000;
+    let tp = t.path().join("sess.jsonl");
+    after_compaction(&tp, 90_000, 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let c = main_call(&mut h, &tp, "Bash").context;
+    assert!(c.contains("Ask the user to run /clear now") && !c.contains("run /compact"), "{c}");
+    assert!(c.contains("90000 tokens right after the last compaction (clear floor 80000)"), "{c}");
+    assert!(c.contains("lane session:s1"), "the checkpoint is asked for first: {c}");
+    // Under the floor it stays a compaction.
+    after_compaction(&tp, 60_000, 300_000);
+    let mut h = Hooks::open(s).unwrap();
+    let c = main_call(&mut h, &tp, "Bash").context;
+    assert!(c.contains("Ask the user to run /compact now") && !c.contains("/clear"), "{c}");
+}
+
+/// ATLAS-CLEAR 0003: the main session is asked for its checkpoint entry
+/// once its context passes the predicted auto-compaction point less the
+/// margin (40k by default), on a tool call or a prompt, once a segment.
+#[test]
+fn the_main_session_is_asked_for_its_checkpoint_before_a_predicted_auto_compaction() {
+    let t = Temp::new("hook-ck-prompt");
+    let mut s = compaction(t.path());
+    // Claude Code compacts a 500k window at 500k - 20k output - 13k buffer.
+    s.compact.window = 500_000;
+    let tp = t.path().join("s1.jsonl");
+    append(&tp, &usage_line("p1", 420_000));
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    assert!(main_call(&mut h, &tp, "Bash").context.is_empty());
+    append(&tp, &usage_line("p2", 430_000));
+    let c = main_call(&mut h, &tp, "Bash").context;
+    assert!(c.contains("auto-compaction is predicted at 467000 tokens and this session is at 430000"), "{c}");
+    assert!(c.contains("Write your checkpoint journal entry now") && c.contains("lane session:s1") && c.contains("entry checkpoint"), "{c}");
+    // Once a segment.
+    append(&tp, &usage_line("p3", 440_000));
+    assert!(main_call(&mut h, &tp, "Bash").context.is_empty());
+    // A subagent is never asked (it hands off by its own limits).
+    let sub = h.handle(&HookEvent { agent_id: "a9".into(), tool_name: "Bash".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreToolUse") });
+    assert!(!sub.context.contains("checkpoint journal entry"), "{sub:?}");
+    // A prompt asks too.
+    let mut h = Hooks::open(s).unwrap();
+    h.set_offer_paths(None);
+    let p = h.handle(&HookEvent { prompt: "carry on".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("UserPromptSubmit") });
+    assert!(p.context.contains("Write your checkpoint journal entry now"), "{}", p.context);
+}
+
+/// ATLAS-CLEAR 0003 backstop: an auto compaction inside the prompt zone with
+/// no checkpoint entry by the model waits once (Claude Code skips a
+/// proactive compaction a PreCompact hook blocks), the next tool call asks
+/// again, and the compaction after that goes ahead, its checkpoint saying
+/// the model's entry is missing.
+#[test]
+fn an_auto_compaction_waits_once_for_the_models_checkpoint_then_notes_it_missing() {
+    let t = Temp::new("hook-ck-backstop");
+    let mut s = compaction(t.path());
+    s.compact.window = 500_000;
+    seed(&s);
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 430_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let pre = |trigger: &str| HookEvent { trigger: trigger.into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") };
+    let a = h.handle(&pre("auto"));
+    let reason = a.block.clone().expect("deferred for the model's checkpoint");
+    assert!(reason.contains("checkpoint"), "{reason}");
+    {
+        let store = MemoryStore::open(&s.store).unwrap();
+        assert!(atlas::checkpoint::newest(&store, "s1").unwrap().is_none());
+    }
+    let c = main_call(&mut h, &tp, "Bash").context;
+    assert!(c.contains("Write your checkpoint journal entry now"), "asked again after the deferral: {c}");
+    assert!(h.handle(&pre("auto")).block.is_none(), "deferred once a segment");
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().expect("a checkpoint");
+    assert!(ck.body.contains("model: missing"), "{}", ck.body);
+}
+
+/// The model's own checkpoint entry lets the compaction through, and the
+/// hook's checkpoint names it (and does not take it as the previous one).
+#[test]
+fn the_models_checkpoint_entry_lets_compaction_through_and_is_named() {
+    let t = Temp::new("hook-ck-model");
+    let mut s = compaction(t.path());
+    s.compact.window = 500_000;
+    seed(&s);
+    {
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let d = Draft { title: "checkpoint: exporter half done".into(), body: "step: tests\nnext: wire the hooks\n".into(), reason: "the model's checkpoint".into(), author: "model".into(), client: "t".into(), ..Draft::default() };
+        w.create("journal:session:s1:0001", "journal", "checkpoint", "session:s1", &d, None).unwrap();
+        drop(w.commit());
+    }
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 440_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let a = h.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    assert!(a.block.is_none(), "{a:?}");
+    let store = MemoryStore::open(&s.store).unwrap();
+    let model = store.head("journal:session:s1:0001").unwrap().unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().expect("a checkpoint");
+    assert_eq!(ck.key, "journal:session:s1:0002");
+    assert!(ck.body.contains(&format!("model: journal:session:s1:0001@{}", &model.sha[..12])), "{}", ck.body);
+    assert!(!ck.body.contains("since: journal:session:s1:0001"), "the model's entry is not the previous checkpoint: {}", ck.body);
+    assert!(ck.body.contains("owed: journal:build-7:0002"), "the store side keeps its whole window: {}", ck.body);
+}
+
+/// ATLAS-CLEAR 0001 restore and 0006 Q3: a /clear writes the ending
+/// session's checkpoint from its own transcript at SessionEnd (reason
+/// clear), and the new session's SessionStart(clear) gives its card (its
+/// key, rulings, owed work) beside the resume card.
+#[test]
+fn a_clear_writes_the_ending_sessions_checkpoint_at_session_end_and_gives_its_card() {
+    let t = Temp::new("hook-clear-card");
+    let s = compaction(t.path());
+    seed(&s);
+    let dir = t.path().join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("old.jsonl");
+    working_transcript(&old, 300_000);
+    // A concurrent live session, newer in the same folder: never read.
+    working_transcript(&dir.join("live.jsonl"), 200_000);
+    let new = dir.join("new.jsonl");
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let end = |reason: &str| HookEvent { session_id: "old".into(), reason: reason.into(), transcript_path: old.to_string_lossy().into_owned(), ..ev("SessionEnd") };
+    // An exit that is not a clear writes nothing.
+    for reason in ["logout", "prompt_input_exit", "other"] {
+        assert_eq!(h.handle(&end(reason)), Default::default(), "{reason}");
+    }
+    assert!(atlas::checkpoint::newest(&MemoryStore::open(&s.store).unwrap(), "old").unwrap().is_none());
+    // The clear: written at SessionEnd, from the ending transcript.
+    h.handle(&end("clear"));
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "old").unwrap().expect("the cleared session's checkpoint");
+    assert!(ck.title.starts_with("checkpoint (clear) at 300000 context tokens"), "{}", ck.title);
+    assert!(ck.meta.contains(&format!("transcript: {}", old.to_string_lossy())), "{}", ck.meta);
+    assert!(store.lane("session:live").unwrap().is_empty(), "the newest other transcript is not guessed");
+    drop(store);
+    let a = h.handle(&HookEvent { session_id: "new".into(), source: "clear".into(), transcript_path: new.to_string_lossy().into_owned(), ..ev("SessionStart") });
+    assert!(a.context.contains(&format!("atlas checkpoint {}@{} (the state before the /clear", ck.key, &ck.sha[..12])), "{}", a.context);
+    assert!(a.context.contains("owed: journal:build-7:0002") && a.context.contains("rules:r00001@"), "{}", a.context);
+    assert!(a.context.contains("atlas resume card"), "{}", a.context);
+    let store = MemoryStore::open(&s.store).unwrap();
+    assert_eq!(store.lane("session:old").unwrap().len(), 1, "SessionStart writes no second checkpoint");
+    assert!(store.lane("session:live").unwrap().is_empty());
+    drop(store);
+    // A clear with no SessionEnd checkpoint (the hook not wired) writes none
+    // and gives no card, rather than guess at another transcript.
+    let t2 = Temp::new("hook-clear-none");
+    let s2 = compaction(t2.path());
+    seed(&s2);
+    let dir2 = t2.path().join("sessions");
+    std::fs::create_dir_all(&dir2).unwrap();
+    working_transcript(&dir2.join("other.jsonl"), 300_000);
+    let mut h2 = Hooks::open(s2.clone()).unwrap();
+    h2.set_offer_paths(None);
+    let b = h2.handle(&HookEvent { session_id: "new2".into(), source: "clear".into(), transcript_path: dir2.join("new2.jsonl").to_string_lossy().into_owned(), ..ev("SessionStart") });
+    assert!(!b.context.contains("atlas checkpoint"), "{}", b.context);
+    assert!(MemoryStore::open(&s2.store).unwrap().lane("session:other").unwrap().is_empty());
+}
+
+/// Review S4 of #192, ruled in ATLAS-CLEAR 0008: Claude Code 2.1.323 runs
+/// PreCompact for a subagent's automatic compaction too (its input names
+/// the agent_id; the transcript_path is the parent's), and skips a
+/// compaction a PreCompact hook blocks. A subagent past its handoff point,
+/// under an enforced hard limit, is blocked every time, so it reaches the
+/// limit's deny and hands off rather than carry on from a summary. The
+/// main-session backstop and its `session:<id>` checkpoint are the main
+/// session's only.
+#[test]
+fn a_subagents_auto_compaction_is_blocked_so_it_hands_off() {
+    let t = Temp::new("hook-sub-compact");
+    let mut s = compaction(t.path());
+    s.cap.warn_tokens = 285_000;
+    s.cap.block_tokens = 450_000;
+    s.compact.window = 1_000_000;
+    seed(&s);
+    let dir = t.path().join("proj");
+    let parent = dir.join("s1.jsonl");
+    let sub = dir.join("s1").join("subagents").join("agent-a9.jsonl");
+    std::fs::create_dir_all(sub.parent().unwrap()).unwrap();
+    working_transcript(&parent, 200_000);
+    append(&sub, &usage_line("m1", 450_000));
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let tp = parent.to_string_lossy().into_owned();
+    let pre = |agent: &str| HookEvent { agent_id: agent.into(), trigger: "auto".into(), transcript_path: tp.clone(), ..ev("PreCompact") };
+    let a = h.handle(&pre("a9"));
+    let reason = a.block.clone().expect("a subagent past its limit is not compacted");
+    assert!(reason.contains("450000") && reason.contains("handoff"), "{reason}");
+    assert!(a.to_json("PreCompact").contains("\"decision\":\"block\""), "{}", a.to_json("PreCompact"));
+    // Every time: not a once-a-segment wait.
+    assert!(h.handle(&pre("a9")).block.is_some());
+    // Its next tool call is the hard limit's deny.
+    let d = h.handle(&HookEvent { agent_id: "a9".into(), tool_name: "Bash".into(), transcript_path: tp.clone(), ..ev("PreToolUse") });
+    assert!(d.deny.as_deref().is_some_and(|r| r.contains("handoff")), "{d:?}");
+    let store = MemoryStore::open(&s.store).unwrap();
+    assert!(store.lane("session:s1").unwrap().is_empty(), "a subagent's compaction writes no session checkpoint");
+    drop(store);
+    // The main session's compaction is not the subagent's: it goes ahead
+    // and writes the session's checkpoint.
+    let m = h.handle(&pre(""));
+    assert!(m.block.is_none(), "{m:?}");
+    assert!(atlas::checkpoint::newest(&MemoryStore::open(&s.store).unwrap(), "s1").unwrap().is_some());
+}
+
+/// Review S4 of #192: a subagent's compaction that is not blocked (before
+/// its handoff point, as on a smaller model window, or with an advisory
+/// limit, which never denies) goes ahead, and still writes no session
+/// checkpoint and runs no main-session backstop.
+#[test]
+fn a_subagents_compaction_that_is_not_blocked_writes_no_session_checkpoint() {
+    let t = Temp::new("hook-sub-compact-ok");
+    let mut s = compaction(t.path());
+    s.cap.warn_tokens = 285_000;
+    s.cap.block_tokens = 450_000;
+    s.compact.window = 1_000_000;
+    seed(&s);
+    let dir = t.path().join("proj");
+    let parent = dir.join("s1.jsonl");
+    let sub = dir.join("s1").join("subagents").join("agent-a9.jsonl");
+    std::fs::create_dir_all(sub.parent().unwrap()).unwrap();
+    // The parent sits inside the main session's prompt zone: the backstop
+    // would wait for the main session's checkpoint, were it run.
+    working_transcript(&parent, 930_000);
+    append(&sub, &usage_line("m1", 167_000));
+    let tp = parent.to_string_lossy().into_owned();
+    let pre = HookEvent { agent_id: "a9".into(), trigger: "auto".into(), transcript_path: tp, ..ev("PreCompact") };
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let a = h.handle(&pre);
+    assert!(a.block.is_none(), "before its handoff point: {a:?}");
+    assert!(MemoryStore::open(&s.store).unwrap().lane("session:s1").unwrap().is_empty());
+    // An advisory limit is never blocked, past it or not.
+    append(&sub, &usage_line("m2", 460_000));
+    let mut adv = s.clone();
+    adv.orchestrate = atlas::orchestrate::resolve(None, None, None, |_| None);
+    adv.orchestrate.enabled = true;
+    for k in [&mut adv.orchestrate.builder, &mut adv.orchestrate.reviewer, &mut adv.orchestrate.research, &mut adv.orchestrate.brief_writer, &mut adv.orchestrate.other] {
+        k.mode = atlas::orchestrate::Mode::Advisory;
+    }
+    let mut h = Hooks::open(adv).unwrap();
+    h.set_offer_paths(None);
+    let a = h.handle(&pre);
+    assert!(a.block.is_none(), "advisory: {a:?}");
+    assert!(MemoryStore::open(&s.store).unwrap().lane("session:s1").unwrap().is_empty());
+}
+
+/// #195 (rulings ATLAS-VERSION 0014 and 0016): the S4 block judges each
+/// subagent against its own model's window. A subagent at 300k with a 450k
+/// hard limit is blocked on a 1M window (the limit comes before Claude
+/// Code's own), and let compact on a 200k one (the agent would fail on a
+/// too-long prompt before any deny).
+mod subagent_window {
+    use super::*;
+
+    /// A session with subagents `ids` at 300k context, each with its meta
+    /// file's `model` alias (None: no alias) and its transcript's assistant
+    /// `message.model` (None: no model on the message). Every meta file
+    /// also carries `"pickedEffortModel": "claude-opus-5-5"`, as Claude Code
+    /// writes it: the parent's model, not the subagent's.
+    fn session(t: &Temp, agents: &[(&str, Option<&str>, Option<&str>)], tweak: impl FnOnce(&mut Settings)) -> (Hooks, String) {
+        let mut s = compaction(t.path());
+        s.cap.warn_tokens = 285_000;
+        s.cap.block_tokens = 450_000;
+        tweak(&mut s);
+        seed(&s);
+        let dir = t.path().join("proj");
+        let parent = dir.join("s1.jsonl");
+        let subs = dir.join("s1").join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        working_transcript(&parent, 200_000);
+        for (id, alias, msg) in agents {
+            let mut m = json!({"agentType": "general-purpose", "toolUseId": format!("toolu_{id}"), "effort": "high", "pickedEffortModel": "claude-opus-5-5"});
+            if let Some(alias) = alias {
+                m["model"] = json!(alias);
+            }
+            std::fs::write(subs.join(format!("agent-{id}.meta.json")), m.to_string()).unwrap();
+            let mut line = json!({"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 2, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 299_998, "output_tokens": 0}}});
+            if let Some(model) = msg {
+                line["message"]["model"] = json!(model);
+            }
+            // A synthetic message and an empty model after it name no real model.
+            let synthetic = json!({"type": "assistant", "message": {"id": "m2", "model": "<synthetic>", "content": []}});
+            let empty = json!({"type": "assistant", "message": {"id": "m3", "model": "", "content": []}});
+            append(&subs.join(format!("agent-{id}.jsonl")), &format!("{line}\n{synthetic}\n{empty}\n"));
+        }
+        let mut h = Hooks::open(s).unwrap();
+        h.set_offer_paths(None);
+        (h, parent.to_string_lossy().into_owned())
+    }
+
+    fn blocked(h: &mut Hooks, tp: &str, id: &str) -> bool {
+        h.handle(&HookEvent { agent_id: id.into(), trigger: "auto".into(), transcript_path: tp.into(), ..ev("PreCompact") }).block.is_some()
+    }
+
+    /// The real layout (ruling 0016): a haiku subagent's meta says
+    /// `"model": "haiku"` and `"pickedEffortModel": "claude-opus-5-5"`, and
+    /// its transcript says `claude-haiku-5-5`. Over its 200k limit it is
+    /// judged on 200k (let compact), not on the parent's 1M.
+    #[test]
+    fn a_haiku_subagent_is_judged_on_200k_not_its_parents_picked_effort_model() {
+        let t = Temp::new("hook-sub-window-real");
+        let (mut h, tp) = session(&t, &[("hk", Some("haiku"), Some("claude-haiku-5-5")), ("alias", Some("haiku"), None)], |_| {});
+        assert!(!blocked(&mut h, &tp, "hk"), "the transcript says haiku: 200k");
+        assert!(!blocked(&mut h, &tp, "alias"), "no transcript model: the meta alias haiku, 200k");
+    }
+
+    #[test]
+    fn a_haiku_and_an_opus_subagent_in_one_session_each_get_their_own_window() {
+        let t = Temp::new("hook-sub-window-family");
+        let agents = [("hk", Some("haiku"), Some("claude-haiku-4-5")), ("op", None, Some("claude-opus-5-5")), ("sn", Some("sonnet"), Some("claude-sonnet-4-6")), ("fb", None, Some("claude-fable-5-2"))];
+        let (mut h, tp) = session(&t, &agents, |s| s.compact.window = 1_000_000);
+        assert!(!blocked(&mut h, &tp, "hk"), "haiku is 200k, whatever compact.window says");
+        for id in ["op", "sn", "fb"] {
+            assert!(blocked(&mut h, &tp, id), "{id} is 1M");
+        }
+    }
+
+    #[test]
+    fn with_the_1m_context_off_opus_is_200k() {
+        let t = Temp::new("hook-sub-window-200k");
+        let (mut h, tp) = session(&t, &[("op", None, Some("claude-opus-5-5"))], |s| s.compact.claude.window = atlas::orchestrate::inferred_window(&|k| (k == "CLAUDE_CODE_DISABLE_1M_CONTEXT").then(|| "1".to_string())));
+        assert!(!blocked(&mut h, &tp, "op"));
+    }
+
+    #[test]
+    fn compact_model_windows_overrides_the_table() {
+        let t = Temp::new("hook-sub-window-config");
+        let (mut h, tp) = session(&t, &[("hk", Some("haiku"), Some("claude-haiku-4-5")), ("op", None, Some("claude-opus-5-5"))], |s| {
+            s.compact.model_windows = [("claude-haiku-4-5".to_string(), 1_000_000), ("claude-opus-5-5".to_string(), 200_000)].into_iter().collect();
+        });
+        assert!(blocked(&mut h, &tp, "hk"), "haiku overridden to 1M");
+        assert!(!blocked(&mut h, &tp, "op"), "opus overridden to 200k");
+    }
+
+    #[test]
+    fn the_transcript_model_beats_the_meta_alias() {
+        let t = Temp::new("hook-sub-window-source");
+        let (mut h, tp) = session(&t, &[("op", Some("haiku"), Some("claude-opus-5-5")), ("hk", Some("opus"), Some("claude-haiku-5-5"))], |_| {});
+        assert!(blocked(&mut h, &tp, "op"), "the transcript's opus wins over the alias haiku: 1M");
+        assert!(!blocked(&mut h, &tp, "hk"), "the transcript's haiku wins over the alias opus: 200k");
+    }
+
+    #[test]
+    fn an_unknown_or_missing_model_falls_back_to_compact_window_then_the_inferred_window() {
+        let t = Temp::new("hook-sub-window-fallback");
+        let agents = [("unk", Some("inherit"), Some("some-other-model")), ("none", None, None)];
+        let (mut h, tp) = session(&t, &agents, |s| s.compact.window = 200_000);
+        for id in ["unk", "none"] {
+            assert!(!blocked(&mut h, &tp, id), "{id}: compact.window 200k");
+        }
+        let t = Temp::new("hook-sub-window-fallback-1m");
+        let (mut h, tp) = session(&t, &agents, |_| {});
+        for id in ["unk", "none"] {
+            assert!(blocked(&mut h, &tp, id), "{id}: no compact.window, 1M");
+        }
+    }
+
+    #[test]
+    fn a_known_model_beats_compact_window() {
+        let t = Temp::new("hook-sub-window-known");
+        let (mut h, tp) = session(&t, &[("op", None, Some("claude-opus-5-5"))], |s| s.compact.window = 200_000);
+        assert!(blocked(&mut h, &tp, "op"), "opus is 1M although compact.window is 200k");
+    }
+
+    #[test]
+    fn compact_model_windows_is_read_from_the_configuration() {
+        let t = Temp::new("hook-sub-window-parse");
+        let c = atlas::config::Config::parse(r#"{"compact": {"model_windows": {"claude-opus-5-5": 200000}}}"#, t.path()).unwrap();
+        let s = Settings::from_config(Some(&c), &t.path().join("index.sqlite")).unwrap();
+        assert_eq!(s.compact.model_windows.get("claude-opus-5-5"), Some(&200_000));
+        // N1 of the #205 review: an empty key, and a window not above
+        // Claude Code's output reserve (20,000), are refused too.
+        let ok = atlas::config::Config::parse(r#"{"compact": {"model_windows": {"haiku": 20001}}}"#, t.path());
+        assert!(ok.is_ok(), "{:?}", ok.err());
+        for bad in [
+            r#"{"compact": {"model_windows": {"x": "big"}}}"#,
+            r#"{"compact": {"model_windows": [1]}}"#,
+            r#"{"compact": {"model_windows": {"": 200000}}}"#,
+            r#"{"compact": {"model_windows": {"  ": 200000}}}"#,
+            r#"{"compact": {"model_windows": {"opus": 20000}}}"#,
+            r#"{"compact": {"model_windows": {"opus": 5}}}"#,
+        ] {
+            let e = atlas::config::Config::parse(bad, t.path()).expect_err(bad).to_string();
+            assert!(e.contains("compact.model_windows"), "{e}");
+        }
+    }
+}
+
+/// Review S4 of #192: the plugin's PreCompact hook passes the agent_id, as
+/// the other subagent-aware hooks do.
+#[test]
+fn the_plugin_passes_the_agent_id_to_pre_compact() {
+    let hooks = json::parse(atlas::claude_settings::PLUGIN_HOOKS).unwrap();
+    let input = &hooks["hooks"]["PreCompact"][0]["hooks"][0]["input"];
+    assert_eq!(input["agent_id"].as_str(), Some("${agent_id}"), "{input}");
+    let e = HookEvent::from_value(&json!({"hook_event_name": "PreCompact", "session_id": "s", "agent_id": "a9", "trigger": "auto", "transcript_path": "t.jsonl"}));
+    assert_eq!((e.agent_id.as_str(), e.trigger.as_str()), ("a9", "auto"));
+}
+
+/// Seconds since the Unix epoch, as `YYYY-MM-DDTHH:MM:SS` (UTC).
+fn utc(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+/// A checkpoint as SessionEnd(clear) writes it, for `session` whose
+/// transcript is `transcript`, stamped `time`.
+fn clear_checkpoint_at(s: &Settings, session: &str, transcript: &Path, time: &str) -> String {
+    let mut store = MemoryStore::open(&s.store).unwrap();
+    let mut w = store.writer().unwrap();
+    let key = format!("journal:session:{session}:0001");
+    let d = Draft {
+        title: "checkpoint (clear) at 300000 context tokens".into(),
+        meta: format!("transcript: {}\nhook_ms: 1.0\n", transcript.to_string_lossy()),
+        body: "step: tests\n".into(),
+        reason: "context clear checkpoint written by the SessionEnd hook".into(),
+        author: "hook".into(),
+        client: "atlas-hook".into(),
+        time: Some(time.into()),
+        ..Draft::default()
+    };
+    w.create(&key, "journal", "checkpoint", &format!("session:{session}"), &d, None).unwrap();
+    drop(w.commit());
+    key
+}
+
+/// Review S2 of #192 (ruled in ATLAS-CLEAR 0008: 2 minutes): a /clear
+/// checkpoint is taken for the new session's card only within 2 minutes of
+/// its SessionEnd, so a clear that wrote none does not take an older one.
+#[test]
+fn a_clear_card_is_taken_only_within_two_minutes() {
+    let t = Temp::new("hook-clear-window");
+    let s = compaction(t.path());
+    let dir = t.path().join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let new = dir.join("new.jsonl");
+    let start = |h: &mut Hooks| h.handle(&HookEvent { session_id: "new".into(), source: "clear".into(), transcript_path: new.to_string_lossy().into_owned(), ..ev("SessionStart") }).context;
+    // Five minutes old: another session's clear, not this one's.
+    clear_checkpoint_at(&s, "a", &dir.join("a.jsonl"), &format!("{}.000Z", utc(now_secs() - 300)));
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let c = start(&mut h);
+    assert!(!c.contains("atlas checkpoint"), "a checkpoint five minutes old gives no card: {c}");
+    // One minute old: the card.
+    let t2 = Temp::new("hook-clear-window2");
+    let s2 = compaction(t2.path());
+    let made = now_secs() - 60;
+    let key = clear_checkpoint_at(&s2, "a", &dir.join("a.jsonl"), &format!("{}.000Z", utc(made)));
+    let mut h = Hooks::open(s2.clone()).unwrap();
+    h.set_offer_paths(None);
+    let c = start(&mut h);
+    assert!(c.contains(&format!("atlas checkpoint {key}@")), "{c}");
+    // The window's edge, as of a fixed now: in at 120 s, out at 121 s.
+    let store = MemoryStore::open(&s2.store).unwrap();
+    let at = store.head(&key).unwrap().unwrap().time;
+    assert!(atlas::checkpoint::cleared_at(&store, &dir, "new", made + 120).unwrap().is_some(), "{at}");
+    assert!(atlas::checkpoint::cleared_at(&store, &dir, "new", made + 121).unwrap().is_none(), "{at}");
+}
+
+/// Review N5 of #192: an entry stamped in the window's first second (with
+/// milliseconds) is inside the window, though `.` sorts before `Z`.
+#[test]
+fn a_clear_checkpoint_in_the_windows_first_second_is_inside_it() {
+    let t = Temp::new("hook-clear-edge");
+    let s = compaction(t.path());
+    let dir = t.path().join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = now_secs() - 30;
+    clear_checkpoint_at(&s, "a", &dir.join("a.jsonl"), &format!("{}.500Z", utc(base)));
+    let store = MemoryStore::open(&s.store).unwrap();
+    let edge = base + atlas::checkpoint::CLEAR_CARD_SECS;
+    assert!(atlas::checkpoint::cleared_at(&store, &dir, "new", edge).unwrap().is_some());
+}
+
+/// Review S2 of #192 (ATLAS-CLEAR 0008): two /clear checkpoints from the
+/// folder inside the window cannot be told apart (several main sessions
+/// clear in one folder), so the new session gets no card rather than
+/// perhaps another session's.
+#[test]
+fn two_clear_checkpoints_in_the_window_give_no_card() {
+    let t = Temp::new("hook-clear-two");
+    let s = compaction(t.path());
+    let dir = t.path().join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    clear_checkpoint_at(&s, "a", &dir.join("a.jsonl"), &format!("{}.000Z", utc(now_secs() - 50)));
+    clear_checkpoint_at(&s, "b", &dir.join("b.jsonl"), &format!("{}.000Z", utc(now_secs() - 20)));
+    // One in another folder does not count.
+    clear_checkpoint_at(&s, "c", &t.path().join("elsewhere").join("c.jsonl"), &format!("{}.000Z", utc(now_secs() - 10)));
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let c = h.handle(&HookEvent { session_id: "new".into(), source: "clear".into(), transcript_path: dir.join("new.jsonl").to_string_lossy().into_owned(), ..ev("SessionStart") }).context;
+    assert!(!c.contains("atlas checkpoint"), "two candidates, no card: {c}");
+    let store = MemoryStore::open(&s.store).unwrap();
+    assert!(atlas::checkpoint::cleared(&store, &dir, "new").unwrap().is_none());
+    // The new session's own checkpoint is never a candidate.
+    assert!(atlas::checkpoint::cleared(&store, &dir, "b").unwrap().is_some());
+}
+
+/// ATLAS-CLEAR 0006 Q3: SessionEnd's input names why the session ends.
+#[test]
+fn session_end_reads_its_reason() {
+    let e = HookEvent::from_value(&json!({"hook_event_name": "SessionEnd", "session_id": "s", "reason": "clear", "transcript_path": "t.jsonl"}));
+    assert_eq!((e.event.as_str(), e.reason.as_str(), e.transcript_path.as_str()), ("SessionEnd", "clear", "t.jsonl"));
+}
+
+/// ATLAS-CLEAR 0006 Q3: the plugin hooks SessionEnd for a /clear only, as a
+/// command hook (the event JSON on stdin), like SessionStart.
+#[test]
+fn the_plugin_hooks_session_end_on_clear() {
+    let hooks = json::parse(atlas::claude_settings::PLUGIN_HOOKS).unwrap();
+    let groups = hooks["hooks"]["SessionEnd"].as_array().expect("a SessionEnd hook").clone();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["matcher"].as_str(), Some("clear"));
+    let h = &groups[0]["hooks"][0];
+    assert_eq!(h["type"].as_str(), Some("command"));
+    assert!(h["command"].as_str().is_some_and(|c| c.contains("--hook")), "{h}");
+}
+
+// ---- BO-2: what a subagent is given at its start (`recall.subagent_context`)
+
+use atlas::memory::settings::SubagentContext;
+
+/// [`settings`] with the subagent context `mode`.
+fn context_settings(dir: &Path, mode: SubagentContext) -> Settings {
+    let mut s = settings(dir);
+    s.recall.subagent_context = mode;
+    s
+}
+
+/// A stand-in for BO-1's compiler: the lane, then the brief's last line, so
+/// a test can tell whose block an agent was given.
+fn stub_binding() -> atlas::hooks::BindingFn {
+    Box::new(|_, brief, lane| Ok(format!("atlas binding: lane {lane}\n- task: {}\n", brief.lines().last().unwrap_or(""))))
+}
+
+/// A session transcript, its agents' folder and their meta files.
+struct Agents {
+    parent: PathBuf,
+    dir: PathBuf,
+}
+
+impl Agents {
+    fn new(root: &Path) -> Agents {
+        let parent = root.join("proj").join("sess.jsonl");
+        let dir = root.join("proj").join("sess").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&parent, "").unwrap();
+        Agents { parent, dir }
+    }
+
+    fn tp(&self) -> String {
+        self.parent.to_string_lossy().into_owned()
+    }
+
+    /// The transcript of agent `id` (its brief); with `launch`, its meta
+    /// file naming that tool use id.
+    fn agent(&self, id: &str, launch: Option<&str>, brief: &str) {
+        if let Some(t) = launch {
+            std::fs::write(self.dir.join(format!("agent-{id}.meta.json")), json!({"agentType": "general-purpose", "toolUseId": t}).to_string()).unwrap();
+        }
+        std::fs::write(self.dir.join(format!("agent-{id}.jsonl")), format!("{}\n", json!({"type": "user", "message": {"role": "user", "content": brief}}))).unwrap();
+    }
+
+    fn launch(&self, h: &mut Hooks, id: &str, brief: &str) -> atlas::hooks::HookAnswer {
+        self.launch_as(h, id, "general-purpose", brief)
+    }
+
+    /// A launch with `subagent_type` `ty`.
+    fn launch_as(&self, h: &mut Hooks, id: &str, ty: &str, brief: &str) -> atlas::hooks::HookAnswer {
+        let input = json!({"description": "d", "subagent_type": ty, "prompt": brief});
+        h.handle(&HookEvent { tool_name: "Agent".into(), tool_use_id: id.into(), transcript_path: self.tp(), tool_prompt: brief.into(), tool_input: input, ..ev("PreToolUse") })
+    }
+
+    fn start(&self, h: &mut Hooks, id: &str) -> atlas::hooks::HookAnswer {
+        self.start_as(h, id, "general-purpose")
+    }
+
+    /// A SubagentStart whose hook input names `agent_type` `ty`.
+    fn start_as(&self, h: &mut Hooks, id: &str, ty: &str) -> atlas::hooks::HookAnswer {
+        h.handle(&HookEvent { agent_id: id.into(), agent_type: ty.into(), transcript_path: self.tp(), ..ev("SubagentStart") })
+    }
+
+    /// Records in the session transcript that launch `id` was refused at
+    /// the permission prompt, as Claude Code writes it.
+    fn refuse(&self, id: &str) {
+        let r = json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "The user doesn't want to proceed with this tool use. The tool use was rejected.", "is_error": true, "tool_use_id": id}]}});
+        let mut f = std::fs::File::options().append(true).open(&self.parent).unwrap();
+        std::io::Write::write_all(&mut f, format!("{r}\n").as_bytes()).unwrap();
+    }
+
+    fn tool(&self, h: &mut Hooks, id: &str) -> atlas::hooks::HookAnswer {
+        h.handle(&HookEvent { agent_id: id.into(), tool_name: "Bash".into(), transcript_path: self.tp(), ..ev("PreToolUse") })
+    }
+}
+
+const GADGET: &str = "Lane: build-7\nContinue the gadget exporter: it writes with temp files and renames them into place.";
+const GADGET_BLOCK: &str = "atlas binding: lane build-7\n- task: Continue the gadget exporter: it writes with temp files and renames them into place.\n";
+
+/// A `Lane:` brief yields the Binding block only: no lane view, no
+/// pointers, no project lines.
+#[test]
+fn a_binding_subagent_gets_its_lanes_block_only() {
+    let t = Temp::new("bo2-only");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    seed(&s);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(stub_binding()));
+    assert_eq!(a.launch(&mut h, "tA", GADGET), Default::default());
+    a.agent("a1", Some("tA"), GADGET);
+    assert_eq!(a.start(&mut h, "a1").context, GADGET_BLOCK);
+    // Its first tool call adds nothing: the block came at the start.
+    assert_eq!(a.tool(&mut h, "a1").context, "");
+}
+
+/// Two launches of one message each get their own block, whatever order
+/// their agents start in.
+#[test]
+fn two_parallel_binding_launches_each_get_their_own() {
+    let t = Temp::new("bo2-parallel");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(stub_binding()));
+    a.launch(&mut h, "tA", "Lane: ALPHA\nBuild alpha.");
+    a.launch(&mut h, "tB", "Lane: BETA\nBuild beta.");
+    a.agent("b", Some("tB"), "Lane: BETA\nBuild beta.");
+    a.agent("x", Some("tA"), "Lane: ALPHA\nBuild alpha.");
+    assert_eq!(a.start(&mut h, "b").context, "atlas binding: lane BETA\n- task: Build beta.\n");
+    assert_eq!(a.start(&mut h, "x").context, "atlas binding: lane ALPHA\n- task: Build alpha.\n");
+}
+
+/// No launch stashed for the agent (a server restart): its first tool call
+/// carries the block, compiled from its own transcript, once.
+#[test]
+fn a_binding_start_with_no_stashed_launch_is_carried_by_the_first_tool_call() {
+    let t = Temp::new("bo2-carrier");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    seed(&s);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(stub_binding()));
+    a.agent("a1", Some("t-before-restart"), GADGET);
+    assert_eq!(a.start(&mut h, "a1").context, "");
+    assert_eq!(a.tool(&mut h, "a1").context, GADGET_BLOCK);
+    assert_eq!(a.tool(&mut h, "a1").context, "");
+}
+
+/// `off`: nothing from the store, at the start or the first tool call.
+#[test]
+fn off_gives_a_subagent_nothing() {
+    let t = Temp::new("bo2-off");
+    let s = context_settings(t.path(), SubagentContext::Off);
+    seed(&s);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(stub_binding()));
+    a.launch(&mut h, "tA", GADGET);
+    a.agent("a1", Some("tA"), GADGET);
+    assert_eq!(a.start(&mut h, "a1").context, "");
+    assert_eq!(a.tool(&mut h, "a1").context, "");
+    // Nor through the carrier.
+    a.agent("a2", Some("t-unknown"), GADGET);
+    assert_eq!(a.start(&mut h, "a2").context, "");
+    assert_eq!(a.tool(&mut h, "a2").context, "");
+}
+
+/// The whole answer stays under the cap, cut between lines, never inside one.
+#[test]
+fn the_binding_answer_is_cut_at_whole_lines_under_the_cap() {
+    let t = Temp::new("bo2-cap");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    // 1,000 characters a line, 1,994 bytes: the cap counts characters.
+    let line = |i: usize| format!("- L{i:02} {}\n", "\u{e9}".repeat(993));
+    h.set_binding(Some(Box::new(move |_, _, _| Ok((0..20).map(line).collect()))));
+    a.launch(&mut h, "tA", "Lane: ALPHA\nBuild alpha.");
+    a.agent("x", Some("tA"), "Lane: ALPHA\nBuild alpha.");
+    let c = a.start(&mut h, "x").context;
+    assert!(c.chars().count() <= atlas::hooks::SUBAGENT_CONTEXT_CHARS, "{}", c.chars().count());
+    let lines: Vec<&str> = c.lines().collect();
+    assert_eq!(lines.len(), 9, "{} lines", lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        assert_eq!(format!("{l}\n"), line(i));
+    }
+}
+
+/// The lane comes only from a `Lane:` line or an exact upper-case id after
+/// "lane": a brief that only mentions a lower-case lane or the word
+/// "session" compiles nothing.
+#[test]
+fn a_binding_lane_comes_only_from_a_declared_lane() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let t = Temp::new("bo2-lane");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    seed(&s);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c2 = calls.clone();
+    h.set_binding(Some(Box::new(move |_, _, lane| {
+        c2.fetch_add(1, Ordering::SeqCst);
+        Ok(format!("atlas binding: lane {lane}\n"))
+    })));
+    let loose = "Fix the session lane bug the build-7 work found in the gadget exporter.";
+    a.launch(&mut h, "tA", loose);
+    a.agent("x", Some("tA"), loose);
+    assert_eq!(a.start(&mut h, "x").context, "");
+    assert_eq!(a.tool(&mut h, "x").context, "");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let id = "Journal under lane ALPHA when done.";
+    a.launch(&mut h, "tB", id);
+    a.agent("y", Some("tB"), id);
+    assert_eq!(a.start(&mut h, "y").context, "atlas binding: lane ALPHA\n");
+}
+
+/// `recall` given explicitly is today's answer, byte for byte.
+#[test]
+fn recall_mode_given_explicitly_is_todays_answer() {
+    let t = Temp::new("bo2-recall");
+    let s = settings(t.path());
+    seed(&s);
+    let mut today = Hooks::open(s.clone()).unwrap();
+    let mut explicit = Hooks::open(context_settings(t.path(), SubagentContext::Recall)).unwrap();
+    explicit.set_binding(Some(stub_binding()));
+    for (h, sid) in [(&mut today, "s1"), (&mut explicit, "s9")] {
+        h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: GADGET.into(), session_id: sid.into(), ..ev("PreToolUse") });
+    }
+    let x = today.handle(&HookEvent { agent_id: "a1".into(), agent_type: "general-purpose".into(), ..ev("SubagentStart") });
+    let y = explicit.handle(&HookEvent { agent_id: "a9".into(), agent_type: "general-purpose".into(), session_id: "s9".into(), ..ev("SubagentStart") });
+    assert!(x.context.contains("lane build-7"), "{}", x.context);
+    assert_eq!(x, y);
+}
+
+/// The config reads every mode and refuses an unknown one.
+#[test]
+fn subagent_context_is_read_from_the_config() {
+    let t = Temp::new("bo2-config");
+    let read = |v: &str| atlas::config::Config::parse(&format!(r#"{{"recall": {{"subagent_context": {v}, "main_lane_bytes": 2048}}}}"#), t.path());
+    for (v, m) in [("\"recall\"", SubagentContext::Recall), ("\"binding\"", SubagentContext::Binding), ("\"off\"", SubagentContext::Off)] {
+        let r = read(v).unwrap().recall.unwrap();
+        assert_eq!((r.subagent_context, r.main_lane_bytes), (Some(m), Some(2048)));
+    }
+    assert!(read("\"lanes\"").is_err());
+    let d = settings(t.path());
+    assert_eq!((d.recall.subagent_context, d.recall.main_lane_bytes), (SubagentContext::Recall, 0));
+}
+
+/// Seeds lane `lane` with `n` decisions of long bodies.
+fn long_lane(s: &Settings, lane: &str, n: usize) {
+    let mut store = MemoryStore::open(&s.store).unwrap();
+    let mut w = store.writer().unwrap();
+    for i in 1..=n {
+        let body = format!("Decision {i} of {lane}: {}\n", "the widget exporter keeps its temp files beside the target. ".repeat(8));
+        let d = Draft { title: format!("decision {i}"), body, reason: "hook test".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+        w.create(&format!("journal:{lane}:{i:04}"), "journal", "decision", lane, &d, None).unwrap();
+    }
+    w.commit().unwrap();
+}
+
+/// Q2: with `main_lane_bytes`, a main-session prompt gets one lane view
+/// (its `Lane:` lane) under the cap, and a head line for each other lane it
+/// names; 0 keeps every view.
+#[test]
+fn a_main_prompt_gets_one_capped_lane_view_and_heads_for_the_rest() {
+    let t = Temp::new("bo2-main-cap");
+    let mut s = settings(t.path());
+    long_lane(&s, "ALPHA", 12);
+    long_lane(&s, "BETA", 3);
+    let prompt = "Lane: ALPHA\nCompare it with what BETA decided.";
+    let today = Hooks::open(s.clone()).unwrap().handle(&HookEvent { prompt: prompt.into(), ..ev("UserPromptSubmit") }).context;
+    assert!(today.contains("lane ALPHA: 12 entries\n") && today.contains("lane BETA: 3 entries\n# decisions"), "{today}");
+    s.recall.main_lane_bytes = 2048;
+    let c = Hooks::open(s).unwrap().handle(&HookEvent { prompt: prompt.into(), session_id: "s2".into(), ..ev("UserPromptSubmit") }).context;
+    let alpha = &c[c.find("lane ALPHA").expect("ALPHA's view")..];
+    let alpha = &alpha[..alpha.find("lane BETA").unwrap_or(alpha.len())];
+    assert!(alpha.len() <= 2048 + 160, "{} bytes: {alpha}", alpha.len());
+    assert!(alpha.contains("# decisions"), "{alpha}");
+    assert!(c.contains("lane BETA: 3 entries, 0 open; recall lane=BETA\n") && !c.contains("lane BETA: 3 entries\n"), "{c}");
+}
+
+// ---- #188 review: the harness order (start, then the meta file, then the
+// first tool call; journal:ATLAS-HOOK-VALUE:0006)
+
+/// One launch waiting: its agent is answered at its start, before its meta
+/// file exists, with what a start that read the meta file gets, in the
+/// default `recall` mode and in `binding`; its first tool call adds nothing.
+#[test]
+fn one_launch_is_answered_at_its_start_in_the_real_order() {
+    for (mode, name) in [(SubagentContext::Recall, "recall"), (SubagentContext::Binding, "binding")] {
+        let t = Temp::new(&format!("bo2-real-one-{name}"));
+        let s = context_settings(t.path(), mode);
+        seed(&s);
+        let a = Agents::new(t.path());
+        let mut real = Hooks::open(s.clone()).unwrap();
+        real.set_binding(Some(stub_binding()));
+        a.launch(&mut real, "tA", GADGET);
+        let at_start = a.start(&mut real, "a1");
+        a.agent("a1", Some("tA"), GADGET);
+        assert_eq!(a.tool(&mut real, "a1").context, "", "{name}");
+        // The meta file written first: the answer a start that reads it gets.
+        let mut early = Hooks::open(s).unwrap();
+        early.set_binding(Some(stub_binding()));
+        a.launch(&mut early, "tE", GADGET);
+        a.agent("e1", Some("tE"), GADGET);
+        let read = a.start(&mut early, "e1");
+        assert_eq!(at_start.context, read.context, "{name}");
+        match mode {
+            SubagentContext::Binding => assert_eq!(at_start.context, GADGET_BLOCK),
+            _ => assert!(at_start.context.contains("lane build-7"), "{name}: {}", at_start.context),
+        }
+    }
+}
+
+/// Two launches of one type: each start is ambiguous, so each agent is
+/// answered at its first tool call by its meta file. Once one agent's meta
+/// file names its launch, the next start is unambiguous again.
+#[test]
+fn two_parallel_launches_of_one_type_are_matched_by_their_meta_files() {
+    let t = Temp::new("bo2-real-same-type");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(stub_binding()));
+    a.launch(&mut h, "tA", "Lane: ALPHA\nBuild alpha.");
+    a.launch(&mut h, "tB", "Lane: BETA\nBuild beta.");
+    assert_eq!(a.start(&mut h, "x").context, "");
+    assert_eq!(a.start(&mut h, "y").context, "");
+    a.agent("y", Some("tB"), "Lane: BETA\nBuild beta.");
+    a.agent("x", Some("tA"), "Lane: ALPHA\nBuild alpha.");
+    assert_eq!(a.tool(&mut h, "y").context, "atlas binding: lane BETA\n- task: Build beta.\n");
+    assert_eq!(a.tool(&mut h, "x").context, "atlas binding: lane ALPHA\n- task: Build alpha.\n");
+    assert_eq!(a.tool(&mut h, "x").context, "");
+    assert_eq!(a.tool(&mut h, "y").context, "");
+    // The first agent's meta file is written before the second starts: the
+    // second's launch is the only one left, so it is answered at its start.
+    a.launch(&mut h, "tC", "Lane: GAMMA\nBuild gamma.");
+    a.launch(&mut h, "tD", "Lane: DELTA\nBuild delta.");
+    assert_eq!(a.start(&mut h, "p").context, "");
+    a.agent("p", Some("tC"), "Lane: GAMMA\nBuild gamma.");
+    assert_eq!(a.start(&mut h, "q").context, "atlas binding: lane DELTA\n- task: Build delta.\n");
+    a.agent("q", Some("tD"), "Lane: DELTA\nBuild delta.");
+    assert_eq!(a.tool(&mut h, "q").context, "");
+    assert_eq!(a.tool(&mut h, "p").context, "atlas binding: lane GAMMA\n- task: Build gamma.\n");
+}
+
+/// Two launches of different types: the hook's `agent_type` names the one
+/// launch of that type, so each agent is answered at its start.
+#[test]
+fn two_parallel_launches_of_different_types_are_answered_at_their_starts() {
+    let t = Temp::new("bo2-real-two-types");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(stub_binding()));
+    a.launch_as(&mut h, "tA", "builder", "Lane: ALPHA\nBuild alpha.");
+    a.launch_as(&mut h, "tB", "reviewer", "Lane: BETA\nReview beta.");
+    assert_eq!(a.start_as(&mut h, "y", "reviewer").context, "atlas binding: lane BETA\n- task: Review beta.\n");
+    assert_eq!(a.start_as(&mut h, "x", "builder").context, "atlas binding: lane ALPHA\n- task: Build alpha.\n");
+    a.agent("x", Some("tA"), "Lane: ALPHA\nBuild alpha.");
+    a.agent("y", Some("tB"), "Lane: BETA\nReview beta.");
+    assert_eq!(a.tool(&mut h, "x").context, "");
+    assert_eq!(a.tool(&mut h, "y").context, "");
+}
+
+/// A launch refused at the permission prompt beside a real one of the same
+/// type: the start is ambiguous until the refusal is in the session
+/// transcript, and the refused launch's block reaches no one either way.
+#[test]
+fn a_refused_launch_beside_a_real_one_never_answers_the_real_agent() {
+    let t = Temp::new("bo2-real-refused");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(stub_binding()));
+    // The refusal is not written yet: the start waits for the meta file.
+    a.launch(&mut h, "tG", "Lane: GHOST\nBuild the ghost.");
+    a.launch(&mut h, "tR", "Lane: REAL\nBuild it.");
+    assert_eq!(a.start(&mut h, "r").context, "");
+    a.agent("r", Some("tR"), "Lane: REAL\nBuild it.");
+    assert_eq!(a.tool(&mut h, "r").context, "atlas binding: lane REAL\n- task: Build it.\n");
+    // The refusal is written: the next real launch is the only one left.
+    a.refuse("tG");
+    a.launch(&mut h, "tS", "Lane: SECOND\nBuild more.");
+    assert_eq!(a.start(&mut h, "r2").context, "atlas binding: lane SECOND\n- task: Build more.\n");
+    a.agent("r2", Some("tS"), "Lane: SECOND\nBuild more.");
+    assert_eq!(a.tool(&mut h, "r2").context, "");
+}
+
+/// A start that guessed wrong (one launch waiting, but the agent is another
+/// launch's) is corrected at the agent's first tool call: it is told plainly
+/// that the start's context was for another launch and given its own, and
+/// the launch it was wrongly given goes back to the queue for its own agent.
+#[test]
+fn a_wrong_guess_at_the_start_is_corrected_at_the_first_tool_call() {
+    let t = Temp::new("bo2-real-wrong");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(stub_binding()));
+    let alpha = "atlas binding: lane ALPHA\n- task: Build alpha.\n";
+    let beta = "atlas binding: lane BETA\n- task: Build beta.\n";
+    // Agent b's launch (tB) was let through before a restart: only tA waits.
+    a.launch(&mut h, "tA", "Lane: ALPHA\nBuild alpha.");
+    assert_eq!(a.start(&mut h, "b").context, alpha);
+    a.agent("b", Some("tB"), "Lane: BETA\nBuild beta.");
+    // b's meta file is written before a starts: tA is a's again.
+    assert_eq!(a.start(&mut h, "a").context, alpha);
+    a.agent("a", Some("tA"), "Lane: ALPHA\nBuild alpha.");
+    assert_eq!(a.tool(&mut h, "a").context, "");
+    let c = a.tool(&mut h, "b").context;
+    assert!(c.starts_with("atlas: correction:") && c.contains("for another launch"), "{c}");
+    assert!(c.ends_with(beta) && !c.contains("ALPHA"), "{c}");
+    assert_eq!(a.tool(&mut h, "b").context, "");
+    // d's meta file comes after c starts: c waits, and gets tC at its first
+    // tool call once d's correction has given it back.
+    a.launch(&mut h, "tC", "Lane: GAMMA\nBuild gamma.");
+    assert_eq!(a.start(&mut h, "d").context, "atlas binding: lane GAMMA\n- task: Build gamma.\n");
+    assert_eq!(a.start(&mut h, "c").context, "");
+    a.agent("d", Some("tD"), "Lane: DELTA\nBuild delta.");
+    a.agent("c", Some("tC"), "Lane: GAMMA\nBuild gamma.");
+    let d = a.tool(&mut h, "d").context;
+    assert!(d.starts_with("atlas: correction:") && d.ends_with("atlas binding: lane DELTA\n- task: Build delta.\n"), "{d}");
+    assert_eq!(a.tool(&mut h, "c").context, "atlas binding: lane GAMMA\n- task: Build gamma.\n");
+}
+
+/// N3': `"binding"` with no compiler set is told at setup.
+#[test]
+fn binding_with_no_compiler_is_warned_at_setup() {
+    let t = Temp::new("bo2-warn");
+    let mut h = Hooks::open(context_settings(t.path(), SubagentContext::Binding)).unwrap();
+    assert!(h.binding_warning().is_some_and(|w| w.contains("binding")), "{:?}", h.binding_warning());
+    h.set_binding(Some(stub_binding()));
+    assert_eq!(h.binding_warning(), None);
+    assert_eq!(Hooks::open(context_settings(t.path(), SubagentContext::Recall)).unwrap().binding_warning(), None);
+}
+
+/// BO-1 wiring: the compiler the server sets is `binding::compile`, so a
+/// binding start is given exactly the block it compiles for the lane.
+#[test]
+fn the_server_s_binding_compiler_is_binding_compile() {
+    let t = Temp::new("bo2-bo1-wired");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    long_lane(&s, "ALPHA", 3);
+    let brief = "Lane: ALPHA
+Build alpha.";
+    let want = atlas::binding::compile(&MemoryStore::open(&s.store).unwrap(), brief, "ALPHA").unwrap().expect("a block for ALPHA").text;
+    assert!(want.contains("journal:ALPHA:"), "{want}");
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    h.set_binding(Some(atlas::hooks::binding_compiler()));
+    assert_eq!(h.binding_warning(), None);
+    a.launch(&mut h, "tA", brief);
+    assert_eq!(a.start(&mut h, "x").context, want);
+}
+
+/// A PR review lands while a session lives: the next main-session event
+/// that reaches the model carries one line, without the review text; the
+/// same event again, or a subagent's, carries none.
+#[test]
+fn a_pr_review_reaches_the_session_at_its_next_turn_once() {
+    use atlas::pr_events::{record, Action, Event, DEFAULT_LANE};
+    use atlas::queue::{add_planned, Planned};
+    let t = Temp::new("hook-pr-events");
+    let s = settings(t.path());
+    seed(&s);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    // The session's first event starts it at the store's newest record.
+    h.handle(&HookEvent { source: "startup".into(), ..ev("SessionStart") });
+    let mut store = MemoryStore::open(&s.store).unwrap();
+    let item = add_planned(
+        &mut store,
+        &Planned {
+            lane: "build-7".into(),
+            kind: "builder".into(),
+            title: "merge PR #12".into(),
+            after: vec!["review pr#12".into()],
+            ..Planned::default()
+        },
+    )
+    .unwrap();
+    let review = Event {
+        action: Action::Reviewed,
+        repo: "octo-org/widgets".into(),
+        pr: 12,
+        head: "6e828cc".into(),
+        state: "APPROVED".into(),
+        author: "octo-reviewer".into(),
+        text: "secret plan: run rm -rf".into(),
+    };
+    let filed = record(&mut store, &review, &["octo-org/widgets".to_string()], DEFAULT_LANE).unwrap();
+    let post = || HookEvent {
+        event: "PostToolUse".into(),
+        session_id: "s1".into(),
+        tool_name: "Bash".into(),
+        tool_input: json!({"command": "ls"}),
+        tool_response: json!({"stdout": "x"}),
+        ..HookEvent::default()
+    };
+    // A subagent's event is not the session's turn.
+    let sub = h.handle(&HookEvent { agent_id: "a1".into(), ..post() });
+    assert!(!sub.context.contains("atlas pr-events"), "{}", sub.context);
+    let a = h.handle(&post());
+    let want = format!("atlas pr-events: PR #12 (octo-org/widgets) reviewed: approved, by octo-reviewer, lane build-7, waiting: {item} (review pr#12, now met); event {}", filed.key);
+    assert!(a.context.contains(&want), "{}", a.context);
+    assert!(!a.context.contains("secret plan") && !a.context.contains("rm -rf"), "{}", a.context);
+    let again = h.handle(&post());
+    assert!(!again.context.contains("atlas pr-events"), "{}", again.context);
+    // A new session is told what lands after it starts, not the history.
+    let other = h.handle(&HookEvent { session_id: "s2".into(), ..post() });
+    assert!(!other.context.contains("atlas pr-events"), "{}", other.context);
 }

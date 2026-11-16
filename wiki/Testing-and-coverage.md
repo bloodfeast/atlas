@@ -9,11 +9,37 @@ every write tool, freshness (`off`, `check`, `auto`, removal, a new name re-read
 surviving a deleted database, the recall check (passing, matching an independent regex scan, and failing when
 an index row is removed), and the binary serving from a config. Tests build their own corpus in a temp folder.
 
-On Linux, in any image with a Rust toolchain:
+On Linux from any machine with Docker (Docker Desktop on Windows and macOS), the public CI's Linux checks on the
+checkout:
 
 ```sh
-docker run --rm -v "$PWD:/src:ro" rust:1 bash -c "cp -r /src /work && cd /work && CARGO_TARGET_DIR=/tmp/t cargo test -j 4"
+cargo xtask linux-test               # cargo test --workspace --locked --no-fail-fast --release, then both clippy runs
+cargo xtask linux-test --debug       # the tests in the dev profile (a faster build, not what the public CI runs)
+cargo xtask linux-test -- NAME       # only the tests matching NAME (clippy still runs; --no-clippy skips it)
+cargo xtask linux-test --clean       # remove this checkout's Linux build volume
+cargo xtask linux-test --clean --all # and the Cargo home every checkout shares
 ```
+
+Commit first. It tests the working tree as it is, edits that are not committed included, while the pull request
+carries only what is committed; a result quoted for a pull request is a run on its clean head.
+
+It runs in the official `rust:<channel>` image for the toolchain `rust-toolchain.toml` pins, with the pinned clippy
+added (a local image built on the first run), at 4 CPUs and `CARGO_BUILD_JOBS=4`. The checkout is mounted
+read-only. `CARGO_HOME` is one named Docker volume every checkout shares, Cargo's package-cache lock with it, so two
+runs at once from two checkouts take turns on the download as two cargo processes on one machine do; the Linux
+build lives in a named volume per checkout, so the second run is incremental and the host's `target` folder is never
+touched. A linked git worktree gets its repository's git folder mounted read-only too, so the tests that read the
+checkout's git history work. The first run pulls the image and builds everything in release (about 10 minutes at 4
+CPUs); later runs rebuild only what changed, and the release test run itself takes about 6.5 minutes. Every step
+runs, `cargo test` goes on past a failing test binary (`--no-fail-fast`, unlike the public CI, so one run names every
+failure), the last line sums them up (`linux-test: PASS in 396s; test ok (1473 passed, 0 failed) 394s; clippy
+all-targets dev ok 1s; clippy default ok 0s`), and the exit code is non-zero when any failed. It is the gate before
+every pull request (see [[Releasing]]): a Windows or macOS machine never compiles the `cfg(target_os = "linux")`
+code, and the development repository's CI does not run the tests.
+
+One gap is left: a checkout made on Windows has no executable bits, and Docker Desktop shows every file of the
+mount as mode 777, executable, so a script whose mode in git is wrong (a `scripts/` file committed without `+x`,
+say) passes here and fails on Linux. `git ls-files -s scripts` shows each file's mode; `100755` is executable.
 
 `cargo test --features dev` adds the measuring modes and their tests; the tier reported for a change runs with it.
 
@@ -75,5 +101,6 @@ Development tasks are `cargo xtask <command>`, in Rust, in the `xtask` workspace
 | `langs-bench` | a code index language's numbers on a pinned public corpus (see [[Code index]]) |
 | `release` | the release, its notes and the wiki (see [[Releasing]]) |
 | `verify-macos` | the whole suite, the recall check and the bench on macOS, to paste back |
+| `linux-test` | the public CI's Linux tests and clippy runs in a Docker container, the gate before a pull request |
 
 The one shell script left is `scripts/launcher.sh`, the release's `bin/atlas` launcher.

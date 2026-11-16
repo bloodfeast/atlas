@@ -44,13 +44,82 @@ impl ReviewSettings {
     }
 }
 
+/// A repo as the gate compares it: lowercase `owner/repo` (or `repo` when
+/// only a name is given). A scheme, a host (`github.com/`,
+/// `git@github.com:`), a trailing `.git` or `/` and a PR URL's `/pull/N`
+/// tail are dropped. `None` when empty, or when it lists several (a comma).
+pub fn repo_name(s: &str) -> Option<String> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.contains(',') {
+        return None;
+    }
+    let s = s.split_once("://").map_or(s.as_str(), |(_, r)| r);
+    let s = s.split("/pull/").next().unwrap_or("");
+    // `git@host:owner/repo`: the host ends at the colon.
+    let s = s.split_once('@').map_or(s, |(_, r)| r).replacen(':', "/", 1);
+    let parts: Vec<&str> = s.split('/').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let name = parts[parts.len().saturating_sub(2)..].join("/");
+    let name = name.strip_suffix(".git").unwrap_or(&name);
+    Some(name.to_string()).filter(|n| !n.is_empty())
+}
+
+/// The repos a free-text `repo:` line names (`api, react`), each read by
+/// [`repo_name`].
+fn repo_names(line: &str) -> Vec<String> {
+    line.split(',').filter_map(repo_name).collect()
+}
+
+/// A PR as a review or a merge names it: its number and, when named, its
+/// repo (`repo` or `owner/repo`, lowercased). An unqualified PR (every
+/// review filed before #183) names no repo and matches that number in any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pr {
+    /// The repo, when named.
+    pub repo: Option<String>,
+    /// The PR number.
+    pub number: u64,
+}
+
+impl Pr {
+    /// Reads `N`, `#N`, `repo#N`, `owner/repo#N` or a PR's URL, with the
+    /// repo in any form [`repo_name`] reads; `repo` (a `repo:` meta line or
+    /// a `--repo`) is the repo of one that names none.
+    pub fn parse(s: &str, repo: Option<&str>) -> Option<Pr> {
+        let s = s.trim();
+        let (r, n) = match s.split_once("/pull/") {
+            Some((base, tail)) => (base, tail.split(['/', '#', '?']).next().unwrap_or("")),
+            None => s.rsplit_once('#').unwrap_or(("", s)),
+        };
+        let number = n.trim().parse().ok()?;
+        Some(Pr { repo: repo_name(r).or_else(|| repo.and_then(repo_name)), number })
+    }
+
+    /// Whether two name the same PR: the same number, and the same repo when
+    /// both name one (the owner counts only when both give it).
+    pub fn same(&self, o: &Pr) -> bool {
+        let name = |r: &str| r.rsplit('/').next().unwrap_or("").to_string();
+        self.number == o.number
+            && match (&self.repo, &o.repo) {
+                (Some(a), Some(b)) if a.contains('/') && b.contains('/') => a == b,
+                (Some(a), Some(b)) => name(a) == name(b),
+                _ => true,
+            }
+    }
+}
+
+impl std::fmt::Display for Pr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.repo.as_deref().unwrap_or(""), self.number)
+    }
+}
+
 /// One filed review, read from its meta.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Review {
     /// The roles it speaks for, lowercased.
     pub roles: Vec<String>,
     /// The PRs it read.
-    pub prs: Vec<u64>,
+    pub prs: Vec<Pr>,
     /// The heads it read (7 or more hex digits, lowercased).
     pub heads: Vec<String>,
     /// Each verdict part: the role it names (`None`: every role), and
@@ -93,11 +162,17 @@ pub fn verdicts_known(meta: &str) -> bool {
 
 impl Review {
     /// Reads a review from its meta: `role:` (or `review:`), `pr:`,
-    /// `head:` and `verdict:` lines, each required. `None` when one is
-    /// missing or names nothing usable.
+    /// `head:` and `verdict:` lines, each required, and an optional `repo:`
+    /// for the PRs that name none. `None` when one is missing or names
+    /// nothing usable ([`Review::problem`] says which).
     pub fn parse(meta: &str) -> Option<Review> {
         let roles: Vec<String> = items(meta_value(meta, "role").or_else(|| meta_value(meta, "review"))?).collect();
-        let prs: Vec<u64> = items(meta_value(meta, "pr")?).filter_map(|p| p.trim_start_matches('#').parse().ok()).collect();
+        // A `repo:` line names the repo of each bare `pr:`; an old free-text
+        // one that lists several (`api, react`) names each.
+        let repos = meta_value(meta, "repo").map(repo_names).unwrap_or_default();
+        let with: Vec<Option<&str>> = if repos.is_empty() { vec![None] } else { repos.iter().map(|r| Some(r.as_str())).collect() };
+        let mut prs: Vec<Pr> = items(meta_value(meta, "pr")?).flat_map(|p| with.iter().filter_map(|r| Pr::parse(&p, *r)).collect::<Vec<_>>()).collect();
+        prs.dedup();
         let heads: Vec<String> = items(meta_value(meta, "head")?).filter(|h| h.len() >= 7 && h.bytes().all(|b| b.is_ascii_hexdigit())).collect();
         let verdicts: Vec<(Option<String>, bool)> = items(meta_value(meta, "verdict")?)
             .map(|part| match (part.rfind('('), part.ends_with(')')) {
@@ -114,10 +189,28 @@ impl Review {
         Some(Review { roles, prs, heads, verdicts })
     }
 
+    /// The first meta line a review entry lacks or cannot use, named for
+    /// the refusal; `None` when [`Review::parse`] reads it.
+    pub fn problem(meta: &str) -> Option<&'static str> {
+        if Review::parse(meta).is_some() {
+            return None;
+        }
+        let has = |k: &str, ok: &dyn Fn(&str) -> bool| meta_value(meta, k).is_some_and(|v| items(v).any(|x| ok(&x)));
+        Some(if !has("role", &|_| true) && !has("review", &|_| true) {
+            "`role:` is missing"
+        } else if !has("pr", &|p| Pr::parse(p, None).is_some()) {
+            "`pr:` names no PR (it takes N, #N, repo#N or owner/repo#N)"
+        } else if !has("head", &|h| h.len() >= 7 && h.bytes().all(|b| b.is_ascii_hexdigit())) {
+            "`head:` names no sha of 7 or more hex digits"
+        } else {
+            "`verdict:` is missing"
+        })
+    }
+
     /// Whether it read this PR at this head (a listed head is a prefix of
     /// the full sha).
-    pub fn reads(&self, pr: u64, head: &str) -> bool {
-        self.prs.contains(&pr) && self.heads.iter().any(|h| head.starts_with(h.as_str()))
+    pub fn reads(&self, pr: &Pr, head: &str) -> bool {
+        self.prs.iter().any(|p| p.same(pr)) && self.heads.iter().any(|h| head.starts_with(h.as_str()))
     }
 
     /// Its verdict for one role: the parts that name the role, else the
@@ -137,14 +230,14 @@ impl Review {
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn reviews(store: &MemoryStore, pr: u64) -> Result<Vec<Review>> {
-    Ok(store.review_metas()?.into_iter().filter_map(|(_, m)| Review::parse(&m)).filter(|r| r.prs.contains(&pr)).collect())
+pub fn reviews(store: &MemoryStore, pr: &Pr) -> Result<Vec<Review>> {
+    Ok(store.review_metas()?.into_iter().filter_map(|(_, m)| Review::parse(&m)).filter(|r| r.prs.iter().any(|p| p.same(pr))).collect())
 }
 
 /// What each role still needs before PR `pr` merges at `head`: empty when
 /// every role has a passing review of that head and none asks for
 /// changes on it.
-pub fn missing(roles: &[String], reviews: &[Review], pr: u64, head: &str) -> Vec<String> {
+pub fn missing(roles: &[String], reviews: &[Review], pr: &Pr, head: &str) -> Vec<String> {
     let short = head.get(..7).unwrap_or(head);
     roles
         .iter()
@@ -273,14 +366,15 @@ pub fn merges(command: &str) -> Vec<Merge> {
     out
 }
 
-/// A PR's number and head sha, or why they could not be read.
-pub type HeadResult = std::result::Result<(u64, String), String>;
+/// A PR (with its repo when gh names it) and its head sha, or why they
+/// could not be read.
+pub type HeadResult = std::result::Result<(Pr, String), String>;
 
 /// How long the gate waits for `gh pr view`.
 const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The PR's number and head sha from `gh pr view --json number,headRefOid`,
-/// run in `cwd`.
+/// The PR's number, repo and head sha from `gh pr view --json
+/// number,headRefOid,url`, run in `cwd`.
 ///
 /// # Errors
 ///
@@ -294,7 +388,7 @@ pub fn gh_head(m: &Merge, cwd: &str) -> HeadResult {
     if let Some(r) = &m.repo {
         c.args(["--repo", r]);
     }
-    c.args(["--json", "number,headRefOid"]);
+    c.args(["--json", "number,headRefOid,url"]);
     if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
         c.current_dir(cwd);
     }
@@ -322,8 +416,10 @@ pub fn gh_head(m: &Merge, cwd: &str) -> HeadResult {
     let v = crate::json::parse(&String::from_utf8_lossy(&out.stdout)).map_err(|e| format!("gh pr view: {e}"))?;
     let number = v.get("number").and_then(Value::as_u64);
     let head = v.get("headRefOid").and_then(Value::as_str).map(str::to_ascii_lowercase);
+    // `https://github.com/OWNER/REPO/pull/N`: the repo the PR is in.
+    let repo = v.get("url").and_then(Value::as_str).and_then(repo_name);
     match (number, head) {
-        (Some(n), Some(h)) if h.len() >= 7 => Ok((n, h)),
+        (Some(n), Some(h)) if h.len() >= 7 => Ok((Pr { repo: repo.or_else(|| m.repo.as_deref().and_then(repo_name)), number: n }, h)),
         _ => Err("gh pr view: no number and headRefOid in its answer".into()),
     }
 }
@@ -354,12 +450,19 @@ pub fn gate(store: &MemoryStore, s: &ReviewSettings, command: &str, head_of: &dy
         // that review whatever its head: say so without asking gh (about
         // half a second), the likeliest denial. The reviews read here are
         // kept for the head check when gh names the same PR.
-        let mut read: Option<(u64, Vec<Review>)> = None;
-        if let Some(pr) = m.selector.as_deref().and_then(|x| x.trim_start_matches('#').parse::<u64>().ok()) {
-            let rs = reviews(store, pr)?;
+        // A `--repo` names its repo; without one, every repo's reviews of
+        // the number count here, and gh's answer narrows them below.
+        if let Some(r) = m.repo.as_deref().filter(|r| r.contains(',')) {
+            lines.push(format!("--repo {r} names several repos; name one"));
+            continue;
+        }
+        let mut read: Option<(Pr, Vec<Review>)> = None;
+        if let Some(number) = m.selector.as_deref().and_then(|x| x.trim_start_matches('#').parse::<u64>().ok()) {
+            let pr = Pr { repo: m.repo.as_deref().and_then(repo_name), number };
+            let rs = reviews(store, &pr)?;
             let unread: Vec<String> = s.roles.iter().filter(|role| !rs.iter().any(|r| r.verdict(role).is_some())).map(|role| format!("{role} review")).collect();
             if !unread.is_empty() {
-                lines.push(format!("PR #{pr} is missing: {}", unread.join("; ")));
+                lines.push(format!("PR {pr} is missing: {}", unread.join("; ")));
                 continue;
             }
             read = Some((pr, rs));
@@ -367,13 +470,15 @@ pub fn gate(store: &MemoryStore, s: &ReviewSettings, command: &str, head_of: &dy
         match head_of(&m) {
             Err(e) => lines.push(format!("the PR {} merges cannot be checked ({e})", m.selector.as_deref().unwrap_or("this branch"))),
             Ok((pr, head)) => {
+                // Reviews read for the same PR (or for its number in any
+                // repo) are a superset; `missing` keeps this repo's.
                 let rs = match read {
-                    Some((p, rs)) if p == pr => rs,
-                    _ => reviews(store, pr)?,
+                    Some((p, rs)) if p.same(&pr) => rs,
+                    _ => reviews(store, &pr)?,
                 };
-                let need = missing(&s.roles, &rs, pr, &head);
+                let need = missing(&s.roles, &rs, &pr, &head);
                 if !need.is_empty() {
-                    lines.push(format!("PR #{pr} is missing: {}", need.join("; ")));
+                    lines.push(format!("PR {pr} is missing: {}", need.join("; ")));
                 }
             }
         }
@@ -384,7 +489,7 @@ pub fn gate(store: &MemoryStore, s: &ReviewSettings, command: &str, head_of: &dy
     let deny = s.mode == Mode::Enforced;
     let (last, rest) = VERDICTS.split_last().unwrap_or((&"", &[]));
     let message = format!(
-        "atlas reviews: {}{}. File each review as a journal entry: entry `review`, meta lines `role:`, `pr:`, `head:` (the sha it read), `verdict:` ({} or {last}) and `report:`.",
+        "atlas reviews: {}{}. File each review as a journal entry: entry `review`, meta lines `role:`, `pr:` (N or repo#N), `head:` (the sha it read), `verdict:` ({} or {last}) and `report:`.",
         if deny { "merge denied. " } else { "do not merge yet. " },
         lines.join(". "),
         rest.join(", ")
@@ -422,7 +527,7 @@ mod tests {
     #[test]
     fn both_review_forms_are_read() {
         let r = Review::parse("role: cost\npr: 99\nhead: 6E828CC\nverdict: merge with follow-ups\nreport: x.md").unwrap();
-        assert_eq!((r.roles.as_slice(), r.prs.as_slice(), r.heads.as_slice()), (&["cost".to_string()][..], &[99][..], &["6e828cc".to_string()][..]));
+        assert_eq!((r.roles.as_slice(), r.prs.as_slice(), r.heads.as_slice()), (&["cost".to_string()][..], &[pr(99)][..], &["6e828cc".to_string()][..]));
         assert_eq!(r.verdict("cost"), Some(true));
         assert_eq!(r.verdict("simplicity"), None);
         // A note as filed before the kind existed: one verdict per role.
@@ -430,7 +535,7 @@ mod tests {
         assert_eq!((n.verdict("simplicity"), n.verdict("cost")), (Some(false), Some(true)));
         // A parenthesis that names no role applies to every role.
         let b = Review::parse("review: simplicity, cost\npr: 368, 371\nhead: 9028fabd, b0af1526\nverdict: pass-with-fixes (both)").unwrap();
-        assert!(b.reads(371, "b0af1526ffff") && b.reads(368, "9028fabd00") && !b.reads(370, "9028fabd00"));
+        assert!(b.reads(&pr(371), "b0af1526ffff") && b.reads(&pr(368), "9028fabd00") && !b.reads(&pr(370), "9028fabd00"));
         assert_eq!(b.verdict("cost"), Some(true));
         // A review entry gives one of the known verdicts; legacy notes are
         // read loosely.
@@ -445,20 +550,86 @@ mod tests {
         assert!(Review::parse("role: cost\npr: 9\nhead: abc\nverdict: pass").is_none());
     }
 
+    fn pr(n: u64) -> Pr {
+        Pr { repo: None, number: n }
+    }
+
+    fn pr_in(repo: &str, n: u64) -> Pr {
+        Pr { repo: Some(repo.into()), number: n }
+    }
+
+    /// #183: `pr:` takes `N`, `#N`, `repo#N` and `owner/repo#N`.
+    #[test]
+    fn repo_qualified_prs_are_read() {
+        for pr in ["386", "#386", "es-modern-contracts#386", "bwhite/es-modern-contracts#386", "Bwhite/ES-Modern-Contracts#386"] {
+            let r = Review::parse(&format!("role: taste\npr: {pr}\nhead: b4baa646\nverdict: merge with follow-ups")).unwrap_or_else(|| panic!("{pr}"));
+            assert_eq!(r.verdict("taste"), Some(true), "{pr}");
+        }
+        assert!(Review::parse("role: taste\npr: es-modern-contracts#\nhead: b4baa646\nverdict: pass").is_none());
+        assert!(Review::parse("role: taste\npr: es-modern-contracts\nhead: b4baa646\nverdict: pass").is_none());
+        // The refusal names the field.
+        assert_eq!(Review::problem("role: taste\npr: es-modern-contracts\nhead: b4baa646\nverdict: pass"), Some("`pr:` names no PR (it takes N, #N, repo#N or owner/repo#N)"));
+        assert_eq!(Review::problem("role: taste\npr: 3\nhead: b4\nverdict: pass"), Some("`head:` names no sha of 7 or more hex digits"));
+        assert_eq!(Review::problem("role: taste\npr: a#3\nhead: b4baa646\nverdict: pass"), None);
+    }
+
+    /// #183: PRs are keyed by repo and number, so one number in two repos
+    /// does not collide; an unqualified one (an old record) still reads.
+    #[test]
+    fn one_pr_number_in_two_repos_does_not_collide() {
+        let head = "b4baa646ffff";
+        let api = Review::parse("role: cost\npr: api#784\nhead: b4baa64\nverdict: pass").unwrap();
+        let react = Review::parse("role: cost\npr: o/react#784\nhead: b4baa64\nverdict: request changes").unwrap();
+        // A `repo:` line names the repo of a bare number.
+        let by_line = Review::parse("role: cost\npr: 784\nrepo: React\nhead: b4baa64\nverdict: request changes").unwrap();
+        assert_eq!(by_line.prs, [pr_in("react", 784)]);
+        let old = Review::parse("role: cost\npr: 784\nhead: b4baa64\nverdict: pass").unwrap();
+        assert!(api.reads(&pr_in("o/api", 784), head) && !api.reads(&pr_in("o/react", 784), head) && !api.reads(&pr_in("api", 785), head));
+        assert!(react.reads(&pr_in("react", 784), head) && !react.reads(&pr_in("other/react", 784), head) && react.reads(&pr(784), head));
+        assert!(old.reads(&pr_in("o/api", 784), head) && old.reads(&pr_in("o/react", 784), head));
+        let roles = vec!["cost".to_string()];
+        assert!(missing(&roles, &[api.clone(), react.clone()], &pr_in("o/api", 784), head).is_empty());
+        assert_eq!(missing(&roles, &[api, react, by_line], &pr_in("o/react", 784), head), ["cost review requested changes at head b4baa64 (a review of a newer head must pass)"]);
+        assert_eq!((pr_in("o/api", 784).to_string(), pr(9).to_string()), ("o/api#784".to_string(), "#9".to_string()));
+    }
+
+    /// Review S1 on #201: a repo, in `pr:`, in a `repo:` line or from a
+    /// gate's `--repo`, is read as lowercase `owner/repo` (or `repo`): a
+    /// scheme, a host, `.git` and a PR URL's tail are dropped, and an old
+    /// free-text `repo:` line that lists several names each.
+    #[test]
+    fn repos_are_read_as_lowercase_owner_repo() {
+        let head = "b4baa646ffff";
+        let parse = |meta: &str| Review::parse(&format!("role: cost\n{meta}\nhead: b4baa64\nverdict: pass")).unwrap_or_else(|| panic!("{meta}"));
+        for p in ["o/api#784", "O/Api#784", "github.com/o/api#784", "https://github.com/o/api#784", "https://github.com/O/api.git#784", "https://github.com/o/api/pull/784", "git@github.com:o/api.git#784"] {
+            assert_eq!(parse(&format!("pr: {p}")).prs, [pr_in("o/api", 784)], "{p}");
+        }
+        for line in ["https://github.com/o/api", "github.com/O/Api", "o/api/", "https://github.com/o/api/pull/784"] {
+            assert_eq!(parse(&format!("pr: 784\nrepo: {line}")).prs, [pr_in("o/api", 784)], "{line}");
+        }
+        let two = parse("pr: 784\nrepo: api, react");
+        assert!(two.reads(&pr_in("o/api", 784), head) && two.reads(&pr_in("o/react", 784), head) && !two.reads(&pr_in("o/web", 784), head));
+        // A merge's `--repo github.com/o/api` names the PR filed as `o/api#784`.
+        let api = parse("pr: o/api#784");
+        assert!(api.reads(&Pr::parse("github.com/o/api#784", None).unwrap(), head));
+        assert!(api.reads(&Pr::parse("784", Some("https://github.com/o/api")).unwrap(), head));
+        assert!(!api.reads(&Pr::parse("784", Some("github.com/o/react")).unwrap(), head));
+    }
+
     #[test]
     fn missing_names_each_role_and_request_changes_blocks_its_head() {
         let roles = vec!["simplicity".to_string(), "cost".to_string()];
         let head = "6e828cc0123456789";
         let r = |meta: &str| Review::parse(meta).unwrap();
-        assert_eq!(missing(&roles, &[], 99, head), ["simplicity review for head 6e828cc", "cost review for head 6e828cc"]);
+        assert_eq!(missing(&roles, &[], &pr(99), head), ["simplicity review for head 6e828cc", "cost review for head 6e828cc"]);
         let old = r("review: simplicity, cost\npr: 99\nhead: d84126e\nverdict: request-changes (simplicity), pass (cost)");
         let cost = r("role: cost\npr: 99\nhead: 6e828cc\nverdict: pass");
         // A review of an older head does not count, either way.
-        assert_eq!(missing(&roles, &[old.clone(), cost.clone()], 99, head), ["simplicity review for head 6e828cc"]);
+        assert_eq!(missing(&roles, &[old.clone(), cost.clone()], &pr(99), head), ["simplicity review for head 6e828cc"]);
         let simp = r("role: simplicity\npr: 99\nhead: 6e828cc\nverdict: merge with follow-ups");
-        assert!(missing(&roles, &[old, cost.clone(), simp.clone()], 99, head).is_empty());
+        assert!(missing(&roles, &[old, cost.clone(), simp.clone()], &pr(99), head).is_empty());
         // Changes requested on this head block even beside a pass of it.
         let no = r("role: simplicity\npr: 99\nhead: 6e828cc\nverdict: REQUEST CHANGES");
-        assert_eq!(missing(&roles, &[simp, no, cost], 99, head), ["simplicity review requested changes at head 6e828cc (a review of a newer head must pass)"]);
+        assert_eq!(missing(&roles, &[simp, no, cost], &pr(99), head), ["simplicity review requested changes at head 6e828cc (a review of a newer head must pass)"]);
     }
 }

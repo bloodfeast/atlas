@@ -288,18 +288,165 @@ pub(crate) fn drop_leading_blank(s: &str) -> String {
     lines[first..].join("\n")
 }
 
+/// A fence line's character, run length, indent and what follows the run:
+/// up to three spaces, then three or more backticks or tildes (CommonMark;
+/// four spaces or a tab make it an indented line, not a fence). The
+/// fragment parser, scripts/changes-check.sh and the changelog readers
+/// share this rule.
+fn fence_run(l: &str) -> Option<(u8, usize, usize, &str)> {
+    let t = l.trim_start_matches(' ');
+    let k = l.len() - t.len();
+    if k > 3 {
+        return None;
+    }
+    let c = *t.as_bytes().first().filter(|c| **c == b'`' || **c == b'~')?;
+    let n = t.bytes().take_while(|b| *b == c).count();
+    (n >= 3).then(|| (c, n, k, &t[n..]))
+}
+
+/// A line's indent in columns: a space is one, a tab moves to the next
+/// multiple of four (scripts/changes-check.sh counts the same way).
+fn indent(l: &str) -> usize {
+    let mut col = 0;
+    for b in l.bytes() {
+        match b {
+            b' ' => col += 1,
+            b'\t' => col += 4 - col % 4,
+            _ => break,
+        }
+    }
+    col
+}
+
+/// The first C0 control character in `text` other than a tab, a line feed or
+/// a carriage return directly before a line feed: GitHub reads a lone
+/// carriage return as a line break, which can start a comment, a heading or
+/// a fence no line rule saw, and the rest can garble or hide text. The
+/// fragment parser, scripts/changes-check.sh and the release share this rule.
+pub(crate) fn stray_control(text: &str) -> Option<char> {
+    let b = text.as_bytes();
+    let bad = |(i, c): (usize, &u8)| *c < 0x20 && !matches!(c, b'\t' | b'\n') && !(*c == b'\r' && b.get(i + 1) == Some(&b'\n'));
+    b.iter().enumerate().find(|p| bad(*p)).map(|(_, c)| char::from(*c))
+}
+
+/// What a refusal of [`stray_control`]'s character says.
+pub(crate) fn control_why(c: char) -> String {
+    format!(
+        "a control character (U+{:04X}) other than a tab or a line ending, which GitHub can read as a line break or hide text with: remove it",
+        u32::from(c)
+    )
+}
+
+/// A list item's or a block quote's marker at the start of `s` (`-`, `*`,
+/// `+`, `1.` or `1)` before a space, a tab or the line's end; `>`): what
+/// follows it.
+fn container_marker(s: &str) -> Option<&str> {
+    if let Some(r) = s.strip_prefix('>') {
+        return Some(r);
+    }
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    let r = if digits > 0 { s[digits..].strip_prefix(['.', ')']) } else { s.strip_prefix(['-', '*', '+']) }?;
+    (r.is_empty() || r.starts_with([' ', '\t'])).then_some(r)
+}
+
+/// Whether a line (outside a fence) is a heading GitHub renders that does
+/// not start at the line's first column: an ATX heading (one to six `#`,
+/// then a space, a tab or the end) after spaces, tabs, or list or quote
+/// markers (`- ## x`, `  # x`, `1. # x`, `> # x`). A `#` not followed so
+/// (`#123`, `C#`) opens no heading.
+pub(crate) fn nested_heading(l: &str) -> bool {
+    let (mut s, mut nested) = (l, false);
+    loop {
+        let t = s.trim_start_matches([' ', '\t']);
+        nested |= t.len() != s.len();
+        s = t;
+        match container_marker(s) {
+            Some(r) => (s, nested) = (r, true),
+            None => break,
+        }
+    }
+    let hashes = s.bytes().take_while(|b| *b == b'#').count();
+    nested && (1..=6).contains(&hashes) && matches!(s.as_bytes().get(hashes), None | Some(b' ' | b'\t'))
+}
+
+/// Whether a line (outside a fence) is a setext heading's underline: only
+/// `=` or only `-`, after and before any spaces or tabs. Under a line of
+/// text GitHub renders that text as a heading.
+pub(crate) fn setext_underline(l: &str) -> bool {
+    let t = l.trim_matches([' ', '\t']);
+    !t.is_empty() && (t.bytes().all(|b| b == b'=') || t.bytes().all(|b| b == b'-'))
+}
+
+/// Fenced code blocks, read line by line: a block opens on a fence line (a
+/// backtick fence whose info string holds no backtick) and closes on a
+/// fence line of the same character, at least as long, with nothing after
+/// it but spaces or tabs. Everything inside is opaque: a `#` line there is
+/// no heading.
+///
+/// A block opened at indent k (a list item's) ends on GitHub at the first
+/// line indented less than k, which ends the item: what follows is read
+/// as Markdown again, and a later fence line opens a block that swallows
+/// the rest. Such a line, the closing fence included, marks the reader
+/// [`Fence::short`], which the parsers and the release refuse.
+#[derive(Default)]
+pub(crate) struct Fence {
+    /// The open block's character, run length and indent.
+    block: Option<(u8, usize, usize)>,
+    /// A line inside a block was indented less than its opening fence.
+    short: bool,
+}
+
+impl Fence {
+    /// Takes the next line (no line ending): whether it belongs to a fenced
+    /// block, its opening and closing lines included.
+    pub(crate) fn opaque(&mut self, l: &str) -> bool {
+        match self.block {
+            Some((c, n, k)) => {
+                if !l.trim_matches([' ', '\t']).is_empty() && indent(l) < k {
+                    self.short = true;
+                }
+                if fence_run(l).is_some_and(|(c2, n2, _, rest)| c2 == c && n2 >= n && rest.trim_matches([' ', '\t']).is_empty()) {
+                    self.block = None;
+                }
+                true
+            }
+            None => match fence_run(l) {
+                Some((c, n, k, rest)) if !(c == b'`' && rest.contains('`')) => {
+                    self.block = Some((c, n, k));
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// Whether a block is still open.
+    pub(crate) fn open(&self) -> bool {
+        self.block.is_some()
+    }
+
+    /// Whether a line inside a block was indented less than the fence that
+    /// opened it (it stays set).
+    pub(crate) fn short(&self) -> bool {
+        self.short
+    }
+}
+
 /// The `## vX.Y.Z` section of the changelog, without leading blank lines or
-/// trailing newlines (what `$(awk ... | sed ...)` captured).
+/// trailing newlines. A `## v` line inside a fenced block neither starts
+/// nor ends a section.
 pub(crate) fn changelog_section(text: &str, tag: &str) -> String {
     let want = format!("## {tag}");
     let mut on = false;
     let mut out = Vec::new();
+    let mut fence = Fence::default();
     for l in text.lines() {
+        let fenced = fence.opaque(l);
         if !on {
-            on = l == want;
+            on = !fenced && l == want;
             continue;
         }
-        if l.starts_with("## v") {
+        if !fenced && l.starts_with("## v") {
             break;
         }
         out.push(l);
@@ -393,12 +540,10 @@ pub const DEFAULT_PUBLIC_REPO: &str = "bloodfeast/atlas";
 /// trimmed of blank lines at both ends.
 fn subsections(section: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, Vec<&str>)> = vec![(String::new(), Vec::new())];
-    let mut fence = false;
+    let mut fence = Fence::default();
     for l in section.lines() {
-        if l.starts_with("```") {
-            fence = !fence;
-        }
-        match l.strip_prefix("### ").filter(|_| !fence) {
+        let fenced = fence.opaque(l);
+        match l.strip_prefix("### ").filter(|_| !fenced) {
             Some(h) => out.push((h.trim().to_string(), Vec::new())),
             None => out.last_mut().expect("never empty").1.push(l),
         }
@@ -420,6 +565,40 @@ pub(crate) fn check_section(section: &str, tag: &str) -> R {
     }
     if !has_text(section) {
         return Err(format!("the {tag} section of CHANGELOG.md is empty: write what changed for users before releasing"));
+    }
+    if let Some(c) = stray_control(section) {
+        return Err(format!("the {tag} section of CHANGELOG.md has {}", control_why(c)));
+    }
+    let mut fence = Fence::default();
+    for l in section.lines() {
+        if fence.opaque(l) {
+            continue;
+        }
+        // No exception for comments: a placeholder belongs outside the
+        // released section.
+        if l.trim_start_matches([' ', '\t']).starts_with('<') {
+            return Err(format!(
+                "the {tag} section of CHANGELOG.md has a line that starts with < outside a fenced block, which GitHub reads as HTML that can hide the rest of the notes (comments included): reword it, or put it in a fenced block"
+            ));
+        }
+        if nested_heading(l) {
+            return Err(format!(
+                "the {tag} section of CHANGELOG.md has a heading after an indent or a list marker, which GitHub renders as a heading: reword it"
+            ));
+        }
+        if setext_underline(l) {
+            return Err(format!(
+                "the {tag} section of CHANGELOG.md has a line of only = or -, which GitHub renders as a heading underline under the line above: reword it"
+            ));
+        }
+    }
+    if fence.open() {
+        return Err(format!("the {tag} section of CHANGELOG.md has an unclosed fenced block, which swallows everything after it: close it"));
+    }
+    if fence.short() {
+        return Err(format!(
+            "the {tag} section of CHANGELOG.md has a line inside a fenced block indented less than the fence that opened it, which ends the block on GitHub: indent every line of the block, its closing fence included, at least as far as its opening fence"
+        ));
     }
     let subs = subsections(section);
     if subs.iter().any(|(h, _)| !h.is_empty()) && !subs.iter().any(|(h, b)| h.eq_ignore_ascii_case("Highlights") && has_text(b)) {
@@ -768,6 +947,7 @@ pub fn run(args: Vec<String>) -> R {
         if std::fs::File::open(&denylist).is_err() {
             return Err("the denylist is not readable".into());
         }
+        crate::version::refuse_pending(&root)?;
         changes = changelog_section(&read_text(&root.join("CHANGELOG.md"))?, &tag);
         check_section(&changes, &tag)?;
         // The README, the wiki and the public files link the public
@@ -960,7 +1140,7 @@ pub fn run(args: Vec<String>) -> R {
         }
     }
     let manifest = release_dir.join("manifest.json");
-    write(&manifest, manifest_json(&version, &public_repo, &stage.join("bin"))?)?;
+    write(&manifest, manifest_json(&version, &public_repo, &stage.join("bin"), &manifest_notes(&root, &version, &changes)?)?)?;
     say("manifest not signed: this run never signs (ATLAS_SIGN_KEY is not read); `release ship` signs the release it publishes");
 
     say("commit");
@@ -1093,10 +1273,11 @@ pub(crate) fn target_of(file: &str) -> Option<&str> {
 /// The release manifest (the format `atlas::update::parse_manifest` reads
 /// and the updater verifies): the version and, for each binary in `bins`
 /// (the launcher `atlas` skipped), its target, file name, download URL in
-/// the `v<version>` release of `repo`, SHA-256 and size, in `ls` order.
+/// the `v<version>` release of `repo`, SHA-256 and size, in `ls` order;
+/// then the notice fields of `notes` ([`ManifestNotes`]).
 /// The one writer: the local run and `cargo xtask release assets`
 /// both call it, and the signature covers these exact bytes.
-pub(crate) fn manifest_json(version: &str, repo: &str, bins: &Path) -> R<String> {
+pub(crate) fn manifest_json(version: &str, repo: &str, bins: &Path, notes: &ManifestNotes) -> R<String> {
     let mut entries = Vec::new();
     for f in ls(bins)? {
         if f == "atlas" {
@@ -1110,15 +1291,180 @@ pub(crate) fn manifest_json(version: &str, repo: &str, bins: &Path) -> R<String>
             size_of(&p)?
         ));
     }
-    Ok(format!("{{\"version\":\"{version}\",\"files\":[{}]}}", entries.join(",")))
+    // The notice fields after the files (issue #190); an older atlas reads
+    // past them.
+    let highlights: Vec<String> = notes.highlights.iter().map(|h| atlas::json::Value::String(h.clone()).to_string()).collect();
+    let plugin = match &notes.plugin_changed_in {
+        Some(v) => format!(",\"plugin_changed_in\":{}", atlas::json::Value::String(v.clone())),
+        None => String::new(),
+    };
+    Ok(format!("{{\"version\":\"{version}\",\"files\":[{}],\"highlights\":[{}]{plugin}}}", entries.join(","), highlights.join(",")))
+}
+
+/// The manifest's notice fields (issue #190), signed with the rest:
+/// `highlights` and `plugin_changed_in`. A manifest without them (every one
+/// before) means no highlights and no plugin change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ManifestNotes {
+    /// The CHANGELOG section's Highlights, bounded ([`manifest_highlights`]).
+    pub(crate) highlights: Vec<String>,
+    /// The release that last changed the plugin's files
+    /// ([`plugin_changed_in`]); an installed plugin older than it needs
+    /// `/plugin`.
+    pub(crate) plugin_changed_in: Option<String>,
+}
+
+/// The paths whose files only Claude Code's `/plugin` update installs.
+pub(crate) const PLUGIN_PATHS: &[&str] = &[".claude-plugin", ".mcp.json", "hooks", "skills"];
+
+/// The manifest's `highlights`: the items of the section's Highlights (see
+/// `notes_parts`), one line each, at most `atlas::update::HIGHLIGHTS_MAX`
+/// of at most `atlas::update::HIGHLIGHT_CHARS` characters.
+pub(crate) fn manifest_highlights(section: &str) -> Vec<String> {
+    let (hi, _, _) = notes_parts(section);
+    let mut items: Vec<String> = Vec::new();
+    let mut cur: Option<String> = None;
+    let mut fence = false;
+    for l in hi.lines() {
+        let t = l.trim();
+        if t.starts_with("```") {
+            fence = !fence;
+            continue;
+        }
+        if fence || t.starts_with("<!--") || t.starts_with('#') {
+            continue;
+        }
+        if t.is_empty() {
+            items.extend(cur.take());
+            continue;
+        }
+        match t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
+            Some(b) => {
+                items.extend(cur.take());
+                cur = Some(b.to_string());
+            }
+            None => match &mut cur {
+                Some(c) => {
+                    c.push(' ');
+                    c.push_str(t);
+                }
+                None => cur = Some(t.to_string()),
+            },
+        }
+    }
+    items.extend(cur);
+    items.iter().filter_map(|i| atlas::update::highlight_line(i)).take(atlas::update::HIGHLIGHTS_MAX).collect()
+}
+
+/// A plugin file as compared: `.claude-plugin/plugin.json` without its
+/// version line.
+fn plugin_file_view<'a>(path: &str, b: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+    if path != ".claude-plugin/plugin.json" {
+        return std::borrow::Cow::Borrowed(b);
+    }
+    let t = String::from_utf8_lossy(b);
+    let kept: Vec<&str> = t.lines().filter(|l| !l.trim_start().starts_with("\"version\":")).collect();
+    std::borrow::Cow::Owned(kept.join("\n").into_bytes())
+}
+
+/// Whether two snapshots of the plugin's files (path -> bytes) differ, the
+/// version line of `.claude-plugin/plugin.json` aside (every release bumps
+/// it).
+pub(crate) fn plugin_files_differ(old: &std::collections::BTreeMap<String, Vec<u8>>, new: &std::collections::BTreeMap<String, Vec<u8>>) -> bool {
+    old.len() != new.len() || old.iter().zip(new).any(|((pa, a), (pb, b))| pa != pb || plugin_file_view(pa, a) != plugin_file_view(pb, b))
+}
+
+/// The plugin's files at `rev` in the repository at `root`.
+fn plugin_snapshot(root: &Path, rev: &str) -> R<std::collections::BTreeMap<String, Vec<u8>>> {
+    let mut ls = Command::new("git");
+    ls.arg("-C").arg(root).args(["ls-tree", "-r", "--name-only", rev, "--"]).args(PLUGIN_PATHS);
+    let names = output(&mut ls)?;
+    let mut out = std::collections::BTreeMap::new();
+    for n in names.lines().filter(|n| !n.is_empty()) {
+        let o = Command::new("git").arg("-C").arg(root).args(["show", &format!("{rev}:{n}")]).output().map_err(|e| format!("git show: {e}"))?;
+        if !o.status.success() {
+            return Err(format!("git show {rev}:{n} failed"));
+        }
+        out.insert(n.to_string(), o.stdout);
+    }
+    Ok(out)
+}
+
+/// The plugin's files at one revision, as path -> bytes.
+pub(crate) type PluginSnapshot = std::collections::BTreeMap<String, Vec<u8>>;
+
+/// The manifest's `plugin_changed_in` for release `version`: walking back
+/// from HEAD through the earlier `v*` tags (newest first), the release whose
+/// plugin files differ from the release before it. With no earlier tag (a
+/// clone without tags, or the first release), or a revision whose files
+/// cannot be read (a shallow clone), it says `version` (or the newest
+/// release read so far) and warns: telling users to run `/plugin` for
+/// nothing is better than not telling them. A git failure never stops the
+/// release.
+pub(crate) fn plugin_changed_in(root: &Path, version: &str) -> R<String> {
+    let want = atlas::update::parse_version(version).ok_or(format!("version {version} is not MAJOR.MINOR.PATCH"))?;
+    let mut tags = Command::new("git");
+    tags.arg("-C").arg(root).args(["tag", "--list", "v*"]);
+    let listed = match output(&mut tags) {
+        Ok(t) => t,
+        Err(e) => {
+            say(&format!("warning: git tag failed ({e}): the manifest says the plugin files changed in {version}"));
+            return Ok(version.to_string());
+        }
+    };
+    let mut earlier: Vec<((u64, u64, u64), String)> = listed.lines().filter_map(|t| atlas::update::parse_version(t.trim()).map(|v| (v, t.trim().to_string()))).filter(|(v, _)| *v < want).collect();
+    earlier.sort();
+    earlier.dedup();
+    let tags: Vec<String> = earlier.into_iter().rev().map(|(_, t)| t).collect();
+    Ok(plugin_history(version, &tags, |rev| plugin_snapshot(root, rev)))
+}
+
+/// [`plugin_changed_in`] over `snapshot` (HEAD is `"HEAD"`; `tags` newest
+/// first).
+pub(crate) fn plugin_history(version: &str, tags: &[String], snapshot: impl Fn(&str) -> R<PluginSnapshot>) -> String {
+    let mut newer = version.to_string();
+    let mut files = match snapshot("HEAD") {
+        Ok(s) => s,
+        Err(e) => {
+            say(&format!("warning: the plugin files at HEAD: {e}: the manifest says they changed in {version}"));
+            return newer;
+        }
+    };
+    if tags.is_empty() {
+        say(&format!("warning: no release tag before v{version} (fetch the tags): the manifest says the plugin files changed in {version}"));
+        return newer;
+    }
+    for tag in tags {
+        match snapshot(tag) {
+            Ok(older) => {
+                if plugin_files_differ(&older, &files) {
+                    say(&format!("plugin files: last changed in {newer} (they differ from {tag})"));
+                    return newer;
+                }
+                files = older;
+                newer = tag.trim_start_matches('v').to_string();
+            }
+            Err(e) => {
+                say(&format!("warning: the plugin files at {tag} cannot be read ({e}; a shallow clone?): the manifest says they changed in {newer}"));
+                return newer;
+            }
+        }
+    }
+    say(&format!("plugin files: unchanged since {newer}, the oldest release tag"));
+    newer
+}
+
+/// The manifest's notice fields for `version` from its CHANGELOG section.
+pub(crate) fn manifest_notes(root: &Path, version: &str, section: &str) -> R<ManifestNotes> {
+    Ok(ManifestNotes { highlights: manifest_highlights(section), plugin_changed_in: Some(plugin_changed_in(root, version)?) })
 }
 
 /// The notes' binaries table rows: platform, file and SHA-256 of each
-/// binary in `bins` (the launcher skipped).
+/// binary in `bins` (the launcher and the manifest skipped).
 pub(crate) fn binaries_table(bins: &Path) -> R<String> {
     let mut out = String::new();
     for f in ls(bins)? {
-        if f != "atlas" {
+        if f != "atlas" && f != "manifest.json" && f != "manifest.json.sig" {
             out.push_str(&format!("| {} | bin/{f} | `{}` |\n", platform_name(&f), sha256_file(&bins.join(&f))?));
         }
     }
@@ -1162,7 +1508,9 @@ pub(crate) fn model_rows(template: &str) -> Vec<ModelRow> {
 
 /// Files the public repository must carry; the export is refused without
 /// them (an export-ignore rule or a lost file would drop them silently).
-pub const PUBLIC_FILES: &[&str] = &[".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/CODEOWNERS", "SECURITY.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "wiki/Home.md"];
+/// The rules templates are among them: atlas embeds them with
+/// `include_str!`, so a public tree without them would not build.
+pub const PUBLIC_FILES: &[&str] = &[".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/CODEOWNERS", "SECURITY.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "wiki/Home.md", "templates/CLAUDE.md", "templates/atlas-rules.md"];
 
 pub(crate) fn check_public_files(tree: &Path) -> R {
     let gone: Vec<&str> = PUBLIC_FILES.iter().copied().filter(|f| !tree.join(f).is_file()).collect();
@@ -1182,6 +1530,84 @@ pub(crate) fn home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_manifest_carries_bounded_highlights_and_the_plugin_flag() {
+        let section = "### Highlights\n\n<!-- a comment -->\n- Faster recall:\n  a wrapped line\n- A status line badge\n* Star item\n\n### Fixed\n\n- not a highlight";
+        assert_eq!(manifest_highlights(section), vec!["Faster recall: a wrapped line", "A status line badge", "Star item"]);
+        let long = format!("### Highlights\n\n{}", (0..9).map(|i| format!("- item {i} {}", "y".repeat(400))).collect::<Vec<_>>().join("\n"));
+        let h = manifest_highlights(&long);
+        assert_eq!(h.len(), atlas::update::HIGHLIGHTS_MAX);
+        assert!(h.iter().all(|l| l.chars().count() <= atlas::update::HIGHLIGHT_CHARS && l.ends_with("...")), "{h:?}");
+        // A section with no subsections is all highlights; a paragraph is one line.
+        assert_eq!(manifest_highlights("One plain\nparagraph."), vec!["One plain paragraph."]);
+        // Written into the manifest, they parse back as the updater reads them.
+        let d = std::env::temp_dir().join(format!("atlas-xtask-notes-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("atlas.exe"), b"MZ").unwrap();
+        let notes = ManifestNotes { highlights: vec!["Faster \"recall\"".into(), "Badge".into()], plugin_changed_in: Some("1.2.0".into()) };
+        let m = atlas::update::parse_manifest(manifest_json("1.2.3", "o/r", &d, &notes).unwrap().as_bytes()).unwrap();
+        assert_eq!(m.highlights, notes.highlights);
+        assert_eq!(m.plugin_changed_in.as_deref(), Some("1.2.0"));
+        let m = atlas::update::parse_manifest(manifest_json("1.2.3", "o/r", &d, &ManifestNotes::default()).unwrap().as_bytes()).unwrap();
+        assert!(m.highlights.is_empty() && m.plugin_changed_in.is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn plugin_changes_ignore_the_version_bump() {
+        use std::collections::BTreeMap;
+        let snap = |v: &str, hooks: &str| -> BTreeMap<String, Vec<u8>> {
+            BTreeMap::from([
+                (".claude-plugin/plugin.json".to_string(), format!("{{\n  \"name\": \"atlas\",\n  \"version\": \"{v}\",\n}}\n").into_bytes()),
+                ("hooks/hooks.json".to_string(), hooks.as_bytes().to_vec()),
+            ])
+        };
+        assert!(!plugin_files_differ(&snap("0.5.0", "{}"), &snap("0.5.1", "{}")), "a version bump alone is no plugin change");
+        assert!(plugin_files_differ(&snap("0.5.0", "{}"), &snap("0.5.1", "{\"hooks\":{}}")), "a hooks edit is");
+        let mut added = snap("0.5.1", "{}");
+        added.insert("skills/new/SKILL.md".into(), b"x".to_vec());
+        assert!(plugin_files_differ(&snap("0.5.0", "{}"), &added), "a new skill is");
+        let mut gone = snap("0.5.0", "{}");
+        gone.remove("hooks/hooks.json");
+        assert!(plugin_files_differ(&snap("0.5.0", "{}"), &gone), "a removed file is");
+    }
+
+    #[test]
+    fn plugin_changed_in_is_the_release_that_last_changed_the_plugin() {
+        use std::collections::BTreeMap;
+        fn snap(v: &str, hooks: &str) -> PluginSnapshot {
+            BTreeMap::from([
+                (".claude-plugin/plugin.json".to_string(), format!("{{\n  \"version\": \"{v}\",\n}}\n").into_bytes()),
+                ("hooks/hooks.json".to_string(), hooks.as_bytes().to_vec()),
+            ])
+        }
+        // Tags newest first; 0.5.1 changed the hooks 0.5.0 and 0.4.0 had.
+        let tags: Vec<String> = ["v0.5.1", "v0.5.0", "v0.4.0"].iter().map(|t| t.to_string()).collect();
+        fn history(head: &str, unreadable: Option<&str>) -> impl Fn(&str) -> R<PluginSnapshot> {
+            let (head, unreadable) = (head.to_string(), unreadable.map(str::to_string));
+            move |rev: &str| -> R<PluginSnapshot> {
+                if unreadable.as_deref() == Some(rev) {
+                    return Err(format!("git show {rev} failed"));
+                }
+                Ok(match rev {
+                    "HEAD" => snap("0.6.0", &head),
+                    "v0.5.1" => snap("0.5.1", "{b}"),
+                    _ => snap(rev, "{a}"),
+                })
+            }
+        }
+        assert_eq!(plugin_history("0.6.0", &tags, history("{b}", None)), "0.5.1", "unchanged since 0.5.1: a plugin at 0.5.1 needs nothing");
+        assert_eq!(plugin_history("0.6.0", &tags, history("{c}", None)), "0.6.0", "this release changes them");
+        let same = |rev: &str| -> R<PluginSnapshot> { Ok(snap(rev, "{a}")) };
+        assert_eq!(plugin_history("0.6.0", &tags, same), "0.4.0", "unchanged since the oldest tag");
+        // Fail soft: a revision that cannot be read (a shallow clone) names
+        // the newest release read so far; no tags names this release.
+        assert_eq!(plugin_history("0.6.0", &tags, history("{b}", Some("v0.5.0"))), "0.5.1");
+        assert_eq!(plugin_history("0.6.0", &tags, history("{b}", Some("v0.5.1"))), "0.6.0");
+        assert_eq!(plugin_history("0.6.0", &tags, history("{b}", Some("HEAD"))), "0.6.0");
+        assert_eq!(plugin_history("0.6.0", &[], same), "0.6.0");
+    }
 
     #[test]
     fn signing_is_checked_before_the_build() {
@@ -1206,6 +1632,98 @@ mod tests {
         assert_eq!(changelog_section(c, "v0.1.0"), "- one\n- more");
         assert_eq!(changelog_section(c, "v0.2.0"), "- two");
         assert_eq!(changelog_section(c, "v0.3.0"), "");
+    }
+
+    /// A fenced block is opaque to the readers, as to the fragment parsers:
+    /// a `## v` line inside one, indented up to three spaces, backticks or
+    /// tildes, neither ends the section nor starts one.
+    #[test]
+    fn changelog_section_reads_past_fenced_version_lines() {
+        for (open, close) in [("```", "```"), ("  ```", "  ```"), ("   ~~~", "~~~~"), ("````sh", "````")] {
+            let c = format!("# Changelog\n\n## v0.2.0\n\n- two\n{open}\n## v0.0.1\n- fake\n{close}\n- after\n\n## v0.1.0\n\n- one\n");
+            assert_eq!(changelog_section(&c, "v0.2.0"), format!("- two\n{open}\n## v0.0.1\n- fake\n{close}\n- after"), "{open}");
+            assert_eq!(changelog_section(&c, "v0.0.1"), "", "{open}: a fenced line is no section");
+            assert_eq!(changelog_section(&c, "v0.1.0"), "- one");
+        }
+        // A shorter run, or the other character, does not close a fence.
+        let c = "## v0.2.0\n\n- two\n````\n```\n## v0.0.1\n~~~~\n````\n\n## v0.1.0\n\n- one\n";
+        assert_eq!(changelog_section(c, "v0.2.0"), "- two\n````\n```\n## v0.0.1\n~~~~\n````");
+        // Four spaces or a tab is not a fence (CommonMark): the line ends it.
+        let c = "## v0.2.0\n\n- two\n    ```\n## v0.0.1\n";
+        assert_eq!(changelog_section(c, "v0.2.0"), "- two\n    ```");
+        // An inline code span at the start of a line opens no fence.
+        let c = "## v0.2.0\n\n```a``` b\n\n## v0.1.0\n\n- one\n";
+        assert_eq!(changelog_section(c, "v0.2.0"), "```a``` b");
+        // A fence left open swallows the rest, and the release refuses it.
+        let c = "## v0.2.0\n\n### Highlights\n\n- two\n  ```\n\n## v0.1.0\n\n- one\n";
+        let s = changelog_section(c, "v0.2.0");
+        assert!(s.ends_with("- one"), "{s}");
+        assert!(check_section(&s, "v0.2.0").unwrap_err().contains("unclosed fenced block"));
+    }
+
+    /// A line indented less than the fence that opened (a list item's fence
+    /// whose item ended) breaks the block on GitHub: the release refuses
+    /// the section, its closing line included; blank lines and lines
+    /// indented at least as far are fine.
+    #[test]
+    fn check_section_refuses_a_line_indented_less_than_its_fence() {
+        let ok = "### Highlights\n\n- a\n  ```\n  x\n\n    y\n\t z\n  ```\n- b";
+        check_section(ok, "v1").unwrap();
+        for bad in [
+            "### Highlights\n\n- a\n  ```\n- b\n## v0.0.1\n```\n",
+            "### Highlights\n\n- a\n   ~~~\n  x\n   ~~~",
+            "### Highlights\n\n- a\n  ```\n  x\n```",
+            "### Highlights\n\n- a\n  ```\n x\n  ```",
+        ] {
+            let e = check_section(bad, "v1").unwrap_err();
+            assert!(e.contains("indented less than"), "{bad:?}: {e}");
+        }
+        let mut f = Fence::default();
+        for l in ["- a", "  ```", "  x", ""] {
+            f.opaque(l);
+        }
+        assert!(f.open() && !f.short());
+        f.opaque("x");
+        assert!(f.short(), "a short line marks the fence");
+    }
+
+    /// Outside a fence the released section holds no line GitHub reads as
+    /// HTML (comments included), no control character but a tab or a line
+    /// ending, and no heading but its own `### ` subsections: none after an
+    /// indent or a list marker, and no setext underline.
+    #[test]
+    fn check_section_refuses_html_controls_and_nested_headings() {
+        let ok = "### Highlights\n\n- a\tb, fixes #12\n  #5 and C# too\n- #7\n  a -- b = c, x < y\n  ```\n  <!-- x -->\n  # y\n  ===\n  - ## v9.9.9\n  ```\n- b";
+        check_section(ok, "v1").unwrap();
+        for (bad, want) in [
+            ("### Highlights\n\n- a\n<!-- x -->", "starts with <"),
+            ("### Highlights\n\n<!-- todo -->\n- a", "starts with <"),
+            ("### Highlights\n\n- a\n  <details>\n\n- b\n  </details>", "starts with <"),
+            ("### Highlights\n\n- a\n\t<br>", "starts with <"),
+            ("### Highlights\n\n- a\r<!--\n- b", "control character"),
+            ("### Highlights\n\n- a\r## v0.0.1", "control character"),
+            ("### Highlights\n\n- a\r```", "control character"),
+            ("### Highlights\n\n- a \u{1b}[2J", "control character"),
+            ("### Highlights\n\n- a\u{0}", "control character"),
+            ("### Highlights\n\n- ## v9.9.9", "heading"),
+            ("### Highlights\n\n- a\n  ## v9.9.9", "heading"),
+            ("### Highlights\n\n1. # x", "heading"),
+            ("### Highlights\n\n- a\n  > ### x", "heading"),
+            ("### Highlights\n\n- v9.9.9\n  ===", "underline"),
+            ("### Highlights\n\nText\n---\n\n- a", "underline"),
+        ] {
+            let e = check_section(bad, "v1").unwrap_err();
+            assert!(e.contains(want) && e.starts_with("the v1 section of CHANGELOG.md"), "{bad:?}: {e}");
+        }
+    }
+
+    /// `###` inside an indented or tilde fence is not a subsection.
+    #[test]
+    fn subsections_skip_every_fence_the_parsers_skip() {
+        for (open, close) in [("  ```", "  ```"), ("~~~", "~~~"), ("   ```sh", "```")] {
+            let s = format!("### Highlights\n\n- a\n{open}\n### Features\n{close}\n- b");
+            assert_eq!(subsections(&s), [("Highlights".to_string(), format!("- a\n{open}\n### Features\n{close}\n- b"))], "{open}");
+        }
     }
 
     #[test]
@@ -1278,7 +1796,7 @@ mod tests {
         assert!(check_section("", "v1").unwrap_err().contains("no v1 section"));
         assert!(check_section("\n   \n<!-- write me -->\n### Highlights\n\n", "v1").unwrap_err().contains("is empty"));
         assert!(check_section("### Features\n\n- a", "v1").unwrap_err().contains("no ### Highlights"));
-        assert!(check_section("### Highlights\n\n<!-- todo -->\n\n### Features\n\n- a", "v1").unwrap_err().contains("no ### Highlights"));
+        assert!(check_section("### Highlights\n\n\n### Features\n\n- a", "v1").unwrap_err().contains("no ### Highlights"));
         // A ### line inside a fence is not a subsection.
         assert_eq!(subsections("### Highlights\n\n```\n### not a heading\n```").len(), 1);
     }
@@ -1291,8 +1809,16 @@ mod tests {
         let root = repo_root();
         let version = cargo_version(&read_text(&root.join("Cargo.toml")).unwrap()).unwrap();
         let tag = format!("v{version}");
-        let section = changelog_section(&read_text(&root.join("CHANGELOG.md")).unwrap(), &tag);
+        let log = read_text(&root.join("CHANGELOG.md")).unwrap();
+        let section = changelog_section(&log, &tag);
         check_section(&section, &tag).unwrap();
+        // Every released section passes the rule too: none holds a comment
+        // or other placeholder the release would now refuse.
+        let tags: Vec<&str> = log.lines().filter_map(|l| l.strip_prefix("## ")).filter(|t| t.starts_with('v')).collect();
+        assert!(tags.len() > 1 && tags.contains(&tag.as_str()), "{tags:?}");
+        for t in tags {
+            check_section(&changelog_section(&log, t), t).unwrap();
+        }
         let t = read_text(&root.join("scripts/release-notes.md.in")).unwrap();
         let n = Notes {
             tag: &tag,

@@ -21,6 +21,10 @@ vaults (see [[Cross-vault links]]); links within a vault are standard `[[wikilin
 - large tool output kept on disk under a handle, the model given a digest (see [[Handles and digests]])
 - an append-only memory store with relevance-gated recall (see [[Memory store and hooks]])
 - projects: one install, each project with its own index and memory (see [[Projects and multi-repo]])
+- onboarding without rules: the server's instructions carry a short habits paragraph (recall before asking,
+  journal, hand off, queue keys, a `Lane:` line in briefs), and the plugin's `atlas` skill holds the full
+  guide, with a reference generated from the code by `cargo xtask skill`; the user's own rules stay in
+  their CLAUDE.md and memory
 - every atlas answer says how fresh it is, and a misses log records what grep found and atlas did not
 - no delete, no rename; writes are additive or exact, atomic, serialised across processes and audited
 - SQLite (WAL) as a derived index plus the coordination layer; the files stay the source of truth

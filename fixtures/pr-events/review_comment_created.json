@@ -1,0 +1,17 @@
+{
+  "action": "created",
+  "comment": {
+    "id": 1002,
+    "user": { "login": "octo-reviewer", "id": 2001, "type": "User" },
+    "body": "nit: name this `rest`",
+    "path": "src/parse.rs",
+    "commit_id": "6e828cc0aa1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "pull_request_review_id": 1001
+  },
+  "pull_request": {
+    "number": 12,
+    "head": { "ref": "widget-parser", "sha": "6e828cc0aa1b2c3d4e5f60718293a4b5c6d7e8f9" }
+  },
+  "repository": { "id": 3001, "name": "widgets", "full_name": "octo-org/widgets" },
+  "sender": { "login": "octo-reviewer", "id": 2001, "type": "User" }
+}

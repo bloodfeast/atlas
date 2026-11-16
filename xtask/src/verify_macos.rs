@@ -26,7 +26,7 @@ fn grep(log: &str, pred: impl Fn(&str) -> bool) -> Vec<&str> {
 }
 
 /// A test line `test NAME ... OUTCOME`.
-fn test_line(l: &str) -> Option<(&str, &str)> {
+pub fn test_line(l: &str) -> Option<(&str, &str)> {
     let rest = l.strip_prefix("test ")?;
     let (name, outcome) = rest.split_once(" ... ")?;
     Some((name, outcome))

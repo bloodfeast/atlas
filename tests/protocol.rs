@@ -52,7 +52,12 @@ fn round_trip_through_the_binary() {
     assert_eq!(init["protocolVersion"], json!("2025-06-18"));
     assert_eq!(init["serverInfo"]["name"], json!("atlas"));
     let instr = init["instructions"].as_str().unwrap();
-    assert!(!instr.contains('\n') && instr.starts_with("Markdown vaults served: perf (Research Log)"), "{instr}");
+    // Two lines: what is served, then the habits paragraph (#186), whose
+    // budget xtask/src/skill.rs checks. No user rule is injected.
+    let (served, guide) = instr.split_once('\n').unwrap_or_else(|| panic!("the served line, then the guide: {instr}"));
+    assert!(served.starts_with("Markdown vaults served: perf (Research Log)"), "{instr}");
+    assert_eq!(guide, atlas::tools::GUIDE, "{instr}");
+    assert!(guide.contains("recall") && guide.contains("handoff") && guide.contains("atlas://help"), "{instr}");
     let tools = out[1]["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 14, "the listed tools; the full tools behind their ops stay callable");
     assert!(tools.iter().any(|t| t["name"] == json!("section")) && tools.iter().any(|t| t["name"] == json!("grep")), "the core read verbs");
@@ -223,16 +228,34 @@ fn no_network_code() {
         // (PreToolUse on a `gh pr merge` only, with review roles configured;
         // Q-RV1); the PR digest reads the working directory's remotes and
         // branch with local `git` (PostToolUse on a `gh pr` command, with
-        // `lean.pr_digest` on; no network). Nothing else spawns. Unsafe code lives only in the platform FFI and the
+        // `lean.pr_digest` on; no network); the PR events supervisor runs
+        // `gh webhook forward` and `gh api` for the repository hooks
+        // (`atlas pr-events serve`, command line only); the worktree ledger lists worktrees
+        // with local `git worktree list` (an admitted Agent launch that declares
+        // `Uses: worktree:NAME`, and `atlas worktrees`; no network). Nothing else spawns. Unsafe code lives only in the platform FFI and the
         // SIMD kernels (scan, embedding GEMM).
         let platform = path.parent().is_some_and(|p| p.ends_with("platform"));
-        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || platform;
+        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || path.ends_with("pr_supervise.rs") || path.ends_with("worktree_ledger.rs") || platform;
         let ffi = platform || path.ends_with("scan.rs") || path.ends_with("gemm.rs");
         // Only the server's code: not the test modules, not comments.
-        let body = src.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(&src);
+        let body = src.split("\n#[cfg(test)]\nmod ").next().unwrap_or(&src);
+        // A test module the other modules' tests reach (the fake gh).
+        let body = body.split("\n#[cfg(test)]\npub(crate) mod tests").next().unwrap_or(body);
         let code: String = body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        // The PR events listener (`atlas pr-events serve`, command line only)
+        // is the one socket: TCP, bound to 127.0.0.1 and nothing else, and it
+        // never connects out (journal:ATLAS-USES:0009).
+        let listens = path.ends_with("pr_listen.rs");
+        if listens {
+            assert_eq!(code.matches("::bind(").count(), 1, "{}", path.display());
+            assert!(code.contains("TcpListener::bind((Ipv4Addr::LOCALHOST, port))"), "{}", path.display());
+            assert!(!code.contains("connect(") && !code.contains("UdpSocket") && !code.contains("ToSocketAddrs"), "{}", path.display());
+        }
         for bad in ["std::net", "TcpStream", "TcpListener", "UdpSocket", "ToSocketAddrs", "Command::new", "unsafe "] {
-            if (spawns && bad == "Command::new") || (ffi && bad == "unsafe ") {
+            if (spawns && bad == "Command::new")
+                || (ffi && bad == "unsafe ")
+                || (listens && matches!(bad, "std::net" | "TcpStream" | "TcpListener"))
+            {
                 continue;
             }
             assert!(!code.contains(bad), "{bad} in {}", path.display());
@@ -242,8 +265,18 @@ fn no_network_code() {
             assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
             assert!(code.contains("Command::new(\"gh\")"), "{}", path.display());
         }
+        // The PR events supervisor's one spawn is gh, and nothing else.
+        if path.ends_with("pr_supervise.rs") {
+            assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
+            assert!(code.contains("Command::new(\"gh\")"), "{}", path.display());
+        }
         // The PR digest's one spawn is git, and nothing else.
         if path.ends_with("pr_digest.rs") {
+            assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
+            assert!(code.contains("Command::new(\"git\")"), "{}", path.display());
+        }
+        // The worktree ledger's one spawn is git, and nothing else.
+        if path.ends_with("worktree_ledger.rs") {
             assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
             assert!(code.contains("Command::new(\"git\")"), "{}", path.display());
         }
@@ -323,7 +356,7 @@ fn help_lists_every_mode_and_subcommand() {
     for f in &flags {
         assert!(all.contains(f), "--help lacks {f}:\n{text}");
     }
-    let subs = main_rs.split("const SUBCOMMANDS: &[&str] = &[").nth(1).unwrap().split(']').next().unwrap();
+    let subs = main_rs.split("const SUBCOMMANDS: &[&str] =").nth(1).unwrap().split_once('[').unwrap().1.split(']').next().unwrap();
     let subs: Vec<&str> = subs.split(',').map(|w| w.trim().trim_matches('"')).collect();
     assert!(subs.contains(&"ideas") && subs.len() > 5, "{subs:?}");
     for w in subs.iter().copied().chain(["digest", "crop", "doctor"]) {
@@ -361,7 +394,7 @@ fn tree(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Option<Vec<u8>
 #[test]
 fn help_touches_nothing() {
     let main_rs = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")).unwrap();
-    let subs = main_rs.split("const SUBCOMMANDS: &[&str] = &[").nth(1).unwrap().split(']').next().unwrap();
+    let subs = main_rs.split("const SUBCOMMANDS: &[&str] =").nth(1).unwrap().split_once('[').unwrap().1.split(']').next().unwrap();
     let subs: Vec<&str> = subs.split(',').map(|w| w.trim().trim_matches('"')).collect();
     let t = std::env::temp_dir().join(format!("atlas-help-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&t);
