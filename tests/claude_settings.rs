@@ -1761,6 +1761,23 @@ fn the_main_session_compaction_settings_are_listed() {
     assert_eq!(atlas::config::Config::load(&h.config()).unwrap().cap.unwrap().main_session, Some(false));
     let (ok, out) = h.run(&["list"]);
     assert!(ok && line(&out).contains("(off)"), "{out}");
+    // atlas#9 item 4: `set main-session-compact on|off` writes the key the
+    // autocompact hook reads (`Settings::cap.main_session`), not only the file.
+    let seen = || {
+        let c = atlas::config::Config::load(&h.config()).unwrap();
+        atlas::memory::settings::Settings::from_config(Some(&c), &h.t.path().join("x.sqlite")).unwrap().cap.main_session
+    };
+    assert!(!seen(), "off reaches Settings");
+    let (ok, out) = h.run(&["set", "main-session-compact", "on"]);
+    assert!(ok, "{out}");
+    assert!(seen(), "on reaches Settings: {out}");
+    let (ok, out) = h.run(&["list"]);
+    assert!(ok && line(&out).contains("(on"), "{out}");
+    let (ok, out) = h.run(&["set", "main-session-compact", "off"]);
+    assert!(ok, "{out}");
+    assert!(!seen(), "set off reaches Settings: {out}");
+    let (ok, out) = h.run(&["list"]);
+    assert!(ok && line(&out).contains("(off)"), "{out}");
 }
 
 /// ATLAS-CLEAR 0004 and 0006: `atlas settings auto-compact` writes Claude

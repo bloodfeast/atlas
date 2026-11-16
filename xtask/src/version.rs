@@ -13,10 +13,12 @@
 //! 1. reads every fragment, and refuses a malformed one, a stray file, a
 //!    fragment git does not track, or an empty set (no `.md` fragment:
 //!    `.none` markers are not changes);
-//! 2. replays the fragments in merge order ([`in_merge_order`]) from
-//!    Cargo.toml's version, one step each ([`next_version`]), or with
-//!    `--release` raises the release number by hand ([`replay`]), or with
-//!    `--set X.Y.Z` takes that version outright ([`target`]);
+//! 2. lists the fragments in merge order ([`in_merge_order`]) and raises
+//!    Cargo.toml's version by the largest pending bump, once per release
+//!    ([`largest`], [`next_version`]), or with `--release` raises the
+//!    release number by hand ([`replay`]), or with `--set X.Y.Z` takes that
+//!    version outright ([`target`]); a set of upgrade notes with no bump is
+//!    nothing to release;
 //! 3. folds the fragments into one new `## vX.Y.Z` section at the top of
 //!    CHANGELOG.md, its parts in the header's order, and refuses a section
 //!    with no Highlights (some fragment must be `section: highlight`);
@@ -31,16 +33,20 @@
 //! still pending ([`refuse_pending`]).
 //!
 //! The version is Release.Feature.Patch, by the same rule above and below
-//! 1.0.0. A `patch` fragment raises the last number; a `feature` fragment
-//! raises the middle one and resets the last to 0; a `breaking` fragment
-//! raises the first and resets the other two. So 0.5.0 with fifteen patches
-//! and then a feature is 0.6.0, and 0.6.0 with patch, patch, feature, patch
-//! is 0.7.1. Otherwise the release number goes up only by hand:
+//! 1.0.0. A release takes the largest pending bump, once: `breaking` over
+//! `feature` over `patch`. A `patch` raises the last number; a `feature`
+//! raises the middle one and resets the last to 0; a `breaking` raises the
+//! first and resets the other two. So 0.6.0 with patch, patch, feature,
+//! patch is 0.7.0, and 0.5.0 with fifteen patches and then a feature is
+//! 0.6.0: the feature is the largest bump, and the patches add nothing to
+//! it. An upgrade note (`section: upgrade`) has no bump of its own (`bump:
+//! none` or none written); a fix or security fragment is `bump: patch`.
+//! Otherwise the release number goes up only by hand:
 //! `--release` makes the next version (X+1).0.0 whatever the fragments say.
 //! `--set X.Y.Z` is the one-off override: every pending fragment goes into
-//! one section at that version, the replay ignored; it must be strictly above
+//! one section at that version, the bumps ignored; it must be strictly above
 //! Cargo.toml's version and cannot go with `--release` (first use: v0.6.0
-//! for the batch since v0.5.0, the replay counting from there). Neither
+//! for the batch since v0.5.0, the largest-bump rule counting from there). Neither
 //! reads a tag.
 //!
 //! The dev-pr workflow's check of a pull request's fragment is
@@ -51,14 +57,17 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use crate::release::{cargo_version, check_section, control_why, nested_heading, output, plugin_version, read_text, setext_underline, stray_control, write, Fence};
+use crate::release::{
+    cargo_version, check_section, control_why, nested_heading, output, plugin_version, read_text, setext_underline, stray_control, write,
+    Fence,
+};
 
 type R<T = ()> = Result<T, String>;
 
 /// Usage.
 pub const USAGE: &str = "usage: cargo xtask version [--dry-run] [--release | --set X.Y.Z]";
 
-/// Which version a release gets: the fragments' replay, the release number
+/// Which version a release gets: the fragments' largest bump, the release number
 /// raised by hand (`--release`), or one given outright (`--set X.Y.Z`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum To {
@@ -70,7 +79,8 @@ pub enum To {
 /// The fragments' folder, from the repository root.
 pub const DIR: &str = "changes";
 
-/// A fragment's `bump:`: which part of Release.Feature.Patch it raises.
+/// A fragment's `bump:`: which part of Release.Feature.Patch it raises. An
+/// upgrade note's `bump: none` (or no `bump:`) is no `Bump` at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Bump {
     /// A change to an existing feature: a fix, performance or correctness.
@@ -97,6 +107,11 @@ impl Bump {
             Bump::Feature => "feature",
             Bump::Breaking => "breaking",
         }
+    }
+
+    /// A fragment's bump as its front matter names it: `none` for none.
+    fn name_of(bump: Option<Bump>) -> &'static str {
+        bump.map_or("none", Bump::name)
     }
 }
 
@@ -166,6 +181,9 @@ fn say(m: &str) {
 
 const NOTHING: &str = "no changelog fragments in changes/: nothing to release (a .none marker is not a change)";
 
+const ONLY_UPGRADES: &str =
+    "nothing to release: only upgrade notes with no bump are pending in changes/, and a release needs a fragment with a bump (changes/README.md)";
+
 /// What a file in `changes/` is, by its name.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Entry {
@@ -184,8 +202,8 @@ pub struct Fragment {
     pub name: String,
     /// The pull request number its name starts with.
     pub pr: u64,
-    /// Its bump.
-    pub bump: Bump,
+    /// Its bump: `None` for an upgrade note's `bump: none` or none written.
+    pub bump: Option<Bump>,
     /// Its section.
     pub section: Section,
     /// Its body, blank lines at both ends trimmed.
@@ -194,7 +212,9 @@ pub struct Fragment {
 
 /// What a name in `changes/` is, or why it is none of them.
 pub fn entry(name: &str) -> R<Entry> {
-    let bad = || format!("changes/{name}: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md or changes/<pr>.none; see changes/README.md)");
+    let bad = || {
+        format!("changes/{name}: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md or changes/<pr>.none; see changes/README.md)")
+    };
     let pr_of = |s: &str| number(s).filter(|_| !s.starts_with('0'));
     if name == "README.md" {
         return Ok(Entry::Readme);
@@ -257,7 +277,12 @@ pub fn parse_fragment(name: &str, text: &str) -> R<Fragment> {
         }
         seen.push(k);
         match k {
-            "bump" => bump = Some(Bump::parse(v).ok_or_else(|| err(&format!("bump must be patch, feature or breaking, not {v}")))?),
+            "bump" => {
+                bump = Some(match v {
+                    "none" => None,
+                    _ => Some(Bump::parse(v).ok_or_else(|| err(&format!("bump must be patch, feature, breaking or none, not {v}")))?),
+                })
+            }
             "section" => {
                 section = Some(Section::parse(v).ok_or_else(|| {
                     err(&format!("section must be highlight, breaking, upgrade, feature, fix, security or known-limit, not {v}"))
@@ -302,14 +327,29 @@ pub fn parse_fragment(name: &str, text: &str) -> R<Fragment> {
     if !closed {
         return Err(err("the front matter has no closing ---"));
     }
-    let bump = bump.ok_or_else(|| err("no bump in the front matter"))?;
+    // `bump` is the value written, `Some(None)` for `bump: none`; an upgrade
+    // note may leave it out.
+    if bump.is_none() && section != Some(Section::Upgrade) {
+        return Err(err("no bump in the front matter"));
+    }
     let section = section.ok_or_else(|| err("no section in the front matter"))?;
-    if section == Section::Breaking && bump != Bump::Breaking {
+    let bump = bump.flatten();
+    // `bump: none` on a breaking section is the none rule's, below.
+    if section == Section::Breaking && bump.is_some_and(|b| b != Bump::Breaking) {
         return Err(err("section: breaking needs bump: breaking"));
     }
     let start = body.iter().position(|l| !l.trim().is_empty()).ok_or_else(|| err("the body is empty"))?;
     if fence.open() {
         return Err(err("an unclosed fenced block: close it with a fence of the same character, at least as long"));
+    }
+    // The contradictions, last, so every other fault keeps its own reason.
+    match (section, bump) {
+        (Section::Upgrade, Some(_)) => return Err(err("section: upgrade takes no bump of its own: write bump: none or leave it out")),
+        (Section::Upgrade, None) => {}
+        (_, None) => return Err(err("bump: none is only for section: upgrade")),
+        (Section::Fix, Some(b)) if b != Bump::Patch => return Err(err("section: fix needs bump: patch")),
+        (Section::Security, Some(b)) if b != Bump::Patch => return Err(err("section: security needs bump: patch")),
+        _ => {}
     }
     let end = body.iter().rposition(|l| !l.trim().is_empty()).map_or(start, |e| e + 1);
     Ok(Fragment { name: name.to_string(), pr, bump, section, body: body[start..end].join("\n") })
@@ -324,8 +364,8 @@ fn parts(v: &str) -> R<(u64, u64, u64)> {
     Ok((x, y, z))
 }
 
-/// The version after `cur` for one fragment's `bump`: each part raised
-/// resets the parts below it (the module docs have the rule).
+/// The version after `cur` for one `bump`: each part raised resets the parts
+/// below it (the module docs have the rule).
 pub fn next_version(cur: &str, bump: Bump) -> R<String> {
     let (x, y, z) = parts(cur)?;
     Ok(match bump {
@@ -335,29 +375,41 @@ pub fn next_version(cur: &str, bump: Bump) -> R<String> {
     })
 }
 
-/// The version after replaying `bumps`, in merge order, from `cur`; with
-/// `release`, (X+1).0.0 whatever they say. No bumps is nothing to release.
-pub fn replay(cur: &str, bumps: &[Bump], release: bool) -> R<String> {
+/// The largest of the pending fragments' bumps (breaking over feature over
+/// patch); `None` when no fragment has one (only upgrade notes).
+pub fn largest(bumps: &[Option<Bump>]) -> Option<Bump> {
+    bumps.iter().flatten().copied().max()
+}
+
+/// The largest pending bump, or why there is nothing to release: no
+/// fragments at all, or only upgrade notes with no bump.
+fn largest_or_nothing(bumps: &[Option<Bump>]) -> R<Bump> {
     if bumps.is_empty() {
         return Err(NOTHING.into());
     }
+    largest(bumps).ok_or_else(|| ONLY_UPGRADES.into())
+}
+
+/// The version after `cur` with `bumps` pending: the largest bump, applied
+/// once; with `release`, (X+1).0.0 whatever they say.
+pub fn replay(cur: &str, bumps: &[Option<Bump>], release: bool) -> R<String> {
+    let bump = largest_or_nothing(bumps)?;
     if release {
         let (x, _, _) = parts(cur)?;
         return Ok(format!("{}.0.0", x + 1));
     }
-    bumps.iter().try_fold(cur.to_string(), |v, b| next_version(&v, *b))
+    next_version(cur, bump)
 }
 
 /// The version a release from `cur` with `bumps` pending gets under `to`.
-/// `--set` ignores the replay but must be strictly above `cur`.
-pub fn target(cur: &str, bumps: &[Bump], to: &To) -> R<String> {
+/// `--set` ignores the bumps but must be strictly above `cur`. Every mode
+/// refuses a set with no bump (only upgrade notes): nothing to release.
+pub fn target(cur: &str, bumps: &[Option<Bump>], to: &To) -> R<String> {
     match to {
         To::Replay => replay(cur, bumps, false),
         To::Release => replay(cur, bumps, true),
         To::Set(v) => {
-            if bumps.is_empty() {
-                return Err(NOTHING.into());
-            }
+            largest_or_nothing(bumps)?;
             if parts(v)? <= parts(cur)? {
                 return Err(format!("--set {v} is not above the current version {cur}"));
             }
@@ -486,7 +538,8 @@ fn replace_first(text: &str, pick: impl Fn(&str) -> bool, with: impl Fn(&str) ->
 
 /// Cargo.toml with its package version set (the line [`cargo_version`] reads).
 pub fn set_cargo_version(text: &str, version: &str) -> R<String> {
-    let out = replace_first(text, |l| l.starts_with("version = \""), |_| format!("version = \"{version}\"")).ok_or("no version in Cargo.toml")?;
+    let out =
+        replace_first(text, |l| l.starts_with("version = \""), |_| format!("version = \"{version}\"")).ok_or("no version in Cargo.toml")?;
     debug_assert_eq!(cargo_version(&out).as_deref(), Some(version));
     Ok(out)
 }
@@ -639,18 +692,16 @@ pub fn run_in(root: &Path, dry_run: bool, to: &To) -> R<String> {
     }
     let cur = crate::release_ci::version_of(root)?;
     in_merge_order(root, &mut p.fragments)?;
-    let mut steps = Vec::new();
-    let mut v = cur.clone();
-    for f in &p.fragments {
-        v = next_version(&v, f.bump)?;
-        steps.push(format!("{} {} {v}", f.name, f.bump.name()));
-    }
-    let bumps: Vec<Bump> = p.fragments.iter().map(|f| f.bump).collect();
+    let steps: Vec<String> = p.fragments.iter().map(|f| format!("{} {}", f.name, Bump::name_of(f.bump))).collect();
+    let bumps: Vec<Option<Bump>> = p.fragments.iter().map(|f| f.bump).collect();
+    // Refuses before anything is written: no bump is nothing to release.
     let next = target(&cur, &bumps, to)?;
+    let alone = replay(&cur, &bumps, false)?;
+    let by = Bump::name_of(largest(&bumps));
     let how = match to {
-        To::Replay => format!("{cur} -> {next}"),
-        To::Release => format!("{cur} -> {next} by --release (the fragments alone: {v})"),
-        To::Set(_) => format!("{cur} -> {next} by --set (the fragments alone: {v})"),
+        To::Replay => format!("{cur} -> {next} by the largest pending bump, {by}"),
+        To::Release => format!("{cur} -> {next} by --release (the fragments alone: {alone}, by the largest pending bump, {by})"),
+        To::Set(_) => format!("{cur} -> {next} by --set (the fragments alone: {alone}, by the largest pending bump, {by})"),
     };
     let tag = format!("v{next}");
     say(&format!("{} fragment(s) in merge order: {}", p.fragments.len(), steps.join(", ")));
@@ -694,7 +745,7 @@ pub fn run_in(root: &Path, dry_run: bool, to: &To) -> R<String> {
         rm.extend(consumed.iter().map(String::as_str));
         git(&rm)?;
         let msg = format!(
-            "Release {tag}\n\nFolds {} changelog fragment(s) into CHANGELOG.md, replayed in merge order\n({how}): {}.\nSets the version in Cargo.toml, Cargo.lock and plugin.json, and deletes the\nfragments and markers it read: {}.",
+            "Release {tag}\n\nFolds {} changelog fragment(s) into CHANGELOG.md, in merge order\n({how}): {}.\nSets the version in Cargo.toml, Cargo.lock and plugin.json, and deletes the\nfragments and markers it read: {}.",
             p.fragments.len(),
             steps.join(", "),
             consumed.join(", ")
@@ -714,7 +765,10 @@ pub fn run_in(root: &Path, dry_run: bool, to: &To) -> R<String> {
         }
         return Err(match (unstaged, put_back.is_empty()) {
             (None, true) => format!("{e}\nrolled back: every file is as it was and nothing was committed"),
-            (u, _) => format!("{e}\nthe rollback failed too, so check `git status`: {}", u.into_iter().chain(put_back).collect::<Vec<_>>().join("; ")),
+            (u, _) => format!(
+                "{e}\nthe rollback failed too, so check `git status`: {}",
+                u.into_iter().chain(put_back).collect::<Vec<_>>().join("; ")
+            ),
         });
     }
     say(&format!("committed {tag}; merge it through a pull request, then `cargo xtask release ship {tag}`"));
@@ -799,21 +853,41 @@ mod tests {
         assert_eq!(entry("187-docs-page.md"), Ok(Entry::Fragment(187)));
         assert_eq!(entry("42.none"), Ok(Entry::None(42)));
         assert_eq!(entry("README.md"), Ok(Entry::Readme));
-        for bad in ["readme.md", "0187.md", "187", "187.txt", "187-.md", "187-Docs.md", "x187.md", "187.none.md", "-1.md", "187 .md", "187_a.md"] {
+        for bad in
+            ["readme.md", "0187.md", "187", "187.txt", "187-.md", "187-Docs.md", "x187.md", "187.none.md", "-1.md", "187 .md", "187_a.md"]
+        {
             assert!(entry(bad).unwrap_err().contains("not a fragment name"), "{bad}");
         }
     }
 
     #[test]
     fn parses_a_good_fragment() {
-        let f = parse_fragment("12.md", "---\nbump: feature\nsection: feature\n---\n\n- **A thing.** It does\n  more.\n- Another.\n\n").unwrap();
-        assert_eq!(f, Fragment { name: "12.md".into(), pr: 12, bump: Feature, section: Section::Feature, body: "- **A thing.** It does\n  more.\n- Another.".into() });
+        let f = parse_fragment("12.md", "---\nbump: feature\nsection: feature\n---\n\n- **A thing.** It does\n  more.\n- Another.\n\n")
+            .unwrap();
+        assert_eq!(
+            f,
+            Fragment {
+                name: "12.md".into(),
+                pr: 12,
+                bump: Some(Feature),
+                section: Section::Feature,
+                body: "- **A thing.** It does\n  more.\n- Another.".into()
+            }
+        );
         // CRLF, blank front matter lines, spaces around the colon, and a fenced block with a `#` line.
-        let f = parse_fragment("3-x.md", "---\r\n\r\nsection :  known-limit\r\nbump:breaking\r\n---\r\n- a\r\n  ```\r\n  # not a heading\r\n  ```\r\n").unwrap();
-        assert_eq!((f.pr, f.bump, f.section), (3, Breaking, Section::KnownLimit));
+        let f = parse_fragment(
+            "3-x.md",
+            "---\r\n\r\nsection :  known-limit\r\nbump:breaking\r\n---\r\n- a\r\n  ```\r\n  # not a heading\r\n  ```\r\n",
+        )
+        .unwrap();
+        assert_eq!((f.pr, f.bump, f.section), (3, Some(Breaking), Section::KnownLimit));
         assert_eq!(f.body, "- a\n  ```\n  # not a heading\n  ```");
         for (s, key, _) in SECTIONS {
-            let bump = if s == Section::Breaking { "breaking" } else { "patch" };
+            let bump = match s {
+                Section::Breaking => "breaking",
+                Section::Upgrade => "none",
+                _ => "patch",
+            };
             assert_eq!(parsed("1.md", bump, key, "- x").section, s);
         }
         assert_eq!(parse_fragment_bytes("1.md", frag("patch", "fix", "- caf\u{e9}").as_bytes()).unwrap().body, "- caf\u{e9}");
@@ -907,13 +981,34 @@ mod tests {
         ("---\nbump: patch\nsection: fix\n---\n- a\n---\n", "underline"),
         ("---\nbump: patch\nsection: fix\n---\n- a\n=\n", "underline"),
         ("---\nbump: patch\nsection: fix\n---\n- a\n\t-- \n", "underline"),
+        // Contradictions (changes/README.md): a fix or security fragment is
+        // a patch, an upgrade note has no bump of its own, and `none` is
+        // only an upgrade note's. Checked last, after every rule above.
+        ("---\nbump: feature\nsection: fix\n---\n- a\n", "section: fix needs bump: patch"),
+        ("---\nbump: breaking\nsection: fix\n---\n- a\n", "section: fix needs bump: patch"),
+        ("---\nbump: feature\nsection: security\n---\n- a\n", "section: security needs bump: patch"),
+        ("---\nbump: breaking\nsection: security\n---\n- a\n", "section: security needs bump: patch"),
+        ("---\nbump: patch\nsection: upgrade\n---\n- a\n", "section: upgrade takes no bump of its own"),
+        ("---\n\nsection :  upgrade\nbump:patch\n---\n\n- a\n", "section: upgrade takes no bump of its own"),
+        ("---\nbump: feature\nsection: upgrade\n---\n- a\n", "section: upgrade takes no bump of its own"),
+        ("---\nbump: breaking\nsection: upgrade\n---\n- a\n", "section: upgrade takes no bump of its own"),
+        ("---\nbump: none\nsection: highlight\n---\n- a\n", "bump: none is only for section: upgrade"),
+        ("---\nbump: none\nsection: breaking\n---\n- a\n", "bump: none is only for section: upgrade"),
+        ("---\nbump: none\nsection: feature\n---\n- a\n", "bump: none is only for section: upgrade"),
+        ("---\nbump: none\nsection: fix\n---\n- a\n", "bump: none is only for section: upgrade"),
+        ("---\nbump: none\nsection: security\n---\n- a\n", "bump: none is only for section: upgrade"),
+        ("---\nbump: none\nsection: known-limit\n---\n- a\n", "bump: none is only for section: upgrade"),
+        ("---\nbump: None\nsection: upgrade\n---\n- a\n", "bump must be patch, feature, breaking or none, not None"),
+        // An upgrade note may leave its bump out, no other section.
+        ("---\nsection: feature\n---\n- a\n", "no bump"),
+        // The format's faults come first: no body, or an open fence, says so.
+        ("---\nbump: none\nsection: fix\n---\n", "body is empty"),
+        ("---\nbump: patch\nsection: upgrade\n---\n- a\n  ```\n", "unclosed fenced block"),
     ];
 
     /// Malformed fragments that are not text at all.
-    pub(crate) const BAD_BYTES: &[(&[u8], &str)] = &[
-        (b"---\nbump: patch\nsection: fix\n---\n- caf\xe9 (Latin-1)\n", "UTF-8"),
-        (b"\xff\xfe-\x00-\x00-\x00\n\x00", "UTF-8"),
-    ];
+    pub(crate) const BAD_BYTES: &[(&[u8], &str)] =
+        &[(b"---\nbump: patch\nsection: fix\n---\n- caf\xe9 (Latin-1)\n", "UTF-8"), (b"\xff\xfe-\x00-\x00-\x00\n\x00", "UTF-8")];
 
     #[test]
     fn refuses_malformed_fragments() {
@@ -956,32 +1051,46 @@ mod tests {
         }
     }
 
+    /// Every bump as a fragment's: each `Some`.
+    fn some(bumps: &[Bump]) -> Vec<Option<Bump>> {
+        bumps.iter().copied().map(Some).collect()
+    }
+
     #[test]
-    fn replay_takes_each_fragment_in_turn() {
-        // Each step counts, in order, and resets what is below it.
-        assert_eq!(replay("0.6.0", &[Patch, Patch, Feature, Patch], false).as_deref(), Ok("0.7.1"));
+    fn a_release_takes_the_largest_bump_once() {
+        // The largest pending bump, once, whatever the order or the count.
+        assert_eq!(replay("0.6.0", &some(&[Patch, Patch, Feature, Patch]), false).as_deref(), Ok("0.7.0"));
         let mut fifteen = vec![Patch; 15];
         fifteen.push(Feature);
-        assert_eq!(replay("0.5.0", &fifteen, false).as_deref(), Ok("0.6.0"), "the patches before the feature leave no trace");
-        assert_eq!(replay("0.5.0", &[Feature, Patch, Patch], false).as_deref(), Ok("0.6.2"));
-        assert_eq!(replay("0.5.0", &[Patch, Patch, Feature], false).as_deref(), Ok("0.6.0"));
-        assert_eq!(replay("0.5.0", &[Feature, Feature], false).as_deref(), Ok("0.7.0"));
-        // A breaking fragment forces a release bump.
-        assert_eq!(replay("0.5.3", &[Breaking], false).as_deref(), Ok("1.0.0"));
-        assert_eq!(replay("1.2.3", &[Feature, Breaking, Patch], false).as_deref(), Ok("2.0.1"));
-        assert_eq!(replay("0.5.0", &[Breaking, Breaking], false).as_deref(), Ok("2.0.0"));
+        assert_eq!(replay("0.5.0", &some(&fifteen), false).as_deref(), Ok("0.6.0"), "the patches add nothing to the feature");
+        assert_eq!(replay("0.5.3", &some(&[Patch; 15]), false).as_deref(), Ok("0.5.4"), "fifteen patches are one patch");
+        assert_eq!(replay("0.5.0", &some(&[Feature, Patch, Patch]), false).as_deref(), Ok("0.6.0"));
+        assert_eq!(replay("0.5.0", &some(&[Patch, Patch, Feature]), false).as_deref(), Ok("0.6.0"));
+        assert_eq!(replay("0.5.0", &some(&[Feature, Feature]), false).as_deref(), Ok("0.6.0"));
+        // A breaking fragment forces a release bump, once.
+        assert_eq!(replay("0.5.3", &some(&[Breaking]), false).as_deref(), Ok("1.0.0"));
+        assert_eq!(replay("1.2.3", &some(&[Feature, Breaking, Patch]), false).as_deref(), Ok("2.0.0"));
+        assert_eq!(replay("0.5.0", &some(&[Breaking, Breaking]), false).as_deref(), Ok("1.0.0"));
+        // Upgrade notes with no bump do not count.
+        assert_eq!(largest(&[None, Some(Patch), None]), Some(Patch));
+        assert_eq!(replay("0.5.3", &[None, Some(Patch), None], false).as_deref(), Ok("0.5.4"));
+        assert_eq!(largest(&[None, None]), None);
         assert!(replay("0.5.0", &[], false).unwrap_err().contains("no changelog fragments"));
+        let e = replay("0.5.0", &[None, None], false).unwrap_err();
+        assert!(e.contains("nothing to release") && e.contains("only upgrade notes with no bump are pending"), "{e}");
+        assert!(!e.contains("no changelog fragments"), "{e}");
     }
 
     #[test]
     fn the_release_flag_raises_the_release_number_by_hand() {
         // `--release` makes it (X+1).0.0, whatever the fragments say.
-        assert_eq!(replay("0.5.0", &[Patch], true).as_deref(), Ok("1.0.0"));
-        assert_eq!(replay("0.5.3", &[Feature, Patch], true).as_deref(), Ok("1.0.0"));
-        assert_eq!(replay("1.2.3", &[Patch], true).as_deref(), Ok("2.0.0"));
-        assert_eq!(replay("0.5.0", &[Patch, Breaking, Patch], true).as_deref(), Ok("1.0.0"));
-        assert_eq!(replay("0.5.0", &[Breaking, Breaking], true).as_deref(), Ok("1.0.0"));
+        assert_eq!(replay("0.5.0", &some(&[Patch]), true).as_deref(), Ok("1.0.0"));
+        assert_eq!(replay("0.5.3", &some(&[Feature, Patch]), true).as_deref(), Ok("1.0.0"));
+        assert_eq!(replay("1.2.3", &some(&[Patch]), true).as_deref(), Ok("2.0.0"));
+        assert_eq!(replay("0.5.0", &some(&[Patch, Breaking, Patch]), true).as_deref(), Ok("1.0.0"));
+        assert_eq!(replay("0.5.0", &some(&[Breaking, Breaking]), true).as_deref(), Ok("1.0.0"));
         assert!(replay("0.5.0", &[], true).unwrap_err().contains("no changelog fragments"));
+        assert!(replay("0.5.0", &[None], true).unwrap_err().contains("nothing to release: only upgrade notes"));
         // The command line.
         let a = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()).collect());
         assert_eq!(a(&[]), Ok(Some((false, To::Replay))));
@@ -1004,7 +1113,7 @@ mod tests {
             parsed("3-a.md", "patch", "fix", "- fix three a"),
             parsed("4.md", "breaking", "breaking", "- breaks four"),
             parsed("5.md", "feature", "highlight", "- shines five\n\n- and five more\n```\n\n- not an item\n```"),
-            parsed("6.md", "patch", "upgrade", "- upgrade six"),
+            parsed("6.md", "none", "upgrade", "- upgrade six"),
             parsed("8.md", "patch", "security", "- harder eight"),
             parsed("1.md", "feature", "highlight", "- shines one"),
         ];
@@ -1122,11 +1231,12 @@ mod tests {
         );
         let head = sh(&d, &["rev-parse", "HEAD"]);
         // A dry run changes nothing. One commit added both: by number, 11 then 12.
-        assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.6.1");
+        // The largest bump is the feature, once.
+        assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.6.0");
         assert_eq!(sh(&d, &["rev-parse", "HEAD"]), head);
         assert_eq!(sh(&d, &["status", "--porcelain"]), "");
 
-        assert_eq!(run_in(&d, false, &To::Replay).unwrap(), "0.6.1");
+        assert_eq!(run_in(&d, false, &To::Replay).unwrap(), "0.6.0");
         assert_eq!(sh(&d, &["rev-parse", "HEAD~1"]), head);
         assert_eq!(sh(&d, &["status", "--porcelain"]), "", "everything is in the one commit");
         let changed = sh(&d, &["diff", "--name-status", "HEAD~1", "HEAD"]);
@@ -1142,13 +1252,14 @@ mod tests {
                 "D\tchanges/13.none",
             ]
         );
-        assert_eq!(crate::release_ci::version_of(&d).unwrap(), "0.6.1");
-        assert!(std::fs::read_to_string(d.join("Cargo.lock")).unwrap().contains("name = \"atlas\"\nversion = \"0.6.1\""));
+        assert_eq!(crate::release_ci::version_of(&d).unwrap(), "0.6.0");
+        assert!(std::fs::read_to_string(d.join("Cargo.lock")).unwrap().contains("name = \"atlas\"\nversion = \"0.6.0\""));
         let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
-        assert_eq!(cl, "# Changelog\n\nHeader.\n\n## v0.6.1\n\n### Highlights\n\n- shines twelve\n\n### Features\n\n- feature eleven\n\n## v0.5.0\n\n### Highlights\n\n- old\n");
+        assert_eq!(cl, "# Changelog\n\nHeader.\n\n## v0.6.0\n\n### Highlights\n\n- shines twelve\n\n### Features\n\n- feature eleven\n\n## v0.5.0\n\n### Highlights\n\n- old\n");
         assert!(d.join("changes/README.md").is_file());
         let msg = sh(&d, &["log", "-1", "--format=%B"]);
-        assert!(msg.starts_with("Release v0.6.1") && msg.contains("0.5.0 -> 0.6.1"), "{msg}");
+        assert!(msg.starts_with("Release v0.6.0") && msg.contains("0.5.0 -> 0.6.0 by the largest pending bump, feature"), "{msg}");
+        assert!(msg.contains("11.md feature, 12.md patch"), "{msg}");
         // Nothing is pending now.
         assert!(run_in(&d, false, &To::Replay).unwrap_err().contains("no changelog fragments"));
     }
@@ -1164,21 +1275,24 @@ mod tests {
         add(&d, "30.md", &frag("patch", "fix", "- fix thirty"));
         sh(&d, &["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
         add(&d, "40.md", &frag("patch", "fix", "- fix forty"));
-        // Merge order 9, 30, 10, 40: 0.5.1, 0.5.2, 0.6.0, 0.6.1. By number
-        // (9, 10, 30, 40) it would be 0.6.2, and by the commit that wrote
-        // each (10 before 30) too.
+        // Merge order 9, 30, 10, 40, not by number (9, 10, 30, 40) nor by the
+        // commit that wrote each (10 before 30): the order the steps list
+        // them in. The version is the largest bump, the feature, once.
         let names = |frags: Vec<Fragment>| frags.into_iter().map(|f| f.name).collect::<Vec<_>>();
         let mut p = pending(&d.join(DIR)).unwrap();
         in_merge_order(&d, &mut p.fragments).unwrap();
         assert_eq!(names(p.fragments), ["9.md", "30.md", "10.md", "40.md"]);
-        assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.6.1");
-        assert_eq!(run_in(&d, false, &To::Replay).unwrap(), "0.6.1");
+        assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.6.0");
+        assert_eq!(run_in(&d, false, &To::Replay).unwrap(), "0.6.0");
         // One section for the release, not one per step.
         let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
         assert_eq!(cl.matches("\n## v").count(), 2, "{cl}");
-        assert!(cl.contains("## v0.6.1\n\n### Highlights\n\n- shines nine\n\n### Features\n\n- feature ten\n\n### Fixes\n\n- fix thirty\n- fix forty\n\n## v0.5.0"), "{cl}");
+        assert!(cl.contains("## v0.6.0\n\n### Highlights\n\n- shines nine\n\n### Features\n\n- feature ten\n\n### Fixes\n\n- fix thirty\n- fix forty\n\n## v0.5.0"), "{cl}");
         let msg = sh(&d, &["log", "-1", "--format=%B"]);
-        assert!(msg.contains("9.md patch 0.5.1, 30.md patch 0.5.2, 10.md feature 0.6.0, 40.md patch 0.6.1"), "{msg}");
+        assert!(
+            msg.contains("(0.5.0 -> 0.6.0 by the largest pending bump, feature): 9.md patch, 30.md patch, 10.md feature, 40.md patch."),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -1187,12 +1301,19 @@ mod tests {
         assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.6.0");
         assert_eq!(run_in(&d, false, &To::Release).unwrap(), "1.0.0");
         assert_eq!(crate::release_ci::version_of(&d).unwrap(), "1.0.0");
-        assert!(std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap().contains("## v1.0.0\n\n### Highlights\n\n- shines twelve\n\n## v0.5.0"));
+        assert!(std::fs::read_to_string(d.join("CHANGELOG.md"))
+            .unwrap()
+            .contains("## v1.0.0\n\n### Highlights\n\n- shines twelve\n\n## v0.5.0"));
         assert!(sh(&d, &["log", "-1", "--format=%B"]).contains("--release"));
 
-        let d = repo("breaking", &[("12.md", &frag("breaking", "breaking", "- breaks twelve")), ("13.md", &frag("patch", "highlight", "- shines"))]);
-        assert_eq!(run_in(&d, false, &To::Replay).unwrap(), "1.0.1");
-        assert!(std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap().contains("## v1.0.1\n\n### Highlights\n\n- shines\n\n### Breaking changes\n\n- breaks twelve\n\n"));
+        let d = repo(
+            "breaking",
+            &[("12.md", &frag("breaking", "breaking", "- breaks twelve")), ("13.md", &frag("patch", "highlight", "- shines"))],
+        );
+        assert_eq!(run_in(&d, false, &To::Replay).unwrap(), "1.0.0");
+        assert!(std::fs::read_to_string(d.join("CHANGELOG.md"))
+            .unwrap()
+            .contains("## v1.0.0\n\n### Highlights\n\n- shines\n\n### Breaking changes\n\n- breaks twelve\n\n"));
     }
 
     #[test]
@@ -1200,16 +1321,18 @@ mod tests {
         // `--set X.Y.Z` is the version, whatever the fragments say, if it is
         // above the current one.
         let set = |v: &str| To::Set(v.into());
-        assert_eq!(target("0.5.0", &[Patch, Patch], &set("0.6.0")).as_deref(), Ok("0.6.0"));
-        assert_eq!(target("0.5.0", &[Breaking], &set("0.6.0")).as_deref(), Ok("0.6.0"));
-        assert_eq!(target("0.5.3", &[Patch], &set("0.5.4")).as_deref(), Ok("0.5.4"));
-        assert_eq!(target("0.5.0", &[Patch], &set("2.0.0")).as_deref(), Ok("2.0.0"));
-        assert_eq!(target("0.9.9", &[Patch], &set("0.10.0")).as_deref(), Ok("0.10.0"));
+        assert_eq!(target("0.5.0", &some(&[Patch, Patch]), &set("0.6.0")).as_deref(), Ok("0.6.0"));
+        assert_eq!(target("0.5.0", &some(&[Breaking]), &set("0.6.0")).as_deref(), Ok("0.6.0"));
+        assert_eq!(target("0.5.3", &some(&[Patch]), &set("0.5.4")).as_deref(), Ok("0.5.4"));
+        assert_eq!(target("0.5.0", &some(&[Patch]), &set("2.0.0")).as_deref(), Ok("2.0.0"));
+        assert_eq!(target("0.9.9", &some(&[Patch]), &set("0.10.0")).as_deref(), Ok("0.10.0"));
         for low in ["0.5.0", "0.4.9", "0.0.1"] {
-            let e = target("0.5.0", &[Patch], &set(low)).unwrap_err();
+            let e = target("0.5.0", &some(&[Patch]), &set(low)).unwrap_err();
             assert!(e.contains(&format!("--set {low} is not above the current version 0.5.0")), "{e}");
         }
         assert!(target("0.5.0", &[], &set("0.6.0")).unwrap_err().contains("no changelog fragments"));
+        // Only upgrade notes: nothing to release under --set too.
+        assert!(target("0.5.0", &[None], &set("0.6.0")).unwrap_err().contains("nothing to release: only upgrade notes"));
         // The command line.
         let a = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()).collect());
         assert_eq!(a(&["--set", "0.6.0"]), Ok(Some((false, set("0.6.0")))));
@@ -1237,8 +1360,8 @@ mod tests {
             ],
         );
         add(&d, "14.md", &frag("patch", "fix", "- fix fourteen"));
-        // The replay alone would make it 0.6.2.
-        assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.6.2");
+        // The fragments alone make it 0.6.0 too: the feature, once.
+        assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.6.0");
         // A dry run returns (and prints) the set version and changes nothing.
         let head = sh(&d, &["rev-parse", "HEAD"]);
         assert_eq!(run_in(&d, true, &set).unwrap(), "0.6.0");
@@ -1265,7 +1388,11 @@ mod tests {
         let names: Vec<String> = names_in(&d.join(DIR)).unwrap().into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["README.md"]);
         let msg = sh(&d, &["log", "-1", "--format=%B"]);
-        assert!(msg.starts_with("Release v0.6.0") && msg.contains("0.5.0 -> 0.6.0 by --set (the fragments alone: 0.6.2)"), "{msg}");
+        assert!(
+            msg.starts_with("Release v0.6.0")
+                && msg.contains("0.5.0 -> 0.6.0 by --set (the fragments alone: 0.6.0, by the largest pending bump, feature)"),
+            "{msg}"
+        );
 
         // The highlight refusal holds under --set too.
         let d = repo("set-nohl", &[("11.md", &frag("feature", "feature", "- f"))]);
@@ -1299,7 +1426,10 @@ mod tests {
         let d = repo("none", &[("13.none", "")]);
         assert!(run_in(&d, false, &To::Replay).unwrap_err().contains("no changelog fragments"));
         // A malformed fragment and a stray name, both reported, nothing written.
-        let d = repo("bad", &[("11.md", "---\nbump: huge\nsection: fix\n---\n- a\n"), ("notes.txt", "x"), ("12.md", &frag("patch", "highlight", "- h"))]);
+        let d = repo(
+            "bad",
+            &[("11.md", "---\nbump: huge\nsection: fix\n---\n- a\n"), ("notes.txt", "x"), ("12.md", &frag("patch", "highlight", "- h"))],
+        );
         let e = run_in(&d, false, &To::Replay).unwrap_err();
         assert!(e.contains("changes/11.md: ") && e.contains("bump must be") && e.contains("changes/notes.txt: not a fragment name"), "{e}");
         assert_eq!(sh(&d, &["status", "--porcelain"]), "");
@@ -1365,6 +1495,135 @@ mod tests {
         assert!(p.files.len() >= p.fragments.len());
     }
 
+    // ------------------------------------- the largest bump, once per release
+
+    /// The v0.6 fragments as they merged (cbe5c4b^), made to conform to the
+    /// fix, security and upgrade rules: fixtures/changes-v0.6. From 0.5.0
+    /// they make 0.6.0, the version v0.6.0 was set to by hand.
+    #[test]
+    fn the_v0_6_fragments_make_0_6_0() {
+        let p = pending(&repo_root().join("fixtures/changes-v0.6")).unwrap();
+        assert_eq!(p.fragments.len(), 26);
+        let bumps: Vec<_> = p.fragments.iter().map(|f| f.bump).collect();
+        assert_eq!(target("0.5.0", &bumps, &To::Replay).as_deref(), Ok("0.6.0"));
+    }
+
+    /// The 26 v0.6 bumps as written, in file-name order: fourteen features
+    /// among them, so one step each would have gone far past 0.6.0.
+    #[test]
+    fn the_raw_v0_6_bumps_take_the_largest_once() {
+        let raw = [
+            Feature, Feature, Feature, Feature, Patch, Feature, Patch, Feature, Feature, Feature, Feature, Patch, Patch, Patch, Feature,
+            Feature, Patch, Patch, Patch, Patch, Patch, Patch, Feature, Patch, Feature, Feature,
+        ];
+        assert_eq!(raw.len(), 26);
+        assert_eq!(target("0.5.0", &some(&raw), &To::Replay).as_deref(), Ok("0.6.0"));
+        // patch, patch, feature, patch from 0.6.0: the feature, once.
+        assert_eq!(target("0.6.0", &some(&[Patch, Patch, Feature, Patch]), &To::Replay).as_deref(), Ok("0.7.0"));
+    }
+
+    /// The refusals the largest-bump rule adds, each with its whole text.
+    const FIX_PATCH: &str = "section: fix needs bump: patch";
+    const SECURITY_PATCH: &str = "section: security needs bump: patch";
+    const UPGRADE_NO_BUMP: &str = "section: upgrade takes no bump of its own: write bump: none or leave it out";
+    const NONE_ONLY_UPGRADE: &str = "bump: none is only for section: upgrade";
+
+    /// Every contradictory fragment, with the text both checks refuse it with.
+    fn contradictions() -> Vec<(String, &'static str)> {
+        let mut v = Vec::new();
+        for bump in ["feature", "breaking"] {
+            v.push((frag(bump, "fix", "- a"), FIX_PATCH));
+            v.push((frag(bump, "security", "- a"), SECURITY_PATCH));
+        }
+        for bump in ["patch", "feature", "breaking"] {
+            v.push((frag(bump, "upgrade", "- a"), UPGRADE_NO_BUMP));
+        }
+        for section in ["highlight", "breaking", "feature", "fix", "security", "known-limit"] {
+            v.push((frag("none", section, "- a"), NONE_ONLY_UPGRADE));
+        }
+        v
+    }
+
+    /// What the contradiction rules leave alone.
+    fn agreements() -> Vec<String> {
+        vec![
+            frag("patch", "fix", "- a"),
+            frag("patch", "security", "- a"),
+            frag("none", "upgrade", "- a"),
+            "---\nsection: upgrade\n---\n- a\n".to_string(),
+            // Feature, highlight and known-limit take any bump (0035).
+            frag("patch", "feature", "- a"),
+            frag("breaking", "highlight", "- a"),
+            frag("patch", "known-limit", "- a"),
+        ]
+    }
+
+    #[test]
+    fn contradictory_fragments_are_refused() {
+        for (text, why) in contradictions() {
+            let e = parse_fragment("5.md", &text).expect_err(&text);
+            assert_eq!(e, format!("changes/5.md: {why}"), "{text:?}");
+        }
+        for text in agreements() {
+            parse_fragment("5.md", &text).unwrap();
+        }
+        // An upgrade note's bump is none, written or not.
+        assert_eq!(parse_fragment("5.md", &frag("none", "upgrade", "- a")).unwrap().bump, None);
+        assert_eq!(parse_fragment("5.md", "---\nsection: upgrade\n---\n- a\n").unwrap().bump, None);
+    }
+
+    #[test]
+    fn the_check_refuses_contradictions_with_the_parser_s_text() {
+        for (i, (text, why)) in contradictions().iter().enumerate() {
+            let (ok, out) = check(&format!("contra-{i}"), "9", true, &[("added", "changes/9.md")], &[("changes/9.md", text.as_bytes())]);
+            assert!(!ok && out.contains(&format!("changes/9.md: {why}\n")), "{text:?}: {out}");
+        }
+        for (i, text) in agreements().iter().enumerate() {
+            let (ok, out) = check(&format!("agreed-{i}"), "9", true, &[("added", "changes/9.md")], &[("changes/9.md", text.as_bytes())]);
+            assert!(ok, "{text:?}: {out}");
+        }
+    }
+
+    /// Three v0.6 fragments as they merged (cbe5c4b^), which the rule now
+    /// refuses: both checks, with the reason.
+    const RAW_207: &str = "---\nbump: feature\nsection: fix\n---\n- **An agent that died on a full disk no longer holds its lane for six hours.** When the disk fills, Claude Code\n  never marks the agent finished, and atlas used to keep counting it against its lane, cap slot and resources\n  until `orchestrate.stale_minutes` (360) passed. Now a SubagentStop counts as a finish (an interim stop, while\n  the agent waits on its own background work, does not).\n  `atlas queue release AGENT` frees a dead agent at once; it refuses one that wrote in the last 5 minutes unless\n  you pass `--force`, and it never edits Claude Code's files. An agent whose last transcript message is a\n  disk-full tool error (`ENOSPC`, \"no space left\", or Windows' \"not enough space on the disk\" / \"os error 112\")\n  stops counting after `orchestrate.disk_full_minutes` (default 10; 0 turns it off).\n";
+    const RAW_155_UPGRADE: &str = "---\nbump: feature\nsection: upgrade\n---\n- **The first search after upgrading embeds the windows of long sections in the background.** On the\n  maintainers' store that is about 2,390 window vectors (about 1.22M tokens) beside the 8,521 section vectors\n  already there, which are kept. Until it is done, answers note `windows pending: N windows, M sections not yet\n  split` and each section scores by the windows it has. On a 7,315-section store, 1,970 windows took 408 s on 8\n  encoder threads. The store's version does not change: an older atlas on the same store keeps working and never\n  deletes the new window vectors.\n";
+    const RAW_160_UPGRADE: &str = "---\nbump: patch\nsection: upgrade\n---\n- **The memory store moves to schema 3 the first time this build opens it.** The migration only adds the worktree\n  ledger's table, index and triggers, and changes no existing row. Before it migrates it writes a copy of the\n  schema 2 store to `memory.sqlite.v2.bak` beside it; if the copy fails, nothing migrates. An older atlas refuses\n  a schema 3 store (\"Update atlas\"), so install this build for every session at once.\n";
+
+    #[test]
+    fn the_raw_v0_6_contradictions_are_refused() {
+        for (name, text, why) in [
+            ("207.md", RAW_207, FIX_PATCH),
+            ("155-upgrade.md", RAW_155_UPGRADE, UPGRADE_NO_BUMP),
+            ("160-upgrade.md", RAW_160_UPGRADE, UPGRADE_NO_BUMP),
+        ] {
+            assert_eq!(parse_fragment(name, text).unwrap_err(), format!("changes/{name}: {why}"));
+            let pr = name.split(['-', '.']).next().unwrap();
+            let path = format!("changes/{name}");
+            let (ok, out) = check(&format!("raw-{name}"), pr, true, &[("added", path.as_str())], &[(path.as_str(), text.as_bytes())]);
+            assert!(!ok && out.contains(&format!("{path}: {why}\n")), "{name}: {out}");
+        }
+    }
+
+    /// Only upgrade notes with no bump pending: nothing to release, under
+    /// every mode, and nothing written.
+    #[test]
+    fn upgrade_notes_alone_are_nothing_to_release() {
+        let d = repo(
+            "upgrades",
+            &[("11-upgrade.md", "---\nsection: upgrade\n---\n- u\n"), ("12.md", &frag("none", "upgrade", "- v")), ("13.none", "")],
+        );
+        let head = sh(&d, &["rev-parse", "HEAD"]);
+        for to in [To::Replay, To::Release, To::Set("0.6.0".into())] {
+            for dry_run in [true, false] {
+                let e = run_in(&d, dry_run, &to).unwrap_err();
+                assert!(e.contains("nothing to release") && e.contains("only upgrade notes with no bump are pending"), "{to:?}: {e}");
+                assert_eq!(sh(&d, &["rev-parse", "HEAD"]), head);
+                assert_eq!(sh(&d, &["status", "--porcelain"]), "");
+            }
+        }
+    }
+
     // ------------------------------------------------ scripts/changes-check.sh
 
     /// Runs the dev-pr check for pull request `pr` over `listing` (the
@@ -1425,7 +1684,13 @@ mod tests {
         assert!(!ok, "{out}");
         // ...except as a `cargo xtask version` fold, which removes others'
         // fragments and writes CHANGELOG.md and Cargo.toml.
-        let (ok, out) = check("fold", "190", true, &[("modified", "Cargo.toml"), ("modified", "CHANGELOG.md"), ("removed", "changes/187.md"), ("removed", "changes/188.none")], &[]);
+        let (ok, out) = check(
+            "fold",
+            "190",
+            true,
+            &[("modified", "Cargo.toml"), ("modified", "CHANGELOG.md"), ("removed", "changes/187.md"), ("removed", "changes/188.none")],
+            &[],
+        );
         assert!(ok, "{out}");
         // Deleting another pull request's fragment is not a fold by itself.
         let (ok, out) = check("bypass", "191", true, &[src, ("removed", "changes/187.md")], &[]);
@@ -1436,13 +1701,20 @@ mod tests {
         let (ok, out) = check("docs", "187", false, &[("modified", "wiki/Home.md")], &[]);
         assert!(ok, "{out}");
         // Both a fragment and a marker.
-        let (ok, out) = check("both", "187", true, &[src, ("added", "changes/187.md"), ("added", "changes/187.none")], &[("changes/187.md", good), ("changes/187.none", b"")]);
+        let (ok, out) = check(
+            "both",
+            "187",
+            true,
+            &[src, ("added", "changes/187.md"), ("added", "changes/187.none")],
+            &[("changes/187.md", good), ("changes/187.none", b"")],
+        );
         assert!(!ok && out.contains("187.none"), "{out}");
         // A bad name, even on a docs-only pull request.
         let (ok, out) = check("badname", "187", false, &[("added", "changes/notes.txt")], &[("changes/notes.txt", b"x")]);
         assert!(!ok && out.contains("not a fragment name"), "{out}");
         // A malformed fragment of its own, even with no build path.
-        let (ok, out) = check("bad", "187", false, &[("added", "changes/187.md")], &[("changes/187.md", b"---\nbump: huge\nsection: fix\n---\n- a\n")]);
+        let (ok, out) =
+            check("bad", "187", false, &[("added", "changes/187.md")], &[("changes/187.md", b"---\nbump: huge\nsection: fix\n---\n- a\n")]);
         assert!(!ok && out.contains("bump must be"), "{out}");
         // A byte order mark, and a file that is not UTF-8, each named.
         let bom = "\u{feff}---\nbump: patch\nsection: fix\n---\n- a\n";
@@ -1478,7 +1750,8 @@ mod tests {
                 frag("breaking", "breaking", "- a"),
                 frag("feature", "feature", "- caf\u{e9}, in UTF-8"),
                 "---\r\nbump: feature\r\nsection: known-limit\r\n---\r\n- a\r\n".to_string(),
-                "---\n\nsection :  upgrade\nbump:patch\n---\n\n- a\n  ```\n  # x\n  ```\n".to_string(),
+                "---\n\nsection :  upgrade\n---\n\n- a\n  ```\n  # x\n  ```\n".to_string(),
+                "---\nbump:none\nsection: upgrade\n---\n- a\n".to_string(),
                 "---\nbump: feature\nsection: highlight\n---\n- **Bold.** text, <kbd>x</kbd> and a < b\n".to_string(),
                 "---\nbump: patch\nsection: fix\n---\n- a\n   ~~~\n   ## v0.0.1\n    <!--\n\n   ~~~~ \n".to_string(),
                 "---\nbump: patch\nsection: fix\n---\n- a\n  ````sh\n  # x\n  ```\n  ````\n".to_string(),

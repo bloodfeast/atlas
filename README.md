@@ -16,11 +16,11 @@ vaults, which open only in Obsidian (elsewhere they are plain text); links withi
 **Languages.** Memory, recall and history, search over Markdown notes and sources, discussions, the work
 queue, projects and multi-repo, and the hooks work whatever programming language a project uses, as does `.proto` indexing (rpc call
 sites are found in any language's files). The code index (`symbol`, item ranges on reads, grep annotations)
-covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C# and Python (through scip-go, scip-typescript,
-scip-dotnet and scip-python when they are installed, or a prebuilt `index.scip` from CI, WSL or Docker, else
-an owned scanner), and any language with a SCIP indexer from a `.scip` file; build and test digests recognise `cargo test`, `nextest`, `go test` (plain and `-json`), jest,
-vitest, `dotnet test` and pytest output, and other
-runners get the generic digest. More languages are planned.
+covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C#, Python, Java and Kotlin (through scip-go,
+scip-typescript, scip-dotnet, scip-python and scip-java when they are installed, or a prebuilt `index.scip`
+from CI, WSL or Docker, else an owned scanner), and any language with a SCIP indexer from a `.scip` file.
+Build and test digests recognise `cargo test`, `nextest`, `go test` (plain and `-json`), jest, vitest,
+`dotnet test`, pytest, Maven and Gradle output, and other runners get the generic digest.
 Ranked search (`fts`, `sections`, `recall`) splits words on spaces and punctuation, so text written without
 spaces (Chinese, Japanese, Thai) is found with `search` in `substring` mode or `grep` instead.
 
@@ -31,13 +31,32 @@ processed 290 more times. Measured on real sessions:
 
 | | Without atlas | With atlas |
 |---|---|---|
-| The tool list, loaded with every session | 47 tools, 5,930 tokens (v0.1) | 14 tools, 5,934 bytes (about 1,480 tokens, at 4 bytes a token); the full reference is one fetched resource |
-| A lookup (median per answer, measured at v0.1.0) | 624 tokens of grep and reads | 288 tokens: 2.2x smaller |
-| Memory questions (100-question evaluation, at v0.2.0) | the whole rulebook loaded | 100/100 answered when the agent follows a result to its source, 99/100 reading only the first result; median 504 tokens each |
+| The tool list, loaded with every session | 47 tools, 5,930 tokens (v0.1) | 14 tools, 6,057 bytes (about 1,514 tokens at 4 bytes a token, measured at v0.6.0); the full reference is one fetched resource |
+| A lookup (7,067 answers against 96 lookups done before atlas, measured at v0.6.0) | grep, then read the files | 6.4x fewer tokens in all (ratio of sums); 10.9x median per answer |
+| Rules and memory at an agent's start (1,560 agents, measured at v0.6.0) | the whole rulebook read once per agent | the relevant records injected as pointers: 108.4x fewer tokens |
+| Memory questions (100-question evaluation, at v0.6.0) | the whole rulebook loaded | 100/100 answered when the agent follows a result to its source, 99/100 reading only the first result; median 506 tokens each |
 
 Shell reads are 36% of what a builder session processes and startup context another 35%; those are the
-buckets atlas targets. How each number was measured, and how to measure your own sessions with
-`cargo xtask attrib`, is on [Token savings and method](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method).
+buckets atlas targets. `atlas --token-report` measures your own store the same way: it takes its baseline from
+your Claude Code transcripts from before atlas, by itself in the background, and nets what atlas puts into
+context (the tool list, hook injections, tool output) against what it saves. How each number was measured, and
+how to measure your own sessions with `cargo xtask attrib`, is on [Token savings and method](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method).
+
+## Beyond the savings
+
+- **Orchestrated mode**, asked at setup and never on by default: an `orchestrate` skill teaches the main session
+  to delegate through lanes and lean briefs, and the hooks cap how many agents of each kind run at once and
+  hand an agent off at its context limit to a fresh one.
+- **`atlas backlog`** lists ruled work that fell out of the queue, aging items first, each with the rulings
+  behind it. It only proposes; the queue's written order never changes.
+- **Pull request reviews.** In a `gh pr diff` file read, context far from a change is one marker line that
+  `recall h:ID lines=A-B` opens, and `atlas pr-events serve` wakes the session that waits on a review.
+- **Long sections are searched whole.** Semantic search embeds a long section as overlapping windows, so a
+  question answered deep inside it finds it.
+- **`atlas worktrees`** keeps an append-only ledger of which lane owns which worktree.
+- **A fresh install teaches Claude atlas.** The server's instructions and a bundled `atlas` skill carry the
+  habits (recall before asking, journal decisions, hand off before stopping), and atlas tells you at session
+  start when an update arrives.
 
 ## Install
 

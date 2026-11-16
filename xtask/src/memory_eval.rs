@@ -1521,8 +1521,8 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
         FROM records WHERE kind IN ('journal', 'handoff') AND scope <> '' GROUP BY scope ORDER BY scope")?;
     let mut ok = true;
 
-    // journal_status: one row per lane, the same counts.
-    let js = call("journal_status", &atlas::json!({}));
+    // journal_status with all: one row per lane, the same counts.
+    let js = call("journal_status", &atlas::json!({"all": true}));
     let mut js_ok = 0;
     for (lane, entries, open, handoffs) in &truth {
         let row = js.lines().find(|l| l.split('\t').next() == Some(lane.as_str()));
@@ -1539,6 +1539,34 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
         }
     }
     ok &= js_ok == truth.len();
+
+    // journal_status by default: exactly the truth lanes active by the
+    // server's own rule (`LaneStatus::active`), then `+N idle lanes` for the
+    // rest, so no lane is lost between the two.
+    let now = atlas::memory::now();
+    let truth_lanes: std::collections::BTreeSet<&str> = truth.iter().map(|(l, ..)| l.as_str()).collect();
+    let active: std::collections::BTreeSet<String> = atlas::memory::MemoryStore::open(store)
+        .and_then(|s| s.lanes())
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|l| truth_lanes.contains(l.lane.as_str()) && l.active(&now))
+        .map(|l| l.lane)
+        .collect();
+    let idle = truth.len() - active.len();
+    let jd = call("journal_status", &atlas::json!({}));
+    let listed: std::collections::BTreeSet<String> =
+        jd.lines().skip(1).filter(|l| !l.starts_with('+')).filter_map(|l| l.split('\t').next()).map(str::to_string).collect();
+    let idle_shown = jd
+        .lines()
+        .filter_map(|l| l.strip_prefix('+'))
+        .find(|r| r.ends_with("(all=true to list)"))
+        .and_then(|r| r.split_whitespace().next()?.parse::<usize>().ok())
+        .unwrap_or(0);
+    let default_ok = listed == active && idle_shown == idle;
+    if !default_ok {
+        println!("    journal_status default: expected active {active:?} and +{idle} idle; got {listed:?} and +{idle_shown} idle");
+    }
+    ok &= default_ok;
 
     // recall lane: every open question and the newest handoff shown; shown
     // plus the `+N more` count is every entry.
@@ -1598,8 +1626,10 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
         let _ = entries;
     }
     println!(
-        "(c) work queue: journal_status {js_ok}/{} lanes exact; recall lane: open questions shown {qs_shown}/{}, newest handoff shown {ho_shown}/{}, latest next and brief shown {latest_shown}/{}; past the default budget: {trimmed} lanes, {counted} older decisions, measurements, commits or notes counted on a +N line",
+        "(c) work queue: journal_status {js_ok}/{} lanes exact (all=true); default {}: {} active listed, +{idle_shown} idle of {idle}; recall lane: open questions shown {qs_shown}/{}, newest handoff shown {ho_shown}/{}, latest next and brief shown {latest_shown}/{}; past the default budget: {trimmed} lanes, {counted} older decisions, measurements, commits or notes counted on a +N line",
         truth.len(),
+        if default_ok { "exact" } else { "WRONG" },
+        listed.len(),
         open_keys.len(),
         newest.len(),
         latest.len()

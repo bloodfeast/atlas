@@ -1,6 +1,6 @@
 ---
 name: atlas
-description: How to work with atlas, the project memory - recall past rulings and decisions before asking, journal to a lane, write handoffs, plan and start queued work by its key, write lean agent briefs with Kind and Lane lines, and keep state across context limits and compaction. Use when orchestrating or briefing agents, when recalling what was decided earlier, when an atlas cap, handoff or compaction message appears, or when a session is about to compact or clear.
+description: How to work with atlas, the project memory - recall past rulings and decisions before asking, journal to a lane, write handoffs, plan and start queued work by its key, write lean agent briefs with Kind and Lane lines, and keep state across context limits and compaction. Use when orchestrating or briefing agents, when recalling what was decided earlier, when an atlas cap, handoff or compaction message appears, or when a session is about to compact or clear; load it before your first journal or handoff.
 ---
 
 # Working with atlas
@@ -21,8 +21,9 @@ entry kind, queue command and setting, generated from the same code as the tool 
    clears the relevance gate, so read what arrived before calling again.
 2. **Journal as you go.** A decision, a measurement, a commit or an open question goes into your lane with
    `journal` when it happens, not at the end. One entry per fact, the headline on the first line.
-3. **Hand off before you stop.** Write a `handoff` for your lane before you stop, and from your handoff point
-   on at the next clean stopping point. It is the only write allowed past the hard limit.
+3. **Hand off whenever work is left for later.** Write a `handoff` for your lane before your final answer
+   whenever work is left for later, and from your handoff point on at the next clean stopping point. It is the
+   only write allowed past the hard limit.
 4. **Name work by its queue key.** Planned work is a `queued` entry with a key (`journal:LANE:NNNN`). Say the
    key, start it with a `Queue:` line in the brief, and mark it done; never describe it from memory.
 5. **Put a `Lane:` line in every brief**, with `Kind:`, so the agent's start gets its lane's recall and its

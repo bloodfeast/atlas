@@ -51,7 +51,8 @@ pub struct Question {
 }
 
 /// The card's token ceiling, Brandon's ruling of 2026-11-06: what the test's card
-/// full of keys measures at his `CARD_BYTES` of 1,160, so no margin by design. It
+/// full of keys measured at his `CARD_BYTES` of 1,160, so no margin by design (the
+/// budget moved to 1,155 on 2026-11-16, where that card reads about 605). It
 /// moves the earlier bar of 600, which 1,110 bytes met by losing facts the eval
 /// asks for. Raising this number is his call, not a fix for a failing test.
 pub const MAX_CARD_TOKENS: usize = 612;

@@ -18,24 +18,47 @@ the release notes, the release commit's message, and this wiki's [[Changelog]] p
 ## Versioning
 
 Releases are batched, and the version comes from changelog fragments. Every pull request that changes what a
-user gets adds `changes/<pr>.md`: front matter naming its bump (`patch`, `feature` or `breaking`) and its section
+user gets adds `changes/<pr>.md`: front matter naming its bump (`patch`, `feature`, `breaking`, or `none` for an
+upgrade note) and its section
 (`highlight`, `breaking`, `upgrade`, `feature`, `fix`, `security` or `known-limit`), then its lines for users.
 A docs, CI or test-only pull request that touches a build path adds an empty `changes/<pr>.none` instead; the
 development repository's `dev-pr` check fails one with neither (`changes/README.md` has the format).
 
-When a release is wanted, `cargo xtask version` (`--dry-run` to preview) replays the pending fragments in merge
+When a release is wanted, `cargo xtask version` (`--dry-run` to preview) lists the pending fragments in merge
 order, folds them into one section for the release at the top of `CHANGELOG.md` (refusing a malformed
-fragment, a stray or untracked file, an empty set, or a section with no Highlights), writes the version into
+fragment, a stray or untracked file, an empty set, a set of upgrade notes with no bump, or a section with no
+Highlights), writes the version into
 `Cargo.toml`, `Cargo.lock` and `.claude-plugin/plugin.json`, and deletes the fragments, all in one commit,
 merged like any other; a failed step puts every file back. The version is Release.Feature.Patch, the same
-above and below 1.0.0: a `patch` fragment raises the last number, a `feature` the middle one and a `breaking`
-the first, each resetting the numbers below it, so 0.6.0 with patch, patch, feature, patch is 0.7.1.
+above and below 1.0.0: a release takes the largest pending bump, once per release. A `patch` raises the last
+number, a `feature` the middle one and a `breaking` the first, each resetting the numbers below it, so 0.6.0
+with patch, patch, feature, patch is 0.7.0. A `fix` or `security` fragment is `bump: patch`, and an upgrade note
+carries no bump of its own (`bump: none` or none written); the checks refuse a fragment that says otherwise.
 Otherwise the release number goes up only by hand, with `--release` ((X+1).0.0). The one-off override,
-`--set X.Y.Z`, folds every pending fragment into one section at that version and ignores the replay; it must
+`--set X.Y.Z`, folds every pending fragment into one section at that version and ignores the bumps; it must
 be strictly above the current version and cannot go with `--release` (first use: v0.6.0 for the batch since
-v0.5.0, the replay counting from there). Merge order is each
+v0.5.0, the largest-bump rule counting from there). Merge order is each
 fragment's adding commit on the first-parent history. `release ship` refuses to start while fragments are
 still pending. Neither reads a tag.
+
+## The README gate
+
+The README is public, and its figures say which version measured them. `cargo xtask release check` and
+`cargo xtask release ship` (before it dispatches the export) refuse a `README.md` that is out of date for the
+version in `Cargo.toml`, and name each README line at fault:
+
+- a figure stamped `at vX.Y.Z` (or `measured at vX.Y.Z`; `X.Y` alone counts too) from a minor more than one
+  before the release: releasing 0.6.1, a figure at v0.5.0 passes and one at v0.4.0 is refused. A figure from an
+  older release number is refused (releasing 1.0.0, a figure at v0.9.0). A version not after the word `at`,
+  such as a `(v0.1)` baseline, is not a stamp;
+- a line that says something is `planned` or `coming` and names, in backticks, a term that a released
+  `## vX.Y.Z` section of `CHANGELOG.md` names in backticks. A promise in prose alone ("more languages are
+  planned") is not caught, so read the README for those when cutting a release.
+
+Fix it by measuring the figure again on this version and stamping it, or taking it out; never by restamping a
+figure that was not measured again. `cargo test -p xtask` runs the gate on the repository's README too
+(`the_repository_readme_passes_for_this_version`), so the version commit that leaves a figure two minors behind
+fails its tests until the README is refreshed.
 
 ## Release notes
 
@@ -83,11 +106,12 @@ cargo xtask release ship vX.Y.Z   # run 2: merges, waits for the build, signs an
 ```
 
 Each run reads what GitHub holds for the version and takes the next step, so a run that stopped anywhere is
-simply run again. It asks before each public act, at a terminal, for a typed answer that names the act and the
-version: `open vX.Y.Z` before the export goes to the public repository, `merge vX.Y.Z` before the merge, and
-`publish vX.Y.Z` once before the signature, the upload, the pushes and the publish. An answer for one act never
-passes another. Without a terminal every one is refused and nothing changes, so no script or agent can open,
-merge or publish a release; no environment variable or flag skips a prompt.
+simply run again. Run 1 asks nothing: it prints its plan and sends the export to the public repository as a pull
+request branch, and the owner's approval of that pull request on GitHub is the gate before anything merges. Run 2
+asks before each of its public acts, at a terminal, for a typed answer that names the act and the version:
+`merge vX.Y.Z` before the merge, and `publish vX.Y.Z` once before the signature, the upload, the pushes and the
+publish. An answer for one act never passes another. Without a terminal every one is refused and nothing changes,
+so no script or agent can merge or publish a release; no environment variable or flag skips a prompt.
 
 **Run 1** (no pull request yet):
 
@@ -97,13 +121,13 @@ merge or publish a release; no environment variable or flag skips a prompt.
    stops it: the build would refuse to make another.
 2. The binary leak check: unless a pass stamp stands for this commit, denylist and accepted-hits file, `release
    check` (below) runs first. The plan says so before it starts: three release builds, tens of minutes.
-3. The plan, then `open vX.Y.Z`. The command records the commit, a random nonce and the run in its stage folder
+3. The plan, then the dispatch, with no prompt. The command records the commit, a random nonce and the run in its stage folder
    (`<stage>/vX.Y.Z/ship/state.json`), and starts the `release-pr` workflow with the version, that commit and the
    nonce. It finds the run by the nonce in its name, watches it to the end, and prints the pull request. A failed
    run is reported by its page only, never its log.
 
-A run already in progress is watched, never started twice. After a failed run, the next run 1 starts it again
-only after a new `open` answer; the release branch may already be on the public repository, and the new run
+A run already in progress is watched, never started twice. After a failed run, the next run 1 starts it again;
+the release branch may already be on the public repository, and the new run
 replaces it. The same holds once the pull request is open: when `main` has moved on since run 1, or the last
 run that was meant to update the pull request failed or never showed, ship re-exports (run 2, step 2). A pull
 request closed without a merge gives way to run 1 again once its branch is gone from the public repository, or
@@ -138,13 +162,12 @@ not merge it on GitHub: run 2 merges it.
    record; without it the checks below stand alone, and the command says so). If not, ship **re-exports**
    instead of merging: run 1's steps again for `HEAD`, which must be the tip of `main` (a re-export never goes
    back to an older commit), with the binary leak check unless a stamp stands, the plan naming the pull request,
-   and a new `open vX.Y.Z` whose prompt names the pull request's number, its current head and `HEAD`. The new
-   `release-pr` run replaces the release branch and updates the open pull request, so its head moves; ship
-   watches the run and prints the pull request. An approval of the old head does not count: review the pull
-   request again, approve it on its new head, and run ship again. A run still in progress is watched, never
-   dispatched again; a failed one is dispatched again only after another `open` answer. Without an answer nothing
-   is dispatched and the pull request does not change (a `release check` run before the prompt may have left its
-   stamp). Otherwise the checkout guard with `HEAD` on `main`.
+   and, with no prompt, a line naming the pull request's number, its current head and `HEAD` before the
+   dispatch. The new `release-pr` run replaces the release branch and updates the open pull request, so its head
+   moves; ship watches the run and prints the pull request. An approval of the old head does not count: review
+   the pull request again, approve it on its new head, and run ship again. A run still in progress is watched,
+   never dispatched again; a failed one is dispatched again on the next run. Otherwise the checkout guard with
+   `HEAD` on `main`.
 3. The owner's latest review must be an approval of the pull request's head commit (an approval of an earlier
    push does not count), and no one else's latest review may ask for changes. Each reviewer's latest is read from
    the pull request's `reviews` by time, comments aside, as GitHub counts it (gh's `latestReviews` leaves the

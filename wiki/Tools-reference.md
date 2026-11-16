@@ -33,7 +33,9 @@ answer as `{"text": ...}` around its text), and `verbose: true` adds scan times 
 `vault:path sha256=... bytes=N` line, then the note exactly as written (the JSON answer repeats the frontmatter
 parsed beside the content). A tool without a text form of its own writes its JSON as `key: value` lines, a list
 of flat records as one table under `key: N`, and every element of every list: the work-queue tools
-(`decision_queue`, `awaiting`, `journal_status`) are never cut. The text (`src/text.rs`):
+(`decision_queue`, `awaiting`, `journal_status`) are never cut. `journal_status` lists the active lanes (an open
+question, a queued entry, or a record in the last 14 days), then `+N idle lanes (all=true to list)` for the
+rest; `all: true` lists every lane. The text (`src/text.rs`):
 
 - A list is a header row of field names, then one tab-separated row per record, so names appear once. Inside a
   value a tab is written `\t`, a newline `\n` and a carriage return `\r`; nothing else is escaped.
@@ -232,7 +234,8 @@ subagents, so a subagent may be told `unchanged since call #N` of an answer only
 follows the reply's `fresh: true` to get it. Once a PreToolUse hook has been seen, a call it did not announce
 is never answered by reference. A PreCompact hook forgets the session's answers. The work-queue tools
 (`decision_queue`, `awaiting`, `journal_status`, `next_id`, the discussion reads, `misses`) and
-`recall {lane}` always answer whole.
+`recall {lane}` always answer whole; whole for `journal_status` means every active lane and the idle count
+(`all: true` for every lane).
 
 `read_note` takes `lines` (`A-B`, `A-` or `A`, from 1) or `budget_tokens` (whole lines up to about that many
 tokens, the first line always); the header line names the lines shown, and a cut ends with

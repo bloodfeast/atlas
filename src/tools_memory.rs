@@ -416,6 +416,13 @@ impl Server {
         } else {
             hits.extend(raw.into_iter().map(|(h, score, _)| (h, score)));
         }
+        // A query that asks for a rule gets the managed records (rules and
+        // memories) first, in their own order, so the governing rule leads
+        // whole even where journal measurements that repeat its words
+        // outscore it. A `kind` filter already says what is wanted.
+        if kind.is_none() && recall::seeks_rule(q) {
+            hits.sort_by_key(|(h, _)| !crate::memory::rules::managed_kind(&h.kind));
+        }
         if hits.is_empty() {
             let records: i64 = store.conn().query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
             let none: String = match (records, has_exports) {
@@ -490,26 +497,25 @@ impl Server {
     }
 
     fn journal_status(&mut self, a: &Map) -> Result<String> {
-        let mut out = String::new();
-        let mut t = Table::new(&mut out, &["lane", "entries", "last", "last_commit", "open_questions", "handoffs"]);
-        for l in self.status_lanes(a)? {
-            t.field(&l.lane).num(l.entries).field(l.last.get(..16).unwrap_or(&l.last)).field(&l.last_commit).num(l.open_questions).num(l.handoffs);
-        }
-        Ok(out)
+        let (lanes, idle) = self.status_lanes(a)?;
+        Ok(status_text(&lanes, idle))
     }
 
     fn journal_status_json(&mut self, a: &Map) -> Result<Value> {
-        let lanes: Vec<Value> = self
-            .status_lanes(a)?
+        let (lanes, idle) = self.status_lanes(a)?;
+        let lanes: Vec<Value> = lanes
             .into_iter()
             .map(|l| crate::json!({"lane": l.lane, "entries": l.entries, "last": l.last, "last_commit": l.last_commit, "open_questions": l.open_questions, "handoffs": l.handoffs}))
             .collect();
-        Ok(crate::json!({"lanes": lanes}))
+        Ok(crate::json!({"lanes": lanes, "idle": idle}))
     }
 
-    /// The lanes `journal_status` lists: every lane, or with `repo` those
-    /// about the repositories it covers.
-    fn status_lanes(&mut self, a: &Map) -> Result<Vec<crate::memory::LaneStatus>> {
+    /// The lanes `journal_status` lists, and how many idle lanes it left
+    /// out: every lane, or with `repo` those about the repositories it
+    /// covers; then, unless `all`, only the active ones
+    /// ([`crate::memory::LaneStatus::active`]).
+    fn status_lanes(&mut self, a: &Map) -> Result<(Vec<crate::memory::LaneStatus>, usize)> {
+        let all = opt_bool(a, "all", false)?;
         let covered = self.repo_coverage(a)?;
         let m = self.mem()?;
         let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
@@ -526,7 +532,7 @@ impl Server {
             }
             out.push(l);
         }
-        Ok(out)
+        Ok(keep_active(out, all, &crate::memory::now()))
     }
 
     /// The repositories a `repo` argument covers (see
@@ -940,4 +946,82 @@ fn w_head(w: &crate::memory::Writer<'_>, key: &str) -> rusqlite::Result<crate::m
 
 fn store_exports_of(w: &crate::memory::Writer<'_>, key: &str) -> Result<Vec<String>> {
     w.exports_of(key)
+}
+
+/// The lanes `journal_status` lists from `lanes` at `now`, and how many idle
+/// lanes it left out: every lane with `all`, else the active ones.
+fn keep_active(lanes: Vec<crate::memory::LaneStatus>, all: bool, now: &str) -> (Vec<crate::memory::LaneStatus>, usize) {
+    if all {
+        return (lanes, 0);
+    }
+    let total = lanes.len();
+    let kept: Vec<_> = lanes.into_iter().filter(|l| l.active(now)).collect();
+    let idle = total - kept.len();
+    (kept, idle)
+}
+
+/// `journal_status` as text: a row per lane, then `+N idle lanes` when
+/// idle lanes were left out.
+fn status_text(lanes: &[crate::memory::LaneStatus], idle: usize) -> String {
+    let mut out = String::new();
+    let mut t = Table::new(&mut out, &["lane", "entries", "last", "last_commit", "open_questions", "handoffs"]);
+    for l in lanes {
+        t.field(&l.lane)
+            .num(l.entries)
+            .field(l.last.get(..16).unwrap_or(&l.last))
+            .field(&l.last_commit)
+            .num(l.open_questions)
+            .num(l.handoffs);
+    }
+    if idle > 0 {
+        out.push_str(&format!("+{idle} idle lane{} (all=true to list)\n", if idle == 1 { "" } else { "s" }));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keep_active, status_text};
+    use crate::memory::LaneStatus;
+
+    fn lane(name: &str, last: &str, open_questions: i64, queued: i64, handoffs: i64) -> LaneStatus {
+        LaneStatus {
+            lane: name.into(),
+            entries: 2,
+            last: last.into(),
+            last_commit: String::new(),
+            open_questions,
+            handoffs,
+            last_work: String::new(),
+            queued,
+        }
+    }
+
+    /// #224: by default only active lanes are listed, then a count of the
+    /// idle ones; `all` lists every lane. A handoff alone keeps no lane.
+    #[test]
+    fn journal_status_lists_active_lanes_unless_all() {
+        let now = "2026-11-16T12:00:00.000Z";
+        let old = "2026-10-27T12:00:00.000Z";
+        let lanes = vec![
+            lane("ASKED", old, 1, 0, 0),
+            lane("PLANNED", old, 0, 1, 0),
+            lane("RECENT", "2026-11-13T12:00:00.000Z", 0, 0, 0),
+            lane("IDLE1", old, 0, 0, 1),
+            lane("IDLE2", old, 0, 0, 0),
+            lane("IDLE3", old, 0, 0, 0),
+            lane("IDLE4", old, 0, 0, 0),
+            lane("IDLE5", old, 0, 0, 0),
+        ];
+        assert!(lanes[2].active(now) && !lanes[3].active(now));
+        let (kept, idle) = keep_active(lanes.clone(), false, now);
+        let t = status_text(&kept, idle);
+        let names: Vec<&str> = t.lines().skip(1).filter_map(|l| l.split('\t').next()).collect();
+        assert_eq!(names, ["ASKED", "PLANNED", "RECENT", "+5 idle lanes (all=true to list)"], "{t}");
+        assert!(t.ends_with("\n+5 idle lanes (all=true to list)\n"), "{t}");
+        println!("default output: {} bytes\n{t}", t.len());
+        let (all, none) = keep_active(lanes, true, now);
+        assert_eq!((all.len(), none), (8, 0));
+        assert!(!status_text(&all, none).contains("idle"));
+    }
 }

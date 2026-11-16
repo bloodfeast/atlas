@@ -20,6 +20,18 @@ const STOP: &[&str] = &[
     "now", "new", "get", "got", "let", "may", "must", "need", "via", "per", "yes", "it's", "don't", "i'm", "please", "thanks", "okay",
 ];
 
+/// Whether a query asks for a rule: it has one of the whole words rule,
+/// rules, always, never or should, or "supposed" followed by "to". Read from
+/// the raw query, lowercased and split on non-alphanumerics, not from
+/// [`terms`], which drops "should" as a stop word. `recall {query}` then
+/// puts rules and memories ahead of other kinds.
+pub fn seeks_rule(query: &str) -> bool {
+    let q = query.to_lowercase();
+    let words: Vec<&str> = q.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    words.iter().any(|w| matches!(*w, "rule" | "rules" | "always" | "never" | "should"))
+        || words.windows(2).any(|p| p == ["supposed", "to"])
+}
+
 /// The words of a question worth searching for: lowercase, at least three
 /// characters, not a stop word, each once, at most 48.
 pub fn terms(text: &str) -> Vec<String> {

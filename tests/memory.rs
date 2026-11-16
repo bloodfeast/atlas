@@ -1321,3 +1321,87 @@ fn recall_says_what_it_left_out() {
     let a = text(call(&mut s, "recall", json!({"query": "gear note", "limit": 200})));
     assert!(!a.contains("(limit="), "{a}");
 }
+
+/// #224: `journal_status {"all": true}` lists every lane, as `{}` did
+/// before idle lanes were left out; lanes touched today are active, so both
+/// answer the same here, through the full tool and through `recall op=status`.
+#[test]
+fn journal_status_all_lists_every_lane() {
+    let f = fixture("mem-status-all");
+    drop(import_all(&f));
+    let (mut s, _fx) = server(&f);
+    for lane in ["ALPHA", "BETA"] {
+        s.answer("journal", &json!({"lane": lane, "entry": "note", "text": "a note"})).unwrap();
+    }
+    let default = s.answer("journal_status", &json!({})).unwrap().into_text();
+    let all = s.answer("journal_status", &json!({"all": true})).unwrap().into_text();
+    assert_eq!(all, default);
+    assert!(all.contains("ALPHA\t") && all.contains("BETA\t") && !all.contains("idle lanes"), "{all}");
+    let merged = s.answer("recall", &json!({"op": "status", "all": true})).unwrap().into_text();
+    assert_eq!(merged, all);
+}
+
+/// #226: a query that asks for a rule (rule, always, never, should,
+/// supposed to) gets the governing memory first, even when journal
+/// measurements outscore it on bm25; with `memory.rules` unset and on.
+/// A query with none of those words keeps the bm25 order.
+#[test]
+fn a_rule_seeking_query_puts_the_governing_memory_first() {
+    let mut wrong = Vec::new();
+    for live in [false, true] {
+        let mut f = fixture(if live { "mem-rule-first-live" } else { "mem-rule-first" });
+        if live {
+            f.settings.recall.rules = atlas::memory::rules::Mode::Live;
+        }
+        drop(import_all(&f));
+        let (mut s, _fx) = server(&f);
+        s.answer(
+            "remember",
+            &json!({"kind": "memory", "key": "brief-writer-order", "title": "Briefs come first", "sub": "feedback", "summary": "briefs before the classifier", "reason": "testing rule ranking",
+                    "body": "Brandon ruled that a haiku agent is the brief writer, and the brief is written and reviewed before the classifier lands in the queue, never after it."}),
+        )
+        .unwrap();
+        for n in 0..2 {
+            s.answer(
+                "journal",
+                &json!({"lane": "CLASSIFY", "entry": "measurement",
+                        "text": format!("haiku brief writer run {n}: brief writer haiku classifier lands\nhaiku brief writer rule classifier lands; haiku brief writer classifier lands rule; brief writer haiku")}),
+            )
+            .unwrap();
+        }
+        let first = |s: &mut atlas::tools::Server, q: &str| -> String {
+            let out = s.answer("recall", &json!({"query": q})).unwrap().into_text();
+            out.lines().next().unwrap_or_default().split_whitespace().nth(1).unwrap_or_default().to_string()
+        };
+        let firsts: Vec<(bool, &str, String)> = [
+            "haiku brief writer rule before classifier lands",
+            "do we always run the haiku brief writer before classifier lands",
+            "never skip the haiku brief writer before classifier lands",
+            "should the haiku brief writer run before classifier lands",
+            "is the haiku brief writer supposed to run before classifier lands",
+        ]
+        .into_iter()
+        .map(|q| (live, q, first(&mut s, q)))
+        .collect();
+        wrong.extend(firsts.into_iter().filter(|(_, _, k)| k != "brief-writer-order"));
+        let plain = first(&mut s, "haiku brief writer before classifier lands");
+        assert!(plain.starts_with("journal:CLASSIFY:"), "live={live}: a plain query keeps the bm25 order, got {plain}");
+    }
+    assert!(wrong.is_empty(), "(live, query, first) not the memory: {wrong:#?}");
+}
+
+/// #232: the review meta shapes from the issue. Key-colon lines are filed,
+/// also with a spaced `repo #N`; `key=value` on one line is refused and the
+/// refusal names the first missing line. Fixed by #201; this guards it.
+#[test]
+fn review_meta_shapes_from_issue_232() {
+    let f = fixture("mem-review-shapes");
+    drop(import_all(&f));
+    let (mut s, _fx) = server(&f);
+    let e = s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": "role=cost pr=api#930 head=1badb68a verdict=merge"})).unwrap_err().to_string();
+    assert!(e.contains("`role:` is missing"), "{e}");
+    for meta in ["role: cost\npr: api#930\nhead: 1badb68a\nverdict: merge with follow-ups", "role: cost\npr: api #930\nhead: 1badb68a\nverdict: merge with follow-ups"] {
+        let out = s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": meta})).unwrap().into_text();
+        assert!(out.starts_with("ok journal:P:") && !out.contains("names no repo"), "{meta:?}: {out}");
+    }
+}

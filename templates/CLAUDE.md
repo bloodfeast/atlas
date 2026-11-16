@@ -39,7 +39,7 @@ the context small.
 - Journal decisions and measurements to the lane as they happen.
   Why: a journal entry is one recall for the next agent; a memory of it is nothing.
 
-- Write a handoff before stopping, naming the state, the evidence and the steps left.
+- Write a handoff before your final answer whenever work is left for later, naming the state, the evidence and the steps left.
   Why: the next agent starts from the handoff, not from a rebuilt context.
 
 - Ask the user design questions as multiple choice, with a recommended default.

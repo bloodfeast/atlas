@@ -1972,7 +1972,8 @@ fn a_new_or_cleared_session_gets_the_resume_card() {
     assert!(card.contains("- work queue: 1 waiting"), "{card}");
     assert!(!card.contains("other handoffs"), "the lanes line names the only handoff: {card}");
     assert!(card.contains("not met") && card.contains("Ship the exporter"), "{card}");
-    assert!(card.contains("(1) resume the work queue, (2) change it first, or (3) do something more pressing"), "{card}");
+    assert!(card.contains("- to resume: handoff:build-7:001 \"Exporter half done\"\n"), "{card}");
+    assert!(card.contains("(1) resume that handoff or the work queue, (2) change it first, or (3) do something more pressing"), "{card}");
     assert!(card.len() <= atlas::resume::CARD_BYTES, "{} bytes", card.len());
     // Compaction keeps its own card; a resumed session needs none.
     assert!(!startup(&mut h, "compact").contains("resume card"));

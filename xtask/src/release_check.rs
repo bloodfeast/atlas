@@ -9,7 +9,9 @@
 //!     x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu inside WSL),
 //!     in the release's build environment with at most 16 jobs, and runs the
 //!     binary leak gate (accepted hits honoured) and the secret scan on
-//!     them. Refuses a checkout with an uncommitted change to a tracked
+//!     them. Refuses first a README.md that is out of date for the version
+//!     ([`stale_readme`]; `release ship` runs the same before its export),
+//!     then a checkout with an uncommitted change to a tracked
 //!     file and a host that did not build every target it should. A pass
 //!     writes a stamp keyed by the commit, the denylist's SHA-256 and the
 //!     accepted-hits file's SHA-256; a later run with the same key says so
@@ -70,6 +72,7 @@ pub fn run(root: &Path, args: Vec<String>) -> R {
                 }
             }
             let version = cargo_version(&read_text(&root.join("Cargo.toml"))?).ok_or("no version in Cargo.toml")?;
+            refuse_stale_readme(root, &version)?;
             let denylist = denylist_from_env()?;
             let accepted = accepted_file(env("ATLAS_LEAK_ACCEPTED"), &denylist)?;
             check_here(root, &format!("v{version}"), &denylist, accepted.as_deref(), force).map(|_| ())
@@ -267,6 +270,120 @@ pub(crate) fn check(c: &Check) -> R<bool> {
     write(&c.stage.join(STAMP), format!("{key}targets {}\n", c.want.join(" ")))?;
     say(&format!("check passed: {} (stamp {})", c.want.join(", "), c.stage.join(STAMP).display()));
     Ok(true)
+}
+
+// ---------------------------------------------------------------- readme
+
+/// `X.Y` or `X.Y.Z` at the start of `s`: (major, minor) and the bytes read.
+fn lead_version(s: &str) -> Option<((u64, u64), usize)> {
+    let b = s.as_bytes();
+    let digits = |from: usize| from + b[from.min(b.len())..].iter().take_while(|c| c.is_ascii_digit()).count();
+    let e1 = digits(0);
+    if e1 == 0 || b.get(e1) != Some(&b'.') {
+        return None;
+    }
+    let e2 = digits(e1 + 1);
+    if e2 == e1 + 1 {
+        return None;
+    }
+    let mut end = e2;
+    if b.get(e2) == Some(&b'.') && digits(e2 + 1) > e2 + 1 {
+        end = digits(e2 + 1);
+    }
+    Some(((s[..e1].parse().ok()?, s[e1 + 1..e2].parse().ok()?), end))
+}
+
+/// Every version stamp in `line`, `at vX.Y[.Z]` (`measured at v...` too,
+/// any case, `at` a word of its own): its text and its (major, minor).
+fn stamps(line: &str) -> Vec<(&str, (u64, u64))> {
+    let lower = line.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("at v") {
+        let at = from + i;
+        from = at + 4;
+        if at > 0 && lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        if let Some((v, n)) = lead_version(&line[at + 4..]) {
+            // "measured at" is named whole in the finding.
+            let start = if lower[..at].ends_with("measured ") { at - 9 } else { at };
+            out.push((&line[start..at + 4 + n], v));
+        }
+    }
+    out
+}
+
+/// Whether `line` promises work: it holds the word `planned` or `coming`.
+fn promises(line: &str) -> bool {
+    line.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("planned") || w.eq_ignore_ascii_case("coming"))
+}
+
+/// The `code` spans of `line`: what sits between a pair of backticks.
+fn code_spans(line: &str) -> Vec<&str> {
+    line.split('`').skip(1).step_by(2).filter(|s| !s.trim().is_empty()).collect()
+}
+
+/// The first release section (`## vX.Y.Z`) of `changelog` that names
+/// `` `term` ``; the header above the first section ships nothing.
+fn shipped_in<'a>(changelog: &'a str, term: &str) -> Option<&'a str> {
+    let quoted = format!("`{term}`");
+    let mut section = None;
+    for l in changelog.lines() {
+        if let Some(v) = l.strip_prefix("## ").filter(|v| v.starts_with('v')) {
+            section = Some(v.trim());
+        } else if section.is_some() && l.contains(&quoted) {
+            return section;
+        }
+    }
+    None
+}
+
+/// What README.md says that is out of date for the release `version`, one
+/// finding per line, each naming its README line:
+///
+/// * (a) a figure stamped `at vX.Y.Z` from a minor more than one before the
+///   release (an older release number counts as older);
+/// * (b) a line that says something is `planned` or `coming` and names, in
+///   backticks, a term a release section of the CHANGELOG already names in
+///   backticks. A promise in prose alone ("more languages are planned") is
+///   not caught: there is nothing exact to look up.
+pub(crate) fn stale_readme(readme: &str, changelog: &str, version: &str) -> Vec<String> {
+    let Some(((major, minor), _)) = lead_version(version) else {
+        return vec![format!("README.md: the release version `{version}` is not X.Y.Z")];
+    };
+    let mut found = Vec::new();
+    for (i, l) in readme.lines().enumerate() {
+        for (text, (smaj, smin)) in stamps(l) {
+            if smaj < major || (smaj == major && smin + 1 < minor) {
+                found.push(format!(
+                    "README.md:{}: `{text}` is a figure from v{smaj}.{smin}, more than one minor before v{version}: measure it again and stamp it with this version, or take it out",
+                    i + 1
+                ));
+            }
+        }
+        if promises(l) {
+            for term in code_spans(l) {
+                if let Some(v) = shipped_in(changelog, term) {
+                    found.push(format!(
+                        "README.md:{}: says `{term}` is planned or coming, but CHANGELOG.md ships it in {v}: say what it does now",
+                        i + 1
+                    ));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Refuses a README.md that [`stale_readme`] finds out of date for
+/// `version`; run by `release check` and by `release ship` before export.
+pub(crate) fn refuse_stale_readme(root: &Path, version: &str) -> R {
+    let found = stale_readme(&read_text(&root.join("README.md"))?, &read_text(&root.join("CHANGELOG.md"))?, version);
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(format!("README.md is out of date for v{version} (wiki/Releasing.md, the README gate):\n{}", found.join("\n")))
 }
 
 // ---------------------------------------------------------------- accept-hit
@@ -553,5 +670,72 @@ mod tests {
         let canon = |s: &str| s.split(", ").nth(1).unwrap().split(' ').next().unwrap().to_string();
         assert_eq!(canon(&sa), canon(&sb));
         assert_ne!(sa, sb);
+    }
+
+    const LOG: &str =
+        "# Changelog\n\nHeader: `atlas header-only`.\n\n## v0.5.0\n\n### Highlights\n\n- **`atlas backlog` combs the backlog.**\n";
+
+    #[test]
+    fn a_readme_figure_more_than_one_minor_old_is_refused_with_its_line() {
+        let readme = "# t\n| a lookup (measured at v0.4.0) | 2x |\n| memory (at v0.2.0) | 99 |\n";
+        let found = stale_readme(readme, LOG, "0.6.1");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].starts_with("README.md:2: `measured at v0.4.0`") && found[0].contains("v0.6.1"), "{}", found[0]);
+        assert!(found[1].starts_with("README.md:3: `at v0.2.0`"), "{}", found[1]);
+    }
+
+    #[test]
+    fn a_figure_one_minor_old_or_newer_passes_and_other_versions_are_not_stamps() {
+        let readme = "at v0.5.0 and AT V0.6.0, at v0.6, at v0.7.0\n47 tools (v0.1), format v0.1.0, that v0.1.0, at version 0.1\n";
+        assert_eq!(stale_readme(readme, LOG, "0.6.1"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_figure_from_an_older_release_number_is_stale() {
+        let found = stale_readme("x (at v0.9.0)\n", LOG, "1.0.0");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("README.md:1:"), "{}", found[0]);
+        assert_eq!(stale_readme("x (at v1.1.0)\n", LOG, "1.2.0"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_promise_the_changelog_has_shipped_is_refused() {
+        let found = stale_readme("Intro.\nA `atlas backlog` command is planned.\n", LOG, "0.6.1");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("README.md:2: ") && found[0].contains("`atlas backlog`") && found[0].contains("v0.5.0"),
+            "{}",
+            found[0]
+        );
+        assert_eq!(stale_readme("`atlas backlog` is coming soon.\n", LOG, "0.6.1").len(), 1);
+    }
+
+    #[test]
+    fn a_promise_of_unshipped_work_or_no_promise_passes() {
+        // Not in a release section (the header does not ship anything).
+        assert_eq!(stale_readme("`atlas header-only` is planned.\n", LOG, "0.6.1"), Vec::<String>::new());
+        assert_eq!(stale_readme("`atlas next` is planned.\n", LOG, "0.6.1"), Vec::<String>::new());
+        // Shipped, but not promised: no `planned` or `coming` word.
+        assert_eq!(stale_readme("`atlas backlog` is incoming; it was unplanned.\n", LOG, "0.6.1"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn refuse_stale_readme_names_the_line_and_needs_both_files() {
+        let d = tmp("readme");
+        assert!(refuse_stale_readme(&d, "0.6.1").unwrap_err().contains("README.md"));
+        std::fs::write(d.join("CHANGELOG.md"), LOG).unwrap();
+        std::fs::write(d.join("README.md"), "ok (at v0.6.0)\n").unwrap();
+        assert_eq!(refuse_stale_readme(&d, "0.6.1"), Ok(()));
+        std::fs::write(d.join("README.md"), "ok\nold (at v0.3.0)\n").unwrap();
+        let e = refuse_stale_readme(&d, "0.6.1").unwrap_err();
+        assert!(e.contains("README.md:2: `at v0.3.0`") && e.contains("v0.6.1"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_repository_readme_passes_for_this_version() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let version = cargo_version(&read_text(&root.join("Cargo.toml")).unwrap()).unwrap();
+        assert_eq!(refuse_stale_readme(root, &version), Ok(()));
     }
 }

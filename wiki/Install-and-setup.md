@@ -184,6 +184,10 @@ cargo build --release --locked
 
 and copy `target/release/atlas` (`atlas.exe` on Windows) into the plugin's `bin` folder as
 `atlas-<arch>-<os>` (for example `atlas-aarch64-unknown-linux-gnu`), or as `atlas.exe` on Windows.
+With a local-folder (directory) marketplace, Claude Code runs the plugin from the clone itself, not from its
+plugin cache, so the binary goes into the clone's `bin/` folder; a copy in the plugin cache is not found and the
+server fails to start (seen on Claude Code 2.1.325). Put the binary in place before the first session: a start
+without it begins Claude Code's 15-minute hold on the server (see [As a Claude Code plugin](#as-a-claude-code-plugin)).
 
 ### Uninstall
 
@@ -247,3 +251,4 @@ failed, and its hooks report it as not connected.
 This is Claude Code's behaviour, measured at 14.9 minutes still failing and 15.2 connected, and atlas cannot change it.
 A session works without atlas in that time: routing, recall and agent caps are off. `atlas doctor` names the wait
 when it can see Claude Code's record of it (`mcp-needs-auth-cache.json`).
+If the server fails to start, run `atlas doctor`: it names the wait and how long is left. It does not end the wait.

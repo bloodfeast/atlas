@@ -14,6 +14,45 @@ Sections are not written here by hand. Each pull request adds a fragment, `chang
 and section, and `cargo xtask version` folds the pending fragments into one section for the next release, in
 the order above, and sets the version by replaying them in merge order (`changes/README.md`).
 
+## v0.6.1
+
+### Highlights
+
+- **The first published 0.6 release.** v0.6.0 was not published, so v0.6.1 brings everything in its section below:
+  semantic search that reads the whole of a long section, a rules template for projects that have none, PR file
+  reads that hide far context behind a marker you can open, and a main session that is told when to ask for
+  `/compact`. It adds two fixes: a routed grep that matches nothing can no longer crash the atlas server, and the
+  worktree ledger now finds worktrees on macOS and Windows, where temp and home paths go through a symlink or a
+  short name.
+
+### Fixes
+
+- **A release's version now takes the largest pending bump, once.** `cargo xtask version` used to raise the version
+  one step per changelog fragment, so the v0.6 batch would have reached 0.19.0; it now raises it by the largest
+  bump among the pending fragments (breaking over feature over patch), so 0.6.0 with patch, patch, feature, patch
+  is 0.7.0. The changelog check refuses contradictory fragments: `section: fix` and `section: security` need
+  `bump: patch`, an upgrade note takes no bump of its own (`bump: none` or none written), and a set of only
+  upgrade notes is nothing to release.
+- **Onboarding is clearer from the first session.** The server instructions say to load the bundled `atlas` skill
+  before your first journal or handoff, and to write a handoff before your final answer whenever work is left for
+  later, not only before you stop (also in the skill and the rules template). The resume card now shows the title
+  and next step of the handoff its question asks about, within a 1,155-byte budget (605 tokens on the test's card
+  full of keys). The install page says that a local-folder marketplace runs the plugin from the clone, so the
+  binary goes in the clone's `bin/` folder before the first session, and that `atlas doctor` names Claude Code's
+  15-minute wait if the server fails to start.
+- **`journal_status` lists only the lanes that are active.** A lane with an open question, a queued entry or a
+  record in the last 14 days is listed. The rest are counted as idle lanes, and `all: true` lists every lane.
+- **Recall puts rules first when you ask about one.** A query with rule, always, never, should or "supposed to"
+  and no kind filter returns rules and memories before other records.
+- **The journal tool's description names its arguments.** It names lane, entry and text, and the meta lines a
+  review entry needs.
+- **The README is up to date for v0.6.** Its figures are measured again and stamped at v0.6.0: a lookup returns
+  6.4x fewer tokens than grep and file reads in all (10.9x median, over 7,067 answers), an agent's start injects
+  108.4x fewer tokens than reading the rulebook, and the memory evaluation answers 100/100 questions at a median 506
+  tokens. It names Java, Kotlin, Maven and Gradle, drops a stale "more languages are planned", and lists the major
+  features since v0.3. `cargo xtask release check` and `release ship` now refuse a README whose stamped figures are
+  more than one minor behind the release, naming each line.
+
 ## v0.6.0
 
 ### Highlights

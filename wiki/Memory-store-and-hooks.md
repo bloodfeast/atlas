@@ -20,7 +20,7 @@ it. The design and the measured hook behaviour it rests on are in `docs/design/a
 | `supersede` | yes | replaces `old` records with a new one placed right after the first |
 | `journal` | yes | a lane entry: `brief`, `decision`, `measurement` (conditions in `meta`), `commit`, `question`, `answered` (`refs: ["answers:<key>"]`), `next`, `note` |
 | `handoff` | yes | a lane handoff; also the one tool the context cap lets through |
-| `journal_status` | | one row per lane: entries, last entry, last commit, open questions, handoffs |
+| `journal_status` | | one row per active lane (an open question, a queued entry, or a record in the last 14 days): entries, last entry, last commit, open questions, handoffs; then `+N idle lanes`. `all: true` lists every lane |
 | `memory_log` | | versions newest first, filtered by key, kind, scope, time, author |
 | `hook` | | the hooks' entry point: event fields in, hook JSON (or nothing) out |
 
@@ -156,12 +156,14 @@ or `"off"`.
   main session to work this way. `atlas --setup` asks whether to turn it on and its options, and the first
   new session asks the same through Claude until it is answered (`atlas settings orchestrate`; see [[Install and setup]]).
 - **Resume card (`memory.resume_card`, on by default):** SessionStart with `source: startup` or `clear` injects
-  where the work stands as keys, in at most 1,160 bytes (612 tokens on the test's card full of keys, at 1,119 bytes, by a public
+  where the work stands as keys, in at most 1,155 bytes (about 605 tokens on the test's card full of keys, at 1,121 bytes, by a public
   vocabulary times a fitted factor, not real tokens; `cargo test -p xtask` holds that card there, the bytes bind at runtime). The lines: the six newest live lanes, each with its open question count and newest
   handoff; the live lanes' open questions; after a `/clear` only, the agents still running from the previous
   session (a new process has none, so none hold slots); the work queue's count, up to five that can start now
-  and the next waiting; the previous session's goal when its newest `goal_status` says not met; and handoffs
-  the lanes line does not name. A lane is live when it has a work record in the last 7 days: an active journal
+  and the next waiting; the previous session's goal when its newest `goal_status` says not met; handoffs
+  the lanes line does not name; and, just before the question and always kept, the handoff the question names
+  (the newest live lane's, else the newest other one) with its title and its next step: the first body line
+  starting with `Next`, or the line under a `Next` heading, clipped to 60 characters (the title alone when there is none). A lane is live when it has a work record in the last 7 days: an active journal
   entry or handoff that atlas did not write itself (queue entries and notes, the hook's cap and compaction
   notes); a note counts only while no queued entry waits in its lane, since there it adds to a brief. A line past
   the budget is cut at an item, and the card ends by asking Claude to put one multiple-choice question to the

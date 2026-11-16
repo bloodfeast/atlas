@@ -3,8 +3,9 @@
 
 use atlas::json;
 
-/// The ceiling, in tokens at the default ratio of bytes per token.
-const BUDGET_TOKENS: f64 = 1500.0;
+/// The ceiling, in tokens at the default ratio of bytes per token. Raised from
+/// 1500 to 1515 when the journal description began naming its arguments (#225).
+const BUDGET_TOKENS: f64 = 1515.0;
 
 #[test]
 fn tools_list_fits_its_budget() {

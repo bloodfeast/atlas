@@ -326,29 +326,36 @@ fn sign_checkout(root: &Path, remote: &str, stub: bool) -> R<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Paths `.gitattributes` at HEAD marks export-ignore: exact paths only, as
-/// it has (a pattern would need git's matcher, so it is refused).
-fn export_ignored(checkout: &Path) -> R<Vec<String>> {
-    let text = git_out(checkout, &["show", "HEAD:.gitattributes"]).unwrap_or_default();
-    let mut out = Vec::new();
-    for l in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
-        let mut w = l.split_whitespace();
-        let Some(path) = w.next() else { continue };
-        if w.any(|a| a == "export-ignore") {
-            if path.contains(['*', '?', '[', '\\']) || path.ends_with('/') {
-                return Err(format!(".gitattributes marks the pattern {path} export-ignore: `release sign` compares exact paths only"));
-            }
-            out.push(path.trim_start_matches('/').to_string());
-        }
+/// The paths of HEAD that `git archive HEAD` leaves out: every tracked path
+/// git itself finds export-ignore, from HEAD's own `.gitattributes` files
+/// at every depth (`check-attr --source`, git 2.40 or later), so a pattern
+/// or a folder's own `* export-ignore` is matched as the export matches it.
+fn export_ignored(checkout: &Path) -> R<std::collections::HashSet<String>> {
+    let paths = git_out(checkout, &["ls-tree", "-r", "-z", "--name-only", "--full-tree", "HEAD"])?;
+    let mut c = git(checkout);
+    c.args(["check-attr", "--stdin", "-z", "--source=HEAD", "export-ignore"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("{c:?}: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("git check-attr: no stdin")?;
+    // Written from a thread: check-attr answers as it reads, so a large
+    // tree would fill the output pipe while the input is still unwritten.
+    let feed = std::thread::spawn(move || std::io::Write::write_all(&mut stdin, paths.as_bytes()));
+    let o = child.wait_with_output().map_err(|e| format!("{c:?}: {e}"))?;
+    let fed = feed.join().map_err(|_| "git check-attr: the input thread panicked".to_string())?;
+    if !o.status.success() {
+        return Err(format!("{c:?} failed: {} (export-ignore needs git 2.40 or later)", String::from_utf8_lossy(&o.stderr).trim()));
     }
-    Ok(out)
+    fed.map_err(|e| format!("{c:?}: {e}"))?;
+    // -z output: path NUL attribute NUL value NUL, per path.
+    let out = String::from_utf8_lossy(&o.stdout);
+    let f: Vec<&str> = out.split('\0').collect();
+    Ok(f.as_chunks::<3>().0.iter().filter(|[_, _, v]| *v == "set").map(|[p, _, _]| p.to_string()).collect())
 }
 
 /// `git ls-tree -r` of `rev` as path -> mode, kind and object, without the
 /// paths `skip` names.
 fn tree_entries(dir: &Path, rev: &str, skip: impl Fn(&str) -> bool) -> R<std::collections::BTreeMap<String, String>> {
-    Ok(git_out(dir, &["ls-tree", "-r", "--full-tree", rev])?
-        .lines()
+    Ok(git_out(dir, &["ls-tree", "-r", "-z", "--full-tree", rev])?
+        .split('\0')
         .filter_map(|l| l.split_once('\t'))
         .filter(|(_, p)| !skip(p))
         .map(|(m, p)| (p.to_string(), m.to_string()))
@@ -362,7 +369,7 @@ fn tree_entries(dir: &Path, rev: &str, skip: impl Fn(&str) -> bool) -> R<std::co
 /// it: sign from the development commit the release was made from.
 pub(crate) fn same_code(checkout: &Path, public: &Path, target: &str) -> R {
     let ignored = export_ignored(checkout)?;
-    let here = tree_entries(checkout, "HEAD", |p| ignored.iter().any(|i| i == p))?;
+    let here = tree_entries(checkout, "HEAD", |p| ignored.contains(p))?;
     let there = tree_entries(public, target, |p| p.starts_with("bin/")).map_err(|_| format!("the draft's commit {} is not in the public clone", short(target)))?;
     let differ: Vec<&String> = here.keys().chain(there.keys().filter(|k| !here.contains_key(*k))).filter(|k| here.get(*k) != there.get(*k)).collect();
     if differ.is_empty() {
@@ -2215,13 +2222,71 @@ Signed-off-by: S <s@example.invalid>");
                 assert!(e.contains(&format!("1 path(s) differ ({f})")), "{e}");
             }
         }
-        // An export-ignore pattern cannot be followed.
+        // An export-ignore pattern is followed: what it matches is never
+        // compared, and only the changed .gitattributes itself differs.
         sh(&dev, &["reset", "-q", "--hard", &good]);
         commit_files(&dev, &[(".gitattributes", "*.yml export-ignore\n")], "a pattern");
-        assert!(sign(&with(true)).unwrap_err().contains("marks the pattern *.yml export-ignore"));
+        let e = sign(&with(true)).unwrap_err();
+        assert!(e.contains("1 path(s) differ (.gitattributes)"), "{e}");
         assert_eq!(sh(&fx.bare, &["rev-parse", "main"]), fx.target);
         assert!(!uploaded(&fx));
         let _ = std::fs::remove_dir_all(&fx.d);
+    }
+
+    /// A development checkout holding `extra` beside the fixture's source,
+    /// and a public repository whose commit is that checkout's `git
+    /// archive` export. `(dir, dev, public, target)`.
+    fn exported(name: &str, extra: &[(&str, &str)]) -> (PathBuf, PathBuf, PathBuf, String) {
+        let d = tmp(name);
+        let dev = dev_checkout(&d);
+        commit_files(&dev, extra, "extra");
+        let public = d.join("public");
+        sh(&d, &["init", "-q", "-b", "main", public.to_str().unwrap()]);
+        let tar = d.join("src.tar");
+        sh(&dev, &["archive", "--format=tar", "-o", tar.to_str().unwrap(), "HEAD"]);
+        crate::tar::extract(&std::fs::read(&tar).unwrap(), &public).unwrap();
+        sh(&public, &["add", "-A"]);
+        sh(&public, &["-c", "user.name=P", "-c", "user.email=pub@example.invalid", "commit", "-q", "-m", "export"]);
+        let target = sh(&public, &["rev-parse", "HEAD"]);
+        (d, dev, public, target)
+    }
+
+    /// A folder whose own `.gitattributes` marks it `* export-ignore` is
+    /// left out of the export, so `same_code` leaves it out too; a real
+    /// code difference is still refused.
+    #[test]
+    fn same_code_skips_a_folder_its_own_gitattributes_export_ignores() {
+        let (d, dev, public, target) = exported(
+            "same-nested",
+            &[
+                ("notes/held/.gitattributes", "# stays out\n* export-ignore\n"),
+                ("notes/held/SETUP.md", "private\n"),
+                ("notes/held/deep/more.md", "deeper\n"),
+                ("odd name/x y.txt", "spaces\n"),
+                ("docs/public.md", "public\n"),
+            ],
+        );
+        assert!(!public.join("notes/held/SETUP.md").exists() && !public.join("notes/held/.gitattributes").exists() && public.join("docs/public.md").is_file());
+        same_code(&dev, &public, &target).unwrap();
+        commit_files(&dev, &[("docs/public.md", "changed\n")], "other code");
+        let e = same_code(&dev, &public, &target).unwrap_err();
+        assert!(e.contains("1 path(s) differ (docs/public.md)"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A root `.gitattributes` pattern is followed as git follows it.
+    #[test]
+    fn same_code_skips_what_a_root_export_ignore_pattern_matches() {
+        let attrs = format!("{}*.secret export-ignore\n", SOURCE[10].1);
+        let (d, dev, public, target) = exported("same-pattern", &[(".gitattributes", &attrs), ("keys/a.secret", "s\n"), ("keys/b.txt", "b\n")]);
+        assert!(!public.join("keys/a.secret").exists() && public.join("keys/b.txt").is_file());
+        same_code(&dev, &public, &target).unwrap();
+        commit_files(&dev, &[("keys/a.secret", "changed: never compared\n")], "secret");
+        same_code(&dev, &public, &target).unwrap();
+        commit_files(&dev, &[("keys/b.txt", "changed\n")], "other code");
+        let e = same_code(&dev, &public, &target).unwrap_err();
+        assert!(e.contains("1 path(s) differ (keys/b.txt)"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

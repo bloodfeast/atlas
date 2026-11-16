@@ -306,7 +306,7 @@ Answers are plain text; `format: "json"` gives JSON. A repeated read answers `un
   - `key` `h:ID` (a digest's handle) reads that stored output: its first page, or one of `lines` (A-B), `item`, `failures`, `grep` (with `context`), `head`, `tail`, `page`, `digest`; a hint line `recall h:ID lines=A-B` is those arguments, and they may also follow the id in `key`; `key` `h:` lists the newest
 - `remember`: Store a memory, rule or decision; revising needs expected_sha; old: supersede.
   - with `old` runs `supersede`
-- `journal`: Append a lane journal entry.
+- `journal`: Append a lane journal entry: lane, entry, text. Review meta: role:, pr:, head:, verdict:.
   - entry `queued` files planned work, as `atlas queue plan` does: the text's first line is the title, the rest its scope; `meta` lines `kind:`, `priority:`, `uses:`, `after:` (queue keys or free text) and `order:` are checked, other lines kept
   - entry `review` files a review for the merge gate (`orchestrate.reviews`): `meta` lines `role:`, `pr:`, `head:` (the sha read), `verdict:` (pass, merge, merge with follow-ups, request changes) and `report:`
   - `amend: KEY` with `expected_sha` (the head's sha) rewrites that entry's title and body as a new version; its lane, entry, meta lines and refs stay (pass the same `lane` and `entry`, no `meta` or `refs`)
@@ -803,9 +803,10 @@ Write a lane handoff (allowed past the context cap). A fresh agent starts from r
 
 #### journal_status
 
-Lanes: entries, last entry, last commit, open questions, handoffs.
+Active lanes (an open question, a queued entry or a record in the last 14 days): entries, last entry, last commit, open questions, handoffs; then +N idle lanes. all lists every lane.
 
 - `repo` string: Only lanes naming this repo of the active project or a repo it talks to or is used by.
+- `all` boolean: Every lane, idle ones too. Default false.
 
 #### memory_log
 

@@ -480,9 +480,9 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "journal_status",
-        description: "Lanes: entries, last entry, last commit, open questions, handoffs.",
+        description: "Active lanes (an open question, a queued entry or a record in the last 14 days): entries, last entry, last commit, open questions, handoffs; then +N idle lanes. all lists every lane.",
         read_only: true,
-        schema: || obj(json!({"repo": s("Only lanes naming this repo of the active project or a repo it talks to or is used by.")}), &[]),
+        schema: || obj(json!({"repo": s("Only lanes naming this repo of the active project or a repo it talks to or is used by."), "all": b("Every lane, idle ones too. Default false.")}), &[]),
     },
     ToolDef {
         name: "memory_log",

@@ -788,6 +788,23 @@ pub struct LaneStatus {
     /// [`WORK_SQL`] passes, where a note counts only while no `queued` entry
     /// waits in the lane (a note in a planned lane is a brief addition).
     pub last_work: String,
+    /// Active `queued` entries: planned work waiting in the lane.
+    pub queued: i64,
+}
+
+/// Days without a journal or handoff record after which a lane is idle, and
+/// `journal_status` leaves it out unless asked for `all`.
+pub const IDLE_DAYS: i64 = 14;
+
+impl LaneStatus {
+    /// Whether the lane is active at `now`: it has an open question, a
+    /// queued entry, or a record from the last [`IDLE_DAYS`]. A handoff alone
+    /// does not keep a lane active, since handoffs never close and most old
+    /// lanes carry one. A time that cannot be read counts as active, so a
+    /// lane is never hidden by a parse.
+    pub fn active(&self, now: &str) -> bool {
+        self.open_questions > 0 || self.queued > 0 || crate::queue::minutes_between(&self.last, now).is_none_or(|m| m <= IDLE_DAYS * 24 * 60)
+    }
 }
 
 /// The open-question test, in SQL over `records r`: an active question no
@@ -1505,6 +1522,7 @@ impl MemoryStore {
                         let (work, notes, waiting): (String, String, i64) = (r.get(6)?, r.get(7)?, r.get(8)?);
                         if waiting > 0 { work } else { work.max(notes) }
                     },
+                    queued: r.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -18,13 +18,17 @@
 //! - the pending ideas, when `memory.ideas` is on (see [`crate::ideas`]);
 //! - the previous session's goal, when it was not met.
 //!
-//! Then one instruction: ask the user, as multiple choice, whether to resume,
-//! change the plan, or do something more pressing first.
+//! Then the handoff the question names (the newest live lane's, else the
+//! newest other one): its key, title and next step, each clipped (Brandon's
+//! ruling of 2026-11-16, journal:ATLAS-RELEASE:0036). Then one instruction:
+//! ask the user, as multiple choice, whether to resume that handoff or the
+//! queue, change the plan, or do something more pressing first.
 //!
 //! The whole card fits [`CARD_BYTES`]: a line past the budget is cut at an
-//! item boundary, and a line with no room left is dropped. The goal line and
-//! the instruction are never cut: their bytes are reserved first, because
-//! the card asks for the goal to be restated as written. A goal too long for
+//! item boundary, and a line with no room left is dropped. The goal line, the
+//! handoff line and the instruction are never cut: their bytes are reserved
+//! first, because the card asks for the goal to be restated as written, and
+//! the question names the handoff. A goal too long for
 //! the card ([`GOAL_CHARS`]) is named by where it is instead of shown cut.
 //!
 //! The previous session is the newest other transcript in the folder. When
@@ -43,14 +47,16 @@ use crate::Result;
 
 /// A lane is live when its newest work record is at most this many days old.
 pub const LIVE_DAYS: i64 = 7;
-/// The card's byte budget, Brandon's ruling of 2026-11-06: 1,160 bytes, the lowest
-/// budget tried that holds every question of the resume eval. The test's card full
-/// of keys reads 612 tokens at 1,119 bytes under it, and that count is the ceiling
-/// in `xtask/src/resume_eval.rs`, with no margin for the estimate's error. Only the
-/// bytes bind at runtime: a card filling the budget could read a few more tokens.
-/// Keys run about 1.83 bytes per token by that estimate, a public vocabulary times
-/// a fitted factor and not real tokens, under the 2.42 of mixed session text.
-pub const CARD_BYTES: usize = 1_160;
+/// The card's byte budget, Brandon's ruling of 2026-11-06 as moved on 2026-11-16:
+/// 1,155 bytes. The 2026-11-06 budget of 1,160 was the lowest tried that held every
+/// question of the resume eval; with the reserved handoff line (#230) one more queue
+/// key fit at 1,160 and the test's card full of keys read 629 tokens, so he took 5
+/// bytes back. That card now reads about 605 tokens at 1,121 bytes, under the
+/// ceiling in `xtask/src/resume_eval.rs`. Only the bytes bind at runtime: a card
+/// filling the budget could read a few more tokens. Keys run about 1.84 bytes per
+/// token by that estimate, a public vocabulary times a fitted factor and not real
+/// tokens, under the 2.42 of mixed session text.
+pub const CARD_BYTES: usize = 1_155;
 /// Items listed at most per line.
 const MAX_LANES: usize = 6;
 const MAX_QUESTIONS: usize = 6;
@@ -178,9 +184,27 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
         lines.push(q);
     }
 
+    // The handoff the closing question names: the newest live lane's, else
+    // the newest recent one the lanes line does not name.
+    let asked = named
+        .first()
+        .and_then(|k| handoffs.iter().find(|(_, x, ..)| x.as_str() == *k))
+        .or_else(|| handoffs.iter().find(|(_, k, _, time)| !named.contains(&k.as_str()) && recent(time)))
+        .map(|(_, k, t, _)| (k.as_str(), t.as_str()));
+    let resume = match asked {
+        Some((k, t)) => {
+            let mut l = format!("- to resume: {k} \"{}\"", one_line(t));
+            if let Some(step) = store.head(k)?.and_then(|h| next_step(&h.body)) {
+                l.push_str(&format!(", next: {}", one_line(&step)));
+            }
+            l + "\n"
+        }
+        None => String::new(),
+    };
+
     let rest: Vec<String> = handoffs
         .iter()
-        .filter(|(_, k, _, time)| !named.contains(&k.as_str()) && recent(time))
+        .filter(|(_, k, _, time)| !named.contains(&k.as_str()) && asked.is_none_or(|(a, _)| a != k.as_str()) && recent(time))
         .take(MAX_HANDOFFS)
         .map(|(_, k, t, _)| format!("{k} ({})", clip(t)))
         .collect();
@@ -189,12 +213,18 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
     }
 
     let goal_line = prev.as_deref().and_then(|p| goal(p).map(|g| goal_line(&g, p))).unwrap_or_default();
-    if lines.is_empty() && goal_line.is_empty() {
+    if lines.is_empty() && goal_line.is_empty() && resume.is_empty() {
         return Ok(None);
     }
     lines.extend(ideas.map(str::to_string));
-    let first = if items.is_empty() { "resume the work above" } else { "resume the work queue" };
-    let ask = format!("{goal_line}Before other work, ask the user one multiple-choice question: (1) {first}, (2) change it first, or (3) do something more pressing.\n");
+    let first = match (asked, items.is_empty()) {
+        (Some(_), true) => "resume that handoff".to_string(),
+        (Some(_), false) => "resume that handoff or the work queue".to_string(),
+        (None, true) => "resume the work above".to_string(),
+        (None, false) => "resume the work queue".to_string(),
+    };
+    // The resume line is reserved with the ask, so a full card still shows it.
+    let ask = format!("{goal_line}{resume}Before other work, ask the user one multiple-choice question: (1) {first}, (2) change it first, or (3) do something more pressing.\n");
     Ok(Some(fit(&lines, &ask, budget)))
 }
 
@@ -254,12 +284,58 @@ fn more(n: usize, max: usize) -> String {
     if n > max { format!(" ({max} of {n})") } else { String::new() }
 }
 
+/// `s` on one line for the resume line: whitespace collapsed, "; " made
+/// ", ", and clipped to [`TITLE_CHARS`].
+fn one_line(s: &str) -> String {
+    clip(&s.split_whitespace().collect::<Vec<_>>().join(" ").replace("; ", ", "))
+}
+
+/// A handoff body's next step: the first line whose text, past list and
+/// heading markers, starts with the word "Next" (any case), from after its
+/// first `:`. A heading such as `## Next steps`, or a line with nothing
+/// after its `:`, gives the first non-blank line under it instead, without
+/// its marker. `None` when no line starts so.
+fn next_step(body: &str) -> Option<String> {
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        let text = unmark(line);
+        let Some(rest) = text.get(..4).filter(|p| p.eq_ignore_ascii_case("next")).and_then(|_| text.get(4..)) else { continue };
+        if rest.chars().next().is_some_and(char::is_alphanumeric) {
+            continue;
+        }
+        let heading = line.trim_start().starts_with('#');
+        let after = rest.split_once(':').map(|(_, a)| a.trim_start_matches(['*', '_']).trim());
+        let step = match after {
+            Some(a) if !a.is_empty() => a,
+            _ if heading || after.is_some() => unmark(lines.find(|l| !l.trim().is_empty())?),
+            _ => text,
+        };
+        return Some(step.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|s| !s.is_empty());
+    }
+    None
+}
+
+/// `line` without its leading heading, quote and list markers.
+fn unmark(line: &str) -> &str {
+    let mut t = line.trim();
+    loop {
+        let s = t.trim_start_matches(['#', '>', '-', '*', '+']).trim_start();
+        let digits = s.trim_start_matches(|c: char| c.is_ascii_digit());
+        let s = if digits.len() < s.len() { digits.strip_prefix(['.', ')']).map_or(s, str::trim_start) } else { s };
+        if s.len() == t.len() {
+            return s;
+        }
+        t = s;
+    }
+}
+
 fn clip(s: &str) -> String {
     let s = s.trim();
     if s.chars().count() <= TITLE_CHARS {
         return s.to_string();
     }
-    let mut c: String = s.chars().take(TITLE_CHARS).collect();
+    // A cut that lands on a space would show "gate ..."; drop the trailing space.
+    let mut c: String = s.chars().take(TITLE_CHARS).collect::<String>().trim_end().to_string();
     c.push_str("...");
     c
 }
@@ -481,15 +557,91 @@ mod tests {
     #[test]
     fn a_big_store_fits_the_budget() {
         let (d, mut s) = store_in("budget");
+        let title = format!("{:-<60}", "Half done ");
         for i in 0..40 {
             let lane = format!("QX{i:02}-PADDINGPADDINGPADDING");
             add(&mut s, &format!("journal:{lane}:0001"), "journal", "question", &lane, NOW, "t");
-            add(&mut s, &format!("handoff:{lane}:001"), "handoff", "", &lane, NOW, "t");
+            add(&mut s, &format!("journal:{lane}:0002"), "journal", crate::queue::ENTRY, &lane, NOW, "claude-code");
+            let body = format!("State: half.\n\nNext: {}\n", "finish the exporter and run every gate on it ".repeat(3));
+            add_handoff(&mut s, &format!("handoff:{lane}:001"), &lane, NOW, &title, &body);
             add(&mut s, &format!("handoff:session:{i}:001"), "handoff", "", &format!("session:{i}"), NOW, "t");
         }
         let c = the_card(&s);
         assert!(c.len() <= CARD_BYTES, "{} bytes: {c}", c.len());
         assert!(c.contains("(6 of 40)") && c.ends_with("something more pressing.\n"), "{c}");
+        assert!(c.contains("\n- open questions for the user (6 of 40): "), "{c}");
+        // The handoff the question names always shows, however full the card.
+        let r = resume_line(&c);
+        assert!(r.contains(&format!("\"{title}\", next: finish the exporter and run every gate on it finish the expo...")), "{c}");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Writes a handoff with a title and body at `time`.
+    fn add_handoff(store: &mut MemoryStore, key: &str, lane: &str, time: &str, title: &str, body: &str) {
+        let d = crate::memory::Draft {
+            title: title.into(),
+            body: body.into(),
+            reason: "t".into(),
+            author: "t".into(),
+            client: "t".into(),
+            time: Some(time.into()),
+            ..Default::default()
+        };
+        let mut w = store.writer().unwrap();
+        w.create(key, "handoff", "", lane, &d, None).unwrap();
+        w.commit().unwrap();
+    }
+
+    /// The reserved line before the question, or "" when there is none.
+    fn resume_line(card: &str) -> String {
+        card.lines().find(|l| l.starts_with("- to resume: ")).unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn a_clip_that_ends_on_a_space_drops_it_before_the_dots() {
+        // Character 60 is the space after "gate", so the cut lands on it.
+        let step = format!("{} gate and then the rest of the step", "x".repeat(TITLE_CHARS - 6));
+        assert_eq!(step.chars().nth(TITLE_CHARS - 1), Some(' '));
+        let want = format!("{} gate...", "x".repeat(TITLE_CHARS - 6));
+        assert_eq!(one_line(&step), want);
+        assert_eq!(clip(&step), want);
+    }
+
+    #[test]
+    fn the_question_names_a_handoff_shown_with_its_next_step() {
+        let (d, mut s) = store_in("next-step");
+        let title = |w: &str| format!("{w:-<60}");
+        // The newest live lane's handoff is the one asked about. Each newer
+        // lane takes over, with each shape of next step.
+        add_handoff(&mut s, "handoff:C:001", "C", "2026-11-04T17:00:00Z", &title("Lane C "), "State: done.\nCommits: abc123\n");
+        add(&mut s, "journal:C:0002", "journal", crate::queue::ENTRY, "C", "2026-11-04T17:00:00Z", "claude-code");
+        let c = the_card(&s);
+        assert_eq!(resume_line(&c), format!("- to resume: handoff:C:001 \"{}\"", title("Lane C ")), "no Next line, the title alone: {c}");
+        assert!(c.contains("(1) resume that handoff or the work queue,"), "{c}");
+
+        let heading = "State.\n\n## Next steps\n\n- run the   linux\tgate; then merge\n- open the PR\n";
+        add_handoff(&mut s, "handoff:B:001", "B", "2026-11-04T17:10:00Z", &title("Lane B "), heading);
+        let c = the_card(&s);
+        let want = format!("- to resume: handoff:B:001 \"{}\", next: run the linux gate, then merge", title("Lane B "));
+        assert_eq!(resume_line(&c), want, "{c}");
+
+        let long = "write the fragment, open the PR on main, run the linux gate and quote its last line";
+        let body = format!("Done: the card.\nNextcloud is unrelated.\n- **Next:** {long}\nNext: not this one\n");
+        add_handoff(&mut s, "handoff:A:001", "A", "2026-11-04T17:20:00Z", &title("Lane A "), &body);
+        let c = the_card(&s);
+        // The cut lands on the space after "gate", which the clip drops.
+        let step: String = long.chars().take(TITLE_CHARS).collect::<String>().trim_end().to_string();
+        assert!(step.ends_with("gate"), "{step:?}");
+        assert_eq!(resume_line(&c), format!("- to resume: handoff:A:001 \"{}\", next: {step}...", title("Lane A ")), "{c}");
+        // The lanes line is unchanged: each lane with its handoff key only.
+        assert_eq!(lanes_line(&c), "- live lanes: A (handoff:A:001); B (handoff:B:001); C (handoff:C:001)", "{c}");
+        assert!(!c.contains("other handoffs"), "{c}");
+        // The line sits just before the question, which names its key.
+        let at = c.find("- to resume: ").unwrap();
+        assert!(c[at..].lines().nth(1).unwrap().starts_with("Before other work"), "{c}");
+        assert!(c.contains("(1) resume that handoff or the work queue,"), "{c}");
+        assert!(c.len() <= CARD_BYTES, "{} bytes: {c}", c.len());
         drop(s);
         let _ = std::fs::remove_dir_all(&d);
     }

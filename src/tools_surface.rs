@@ -21,7 +21,7 @@ pub const HELP_URI: &str = "atlas://help";
 /// The habits paragraph of the `initialize` instructions, sent in every
 /// session: what atlas is, the habits, and where the full guide is. Its
 /// token budget is a test (`xtask/src/skill.rs`).
-pub const GUIDE: &str = "atlas is this project's memory: rulings, decisions, lane journals, handoffs and the work queue, kept across sessions. Habits: `recall` before asking what may already be decided; `journal` decisions and measurements to your lane as they happen; write a `handoff` before you stop; name planned work by its queue key; put `Kind:` and `Lane:` lines in every agent brief. Full guide: the bundled `atlas` skill; every op and argument: atlas://help or `note op=help`.";
+pub const GUIDE: &str = "atlas is this project's memory: decisions, journals, handoffs and work queue, across sessions. Habits: `recall` before asking what may be decided; `journal` decisions and measures to your lane as they happen; write a `handoff` before your final answer whenever work is left for later; name planned work by its queue key; put `Kind:` and `Lane:` lines in every brief. Load the bundled `atlas` skill before your first journal or handoff; ops: atlas://help or `note op=help`.";
 
 /// One op of a merged tool: the tool, the op, the full tool it runs.
 struct Op {
@@ -208,7 +208,7 @@ pub(super) const LISTED: &[ToolDef] = &[
     },
     ToolDef {
         name: "journal",
-        description: "Append a lane journal entry.",
+        description: "Append a lane journal entry: lane, entry, text. Review meta: role:, pr:, head:, verdict:.",
         read_only: false,
         schema: || {
             schema(
@@ -414,4 +414,21 @@ pub fn help() -> String {
 /// Every op of the merged tools: (tool, op, the full tool it runs).
 pub fn ops() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
     OPS.iter().map(|o| (o.tool, o.op, o.runs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LISTED;
+
+    /// #225: a deferred client sees only the listed description until it
+    /// loads the schema, so the description names the required arguments
+    /// and a review entry's meta lines, on one short line.
+    #[test]
+    fn the_listed_journal_description_names_its_arguments() {
+        let d = LISTED.iter().find(|t| t.name == "journal").unwrap().description;
+        for w in ["lane", "entry", "text", "role:", "pr:", "head:", "verdict:"] {
+            assert!(d.contains(w), "{w} missing from {d:?}");
+        }
+        assert!(!d.contains('\n') && d.len() < 300, "{} bytes: {d:?}", d.len());
+    }
 }

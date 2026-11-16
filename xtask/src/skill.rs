@@ -570,9 +570,22 @@ mod tests {
         let t = crate::bpe::tokens(g);
         assert_eq!(guide_cap(), 180);
         assert!((100..=guide_cap()).contains(&t), "the instructions' guide is {t} estimated tokens; the cap is {} ({GUIDE_BUDGET} real): {g}", guide_cap());
-        for w in ["recall", "journal", "handoff", "queue key", "Lane:", "`atlas` skill", "atlas://help"] {
+        for w in ["recall", "journal", "handoff", "queue key", "Lane:", "`atlas` skill", "atlas://help", "before your first journal or handoff", "whenever work is left for later"] {
             assert!(g.contains(w), "the instructions name {w}: {g}");
         }
         assert!(!g.contains('\n'), "one paragraph");
+    }
+
+    /// The handoff habit, in the skill and in the rules template the setup
+    /// writes: a handoff whenever work is left for later, not only at a stop.
+    #[test]
+    fn the_handoff_habit_covers_work_left_for_later() {
+        let s = skill();
+        let item = s.lines().skip_while(|l| !l.starts_with("3. **")).take(3).collect::<Vec<_>>().join(" ");
+        assert!(item.contains("whenever work is left for later"), "SKILL.md item 3: {item}");
+        let t = atlas::claude_settings::rules_template::RULES_CLAUDE_MD;
+        let rule = t.lines().find(|l| l.contains("Write a handoff")).unwrap_or("");
+        assert!(rule.contains("whenever work is left for later"), "templates/CLAUDE.md: {rule}");
+        assert!(t.is_ascii(), "the template is ASCII");
     }
 }

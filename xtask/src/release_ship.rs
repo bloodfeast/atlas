@@ -10,14 +10,15 @@
 //!         the development repository's main (`checkout_guard`, OnMain::Tip)
 //!         and its origin is github.com/bloodfeast/atlas-dev; runs
 //!         `release check` unless a current stamp stands (three release
-//!         builds); shows the plan; asks `open vX.Y.Z` at the terminal;
-//!         dispatches the release-pr workflow with the version, HEAD and a
-//!         nonce; finds that run by the nonce in its name, watches it, and
-//!         prints the pull request.
+//!         builds); shows the plan; asks nothing at the terminal (the
+//!         owner's approval of the public pull request on GitHub is the gate
+//!         before anything merges); dispatches the release-pr workflow with
+//!         the version, HEAD and a nonce; finds that run by the nonce in its
+//!         name, watches it, and prints the pull request.
 //!     re-export (the pull request open, but the state file names another
 //!         commit than HEAD, or its run is missing, still going or failed):
-//!         run 1 again through the same steps and its own `open vX.Y.Z`
-//!         prompt, from the tip of main only; release-pr replaces the
+//!         run 1 again through the same steps, again without a prompt,
+//!         from the tip of main only; release-pr replaces the
 //!         branch, so the open pull request's head moves and needs a new
 //!         approval. A run still going is watched, never dispatched again.
 //!     run 2 (the pull request open, and HEAD's export by the state file,
@@ -802,7 +803,7 @@ pub fn ship(s: &Ship) -> R<Done> {
             }
             match stale_export(s)? {
                 Some(why) => {
-                    say(&format!("{}: {why}. Re-export: run 1 again for HEAD, behind its own `open {tag}` prompt", p.url));
+                    say(&format!("{}: {why}. Re-export: run 1 again for HEAD", p.url));
                     open(s, Some(&p))
                 }
                 None => merge_step(s, &p),
@@ -810,7 +811,7 @@ pub fn ship(s: &Ship) -> R<Done> {
         }
         Some(p) if p.state == "CLOSED" => match s.hub.branch_tip(&branch)? {
             Some(tip) if tip == p.head_oid => Err(format!(
-                "the release pull request {} was closed without a merge, and branch {branch} still holds its head {}: nothing more happens to it here. To start {tag} again, delete branch {branch} on {} by hand, then run ship again: run 1 starts over after a new `open` answer",
+                "the release pull request {} was closed without a merge, and branch {branch} still holds its head {}: nothing more happens to it here. To start {tag} again, delete branch {branch} on {} by hand, then run ship again: run 1 starts over",
                 p.url,
                 short(&p.head_oid),
                 s.repo
@@ -901,6 +902,7 @@ fn open(s: &Ship, reexport: Option<&PrInfo>) -> R<Done> {
         return Err(format!("asked to ship {tag}, but this checkout is v{version} (Cargo.toml)"));
     }
     crate::version::refuse_pending(&s.root)?;
+    crate::release_check::refuse_stale_readme(&s.root, &version)?;
     let last = State::read(&s.state_file())?.filter(|st| st.tag == *tag);
     let moved = last.as_ref().filter(|st| st.commit != head);
     let key = crate::release_check::current_key(&s.root, &s.denylist, s.accepted.as_deref())?.1;
@@ -924,18 +926,7 @@ fn open(s: &Ship, reexport: Option<&PrInfo>) -> R<Done> {
     if !stamped {
         (s.check)()?;
     }
-    let prompt = match reexport {
-        Some(p) => format!(
-            "dispatch release-pr for {tag} at {}: the export becomes PUBLIC on {} and replaces branch release/{tag}, so pull request #{}, now at its head {}, moves to the export of {}",
-            short(&head),
-            s.repo,
-            p.number,
-            short(&p.head_oid),
-            short(&head)
-        ),
-        None => format!("dispatch release-pr for {tag} at {}: the export becomes PUBLIC on {} as branch release/{tag}", short(&head), s.repo),
-    };
-    s.confirm.confirm(&prompt, &format!("open {tag}"))?;
+    say(&dispatch_note(tag, &head, &s.repo, reexport));
     let mut st = State { tag: tag.clone(), commit: head.clone(), nonce: nonce(), run: 0 };
     st.write(&s.state_file())?;
     s.hub.dispatch(&version, &head, &st.nonce)?;
@@ -947,6 +938,23 @@ fn open(s: &Ship, reexport: Option<&PrInfo>) -> R<Done> {
     st.run = run.id;
     st.write(&s.state_file())?;
     watched_open(s, &run, reexport.is_some())
+}
+
+/// What run 1 is about to do, said after the plan and the check, just
+/// before the dispatch (run 1 asks nothing: the owner's approval of the
+/// public pull request on GitHub is the gate before anything merges). With
+/// a re-export it names the open pull request's real head, not HEAD twice.
+fn dispatch_note(tag: &str, head: &str, repo: &str, reexport: Option<&PrInfo>) -> String {
+    match reexport {
+        Some(p) => format!(
+            "dispatching release-pr for {tag} at {}: the export becomes PUBLIC on {repo} and replaces branch release/{tag}, so pull request #{}, now at its head {}, moves to the export of {}",
+            short(head),
+            p.number,
+            short(&p.head_oid),
+            short(head)
+        ),
+        None => format!("dispatching release-pr for {tag} at {}: the export becomes PUBLIC on {repo} as branch release/{tag}", short(head)),
+    }
 }
 
 /// Watches a release-pr run; on success, the pull request it opened (or
@@ -1287,7 +1295,6 @@ mod tests {
     struct Typed {
         answers: RefCell<Vec<&'static str>>,
         asked: RefCell<Vec<String>>,
-        prompts: RefCell<Vec<String>>,
     }
 
     impl Typed {
@@ -1297,9 +1304,8 @@ mod tests {
     }
 
     impl Confirm for Typed {
-        fn confirm(&self, prompt: &str, expect: &str) -> R {
+        fn confirm(&self, _prompt: &str, expect: &str) -> R {
             self.asked.borrow_mut().push(expect.to_string());
-            self.prompts.borrow_mut().push(prompt.to_string());
             let mut a = self.answers.borrow_mut();
             let got = if a.is_empty() { "" } else { a.remove(0) };
             if got == expect {
@@ -1432,30 +1438,30 @@ mod tests {
     }
 
     #[test]
-    fn row_2_run_1_checks_asks_once_dispatches_and_watches() {
+    fn row_2_run_1_checks_asks_nothing_dispatches_and_watches() {
+        // No stamp: the check runs before the dispatch, and run 1 asks
+        // nothing (No refuses every prompt, so a prompt would stop it).
+        let w = world("ship-r2-check");
+        w.no_draft();
+        *w.hub.opens.borrow_mut() = Some(ready(&w.head()));
+        assert_eq!(w.ship(&No, None).unwrap(), Done::Opened("https://github.com/acme/tool/pull/5".into()));
+        assert_eq!(w.checks.get(), 1, "no stamp: the check runs before the dispatch");
+        assert_eq!(w.hub.count("dispatch"), 1);
+        w.done();
+        // One dispatch of HEAD, the run found by its nonce after a look that
+        // saw nothing, watched, and the pull request printed.
         let w = world("ship-r2");
         w.no_draft();
         let head = w.head();
-        // Refused at the terminal: nothing dispatched, no state written.
-        let e = w.ship(&No, None).unwrap_err();
-        assert_eq!(e, "refused at `open v1.2.3`; nothing was changed");
-        assert_eq!(w.hub.count("dispatch"), 0);
-        assert!(w.state().is_none());
-        assert_eq!(w.checks.get(), 1, "no stamp: the check runs before the prompt");
-        // Another act's answer does not open it.
-        assert!(w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err().contains("refused at `open v1.2.3`"));
-        assert_eq!(w.hub.count("dispatch"), 0);
-        // Typed: one dispatch of HEAD, the run found by its nonce after a
-        // look that saw nothing, watched, and the pull request printed.
         w.stamp();
         *w.hub.opens.borrow_mut() = Some(ready(&head));
         // Two blind looks: the state look before the plan, then the first
         // look after the dispatch, so the search waits once.
         w.hub.hide_runs.set(2);
-        let t = Typed::new(&["open v1.2.3"]);
+        let t = Typed::new(&[]);
         assert_eq!(w.ship(&t, None).unwrap(), Done::Opened("https://github.com/acme/tool/pull/5".into()));
-        assert_eq!(w.checks.get(), 2, "a current stamp: no check");
-        assert_eq!(*t.asked.borrow(), ["open v1.2.3"]);
+        assert_eq!(w.checks.get(), 0, "a current stamp: no check");
+        assert!(t.asked.borrow().is_empty(), "run 1 asks nothing: {:?}", t.asked.borrow());
         let st = w.state().unwrap();
         assert_eq!((st.tag.as_str(), st.commit.as_str(), st.run), (TAG, head.as_str(), 7));
         assert_eq!(*w.hub.calls.borrow(), [format!("dispatch 1.2.3 {head} {}", st.nonce), format!("watch {DEV_REPO} 7")]);
@@ -1469,15 +1475,15 @@ mod tests {
         w.no_draft();
         // Behind origin's main: run 1 wants the tip.
         crate::release_ci::tests::fall_behind(&w.dev);
-        assert!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err().contains(", not origin/main ("));
+        assert!(w.ship(&Typed::new(&[]), None).unwrap_err().contains(", not origin/main ("));
         sh(&w.dev, &["reset", "-q", "--hard", "origin/main"]);
         std::fs::write(w.dev.join("README.md"), "changed\n").unwrap();
-        assert!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err().starts_with("uncommitted changes in "));
+        assert!(w.ship(&Typed::new(&[]), None).unwrap_err().starts_with("uncommitted changes in "));
         sh(&w.dev, &["checkout", "-q", "--", "."]);
         commit_files(&w.dev, &[("Cargo.toml", "[package]\nname = \"x\"\nversion = \"1.2.4\"\n")], "bump");
-        assert!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err().starts_with("plugin.json version 1.2.3 is not Cargo.toml's 1.2.4"));
+        assert!(w.ship(&Typed::new(&[]), None).unwrap_err().starts_with("plugin.json version 1.2.3 is not Cargo.toml's 1.2.4"));
         commit_files(&w.dev, &[(".claude-plugin/plugin.json", "{\n  \"version\": \"1.2.4\"\n}\n")], "bump");
-        assert_eq!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err(), "asked to ship v1.2.3, but this checkout is v1.2.4 (Cargo.toml)");
+        assert_eq!(w.ship(&Typed::new(&[]), None).unwrap_err(), "asked to ship v1.2.3, but this checkout is v1.2.4 (Cargo.toml)");
         assert_eq!(w.hub.count("dispatch"), 0);
         w.done();
     }
@@ -1487,8 +1493,20 @@ mod tests {
         let w = world("ship-r1-fragments");
         w.no_draft();
         commit_files(&w.dev, &[("changes/7.md", "---\nbump: patch\nsection: fix\n---\n- a\n")], "fragment");
-        let e = w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err();
+        let e = w.ship(&Typed::new(&[]), None).unwrap_err();
         assert!(e.contains("not in a release yet") && e.contains("cargo xtask version"), "{e}");
+        assert_eq!(w.hub.count("dispatch"), 0);
+        w.done();
+    }
+
+    #[test]
+    fn run_1_refuses_a_stale_readme() {
+        let w = world("ship-r1-readme");
+        w.no_draft();
+        commit_files(&w.dev, &[("README.md", "# tool\n\n| a figure (measured at v1.0.0) | 2x |\n")], "old figure");
+        let e = w.ship(&Typed::new(&[]), None).unwrap_err();
+        assert!(e.contains("README.md:3: `measured at v1.0.0`") && e.contains("v1.2.3"), "{e}");
+        assert_eq!(w.checks.get(), 0, "refused before the check");
         assert_eq!(w.hub.count("dispatch"), 0);
         w.done();
     }
@@ -1506,15 +1524,15 @@ mod tests {
     }
 
     #[test]
-    fn row_4_a_failed_run_is_dispatched_again_only_after_a_new_prompt() {
+    fn row_4_a_failed_run_is_dispatched_again_without_a_prompt() {
         let w = world("ship-r4");
         w.no_draft();
         w.stamp();
         w.hub.pr_runs.borrow_mut().push(Run { id: 4, title: "release-pr v1.2.3 abc".into(), status: "completed".into(), conclusion: "failure".into(), ..Run::default() });
-        assert!(w.ship(&No, None).unwrap_err().contains("refused at `open v1.2.3`"));
-        assert_eq!(w.hub.count("dispatch"), 0);
         *w.hub.opens.borrow_mut() = Some(ready(&w.head()));
-        assert!(matches!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap(), Done::Opened(_)));
+        let t = Typed::new(&[]);
+        assert!(matches!(w.ship(&t, None).unwrap(), Done::Opened(_)));
+        assert!(t.asked.borrow().is_empty(), "run 1 asks nothing: {:?}", t.asked.borrow());
         assert_eq!(w.hub.count("dispatch"), 1);
         w.done();
         // A run that fails is reported by its page, never its log.
@@ -1522,7 +1540,7 @@ mod tests {
         w.no_draft();
         w.stamp();
         w.hub.watch_fails.set(true);
-        let e = w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err();
+        let e = w.ship(&Typed::new(&[]), None).unwrap_err();
         assert_eq!(e, "the release-pr run failed: https://example.invalid/run/7 (run ship again to dispatch again)");
         w.done();
     }
@@ -1672,16 +1690,16 @@ mod tests {
         w.no_draft();
         *w.hub.pr.borrow_mut() = Some(PrInfo { state: "CLOSED".into(), ..ready(&w.fx.target) });
         *w.hub.branch.borrow_mut() = Some(w.fx.target.clone());
-        let e = w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err();
+        let e = w.ship(&Typed::new(&[]), None).unwrap_err();
         assert!(e.contains("was closed without a merge"), "{e}");
-        assert!(e.contains("delete branch release/v1.2.3 on acme/tool by hand, then run ship again: run 1 starts over after a new `open` answer"), "{e}");
+        assert!(e.contains("delete branch release/v1.2.3 on acme/tool by hand, then run ship again: run 1 starts over"), "{e}");
         assert!(w.hub.calls.borrow().is_empty());
         w.done();
     }
 
     /// The way out of a closed release pull request: once its branch is
     /// gone, or holds a later export than the closed head, run 1 starts over,
-    /// behind its own prompt.
+    /// without a prompt.
     #[test]
     fn row_8_a_closed_pull_request_without_its_branch_starts_run_1_again() {
         for (name, tip) in [("ship-r8-gone", None), ("ship-r8-moved", Some("d".repeat(40)))] {
@@ -1690,12 +1708,11 @@ mod tests {
             w.stamp();
             *w.hub.pr.borrow_mut() = Some(PrInfo { state: "CLOSED".into(), ..ready(&w.fx.target) });
             *w.hub.branch.borrow_mut() = tip;
-            let e = w.ship(&No, None).unwrap_err();
-            assert!(e.contains("refused at `open v1.2.3`"), "{name}: {e}");
-            assert_eq!(w.hub.count("dispatch"), 0);
             assert!(w.state().is_none());
             *w.hub.opens.borrow_mut() = Some(PrInfo { number: 6, url: "https://github.com/acme/tool/pull/6".into(), ..ready(&w.head()) });
-            assert_eq!(w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap(), Done::Opened("https://github.com/acme/tool/pull/6".into()), "{name}");
+            let t = Typed::new(&[]);
+            assert_eq!(w.ship(&t, None).unwrap(), Done::Opened("https://github.com/acme/tool/pull/6".into()), "{name}");
+            assert!(t.asked.borrow().is_empty(), "{name}: run 1 asks nothing: {:?}", t.asked.borrow());
             assert_eq!(w.hub.count("dispatch"), 1);
             assert_eq!(w.state().unwrap().commit, w.head());
             w.done();
@@ -1776,7 +1793,7 @@ mod tests {
     #[test]
     fn row_14_a_draft_before_the_merge_is_refused() {
         let w = world("ship-r14");
-        let e = w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err();
+        let e = w.ship(&Typed::new(&[]), None).unwrap_err();
         assert!(e.contains("before the release pull request merged (no pull request)"), "{e}");
         *w.hub.pr.borrow_mut() = Some(ready(&w.fx.target));
         assert!(w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err().contains("before the release pull request merged (https://github.com/acme/tool/pull/5)"));
@@ -1796,19 +1813,17 @@ mod tests {
         let st = State { tag: TAG.into(), commit: old.clone(), nonce: "n".into(), run: 7 };
         st.write(&w.stage().join("ship/state.json")).unwrap();
         w.stamp();
-        // Re-export, never a merge: another act's answer changes nothing.
-        let e = w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err();
-        assert!(e.contains("refused at `open v1.2.3`"), "{e}");
-        assert_eq!((w.hub.count("dispatch"), w.hub.count("merge")), (0, 0));
-        assert_eq!(w.state().unwrap(), st, "state.json unchanged");
-        // Typed: one dispatch of HEAD with a new nonce; the pull request's head moves.
+        // Re-export, never a merge: a `merge` answer is never asked for.
+        // One dispatch of HEAD with a new nonce; the pull request's head moves.
         *w.hub.opens.borrow_mut() = Some(PrInfo { head_oid: new_export.clone(), ..ready(&w.fx.target) });
-        let t = Typed::new(&["open v1.2.3"]);
+        let t = Typed::new(&["merge v1.2.3"]);
         assert_eq!(w.ship(&t, None).unwrap(), Done::Opened("https://github.com/acme/tool/pull/5".into()));
-        assert_eq!(*t.asked.borrow(), ["open v1.2.3"]);
-        let prompt = t.prompts.borrow()[0].clone();
-        assert!(prompt.contains(&format!("#5, now at its head {}, moves to the export of {}", short(&w.fx.target), short(&head))), "{prompt}");
-        assert!(!prompt.contains(short(&old)), "the state's commit is not what the pull request holds: {prompt}");
+        assert!(t.asked.borrow().is_empty(), "run 1 asks nothing: {:?}", t.asked.borrow());
+        assert_eq!(w.hub.count("merge"), 0);
+        // The note before the dispatch names the pull request's real head.
+        let note = dispatch_note(TAG, &head, REPO, Some(&ready(&w.fx.target)));
+        assert!(note.contains(&format!("#5, now at its head {}, moves to the export of {}", short(&w.fx.target), short(&head))), "{note}");
+        assert!(!note.contains(short(&old)), "the state's commit is not what the pull request holds: {note}");
         let now = w.state().unwrap();
         assert_eq!((now.commit.as_str(), now.run), (head.as_str(), 7));
         assert_ne!(now.nonce, "n");
@@ -1823,7 +1838,7 @@ mod tests {
         // A re-export never goes back: HEAD must be origin/main's tip.
         st.write(&w.stage().join("ship/state.json")).unwrap();
         crate::release_ci::tests::fall_behind(&w.dev);
-        let e = w.ship(&Typed::new(&["open v1.2.3"]), None).unwrap_err();
+        let e = w.ship(&Typed::new(&[]), None).unwrap_err();
         assert!(e.contains(", not origin/main ("), "{e}");
         assert_eq!(w.hub.count("dispatch"), 1);
         sh(&w.dev, &["reset", "-q", "--hard", "origin/main"]);
@@ -1834,11 +1849,13 @@ mod tests {
         assert!(e.starts_with("HEAD is "), "{e}");
         assert!(!w.stage().join("sign").exists());
         std::fs::rename(w.fx.stub.join("release-v1.2.3"), w.fx.d.join("held-release")).unwrap();
-        // Run 1 again from a moved HEAD says so in its plan and asks again.
+        // Run 1 again from a moved HEAD says so in its plan and dispatches
+        // again, without a prompt.
         *w.hub.pr.borrow_mut() = None;
+        *w.hub.opens.borrow_mut() = Some(ready(&w.head()));
         w.stamp();
-        assert!(w.ship(&No, None).unwrap_err().contains("refused at `open v1.2.3`"));
-        assert_eq!(w.hub.count("dispatch"), 1);
+        assert!(matches!(w.ship(&No, None).unwrap(), Done::Opened(_)));
+        assert_eq!(w.hub.count("dispatch"), 2);
         w.done();
     }
 
@@ -1859,9 +1876,9 @@ mod tests {
 
     /// A re-export whose run failed, or never showed, leaves state.json on
     /// HEAD and the pull request on the old export: ship dispatches again,
-    /// only after a new `open` answer, and never merges the old head.
+    /// without a prompt, and never merges the old head.
     #[test]
-    fn a_failed_or_missing_reexport_run_is_dispatched_again_only_after_a_new_open() {
+    fn a_failed_or_missing_reexport_run_is_dispatched_again_never_merged() {
         let w = world("ship-r15-failed");
         w.no_draft();
         w.stamp();
@@ -1869,23 +1886,21 @@ mod tests {
         let st = State { tag: TAG.into(), commit: w.head(), nonce: "n1".into(), run: 4 };
         st.write(&w.stage().join("ship/state.json")).unwrap();
         w.hub.pr_runs.borrow_mut().push(Run { id: 4, title: "release-pr v1.2.3 n1".into(), status: "completed".into(), conclusion: "failure".into(), ..Run::default() });
-        let e = w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err();
-        assert!(e.contains("refused at `open v1.2.3`"), "{e}");
-        assert_eq!((w.hub.count("dispatch"), w.hub.count("merge")), (0, 0));
-        assert_eq!(w.state().unwrap(), st);
         *w.hub.opens.borrow_mut() = Some(PrInfo { head_oid: "e".repeat(40), ..ready(&w.fx.target) });
-        let t = Typed::new(&["open v1.2.3"]);
+        let t = Typed::new(&["merge v1.2.3"]);
         assert!(matches!(w.ship(&t, None).unwrap(), Done::Opened(_)));
-        assert_eq!(w.hub.count("dispatch"), 1);
-        // The prompt names the pull request's real head, not HEAD twice
+        assert!(t.asked.borrow().is_empty(), "run 1 asks nothing: {:?}", t.asked.borrow());
+        assert_eq!((w.hub.count("dispatch"), w.hub.count("merge")), (1, 0));
+        // The note names the pull request's real head, not HEAD twice
         // (state.json already named HEAD after the failed run).
-        let prompt = t.prompts.borrow()[0].clone();
-        assert!(prompt.contains(&format!("now at its head {}, moves to the export of {}", short(&w.fx.target), short(&w.head()))), "{prompt}");
+        let note = dispatch_note(TAG, &w.head(), REPO, Some(&ready(&w.fx.target)));
+        assert!(note.contains(&format!("now at its head {}, moves to the export of {}", short(&w.fx.target), short(&w.head()))), "{note}");
         // No run named by state.json's nonce: the same.
         State { nonce: "gone".into(), ..st }.write(&w.stage().join("ship/state.json")).unwrap();
-        let e = w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err();
-        assert!(e.contains("refused at `open v1.2.3`"), "{e}");
-        assert_eq!((w.hub.count("dispatch"), w.hub.count("merge")), (1, 0));
+        let t = Typed::new(&["merge v1.2.3"]);
+        assert!(matches!(w.ship(&t, None).unwrap(), Done::Opened(_)));
+        assert!(t.asked.borrow().is_empty(), "run 1 asks nothing: {:?}", t.asked.borrow());
+        assert_eq!((w.hub.count("dispatch"), w.hub.count("merge")), (2, 0));
         w.done();
     }
 
@@ -1900,7 +1915,7 @@ mod tests {
         w.stamp();
         let missing = (w.fx.d.join("absent.pem"), "1".repeat(64));
         *w.hub.opens.borrow_mut() = Some(ready(&w.fx.target));
-        assert!(matches!(w.ship(&Typed::new(&["open v1.2.3"]), Some(missing.clone())).unwrap(), Done::Opened(_)));
+        assert!(matches!(w.ship(&Typed::new(&[]), Some(missing.clone())).unwrap(), Done::Opened(_)));
         w.hub.rel_runs.borrow_mut().push(run_of("in_progress", ""));
         let t = Typed::new(&["merge v1.2.3", "publish v1.2.3"]);
         let e = w.ship(&t, Some(missing)).unwrap_err();

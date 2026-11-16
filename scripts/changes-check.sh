@@ -113,7 +113,7 @@ check_fragment() {
             if (k in seen) { print "duplicate front matter key " k; bad = 1; exit }
             seen[k] = 1
             if (k == "bump") {
-                if (v !~ /^(patch|feature|breaking)$/) { print "bump must be patch, feature or breaking, not " v; bad = 1; exit }
+                if (v !~ /^(patch|feature|breaking|none)$/) { print "bump must be patch, feature, breaking or none, not " v; bad = 1; exit }
                 bump = v
             } else if (k == "section") {
                 if (v !~ /^(highlight|breaking|upgrade|feature|fix|security|known-limit)$/) {
@@ -156,11 +156,20 @@ check_fragment() {
             if (bad) exit 1
             if (NR == 0) { print "the front matter must open with ---"; exit 1 }
             if (!closed) { print "the front matter has no closing ---"; exit 1 }
-            if (bump == "") { print "no bump in the front matter"; exit 1 }
+            # An upgrade note may leave its bump out; no other section may.
+            if (bump == "" && section != "upgrade") { print "no bump in the front matter"; exit 1 }
             if (section == "") { print "no section in the front matter"; exit 1 }
-            if (section == "breaking" && bump != "breaking") { print "section: breaking needs bump: breaking"; exit 1 }
+            # bump: none on a breaking section falls to the none rule below.
+            if (section == "breaking" && bump != "breaking" && bump != "none") { print "section: breaking needs bump: breaking"; exit 1 }
             if (!started) { print "the body is empty"; exit 1 }
             if (fence) { print "an unclosed fenced block: close it with a fence of the same character, at least as long"; exit 1 }
+            # The contradictions, last, so every other fault keeps its own
+            # reason: an upgrade note has no bump of its own, none is only for
+            # an upgrade note, and a fix or security fragment is a patch.
+            if (section == "upgrade" && bump != "" && bump != "none") { print "section: upgrade takes no bump of its own: write bump: none or leave it out"; exit 1 }
+            if (section != "upgrade" && bump == "none") { print "bump: none is only for section: upgrade"; exit 1 }
+            if (section == "fix" && bump != "patch") { print "section: fix needs bump: patch"; exit 1 }
+            if (section == "security" && bump != "patch") { print "section: security needs bump: patch"; exit 1 }
         }
     ' "$1"
 }
