@@ -45,12 +45,19 @@ pub const MAX_FILES: usize = 20_000;
 /// `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`,
 /// `*.keystore`, `*.kdbx`, `*.asc`, `*.gpg`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`,
 /// `id_ed25519*`, `credentials`, `credentials.*`, `*.credentials`, `.netrc`,
-/// `_netrc`, `.npmrc`, `.pypirc`, `secrets.*` and `*.secret`. Matching is
-/// case-insensitive.
+/// `_netrc`, `.npmrc`, `.pypirc`, `secrets.*`, `secretsdata.json` and
+/// `*.secret`. Matching is case-insensitive.
+///
+/// `secretsdata.json` is where podman's file secret driver keeps every
+/// secret's value, in plain JSON (`containers/storage/secrets/filedriver/`,
+/// rootless or rootful). Its metadata beside it, `secrets.json`, is already
+/// covered by `secrets.*`; the values file is not, since its name does not
+/// start with `secrets.`.
 ///
 /// The name rules (`id_rsa*` and the other key names, `credentials`,
-/// `credentials.*`, `_netrc`, `secrets.*`) do not apply to a Markdown note
-/// (`*.md`): a note is never the key or credential file those names guard,
+/// `credentials.*`, `_netrc`, `secrets.*`, `secretsdata.json`) do not apply
+/// to a Markdown note (`*.md`): a note is never the key or credential file
+/// those names guard,
 /// so `Secrets.md` and `id_rsa rotation.md` are read. The extension and
 /// `.env` rules apply to every name, and a caller checks the name a path
 /// resolves to as well as the name given ([`path_denied`]), so a note that
@@ -73,6 +80,7 @@ pub fn is_denied(name: &str) -> bool {
         || n.starts_with("credentials.")
         || matches!(n.as_str(), ".netrc" | "_netrc" | ".npmrc" | ".pypirc")
         || n.starts_with("secrets.")
+        || n == "secretsdata.json"
 }
 
 /// True for folder names on the deny-list: the `.env` and extension rules of
@@ -404,6 +412,9 @@ mod tests {
             "aws.credentials",
             ".netrc",
             "secrets.toml",
+            "secrets.json",
+            "secretsdata.json",
+            "SecretsData.JSON",
             "store.p12",
         ] {
             assert!(is_denied(n), "{n} should be denied");
