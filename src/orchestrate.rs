@@ -50,11 +50,22 @@ const FILE_CLOCK_SLACK: Duration = Duration::from_secs(1);
 /// `atlas queue release` refuses, without `--force`, an agent that wrote its
 /// transcript or meta file this recently: it may still be alive.
 pub const RELEASE_QUIET: Duration = Duration::from_secs(5 * 60);
-/// The suffix of atlas's own release record beside an agent's meta file,
-/// `agent-<id>.atlas-released` (#204): its time is when the agent was
-/// released, and the agent counts again once it writes after that. Claude
-/// Code's meta file is never edited.
+/// The suffix of the release record files atlas 0.6.1 and earlier wrote
+/// beside an agent's meta file, `agent-<id>.atlas-released` (#204). They are
+/// read once into [`RELEASE_TABLE`] by [`Agents::running`] and deleted; atlas
+/// writes none now (#222).
 pub const RELEASED_SUFFIX: &str = ".atlas-released";
+/// atlas's own release records, in the memory store (#222, ruling
+/// journal:ATLAS-RELEASE:0066 Q3): one row per agent atlas counts finished,
+/// `time` its release in nanoseconds since the Unix epoch. The agent counts
+/// again once it writes after that, and the row then goes. Written by
+/// `atlas queue release` and at a SubagentStop, so every process that opens
+/// the store (the hooks, `atlas queue next`, `atlas backlog`) sees it.
+/// Claude Code's meta file is never edited.
+pub const RELEASE_TABLE: &str = "CREATE TABLE IF NOT EXISTS agent_releases(agent TEXT PRIMARY KEY, time INTEGER NOT NULL);";
+/// A release row older than this before a new one is written is pruned: an
+/// agent that wrote nothing for this long is never counted anyway.
+const RELEASE_KEEP: Duration = Duration::from_secs(30 * 24 * 3600);
 /// How much of a transcript's end is read first for its last message line.
 const TAIL_BYTES: u64 = 64 * 1024;
 /// The most of a transcript's end read for its last message line: a tool
@@ -217,6 +228,10 @@ pub struct OrchestrateSpec {
     /// The folders a `worktree:NAME` resolves under (`orchestrate.worktree_roots`;
     /// none: every linked worktree of the project's repositories).
     pub worktree_roots: Vec<std::path::PathBuf>,
+    /// runq's state root, for the restart point's holders (`orchestrate.runq_root`;
+    /// `RUNQ_ROOT` comes first, runq's Windows default last: see
+    /// [`crate::restart::runq_root`]).
+    pub runq_root: Option<std::path::PathBuf>,
 }
 
 /// One kind's resolved settings.
@@ -270,6 +285,8 @@ pub struct OrchSettings {
     pub judge: crate::taskjudge::JudgeSettings,
     /// The worktree ledger's roots (`orchestrate.worktree_roots`).
     pub worktree_roots: Vec<std::path::PathBuf>,
+    /// runq's state root (`orchestrate.runq_root`).
+    pub runq_root: Option<std::path::PathBuf>,
 }
 
 impl Default for OrchSettings {
@@ -395,6 +412,7 @@ pub fn resolve(
             classifier: o.judge_classifier.clone(),
         },
         worktree_roots: o.worktree_roots.clone(),
+        runq_root: o.runq_root.clone(),
     }
 }
 
@@ -502,17 +520,32 @@ pub fn subagents_dir(transcript: &str) -> PathBuf {
     Path::new(transcript.strip_suffix(".jsonl").unwrap_or(transcript)).join("subagents")
 }
 
-/// Whether a transcript's last message line (`user` or `assistant`) is a
-/// tool error that says the disk is full: `ENOSPC`, "no space left" (Node,
+thread_local! {
+    /// Transcript tails [`ends_in_disk_full`] read on this thread (a test seam).
+    static TAIL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many transcript tails [`ends_in_disk_full`] has read on this thread
+/// (tests: a quiet agent's tail is read once, not on every count).
+#[doc(hidden)]
+pub fn tail_reads() -> usize {
+    TAIL_READS.with(std::cell::Cell::get)
+}
+
+/// Whether the `user` lines after a transcript's last `assistant` line hold
+/// a tool error that says the disk is full: `ENOSPC`, "no space left" (Node,
 /// Git Bash), or Windows' "not enough space on the disk" / "os error 112"
-/// (Rust std, cargo, rustc, linkers), in any case. The lines Claude Code
-/// writes after a tool result and before the model answers (a hook's
-/// `attachment`, the next `api-request`, `system` lines) and a torn last
-/// line are passed over (#207 review). The end is read from [`TAIL_BYTES`],
-/// further back up to [`TAIL_MAX_BYTES`] while no message line is whole in
-/// it; a missing or unreadable file is no.
+/// (Rust std, cargo, rustc, linkers), in any case. Parallel tool calls
+/// answer with one result line each, so an error is seen though a good
+/// result follows it (#222 R1). The lines Claude Code writes after a tool
+/// result and before the model answers (a hook's `attachment`, the next
+/// `api-request`, `system` lines) and a torn last line are passed over
+/// (#207 review). The end is read from [`TAIL_BYTES`], further back up to
+/// [`TAIL_MAX_BYTES`] while no `assistant` line is whole in it; a missing or
+/// unreadable file is no.
 pub fn ends_in_disk_full(transcript: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
+    TAIL_READS.with(|n| n.set(n.get() + 1));
     let Ok(mut f) = std::fs::File::open(transcript) else { return false };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let mut window = TAIL_BYTES;
@@ -531,7 +564,7 @@ pub fn ends_in_disk_full(transcript: &Path) -> bool {
             let Ok(v) = crate::json::parse(line.trim()) else { continue };
             match v.get("type").and_then(Value::as_str) {
                 Some("assistant") => return false,
-                Some("user") => return is_disk_full_error(&v),
+                Some("user") if is_disk_full_error(&v) => return true,
                 _ => {}
             }
         }
@@ -572,15 +605,22 @@ pub fn find_agent_dir(projects: &Path, id: &str) -> Option<PathBuf> {
 }
 
 /// Records agent `id` (in the agents folder `dir`) finished in atlas's own
-/// release record (#204), for an agent whose finish Claude Code never wrote
-/// (a full disk): its lane, cap slot and resources are free at once, until
-/// it writes again. An agent that wrote in the last [`RELEASE_QUIET`] is
-/// refused unless `force`. Claude Code's meta file is never edited.
+/// release record in `store` (#204, [`RELEASE_TABLE`]), for an agent whose
+/// finish Claude Code never wrote (a full disk): its lane, cap slot and
+/// resources are free at once, until it writes again. An agent that wrote
+/// in the last [`RELEASE_QUIET`] is refused unless `force`. Claude Code's
+/// meta file is never edited.
 ///
 /// # Errors
 ///
 /// A message: no such agent, one that may be alive, or a failed write.
-pub fn release(dir: &Path, id: &str, force: bool, now: SystemTime) -> std::result::Result<String, String> {
+pub fn release(
+    store: &crate::memory::MemoryStore,
+    dir: &Path,
+    id: &str,
+    force: bool,
+    now: SystemTime,
+) -> std::result::Result<String, String> {
     let id = id.strip_prefix("agent-").unwrap_or(id);
     let meta_path = dir.join(format!("agent-{id}.meta.json"));
     let Ok(text) = std::fs::read_to_string(&meta_path) else {
@@ -604,32 +644,98 @@ pub fn release(dir: &Path, id: &str, force: bool, now: SystemTime) -> std::resul
         ));
     }
     // Never older than its last write, whatever the file clock reads.
-    record_finish(dir, id, now.max(last)).map_err(|e| format!("{}: {e}", dir.join(format!("agent-{id}{RELEASED_SUFFIX}")).display()))?;
+    record_finish(store, id, now.max(last)).map_err(|e| format!("{}: {e}", store.path().display()))?;
     Ok(format!(
         "released agent {id} ({name}): atlas counts it finished, so its lane, cap slot and resources are free. It counts again if it writes again."
     ))
 }
 
-/// Writes atlas's release record for agent `id` in the agents folder `dir`,
-/// timed `at`: by `atlas queue release`, and at a SubagentStop so that
-/// another process (`atlas queue next`, `atlas backlog`, a command hook)
-/// sees that finish too (#207 review S2).
+/// A time as [`RELEASE_TABLE`] stores it: nanoseconds since the Unix epoch.
+fn release_nanos(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// Writes atlas's release record for agent `id` in `store`, timed `at`
+/// ([`RELEASE_TABLE`]; a later record of the same agent wins): by `atlas
+/// queue release`, and at a SubagentStop so that another process (`atlas
+/// queue next`, `atlas backlog`, a command hook) sees that finish too (#207
+/// review S2). Rows older than [`RELEASE_KEEP`] before `at` are pruned.
 ///
 /// # Errors
 ///
-/// I/O errors creating the file or setting its time (a full disk).
-pub fn record_finish(dir: &Path, id: &str, at: SystemTime) -> std::io::Result<()> {
+/// [`crate::Error::StoreTooNew`] (nothing written) or [`crate::Error::Db`].
+pub fn record_finish(store: &crate::memory::MemoryStore, id: &str, at: SystemTime) -> crate::Result<()> {
     let id = id.strip_prefix("agent-").unwrap_or(id);
-    std::fs::File::create(dir.join(format!("agent-{id}{RELEASED_SUFFIX}")))?.set_modified(at)
+    let conn = store.conn();
+    let nanos = release_nanos(at);
+    let keep = release_nanos(at.checked_sub(RELEASE_KEEP).unwrap_or(UNIX_EPOCH));
+    crate::memory::guarded(conn, store.path(), || {
+        conn.execute_batch(RELEASE_TABLE)?;
+        conn.execute(
+            "INSERT INTO agent_releases(agent, time) VALUES(?1, ?2) ON CONFLICT(agent) DO UPDATE SET time = max(time, excluded.time)",
+            rusqlite::params![id, nanos],
+        )?;
+        conn.execute("DELETE FROM agent_releases WHERE time < ?1", [keep])?;
+        Ok(())
+    })
 }
 
-/// Removes agent `id`'s release record from the agents folder `dir`, if
-/// any: the agent only waits on its own background work (an interim stop),
-/// so it still holds what it held (#207 review S1).
-pub fn clear_finish(dir: &Path, id: &str) {
+/// Removes agent `id`'s release record from `store`, if any: the agent
+/// only waits on its own background work (an interim stop), so it still
+/// holds what it held (#207 review S1); or it wrote again after it.
+///
+/// # Errors
+///
+/// [`crate::Error::StoreTooNew`] (nothing written) or [`crate::Error::Db`].
+pub fn clear_finish(store: &crate::memory::MemoryStore, id: &str) -> crate::Result<()> {
     let id = id.strip_prefix("agent-").unwrap_or(id);
-    // No record is the usual case, and nothing more can be done on an error.
-    let _ = std::fs::remove_file(dir.join(format!("agent-{id}{RELEASED_SUFFIX}")));
+    if !has_release_table(store.conn())? {
+        return Ok(());
+    }
+    let conn = store.conn();
+    crate::memory::guarded(conn, store.path(), || {
+        conn.execute("DELETE FROM agent_releases WHERE agent = ?1", [id])?;
+        Ok(())
+    })
+}
+
+/// Whether the store has [`RELEASE_TABLE`]: a read, never DDL.
+fn has_release_table(conn: &rusqlite::Connection) -> crate::Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_releases')", [], |r| r.get(0))?)
+}
+
+/// Every release record in `store`, by agent id (none without the table).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn released(store: &crate::memory::MemoryStore) -> crate::Result<HashMap<String, SystemTime>> {
+    let conn = store.conn();
+    if !has_release_table(conn)? {
+        return Ok(HashMap::new());
+    }
+    let mut st = conn.prepare_cached("SELECT agent, time FROM agent_releases")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().map(|(a, n)| (a, UNIX_EPOCH + Duration::from_nanos(u64::try_from(n).unwrap_or(0)))).collect())
+}
+
+/// Reads the release record files of atlas 0.6.1 and earlier among
+/// `entries` (of the agents folder) into `store`, then deletes each one
+/// recorded. A file that cannot be recorded stays for the next pass.
+fn import_release_files(store: &crate::memory::MemoryStore, entries: &[std::fs::DirEntry]) {
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_prefix("agent-").and_then(|n| n.strip_suffix(RELEASED_SUFFIX)) else { continue };
+        let Some(at) = e.metadata().and_then(|m| m.modified()).ok() else { continue };
+        match record_finish(store, id, at) {
+            Ok(()) => {
+                if let Err(err) = std::fs::remove_file(e.path()) {
+                    eprintln!("atlas agent cap: {}: {err}", e.path().display());
+                }
+            }
+            Err(err) => eprintln!("atlas agent cap: release record of {id}: {err}"),
+        }
+    }
 }
 
 /// The tool use id of the launch that started agent `id` (in the session
@@ -736,7 +842,7 @@ pub struct Running {
 }
 
 /// One Agent launch, as its PreToolUse sees it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Launch<'a> {
     /// The session's transcript path.
     pub transcript: &'a str,
@@ -746,6 +852,21 @@ pub struct Launch<'a> {
     pub input: &'a Value,
     /// Its prompt (the brief).
     pub brief: &'a str,
+    /// The memory store atlas's release records live in ([`RELEASE_TABLE`]);
+    /// `None` reads none.
+    pub store: Option<&'a crate::memory::MemoryStore>,
+}
+
+impl std::fmt::Debug for Launch<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Launch")
+            .field("transcript", &self.transcript)
+            .field("tool_use_id", &self.tool_use_id)
+            .field("input", &self.input)
+            .field("brief", &self.brief)
+            .field("store", &self.store.map(crate::memory::MemoryStore::path))
+            .finish()
+    }
 }
 
 /// The orchestrator's state in one hook process.
@@ -784,7 +905,14 @@ pub struct Agents {
     /// The last launch [`Agents::admit`] judged was refused at its kind's
     /// cap (not Claude Code's own limit).
     kind_refused: bool,
+    /// [`ends_in_disk_full`]'s answer per transcript, with the length and
+    /// time it was read at: an unchanged transcript is not read again (#222 R3).
+    disk_full: HashMap<PathBuf, (u64, SystemTime, bool)>,
 }
+
+/// The most transcripts [`Agents`] keeps a disk-full answer for; past it the
+/// cache starts over.
+const DISK_FULL_CACHE: usize = 1024;
 
 /// The sub-lane an admitted launch runs as.
 #[derive(Debug, Clone)]
@@ -840,7 +968,27 @@ impl Agents {
             passed: HashMap::new(),
             seen: None,
             kind_refused: false,
+            disk_full: HashMap::new(),
         }
+    }
+
+    /// [`ends_in_disk_full`], read again only when the transcript's length
+    /// or time changed since the last read (`md`: its metadata).
+    fn ends_in_disk_full_cached(&mut self, transcript: &Path, md: Option<&std::fs::Metadata>) -> bool {
+        let stamp = md.and_then(|m| Some((m.len(), m.modified().ok()?)));
+        if let (Some((len, at)), Some(&(l, t, full))) = (stamp, self.disk_full.get(transcript)) {
+            if len == l && at == t {
+                return full;
+            }
+        }
+        let full = ends_in_disk_full(transcript);
+        if let Some((len, at)) = stamp {
+            if self.disk_full.len() >= DISK_FULL_CACHE {
+                self.disk_full.clear();
+            }
+            self.disk_full.insert(transcript.to_path_buf(), (len, at, full));
+        }
+        full
     }
 
     /// Whether the last launch [`Agents::admit`] judged was refused at its
@@ -1030,10 +1178,22 @@ impl Agents {
     /// file created since the oldest pending launch, in any state (running
     /// or already finished), pairs with its launch's record.
     ///
+    /// atlas's release records are read from `store` ([`RELEASE_TABLE`]);
+    /// the release files of atlas 0.6.1 and earlier found in the folder are
+    /// read into it once and deleted, and a record its agent wrote after is
+    /// removed. `None` reads no release records. A store error is logged and
+    /// reads as none.
+    ///
     /// # Errors
     ///
     /// I/O errors listing the folder.
-    pub fn running(&mut self, s: &OrchSettings, dir: &Path, now: SystemTime) -> std::io::Result<Vec<Running>> {
+    pub fn running(
+        &mut self,
+        s: &OrchSettings,
+        dir: &Path,
+        store: Option<&crate::memory::MemoryStore>,
+        now: SystemTime,
+    ) -> std::io::Result<Vec<Running>> {
         let rd = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1046,15 +1206,20 @@ impl Agents {
         let mut out = Vec::new();
         let mut started: Vec<(SystemTime, String, String)> = Vec::new();
         let entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
-        // atlas's own release records (`atlas queue release`), by agent id.
-        let released: HashMap<String, SystemTime> = entries
-            .iter()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let id = name.strip_prefix("agent-")?.strip_suffix(RELEASED_SUFFIX)?.to_string();
-                Some((id, e.metadata().and_then(|m| m.modified()).ok()?))
-            })
-            .collect();
+        // atlas's own release records (`atlas queue release`, SubagentStop),
+        // by agent id, after any old release files are read into the store.
+        let released: HashMap<String, SystemTime> = match store {
+            Some(st) => {
+                import_release_files(st, &entries);
+                released(st).unwrap_or_else(|e| {
+                    eprintln!("atlas agent cap: release records: {e}");
+                    HashMap::new()
+                })
+            }
+            None => HashMap::new(),
+        };
+        // Records whose agent wrote after them: the agent counts again.
+        let mut written_since: Vec<String> = Vec::new();
         for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_prefix("agent-").and_then(|n| n.strip_suffix(".meta.json")) else { continue };
@@ -1070,7 +1235,15 @@ impl Agents {
                 }
             }
             let transcript = dir.join(format!("agent-{id}.jsonl"));
-            let Some(last) = [md.as_ref().and_then(|m| m.modified().ok()), modified(&transcript)].into_iter().flatten().max() else { continue };
+            let tmd = std::fs::metadata(&transcript).ok();
+            let Some(last) =
+                [md.as_ref().and_then(|m| m.modified().ok()), tmd.as_ref().and_then(|m| m.modified().ok())].into_iter().flatten().max()
+            else {
+                continue;
+            };
+            if released.get(id).is_some_and(|r| *r < last) {
+                written_since.push(id.to_string());
+            }
             if self.started.is_some_and(|st| last < st) {
                 continue;
             }
@@ -1088,7 +1261,7 @@ impl Agents {
             // An agent that died on a full disk never gets its finish written
             // (#204): its last message line says so, and a short idle window
             // ends it. After the meta, so a finished agent costs no tail read.
-            if !s.disk_full.is_zero() && idle > s.disk_full && ends_in_disk_full(&transcript) {
+            if !s.disk_full.is_zero() && idle > s.disk_full && self.ends_in_disk_full_cached(&transcript, tmd.as_ref()) {
                 continue;
             }
             let kind = self.kind_of(s, dir, id, "");
@@ -1098,6 +1271,13 @@ impl Agents {
         started.sort();
         for (_, id, t) in started {
             self.pair(&id, &t);
+        }
+        if let Some(st) = store {
+            for id in written_since {
+                if let Err(e) = clear_finish(st, &id) {
+                    eprintln!("atlas agent cap: release record of {id}: {e}");
+                }
+            }
         }
         // A sub-lane is kept while its launch is pending or its agent runs,
         // and, until LAUNCH_HOLD_TTL, while its agent has not been seen (a
@@ -1119,7 +1299,7 @@ impl Agents {
     /// Whether a launch may start: `None` (no decision) or a deny reason.
     /// Errors give no decision.
     pub fn admit(&mut self, s: &OrchSettings, launch: &Launch<'_>, now: SystemTime, clock: Instant) -> Option<String> {
-        let Launch { transcript, tool_use_id, input, brief } = *launch;
+        let Launch { transcript, tool_use_id, input, brief, store } = *launch;
         self.seen = None;
         self.last = None;
         self.kind_refused = false;
@@ -1129,7 +1309,7 @@ impl Agents {
         let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let (kind, source) = classify_source(s, brief, &f("subagent_type"), &f("isolation"));
         let dir = subagents_dir(transcript);
-        let running = match self.running(s, &dir, now) {
+        let running = match self.running(s, &dir, store, now) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("atlas agent cap: {}: {e}", dir.display());

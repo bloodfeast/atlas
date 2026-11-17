@@ -561,20 +561,91 @@ fn a_closed_gate_stops_a_swap() {
     assert!(matches!(u.check(), Outcome::Swapped { .. }));
 }
 
+/// Eight processes change one update state 25 times each, all at once: only
+/// the file lock orders them (each process has its own turns), and not one
+/// of the 200 changes is lost. The test binary runs itself as each child.
 #[test]
 fn state_changes_from_many_processes_are_never_lost() {
+    const CHILD: &str = "ATLAS_TEST_STATE_CHILD";
+    if let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) {
+        // A child: wait for the start so all eight overlap, then change.
+        let go = dir.with_extension("go");
+        let start = Instant::now();
+        while !go.exists() {
+            assert!(start.elapsed() < Duration::from_secs(60), "no start signal");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..25 {
+            // A long wait: a loaded machine is not a lost change.
+            update::update_state_within(&dir, Duration::from_secs(60), |st| st.checked += 1).unwrap();
+        }
+        return;
+    }
     let t = Temp::new("upd-lock");
     let dir = t.path().join("state");
-    std::thread::scope(|s| {
-        for _ in 0..8 {
-            s.spawn(|| {
-                for _ in 0..25 {
-                    update::update_state(&dir, |st| st.checked += 1);
-                }
-            });
-        }
-    });
+    let exe = std::env::current_exe().unwrap();
+    let children: Vec<_> = (0..8)
+        .map(|_| {
+            Command::new(&exe)
+                .args(["--exact", "state_changes_from_many_processes_are_never_lost", "--nocapture", "--test-threads", "1"])
+                .env(CHILD, &dir)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    fs::write(dir.with_extension("go"), "").unwrap();
+    for mut c in children {
+        assert!(c.wait().unwrap().success(), "a child failed");
+    }
     assert_eq!(update::read_state(&dir).unwrap().checked, 200);
+}
+
+/// A change whose lock another process holds past the wait is an error,
+/// never a silent drop: the state is untouched, and the same change lands
+/// once the lock is free.
+#[test]
+fn a_state_change_past_its_lock_wait_is_an_error_not_lost() {
+    let t = Temp::new("upd-held");
+    let dir = t.path().join("state");
+    update::update_state(&dir, |s| s.checked = 1).unwrap();
+    // Another process's lock, held past the change's wait (a second lock in
+    // one process waits on the first, as across processes).
+    let held = atlas::fsio::FileLock::acquire(&dir.join(update::STATE_FILE)).unwrap();
+    let wait = Duration::from_millis(300);
+    let start = Instant::now();
+    let r = update::update_state_within(&dir, wait, |s| s.checked = 2);
+    let e = r.expect_err("a change that cannot take the lock is reported");
+    assert!(e.contains("lock") && e.contains("nothing written"), "{e}");
+    assert!(start.elapsed() < wait + Duration::from_secs(2), "waited {:?}", start.elapsed());
+    assert_eq!(update::read_state(&dir).unwrap().checked, 1, "nothing half applied");
+    drop(held);
+    update::update_state_within(&dir, wait, |s| s.checked = 2).unwrap();
+    assert_eq!(update::read_state(&dir).unwrap().checked, 2);
+}
+
+/// The threads of one process take the state in the order they came, and
+/// one that gives up is skipped: the next in line is not stuck behind it.
+#[test]
+fn state_turns_are_served_in_order_and_skip_one_that_gave_up() {
+    let turns = update::StateTurns::default();
+    let first = turns.take(Instant::now()).expect("an empty queue serves at once");
+    // While `first` holds its turn, a second gives up at its deadline.
+    assert!(turns.take(Instant::now() + Duration::from_millis(50)).is_none());
+    let order = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        let (turns, order) = (&turns, &order);
+        let waiter = s.spawn(move || {
+            let _t = turns.take(Instant::now() + Duration::from_secs(30)).expect("served after the one that gave up");
+            order.lock().unwrap().push("waiter");
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        order.lock().unwrap().push("first");
+        drop(first);
+        waiter.join().unwrap();
+    });
+    assert_eq!(*order.lock().unwrap(), ["first", "waiter"]);
+    assert!(turns.take(Instant::now()).is_some(), "the queue is free again");
 }
 
 #[test]
@@ -586,11 +657,11 @@ fn the_live_check_runs_when_the_last_check_expires() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     // Another server checked 40 minutes ago: 20 minutes (and a second), not
     // an hour plus the 40 minutes the check would skip.
-    update::update_state(&dir, |s| s.checked = now - 40 * 60);
+    update::update_state(&dir, |s| s.checked = now - 40 * 60).unwrap();
     let w = update::next_check_in(&dir, hour, hour);
     assert!(w >= Duration::from_secs(20 * 60) && w <= Duration::from_secs(20 * 60 + 2), "{w:?}");
     // Just checked: an hour and a second.
-    update::update_state(&dir, |s| s.checked = now);
+    update::update_state(&dir, |s| s.checked = now).unwrap();
     assert!(update::next_check_in(&dir, hour, hour) <= hour + Duration::from_secs(1));
 }
 

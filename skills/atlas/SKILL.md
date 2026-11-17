@@ -11,7 +11,9 @@ in it is lost when an agent ends; what an agent did not write down is.
 
 This guide is the habits and the workflow. `reference.md` beside it lists every tool, op, argument, journal
 entry kind, queue command and setting, generated from the same code as the tool schemas and `atlas://help`
-(also `note op=help`). Delegating large work is the `orchestrate` skill.
+(also `note op=help`). Delegating large work is the `orchestrate` skill. `recall`, `search`, `section` and
+`grep` are loaded from the start; `lookup` (where an identifier is defined) and `symbol` (code definitions,
+references and callers) are deferred like the write tools: load them by a tool search before the first call.
 
 ## The habits
 
@@ -27,7 +29,14 @@ entry kind, queue command and setting, generated from the same code as the tool 
 4. **Name work by its queue key.** Planned work is a `queued` entry with a key (`journal:LANE:NNNN`). Say the
    key, start it with a `Queue:` line in the brief, and mark it done; never describe it from memory.
 5. **Put a `Lane:` line in every brief**, with `Kind:`, so the agent's start gets its lane's recall and its
-   kind's limits.
+   kind's limits. Declare each record the agent needs as a Gherkin tag, the full key every time
+   (`@journal:LANE:0012`, pinned `@journal:LANE:0012#a1b2c3d4`), above Feature or above the
+   Scenario or Spike it serves: the start lists each by key and title. Not `0012, 0013` after a key,
+   nor `0140 onward`: name the few that bind.
+6. **Write terse.** Journal, handoff and brief text comes back later as recall answers, so every word costs
+   again on each read. Style for what you write into atlas and your replies: telegraphic, keys kept. Drop
+   filler, preamble and restatement; fragments are fine. Keep every key, number, path, commit, error line and
+   quoted ruling exact; a key stands in for its text.
 
 atlas injects no rules of its own. The user's rules stay in their CLAUDE.md and memory files, which atlas
 indexes and recalls like any other source.

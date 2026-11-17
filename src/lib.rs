@@ -77,6 +77,8 @@ pub mod redact;
 pub mod records;
 pub mod regex;
 pub mod report;
+pub mod restart;
+pub mod restart_warn;
 pub mod resume;
 pub mod reviews;
 pub mod registry;

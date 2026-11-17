@@ -84,13 +84,14 @@ it, change `channel` in `rust-toolchain.toml`, `CLIPPY_TOOLCHAIN` in `xtask/src/
 ## Before a pull request
 
 Every pull request passes, on the machine that made it and on its committed head: `cargo fmt` on the files it
-touches; both clippy runs above; `cargo test`; and `cargo xtask linux-test`, the public CI's Linux tests (in
-release, going on past a failure) and both clippy runs in a Docker Linux container (see [[Testing and coverage]]).
+touches; both clippy runs above; `cargo xtask test-gate`, the tests on nextest and then the doc tests; and `cargo
+xtask linux-test`, the same tests in release (going on past a failure) and both clippy runs in a Docker Linux
+container (see [[Testing and coverage]]).
 The last is there because a Windows or macOS machine never compiles the `cfg(target_os = "linux")` code and the
 development repository's CI builds and lints but runs no tests, so before it a Linux-only failure first showed on
 the public repository's release pull request. Commit first, since it tests the working tree as it is; its last
-line is the result to quote, for example `linux-test: PASS in 396s; test ok (1473 passed, 0 failed) 394s; clippy
-all-targets dev ok 1s; clippy default ok 0s`.
+line is the result to quote, for example `linux-test: PASS in 250s; test ok (1715 passed, 0 failed) 239s; doctest
+ok (2 passed, 0 failed) 4s; clippy all-targets dev ok 5s; clippy default ok 1s`.
 
 ## The release
 
@@ -119,7 +120,9 @@ so no script or agent can merge or publish a release; no environment variable or
    `github.com/bloodfeast/atlas-dev` as git really fetches and pushes (`insteadOf` and a push URL applied).
    `Cargo.toml` must be the version asked for. A draft release of the version already on the public repository
    stops it: the build would refuse to make another.
-2. The binary leak check: unless a pass stamp stands for this commit, denylist and accepted-hits file, `release
+2. The export guard (see [Outside pull requests](#outside-pull-requests)): a change on the public `main` that
+   `HEAD` does not hold, which the export would revert, stops it before anything is checked or dispatched.
+   Then the binary leak check: unless a pass stamp stands for this commit, denylist and accepted-hits file, `release
    check` (below) runs first. The plan says so before it starts: three release builds, tens of minutes.
 3. The plan, then the dispatch, with no prompt. The command records the commit, a random nonce and the run in its stage folder
    (`<stage>/vX.Y.Z/ship/state.json`), and starts the `release-pr` workflow with the version, that commit and the
@@ -145,8 +148,8 @@ temporary file that only the job can read and removed after it; every term is ma
 printed. Job `pr` never holds the denylist: `cargo xtask release --pr` makes the early checks (the changelog
 section with its highlights, `Cargo.toml` and `plugin.json` on the same version, the links naming the public
 repository, the public-repository guard as far as the release app can see it), exports the same commit again and
-refuses any other than the one `linux-leak` checked, then pushes branch `release/vX.Y.Z` to the public
-repository, the exported tree on top of its `main` with `bin/` left as it is, and opens a pull request into `main`
+refuses any other than the one `linux-leak` checked, makes the export guard again on the public `main` it
+clones, then pushes branch `release/vX.Y.Z` to the public repository, the exported tree on top of its `main` with `bin/` left as it is, and opens a pull request into `main`
 whose body is the release notes. Each job's secrets are its own, in an Environment that only `main` may use. No tests
 run and nothing else is built there: the public repository's CI tests the pull request.
 
@@ -183,7 +186,8 @@ not merge it on GitHub: run 2 merges it.
    history. GitHub picks the squash commit's author (it refused the public address given as `--author-email`), and
    ship checks every address after the merge. Never with the admin bypass. The branch is kept.
 6. Every author, committer and `Co-authored-by:` address of the public history, merge commit included, must be
-   the public one or GitHub's own (the address check, below); a hit stops everything and names the merge commit and
+   the public one or GitHub's own, or an outside pull request's author on its own squash commit (the address
+   check, below); a hit stops everything and names the merge commit and
    how many addresses were refused, never the addresses. The same check runs again whenever a later run finds the
    pull request already merged.
 7. The release workflow's run on the merge commit is watched to its end (a run 2 that stopped after the merge
@@ -330,9 +334,77 @@ Both this and the pull request refuse an export without `.github/workflows/ci.ym
 
 **The address check.** Every author, committer and `Co-authored-by:` address in the public history must be the
 public one, or GitHub's own on the commits a merged pull request makes (`noreply@github.com`, an app's `[bot]`
-address). A refused address is counted in the error, never printed. The two
-v0.2.1 merges whose author address GitHub's web merge took from the merger's account are accepted by name; no
-other commit is.
+address), or, as the author of its own squash commit only, the address of a merged outside pull request's author
+(the address rule under [Outside pull requests](#outside-pull-requests)). A refused address is counted in the
+error, never printed. The two v0.2.1 merges whose author address GitHub's web merge took from the merger's account
+are accepted by name; no other commit is.
+
+## Outside pull requests
+
+Anyone may open a pull request on the public repository (`CONTRIBUTING.md`, exported, tells them how). The public
+CI tests it, and the owner merges it on GitHub as one squash commit, its author kept. Three parts of the release
+keep such a change and its author:
+
+**Before merging one**, in GitHub's squash dialog delete every `Co-authored-by:` line of anyone but the pull
+request's author (an AI tool's address is a common one). The address rule (below) passes only the author's own
+address, so import and run 1 refuse otherwise, naming the commit and the refused slot, never the address. The
+public history cannot change after the merge: the only remedy then is to check the address by hand and add the
+commit to `ACCEPTED_MERGES` in `xtask/src/release_ci.rs`.
+
+**Import.** The development repository holds the code, and every release exports its tree on top of the public
+`main`, so a change merged only on the public repository would be reverted by the next export. After the merge,
+in a clean checkout of the development repository:
+
+```sh
+cargo xtask release import             # one development pull request per public change
+cargo xtask release import --dry-run   # the commits only: nothing pushed, nothing opened
+```
+
+It clones the public repository (and never pushes to it), and lists every commit of its `main` that is not a
+release's (`atlas vX.Y.Z`, `atlas vX.Y.Z (#N)` or `atlas vX.Y.Z binaries`, every address the public one or
+GitHub's) and that the development `main` does not hold yet. A change is held when a commit in the development
+history carries a `Public-commit: <sha>` trailer naming it (an import's commit does), or when the change,
+`changes/` aside, applies in reverse to the development tree (it was made there by hand); a held change is skipped
+and named. For each other change, which GitHub must tie to a merged outside pull request (below), it makes branch
+`import/public-<n>` on the development `main` with the change applied, its author, address and date kept and its
+subject ending `(public #<n>)`, pushes the branch to the development repository and opens a pull request there
+whose body names the public pull request and commit. A changelog fragment the outside pull request carries,
+`changes/<n>.md`, is renamed `changes/public-<n>.md` (a slug kept), with `author: <login>` added to its front
+matter, so it never collides with a development pull request's fragment; `cargo xtask version` folds it like any
+other, and each of its lines in the CHANGELOG ends `Thanks to @<login> (#<n>).`. The development `dev-pr` check
+takes an imported fragment as the pull request's own. A change that does not apply to the development `main`, or
+that GitHub ties to no merged outside pull request, is named and left for the owner to bring in by hand, with a
+`Public-commit:` trailer naming it.
+
+Merge an import pull request with **Rebase and merge**, never squash: a squash makes whoever merges the commit's
+author (the outside author only a co-author), and once the branch has a second commit, GitHub's squash message
+moves the `Public-commit:` line out of the commit's trailer block. The guard still finds that line anywhere in a
+commit's message, but the author is lost. Only an import writes these lines: a contributor's own `Public-commit:`
+or `Public-pr:` lines are stripped from the message it copies, so no public change is marked held by its
+contributor. Before it opens anything, the import runs the address check (below) over the whole public `main` and
+refuses a commit the release would refuse. Imports are not stacked: each one is built on the development `main`,
+so a public change that depends on another one fails "does not apply" until the first one's import is merged; run
+the import again then.
+
+**The export guard.** Release run 1 (`release ship`, before the leak check and the dispatch) and `release --pr`
+(before the release branch is pushed) clone the public repository and refuse while its `main` holds a change
+that is not a release's and that `HEAD` does not hold, naming each commit and saying to run `cargo xtask release
+import` first. Nothing is pushed or dispatched; merge the import's pull request, then run ship again. Run 1 then
+runs the address check (below) over every commit of the public `main`, the check run 2 makes after its merge,
+and refuses before the leak check and the dispatch, so a commit it refuses never stops a release halfway.
+
+**The address rule.** The address check (run 2 step 6, every later run, `sign` and the local rehearsal) passes a
+commit's author address when GitHub says the commit is an outside pull request's squash commit: `repos/<repo>/
+commits/<sha>/pulls` names a pull request merged into `main` of the public repository with that commit as its merge
+commit, opened by a user (not a bot) other than the repository's owner, and `repos/<repo>/commits/<sha>` names that
+same account as the commit's author and `web-flow` (GitHub itself) as its committer. No address is kept in a list:
+an owner address links to the owner's account, so it still fails as an outside commit's author, and every
+committer and `Co-authored-by:` address of an outside commit is checked as before. A commit GitHub ties to no
+merged outside pull request fails on an unknown address, and the check still prints counts only, never an
+address. Both endpoints answer for a public repository with any token, or none, so the owner's `gh` reads them.
+The rule trusts any GitHub user but the owner, so the owner contributes as the owner, never from another account.
+When GitHub does not answer (an error or a rate limit), the check says it "could not verify" the commit, which is
+not a refused address; nothing passes unverified, so run again once GitHub answers.
 
 ## The wiki
 

@@ -109,8 +109,16 @@ launch waiting in the session, or exactly one waiting launch whose `subagent_typ
 tool call checks that launch against the meta file; a wrong guess is told so and given its own launch's context
 and sub-lane. An ambiguous start is answered at that first tool call instead, from the launch its meta file names,
 else from its own transcript, so parallel launches never trade briefs. `recall.subagent_context`
-picks what a subagent is given: `"recall"` (the default, as below), `"binding"` (only the Binding block of the lane
-its brief declares, compiled when the launch is let through, at most 9,000 characters, no lane view and no pointers)
+picks what a subagent is given: `"recall"` (the default, as below), `"binding"` (only the Binding block: the keys its
+brief names, key and title, whether as Gherkin tags (also in backticks or brackets), refs, bare keys or short
+continuations in the key's sentence on its line (`0507 and 0508 from atlas`, `; the base ruling is 0031`, a range
+`0188-0196` or `0188 through 0196`; a zero-padded number of the key's width, never a year, a count or a `#` number),
+brief-wide ones before each scenario's, then the handoff, decisions, open questions and next step of the lane it
+declares (matched without case), then the newest handoff and decisions of each other lane a named key is filed in,
+headed as context when the brief only cites that key in its prose rather than in a tag, a `Given`, `Rulings:` or
+`Rules:` line, a `Rulings` section or a `recall KEY` instruction, or names the lane there; compiled when the launch is let through, at most
+2,400 bytes, with the lane's handoff and newest 3 decisions always kept however many keys the brief names, each
+`+N more` count saying where to recall it, no lane view and no pointers)
 or `"off"`.
 
 - **Recall** (`UserPromptSubmit` in the main session; `SubagentStart` for subagents, whose brief is taken from the

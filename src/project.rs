@@ -1177,11 +1177,73 @@ impl Graph {
         self.repos.iter().filter(|r| crate::memory::contains_word(&lower, &r.name.to_lowercase())).collect()
     }
 
-    /// One line on a repository: its role, what it talks to and depends on,
-    /// and what uses it.
+    /// Whether a text or a working directory already says where a
+    /// repository is (E4, journal:ATLAS-EFFICIENCY:0006), so its line would
+    /// tell the agent nothing: the text names a path in its checkout (either
+    /// separator, a Git Bash `/h/...` form, or a relative path from `cwd`),
+    /// or a path in a checkout with the same remote (a worktree); or `cwd` is
+    /// in its checkout or such a worktree. A repository with no local
+    /// checkout is never placed. A path compares as written and, when that
+    /// misses, canonical ([`path_key`]): a link, macOS `/var` for
+    /// `/private/var` or a Windows 8.3 short name is the folder it resolves
+    /// to. A network path (`//host`, `\\host`) is never looked at on disk;
+    /// `remotes` keeps each checkout's remote once read.
+    pub fn placed(&self, r: &Repo, text: &str, cwd: &str, remotes: &mut Remotes) -> bool {
+        let Some(root) = r.path.as_deref() else { return false };
+        let key = lexical_key(root);
+        if key.is_empty() {
+            return false;
+        }
+        // The checkout's canonical key, resolved once and only when a
+        // comparison as written misses; none for a network checkout.
+        let mut canon: Option<Option<String>> = None;
+        let mut within = |p: &Path| {
+            key_within(&lexical_key(p), &key) || {
+                let c = canon.get_or_insert_with(|| (!is_unc(root)).then(|| path_key(root)));
+                c.as_deref().is_some_and(|c| !is_unc(p) && key_within(&path_key(p), c))
+            }
+        };
+        let cwd_path = Path::new(cwd);
+        let cwd_abs = !cwd.is_empty() && cwd_path.is_absolute();
+        if cwd_abs && (within(cwd_path) || same_remote(cwd_path, r, remotes)) {
+            return true;
+        }
+        let norm = text.replace('\\', "/");
+        let norm = if cfg!(windows) { norm.to_lowercase() } else { norm };
+        // A checkout at a drive root (`h:`) is named only as `h:/...`, never
+        // by a bare `h:`.
+        let named = if key.len() == 2 && key.ends_with(':') { format!("{key}/") } else { key.clone() };
+        let bash = named.as_bytes().get(1).filter(|&&c| c == b':').map(|_| format!("/{}{}", &named[..1], &named[2..]));
+        if names_root(&norm, &named) || bash.is_some_and(|b| names_root(&norm, &b)) {
+            return true;
+        }
+        let tokens: Vec<&str> = text
+            .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | '<' | '>' | '[' | ']' | ',' | ';' | '|'))
+            .map(|t| t.trim_end_matches(['.', ':']))
+            .filter(|t| t.contains('/') || t.contains('\\'))
+            .take(PLACE_TOKENS)
+            .collect();
+        tokens.iter().any(|t| {
+            let p = Path::new(t);
+            if p.is_absolute() {
+                within(p) || same_remote(p, r, remotes)
+            } else if cwd_abs && !t.starts_with('/') {
+                let j = lexical_join(cwd_path, t);
+                within(&j) || same_remote(&j, r, remotes)
+            } else {
+                false
+            }
+        })
+    }
+
+    /// One line on a repository: its name and checkout path, its role, what
+    /// it talks to and depends on, and what uses it.
     pub fn describe(&self, name: &str) -> Option<String> {
         let r = self.repo(name)?;
         let mut s = format!("repo {}", r.name);
+        if let Some(p) = &r.path {
+            s.push_str(&format!(" at {}", p.to_string_lossy().replace('\\', "/").trim_start_matches("//?/")));
+        }
         if !r.role.is_empty() {
             s.push_str(&format!(": {}", r.role));
         }
@@ -1201,6 +1263,99 @@ impl Graph {
         }
         Some(s)
     }
+}
+
+/// The most path-like words of a text [`Graph::placed`] checks.
+const PLACE_TOKENS: usize = 32;
+
+/// Whether a normalised text holds `root` as a whole path: followed by a
+/// separator, the end or a character no path name continues with (a `.`
+/// continues one when a name character follows it: `atlas.bak`). A `root`
+/// ending in `/` (a drive root) is whole wherever it stands.
+fn names_root(text: &str, root: &str) -> bool {
+    let b = text.as_bytes();
+    let cont = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+    let mut from = 0;
+    while let Some(i) = text[from..].find(root) {
+        let at = from + i;
+        let end = at + root.len();
+        let before = at.checked_sub(1).and_then(|i| b.get(i)).copied();
+        let after = |k: usize| b.get(end + k).copied();
+        let continues = !root.ends_with('/') && (after(0).is_some_and(cont) || (after(0) == Some(b'.') && after(1).is_some_and(cont)));
+        if !before.is_some_and(cont) && !continues {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// `rel` joined to `base`, with `.` and `..` resolved from the text alone.
+fn lexical_join(base: &Path, rel: &str) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for c in Path::new(rel).components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether a path names a network share (`//host/...`, `\\host\...`,
+/// `\\?\UNC\...`): a stat there can wait seconds on the network, so
+/// [`Graph::placed`] never climbs one.
+fn is_unc(p: &Path) -> bool {
+    let s = p.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    match s.strip_prefix("//?/") {
+        Some(rest) => rest.starts_with("unc/"),
+        None => s.starts_with("//"),
+    }
+}
+
+/// The remote of each checkout [`Graph::placed`] has climbed to, kept for
+/// the life of its holder (the hook process): a checkout's git config is
+/// read once.
+#[derive(Debug, Default)]
+pub struct Remotes {
+    map: HashMap<PathBuf, Option<String>>,
+    /// Folders looked at for a `.git` (a count, for tests).
+    pub stats: usize,
+    /// Git configs read (a count, for tests).
+    pub reads: usize,
+}
+
+/// Whether the checkout holding `path` (its nearest folder with a `.git`)
+/// has the remote of `r`: the same repository, another worktree. Reads the
+/// git config only, once per checkout; a path that does not exist climbs
+/// to one that does; a network path is never looked at.
+fn same_remote(path: &Path, r: &Repo, remotes: &mut Remotes) -> bool {
+    let Some(want) = r.remote.as_deref() else { return false };
+    if is_unc(path) {
+        return false;
+    }
+    let Some(top) = path.ancestors().take(24).find(|a| {
+        if a.as_os_str().is_empty() {
+            return false;
+        }
+        remotes.stats += 1;
+        is_repo(a)
+    }) else {
+        return false;
+    };
+    let got = match remotes.map.get(top) {
+        Some(g) => g.clone(),
+        None => {
+            remotes.reads += 1;
+            let g = read_remote(top);
+            remotes.map.insert(top.to_path_buf(), g.clone());
+            g
+        }
+    };
+    got.is_some_and(|got| normalize_remote(&got) == want)
 }
 
 /// The repository a session is working in, from the paths its tool calls
@@ -1609,5 +1764,208 @@ mod tests {
             assert!(too_wide(&link, Some(&home)), "a link to home");
         }
         let _ = std::fs::remove_dir_all(&t);
+    }
+
+    // E4 fix pass (review of #282, S3/S4 and nits N1-N3): each branch of
+    // `Graph::placed` has a case that fails without it.
+
+    fn repo_at(path: &Path, remote: Option<&str>) -> Repo {
+        Repo { name: "atlas".into(), path: Some(path.to_path_buf()), remote: remote.map(normalize_remote), ..Repo::default() }
+    }
+
+    fn placed_in(r: &Repo, text: &str, cwd: &str) -> bool {
+        Graph::default().placed(r, text, cwd, &mut Remotes::default())
+    }
+
+    #[test]
+    fn a_git_bash_path_places_the_repo() {
+        let r = repo_at(Path::new("q:/work/atlas"), None);
+        assert!(placed_in(&r, "build in /q/work/atlas/src/main.rs", ""));
+    }
+
+    #[test]
+    fn a_sibling_whose_name_starts_with_the_repo_does_not_place_it() {
+        let r = repo_at(Path::new("q:/work/atlas"), None);
+        assert!(!placed_in(&r, "work in q:/work/atlas-worktrees/eff-e4/src", ""), "atlas-worktrees is not atlas");
+        assert!(!placed_in(&r, "work in q:/work/atlas_old/src", ""), "atlas_old is not atlas");
+        assert!(placed_in(&r, "work in q:/work/atlas, then report", ""), "the repo itself, before a comma");
+    }
+
+    /// N1: `atlas.bak` is another folder; `atlas.` ending a sentence is the
+    /// repo.
+    #[test]
+    fn a_dotted_sibling_does_not_place_the_repo_but_a_full_stop_does() {
+        let r = repo_at(Path::new("q:/work/atlas"), None);
+        assert!(!placed_in(&r, "copy q:/work/atlas.bak/x first", ""));
+        assert!(placed_in(&r, "the checkout is q:/work/atlas.", ""));
+    }
+
+    /// N3: a checkout at a drive root is named by `q:/...`, not by a bare
+    /// `q:`.
+    #[test]
+    fn a_drive_root_checkout_is_placed_by_a_path_not_a_bare_drive() {
+        let r = repo_at(Path::new("q:/"), None);
+        assert!(!placed_in(&r, "drive q: is nearly full", ""));
+        assert!(placed_in(&r, "see q:/notes/todo.md", ""));
+    }
+
+    /// A relative path from the working directory, `..` resolved (N2).
+    #[test]
+    fn a_relative_path_from_the_cwd_places_the_repo() {
+        let base = std::env::temp_dir().join("atlas-placed-rel");
+        let r = repo_at(&base.join("atlas"), None);
+        let cwd = base.to_string_lossy().into_owned();
+        assert!(placed_in(&r, "edit atlas/src/main.rs", &cwd));
+        assert!(!placed_in(&r, "edit other/src/main.rs", &cwd));
+        let sibling = base.join("other").to_string_lossy().into_owned();
+        assert!(placed_in(&r, "edit ../atlas/src/main.rs", &sibling), "N2: .. is resolved");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_path_in_another_case_places_the_repo_on_windows() {
+        let r = repo_at(Path::new("q:/work/atlas"), None);
+        assert!(placed_in(&r, r"build in Q:\Work\Atlas\src", ""));
+    }
+
+    /// A path in a worktree of the repo (the common real case: briefs name
+    /// atlas-worktrees/eff-*), found by its remote; the remote is read once.
+    #[test]
+    fn a_path_in_a_worktree_places_the_repo_by_its_remote() {
+        let t = std::env::temp_dir().join(format!("atlas-placed-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let remote = "git@git.example:acme/atlas.git";
+        let co = t.join("atlas");
+        std::fs::create_dir_all(co.join(".git").join("worktrees").join("wt")).unwrap();
+        std::fs::write(co.join(".git").join("config"), format!("[remote \"origin\"]\n\turl = {remote}\n")).unwrap();
+        std::fs::write(co.join(".git").join("worktrees").join("wt").join("commondir"), "../..\n").unwrap();
+        let wt = t.join("atlas-worktrees").join("wt");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", co.join(".git").join("worktrees").join("wt").display())).unwrap();
+        let r = repo_at(&co, Some(remote));
+        let mut remotes = Remotes::default();
+        let text = format!("fix {}", wt.join("src").join("lib.rs").display());
+        assert!(Graph::default().placed(&r, &text, "", &mut remotes));
+        assert!(Graph::default().placed(&r, &text, "", &mut remotes));
+        assert_eq!(remotes.reads, 1, "the worktree's remote is read once");
+        let other = repo_at(&co, Some("git@git.example:acme/other.git"));
+        assert!(!Graph::default().placed(&other, &text, "", &mut remotes), "another remote does not place it");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// S4: a network path is never looked at on disk, in the text or as the
+    /// working directory.
+    #[test]
+    fn a_network_path_is_never_looked_at() {
+        let r = repo_at(Path::new("q:/work/atlas"), Some("git@git.example:acme/atlas.git"));
+        let mut remotes = Remotes::default();
+        let text = r"see //atlas-test-nohost.invalid/share/x and \atlas-test-nohost.invalid\share\y";
+        assert!(!Graph::default().placed(&r, text, "", &mut remotes));
+        assert!(!Graph::default().placed(&r, "", "//atlas-test-nohost.invalid/share/dir", &mut remotes));
+        assert_eq!((remotes.stats, remotes.reads), (0, 0));
+    }
+
+    // Placement compares canonical paths (public #14): a checkout reached
+    // through a symlink or junction (macOS `/var` -> `/private/var`) or a
+    // Windows 8.3 short name is the same folder as its long, resolved form.
+
+    /// A directory link `link` -> `target`: a symlink on Unix, a junction on
+    /// Windows (no privilege needed). False when the system refused one.
+    #[cfg(unix)]
+    fn dir_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn dir_link(target: &Path, link: &Path) -> bool {
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output();
+        made.is_ok_and(|o| o.status.success())
+    }
+
+    /// The 8.3 short form of an existing path, when the volume makes them
+    /// and it differs from the long form.
+    #[cfg(windows)]
+    fn short_name(p: &Path) -> Option<PathBuf> {
+        use std::os::windows::process::CommandExt;
+        let o = std::process::Command::new("cmd").raw_arg(format!("/C for %I in (\"{}\") do @echo %~sI", p.display())).output().ok()?;
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        (o.status.success() && s.contains('~') && Path::new(&s).exists()).then(|| PathBuf::from(s))
+    }
+
+    /// A tree `real/atlas/src` with a link `link` -> `real`, under a fresh
+    /// temp folder: (base, real, link).
+    fn linked_tree(tag: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let base = std::env::temp_dir().join(format!("atlas-placed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("atlas").join("src")).unwrap();
+        std::fs::create_dir_all(real.join("other")).unwrap();
+        let link = base.join("link");
+        if !dir_link(&real, &link) {
+            eprintln!("skipped: no directory link could be made");
+            let _ = std::fs::remove_dir_all(&base);
+            return None;
+        }
+        Some((base, real, link))
+    }
+
+    fn remove_linked_tree(base: &Path) {
+        // The link first, so removing the tree never follows it.
+        let link = base.join("link");
+        let _ = std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_cwd_through_a_link_places_the_repo_either_way() {
+        let Some((base, real, link)) = linked_tree("cwd") else { return };
+        let s = |p: PathBuf| p.to_string_lossy().into_owned();
+        let at_real = repo_at(&real.join("atlas"), None);
+        let at_link = repo_at(&link.join("atlas"), None);
+        assert!(placed_in(&at_real, "", &s(link.join("atlas").join("src"))), "cwd through the link, checkout resolved");
+        assert!(placed_in(&at_link, "", &s(real.join("atlas").join("src"))), "cwd resolved, checkout through the link");
+        assert!(!placed_in(&at_real, "", &s(link.join("other"))), "a cwd outside the checkout does not place it");
+        assert!(!placed_in(&at_link, "", &s(real.join("other"))), "nor in the other form");
+        remove_linked_tree(&base);
+    }
+
+    #[test]
+    fn a_path_in_the_text_through_a_link_places_the_repo() {
+        let Some((base, real, link)) = linked_tree("text") else { return };
+        let at_real = repo_at(&real.join("atlas"), None);
+        let abs = format!("edit {}", link.join("atlas").join("src").join("lib.rs").display());
+        assert!(placed_in(&at_real, &abs, ""), "an absolute path through the link");
+        let cwd = link.to_string_lossy().into_owned();
+        assert!(placed_in(&at_real, "edit atlas/src/lib.rs", &cwd), "a relative path from a cwd through the link");
+        assert!(!placed_in(&at_real, "edit other/notes.md", &cwd), "a relative path outside it");
+        let other = format!("edit {}", link.join("other").join("notes.md").display());
+        assert!(!placed_in(&at_real, &other, ""), "an absolute path outside it");
+        remove_linked_tree(&base);
+    }
+
+    /// A Windows runner's temp folder is often reached by an 8.3 short name
+    /// (`RUNNER~1`): a cwd or a path in that form places the long checkout,
+    /// and the long form places a short checkout.
+    #[cfg(windows)]
+    #[test]
+    fn a_short_name_places_the_repo_on_windows() {
+        let base = std::env::temp_dir().join(format!("atlas-placed-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let long = base.join("a long checkout folder name");
+        std::fs::create_dir_all(long.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("a long sibling folder name")).unwrap();
+        let Some(short) = short_name(&long) else {
+            eprintln!("skipped: this volume makes no 8.3 names");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let at_long = repo_at(&long, None);
+        let at_short = repo_at(&short, None);
+        assert!(placed_in(&at_long, "", &s(&short.join("src"))), "short cwd, long checkout");
+        assert!(placed_in(&at_short, "", &s(&long.join("src"))), "long cwd, short checkout");
+        assert!(placed_in(&at_long, &format!("edit {}", short.join("src").join("lib.rs").display()), ""), "a short path in the text");
+        assert!(!placed_in(&at_long, "", &s(&base.join("a long sibling folder name"))), "a sibling does not place it");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

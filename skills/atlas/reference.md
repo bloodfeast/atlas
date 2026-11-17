@@ -202,6 +202,7 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `orchestrate.reviews`
 - `orchestrate.reviews.mode`
 - `orchestrate.reviews.roles`
+- `orchestrate.runq_root`
 - `orchestrate.stale_minutes`
 - `orchestrate.types`
 - `orchestrate.window`
@@ -311,7 +312,7 @@ Answers are plain text; `format: "json"` gives JSON. A repeated read answers `un
   - entry `review` files a review for the merge gate (`orchestrate.reviews`): `meta` lines `role:`, `pr:`, `head:` (the sha read), `verdict:` (pass, merge, merge with follow-ups, request changes) and `report:`
   - `amend: KEY` with `expected_sha` (the head's sha) rewrites that entry's title and body as a new version; its lane, entry, meta lines and refs stay (pass the same `lane` and `entry`, no `meta` or `refs`)
 - `handoff`: Write a lane handoff (allowed past the context cap).
-- `note`: Vault notes, read only. op help: every op and argument.
+- `note`: Vault notes, read only. op read: the whole note; section is cheaper for one heading. op help: every op and argument.
   - op `read` runs `read_note`
   - op `list` runs `list_notes`
   - op `find` runs `find_by_frontmatter`
@@ -371,7 +372,7 @@ Notes in a vault folder: path, title, size, sha256.
 
 #### read_note
 
-A note's text and sha256; lines or budget_tokens for part of it.
+A note's whole text and sha256; lines or budget_tokens for part of it. For one heading, section is the cheaper read.
 
 - `vault` string, required
 - `path` string, required
@@ -730,8 +731,8 @@ Store a memory, rule or decision (new key: create; existing key: new version, ne
 
 - `kind` string (memory, rule, decision), required
 - `key` string: Memory slug; rules and decisions get one.
-- `title` string: One line.
-- `summary` string: Memory: index description.
+- `title` string: One line; a memory's or a rule's is at most 120 characters.
+- `summary` string: Memory: index description, one line of at most 200 characters.
 - `body` string, required
 - `sub` string: Memory type (user, feedback, project, reference).
 - `scope` string: user: the shared user layer, seen in every project (memories only).

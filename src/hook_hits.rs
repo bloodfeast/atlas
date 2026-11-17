@@ -564,8 +564,11 @@ pub fn at_floor(rows: &[(Injection, Option<&'static str>)], floor: f32, scale: f
 
 /// The relevance floor (`recall.inject_floor`) tuned on hit data, by a
 /// fixed objective: the floor that maximises the bytes kept hits save net
-/// of the bytes injected ([`FloorPoint::net`]). Candidates are 0, every
-/// cosine in the data, and just above the highest; a tie goes to the lower floor (inject more).
+/// of the bytes injected ([`FloorPoint::net`]). Candidates are the active
+/// floor, every cosine above it in the data, and just above the highest; a
+/// tie goes to the lower floor (inject more). The hook logs only what it
+/// injected, so no row sits below the active floor and the data cannot
+/// speak there: a floor below it is never recommended.
 ///
 /// # Arguments
 ///
@@ -573,16 +576,18 @@ pub fn at_floor(rows: &[(Injection, Option<&'static str>)], floor: f32, scale: f
 /// * `scale` - the share of a hit's counterfactual credited (1 is the
 ///   ledger's rule-based credit; the measured ratio over the ledger ratio is
 ///   the measured alternative).
-pub fn tune(rows: &[(Injection, Option<&'static str>)], scale: f64) -> FloorPoint {
-    let mut cands: Vec<f32> = rows.iter().filter_map(|(i, _)| i.cos).collect();
+/// * `active` - the floor in force (`recall.inject_floor`), the lowest
+///   candidate.
+pub fn tune(rows: &[(Injection, Option<&'static str>)], scale: f64, active: f32) -> FloorPoint {
+    let mut cands: Vec<f32> = rows.iter().filter_map(|(i, _)| i.cos).filter(|c| *c > active).collect();
     // Above every cosine: inject only the keys without one.
     if let Some(top) = cands.iter().copied().reduce(f32::max) {
         cands.push(top.next_up());
     }
-    cands.push(0.0);
+    cands.push(active);
     cands.sort_by(f32::total_cmp);
     cands.dedup();
-    let mut best = at_floor(rows, 0.0, scale);
+    let mut best = at_floor(rows, active, scale);
     for f in cands {
         let p = at_floor(rows, f, scale);
         if p.net > best.net {
@@ -609,16 +614,28 @@ mod tests {
             (inj(None, 100, 1000), None),
         ];
         // Dropping both misses below 0.50 saves 200 bytes and loses no hit.
-        let b = tune(&rows, 1.0);
+        let b = tune(&rows, 1.0, 0.0);
         assert_eq!((b.floor, b.kept, b.hits), (0.50, 2, 1));
         assert_eq!(b.net, 1000.0 - 200.0);
         // A hit worth less than the misses' cost: the floor drops it too, but
         // the key without a cosine stays.
-        let b = tune(&rows, 0.05);
+        let b = tune(&rows, 0.05, 0.0);
         assert_eq!((b.kept, b.hits), (1, 0));
         // All hits: nothing to gain, the lowest floor.
         let all: Vec<_> = rows.iter().map(|(i, _)| (i.clone(), Some("quote"))).collect();
-        assert_eq!(tune(&all, 1.0).floor, 0.0);
+        assert_eq!(tune(&all, 1.0, 0.0).floor, 0.0);
+    }
+
+    /// The hook logs only what it injected: under an active floor of 0.60
+    /// no row sits below it, so every floor under 0.60 scores the same and
+    /// the data cannot speak there. The tuner must not recommend one.
+    #[test]
+    fn the_tuner_never_goes_below_the_active_floor() {
+        let rows =
+            vec![(inj(Some(0.62), 100, 1000), Some("key")), (inj(Some(0.70), 100, 1000), Some("quote")), (inj(None, 100, 1000), None)];
+        let b = tune(&rows, 1.0, 0.60);
+        assert_eq!(b.floor, 0.60);
+        assert_eq!((b.kept, b.hits), (3, 2));
     }
 
     #[test]

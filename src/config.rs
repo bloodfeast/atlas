@@ -675,7 +675,7 @@ fn parse_orchestrate(v: &Value, base: &Path) -> Result<crate::orchestrate::Orche
     const KINDS: &str = "builder, reviewer, research, brief-writer or none";
     const MODES: &str = "enforced, advisory or off";
     const FRESH: &str = "auto or ask";
-    let f = Fields::new("orchestrate", v, &["enabled", "window", "stale_minutes", "disk_full_minutes", "default_kind", "mode", "fresh", "types", "kinds", "resources", "aging_minutes", "bare_gpu_words", "reviews", "judge", "worktree_roots"])?;
+    let f = Fields::new("orchestrate", v, &["enabled", "window", "stale_minutes", "disk_full_minutes", "default_kind", "mode", "fresh", "types", "kinds", "resources", "aging_minutes", "bare_gpu_words", "reviews", "judge", "worktree_roots", "runq_root"])?;
     let mut o = OrchestrateSpec {
         enabled: f.boolean("enabled")?,
         window: f.uint("window")?,
@@ -687,6 +687,7 @@ fn parse_orchestrate(v: &Value, base: &Path) -> Result<crate::orchestrate::Orche
         aging_minutes: f.uint("aging_minutes")?,
         bare_gpu_words: f.boolean("bare_gpu_words")?,
         worktree_roots: f.strings("worktree_roots")?.unwrap_or_default().iter().map(|p| absolute(base, Path::new(p))).collect(),
+        runq_root: f.string("runq_root")?.filter(|p| !p.is_empty()).map(|p| absolute(base, Path::new(&p))),
         ..OrchestrateSpec::default()
     };
     if let Some(rv) = f.get("resources") {

@@ -720,9 +720,26 @@ fn a_root_of_repos_is_discovered_offered_written_routed_and_indexed() {
     touch(&mut h, ledger.join("README.md"));
     assert_eq!(h.active_repo("s", &cwd).as_deref(), Some("ledger"), "a remote-mapped checkout routes too");
     assert_eq!(h.active_repo("other-session", &cwd).as_deref(), Some("gateway"));
-    // A prompt naming a repo gets its line from the graph.
-    let ans = h.handle(&HookEvent { event: "UserPromptSubmit".into(), session_id: "s".into(), prompt: "what does gateway depend on".into(), ..HookEvent::default() });
-    assert!(ans.context.contains("repo gateway: public API edge; talks to billing, auth; through them ledger"), "{}", ans.context);
+    // A prompt naming a repo gets its line from the graph, with its path,
+    // when the working directory is not in it (E4).
+    let gw = project::path_key(&acme.join("gateway"));
+    let ask = |h: &mut Hooks, session: &str, cwd: &Path| {
+        h.handle(&HookEvent {
+            event: "UserPromptSubmit".into(),
+            session_id: session.into(),
+            prompt: "what does gateway depend on".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            ..HookEvent::default()
+        })
+        .context
+    };
+    let ans = ask(&mut h, "s", &acme);
+    let line = ans.lines().find(|l| l.contains("repo gateway at ")).unwrap_or_else(|| panic!("{ans}"));
+    assert!(line.ends_with("gateway: public API edge; talks to billing, auth; through them ledger"), "{line}");
+    let at = line.split("repo gateway at ").nth(1).unwrap().split(": public").next().unwrap();
+    assert_eq!(project::path_key(Path::new(at)), gw, "the line carries the checkout's path");
+    let ans = ask(&mut h, "s-in", &acme.join("gateway").join("cmd"));
+    assert!(!ans.contains("repo gateway"), "the cwd already places it: {ans}");
 
     // The .proto index across repos: definitions, type references, rpc call sites.
     let mut server = server_for(&e);

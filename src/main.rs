@@ -544,7 +544,11 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
     if let Some(scale) = tune {
         println!("floor\tkept\thits\thit_rate\ttokens_injected\thits_per_1k_tokens\tnet_tokens");
         let free = verdicts.iter().filter(|(i, _)| i.cos.is_none()).count();
-        for step in 0..=100 {
+        let active = setup.memory.recall.inject_floor;
+        // The hook logs only what it injected: below the active floor the
+        // data holds nothing, so the table and the tuner start at it.
+        println!("from the active recall.inject_floor {active:.2}: rows below it were never injected, so never logged");
+        for step in (0..=100u32).filter(|s| *s as f32 / 100.0 >= active - 1e-6) {
             let p = hook_hits::at_floor(&verdicts, step as f32 / 100.0, scale);
             let rate = if p.kept > 0 { p.hits as f64 / p.kept as f64 * 100.0 } else { 0.0 };
             let per = if p.bytes > 0 { p.hits as f64 / (p.bytes as f64 / bpt) * 1000.0 } else { 0.0 };
@@ -553,7 +557,7 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
                 break;
             }
         }
-        let b = hook_hits::tune(&verdicts, scale);
+        let b = hook_hits::tune(&verdicts, scale, active);
         println!("tuned recall.inject_floor {:.4} (hit scale {scale}): keeps {} of {}, {} hits, net {:.0} tokens", b.floor, b.kept, verdicts.len(), b.hits, b.net / bpt);
     }
     if rows {
@@ -1362,19 +1366,37 @@ fn run() -> Result<ExitCode, String> {
             } else {
                 None
             };
+            // Routed Reads are credited as judged (E4): the output each
+            // replaced less the later Reads of the file in its transcript
+            // (read only); a row logged before that is credited 0.
+            let read_credit = atlas::tokens::read_credit(&conn).map_err(|e| e.to_string())?;
+            atlas::tokens::add_hook_credit(&mut by_tool, &read_credit.by, false, bytes_per_token);
+            atlas::tokens::add_hook_credit(&mut by_day, &read_credit.by, true, bytes_per_token);
+            atlas::tokens::add_hook_credit(&mut by_day_net, &read_credit.by, true, bytes_per_token);
             let side = atlas::baseline::AtlasSide::read(&conn).map_err(|e| e.to_string())?;
             let latest = atlas::baseline::latest(&conn).map_err(|e| e.to_string())?;
             let brief = atlas::tokens::brief_report(&conn, bytes_per_token).map_err(|e| e.to_string())?;
+            // The brief as read before atlas (#219): the rulebook's path
+            // text in the pre-atlas transcripts' reads; the file is not opened.
+            let measured = match &setup.memory.brief_reference {
+                Some(p) => atlas::tokens::brief_measured(&conn, p, bytes_per_token).map_err(|e| e.to_string())?,
+                None => None,
+            };
             // What the recall hooks inject, judged against the brief row.
             let inject = atlas::tokens::inject_report(&conn, bytes_per_token).map_err(|e| e.to_string())?;
-            let matched = atlas::tokens::brief_vs_inject(&conn, bytes_per_token).map_err(|e| e.to_string())?;
+            let matched = atlas::tokens::brief_vs_inject(&conn, bytes_per_token, measured.as_ref()).map_err(|e| e.to_string())?;
             let select = atlas::tokens::select_report(&conn, bytes_per_token).map_err(|e| e.to_string())?;
             // Compactions, as SessionStart(compact) saw them, and the
             // lookups made again after one.
             let compact = atlas::compact::totals(&conn, bytes_per_token).map_err(|e| e.to_string())?;
             // What atlas itself costs (#227): the store, and the
             // transcripts when given (read only).
-            let cost = atlas::token_cost::measure(&conn, bytes_per_token, transcripts.as_deref()).map_err(|e| e.to_string())?;
+            let mut cost = atlas::token_cost::measure(&conn, bytes_per_token, transcripts.as_deref()).map_err(|e| e.to_string())?;
+            // Net counts the rulebook only as measured, never its file size,
+            // and less the recall-by-record credit that may read the same
+            // rulebook windows.
+            let recall_records = atlas::tokens::recall_records_credit(&conn, bytes_per_token).map_err(|e| e.to_string())?;
+            cost.credit_rulebook(matched.as_ref(), recall_records);
             let inputs = atlas::token_report::Inputs {
                 bytes_per_token,
                 baseline: latest.as_ref().map(|(when, b)| (when.as_str(), b)),
@@ -1384,11 +1406,13 @@ fn run() -> Result<ExitCode, String> {
                 by_day: &by_day,
                 by_day_net: &by_day_net,
                 brief: brief.as_ref(),
+                measured: measured.as_ref(),
                 inject: inject.as_ref(),
                 matched: matched.as_ref(),
                 select: &select,
                 compact: compact.as_ref(),
                 hook_hits,
+                read_credit: Some(&read_credit),
                 cost: Some(&cost),
             };
             print!("{}", if tsv { atlas::token_report::tsv(&inputs) } else { atlas::token_report::human(&inputs) });
@@ -1866,8 +1890,25 @@ fn serve_mode(
         s.set_memory_sync(Some(mem.clone()));
         Ok(s)
     });
-    atlas::protocol::serve_with_hooks(&mut server, Some(setup.memory.clone()), Some(index), BufReader::new(io::stdin()), io::stdout())
-        .map_err(|e| ServeFail::io(Site::Serve, e))?;
+    // The restart point's catch: shutdown, logoff, a closed terminal (#221).
+    // Written, not printed: a closed stderr must not stop the server.
+    let armed = atlas::restart::arm(&setup.memory.store);
+    // Tests: a restart point prepared before any hook, for the test that
+    // closes the real server's stdin (#221). Only in a test build: the
+    // `test-seams` feature, which only the tests' dev-dependency turns on
+    // (linux-test runs them in release), so a shipped build never reads it.
+    #[cfg(feature = "test-seams")]
+    if let Some(p) = std::env::var("ATLAS_TEST_RESTART_SEED").ok().and_then(|t| atlas::restart::Point::parse(&t)) {
+        atlas::restart::prepare(&p);
+        atlas::restart::note("test seed prepared");
+    }
+    let _ = std::io::Write::write_fmt(&mut io::stderr(), format_args!("atlas restart point: {armed}\n"));
+    let served =
+        atlas::protocol::serve_with_hooks(&mut server, Some(setup.memory.clone()), Some(index), BufReader::new(io::stdin()), io::stdout());
+    // A shutdown signal that came with the end of input: its catch finishes
+    // before the process exits (#221, S2).
+    atlas::restart::before_exit();
+    served.map_err(|e| ServeFail::io(Site::Serve, e))?;
     Ok((Exit::Eof, ExitCode::SUCCESS))
 }
 

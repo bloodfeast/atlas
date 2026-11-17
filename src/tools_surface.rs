@@ -21,7 +21,15 @@ pub const HELP_URI: &str = "atlas://help";
 /// The habits paragraph of the `initialize` instructions, sent in every
 /// session: what atlas is, the habits, and where the full guide is. Its
 /// token budget is a test (`xtask/src/skill.rs`).
-pub const GUIDE: &str = "atlas is this project's memory: decisions, journals, handoffs and work queue, across sessions. Habits: `recall` before asking what may be decided; `journal` decisions and measures to your lane as they happen; write a `handoff` before your final answer whenever work is left for later; name planned work by its queue key; put `Kind:` and `Lane:` lines in every brief. Load the bundled `atlas` skill before your first journal or handoff; ops: atlas://help or `note op=help`.";
+pub const GUIDE: &str = "atlas is project memory across sessions: decisions, journals, work queue. Habits: `recall` before asking what is decided; `journal` decisions, measures to your lane; `handoff` before your final answer whenever work is left for later; name planned work by its queue key; `Kind:`, `Lane:` lines in briefs. Load the `atlas` skill before your first journal or handoff; ops: atlas://help or `note op=help`. `lookup` finds identifiers, `symbol` code symbols.";
+
+/// The style rule for what agents write into atlas and for their replies
+/// (#274): telegraphic, keys kept, modelled on the compact instructions
+/// ([`crate::claude_settings::COMPACT_INSTRUCTIONS`]). One const, sent in
+/// three places: a line of the `initialize` instructions, the bundled
+/// skill's `SKILL.md` (a test in `xtask/src/skill.rs`), and the first
+/// `journal` or `handoff` answer of a session.
+pub const STYLE: &str = "Style for what you write into atlas and your replies: telegraphic, keys kept. Drop filler, preamble and restatement; fragments are fine. Keep every key, number, path, commit, error line and quoted ruling exact; a key stands in for its text.";
 
 /// One op of a merged tool: the tool, the op, the full tool it runs.
 struct Op {
@@ -225,7 +233,7 @@ pub(super) const LISTED: &[ToolDef] = &[
     },
     ToolDef {
         name: "note",
-        description: "Vault notes, read only. op help: every op and argument.",
+        description: "Vault notes, read only. op read: the whole note; section is cheaper for one heading. op help: every op and argument.",
         read_only: true,
         schema: || {
             let mut ops = ops_of("note");

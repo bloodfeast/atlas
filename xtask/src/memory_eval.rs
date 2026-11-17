@@ -56,6 +56,22 @@
 //! their lanes, for which an item of another lane is; with `--rows`, one
 //! `offtopic row` per prompt names each item and its cosine.
 //!
+//! `--starts DIR` adds
+//!
+//! * (s) subagent starts: real launch briefs (`DIR/starts.jsonl`, see
+//!   [`parse_starts`]), each fired through the server's hook route
+//!   ([`atlas::hooks::Hooks::serve_setup`]: the launch's PreToolUse of the
+//!   Agent tool, then SubagentStart) once per `recall.subagent_context` mode
+//!   (recall, binding, off), each start and mode on its own fresh copy of
+//!   the store frozen with them (`DIR/memory.sqlite`), rewound to the
+//!   start's time ([`rewind_store`]). Each brief lists the facts its agent
+//!   then recalled by key and its brief did not name; each is scored as a
+//!   (b) question asked of the injection ([`score_start`]): present in it,
+//!   named by key or title, or found by the one informed follow-up.
+//!   Reported per mode and per Kind, `agent-kind:` needs apart from the
+//!   rest; informational (it never fails the run, and a bad fixture skips
+//!   it with the reason) until a pass bar is set.
+//!
 //! The question file is plain text, one block per question:
 //!
 //! ```text
@@ -272,16 +288,23 @@ pub fn embed_all_pending_cached(settings: &atlas::memory::settings::Settings, ca
     Ok(Some(n))
 }
 
-/// Record keys an answer lists, in order: `== KEY ...` (a record) and
-/// `- KEY: title` or `- KEY score: title` (a pointer).
+/// Record keys an answer lists, in order: `== KEY ...` (a record),
+/// `- KEY: title` or `- KEY score: title` (a pointer), and a Binding
+/// block's `KEY@sha: title` after `- ` or a one-word lead (`handoff: `,
+/// `named: `), the hash dropped.
 pub fn keys_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for l in text.lines() {
         let rest = match (l.strip_prefix("== "), l.strip_prefix("- ")) {
             (Some(r), _) | (None, Some(r)) => r,
-            _ => continue,
+            // A lead word is followed only by a `KEY@sha:` ref.
+            _ => match l.split_once(": ") {
+                Some((lead, r)) if lead_ref(lead, r) => r,
+                _ => continue,
+            },
         };
-        let k = rest.split_whitespace().next().unwrap_or("").trim_end_matches(':');
+        let w = rest.split_whitespace().next().unwrap_or("").trim_end_matches(':');
+        let k = w.split_once('@').map_or(w, |(k, _)| k);
         // A key has no spaces and is not a bare word of prose: it holds a
         // colon or a dash, or is a memory slug.
         if !k.is_empty()
@@ -292,6 +315,14 @@ pub fn keys_in(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether `lead: rest` is a Binding line: a lower-case word, then a
+/// `KEY@sha:` ref.
+fn lead_ref(lead: &str, rest: &str) -> bool {
+    !lead.is_empty()
+        && lead.chars().all(|c| c.is_ascii_lowercase())
+        && rest.split_whitespace().next().is_some_and(|w| w.contains('@') && w.ends_with(':'))
 }
 
 /// How the one follow-up is chosen for a recall query.
@@ -534,7 +565,8 @@ pub struct Opts {
     /// One row per question.
     pub rows: bool,
     /// Questions whose calls and answers are printed whole, and their hook
-    /// injections with the candidates that passed the gate.
+    /// injections with the candidates that passed the gate; a start id of
+    /// (s) prints that start's injection in each mode.
     pub show: Vec<String>,
     /// The project to run as (default: the one the working directory and
     /// the configuration resolve to; see [`atlas::project`]).
@@ -547,6 +579,9 @@ pub struct Opts {
     /// An off-topic prompt file (see [`parse_offtopic`]), replayed through
     /// the hook beside the recall questions at every floor.
     pub offtopic: Option<PathBuf>,
+    /// A folder of subagent starts for (s): `starts.jsonl` (see
+    /// [`parse_starts`]) and `memory.sqlite`, the store frozen with them.
+    pub starts: Option<PathBuf>,
 }
 
 /// An off-topic prompt's label: `neg` (it should recall nothing) or the
@@ -1442,7 +1477,251 @@ pub fn run(o: &Opts) -> Result<bool, String> {
         ok &= pass == n && dangling == 0 && check.dangling.is_empty();
     }
 
+    // (s) subagent starts: informational until a pass bar is set, so it
+    // never changes `ok`, and a bad fixture skips it with the reason.
+    if let Some(dir) = &o.starts {
+        if let Err(e) = run_starts(dir, &settings, &mut server, &cwd.to_string_lossy(), bpt, o.rows, &o.show) {
+            println!("(s) skipped: {e}");
+        }
+        server.set_memory(settings.clone());
+    }
+
     Ok(ok)
+}
+
+/// A store file copied to `to`, with no stale write-ahead log beside it.
+/// The source must be checkpointed ([`checkpoint`]): only its main file is
+/// copied.
+fn copy_store(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(d) = to.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    for ext in ["-wal", "-shm"] {
+        let p = PathBuf::from(format!("{}{ext}", to.display()));
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+    }
+    std::fs::copy(from, to).map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))?;
+    Ok(())
+}
+
+/// Moves everything in a store's write-ahead log into its main file, so a
+/// copy of the main file alone is the whole store. An error when another
+/// connection still holds the log.
+fn checkpoint(path: &Path) -> Result<(), String> {
+    let err = |e: rusqlite::Error| format!("checkpoint {}: {e}", path.display());
+    let c = rusqlite::Connection::open(path).map_err(err)?;
+    let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0)).map_err(err)?;
+    if busy != 0 {
+        return Err(format!("checkpoint {}: another connection holds the log", path.display()));
+    }
+    Ok(())
+}
+
+/// Vectors for every pending head of the store at `path`; how many.
+fn embed_store(path: &Path, model: &atlas::embed::Model, threads: usize) -> Result<usize, String> {
+    let mem = atlas::memory::MemoryStore::open(path).map_err(|e| e.to_string())?;
+    let mut n = 0;
+    loop {
+        let k = atlas::memory::vectors::embed_pending(&mem, model, 128, threads).map_err(|e| e.to_string())?;
+        if k == 0 {
+            return Ok(n);
+        }
+        n += k;
+    }
+}
+
+/// What [`rewind_store`] took back out of a store copy.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Rewound {
+    /// Records gone: created after the time, or with no version by then.
+    pub records: usize,
+    /// Versions gone: written after the time, or of a record created after
+    /// it.
+    pub versions: usize,
+}
+
+impl Rewound {
+    fn add(&mut self, o: &Rewound) {
+        self.records += o.records;
+        self.versions += o.versions;
+    }
+}
+
+/// Rewinds a store copy to how it stood at `time` (UTC, as the store
+/// writes times): a record created after it goes (whatever time its
+/// source states for its versions), then the compaction eval's prune
+/// ([`crate::compact_live::prune_store`]) takes out every later version
+/// and undoes every later supersede and retirement, with heads, refs,
+/// placement and the search index following. Its one gap stands here too:
+/// a ref added after `time` to a record that survives stays.
+///
+/// # Errors
+///
+/// The copy failing to open or write, as text.
+pub fn rewind_store(path: &Path, time: &str) -> Result<Rewound, String> {
+    let err = |e: rusqlite::Error| format!("rewind {}: {e}", path.display());
+    let mut c = rusqlite::Connection::open(path).map_err(err)?;
+    let tx = c.transaction().map_err(err)?;
+    // The append-only guard comes back below, from the schema.
+    tx.execute_batch("DROP TRIGGER IF EXISTS versions_no_delete;").map_err(err)?;
+    let early = tx.execute("DELETE FROM versions WHERE rid IN (SELECT rid FROM records WHERE created > ?1)", [time]).map_err(err)?;
+    tx.execute_batch(atlas::memory::SCHEMA).map_err(err)?;
+    tx.commit().map_err(err)?;
+    drop(c);
+    let (versions, records) = crate::compact_live::prune_store(path, time)?;
+    Ok(Rewound { records, versions: versions + early })
+}
+
+/// The `recall.subagent_context` modes (s) fires each start in. Recall
+/// comes last: a store shared with an earlier mode would show in its lane
+/// view as that mode's filed launch brief, which the tests check.
+const START_MODES: [(&str, atlas::memory::settings::SubagentContext); 3] = [
+    ("binding", atlas::memory::settings::SubagentContext::Binding),
+    ("off", atlas::memory::settings::SubagentContext::Off),
+    ("recall", atlas::memory::settings::SubagentContext::Recall),
+];
+
+/// The order (s) reports the modes in.
+const START_REPORT: [&str; 3] = ["recall", "binding", "off"];
+
+/// (s): every start of `dir/starts.jsonl` fired through the server's hook
+/// route once per `recall.subagent_context` mode ([`fire_start`]), each
+/// against its own copy of the store frozen with them (`dir/memory.sqlite`)
+/// rewound to the start's time ([`rewind_store`]), and scored by
+/// [`score_start`]; the follow-ups are `recall {key}` on that copy.
+///
+/// # Errors
+///
+/// A bad fixture (unreadable, unparsable, or a need its record does not
+/// hold at the start's time) or a store copy failing, as text; the caller
+/// reports it and skips (s).
+fn run_starts(
+    dir: &Path,
+    base: &atlas::memory::settings::Settings,
+    server: &mut atlas::tools::Server,
+    cwd: &str,
+    bpt: f64,
+    rows: bool,
+    show: &[String],
+) -> Result<(), String> {
+    let file = dir.join("starts.jsonl");
+    let starts = parse_starts(&std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?)?;
+    let work = base.store.parent().ok_or("the store has no folder")?.join("starts");
+    let frozen = work.join("frozen.sqlite");
+    copy_store(&dir.join("memory.sqlite"), &frozen)?;
+    let model = if base.model.is_file() { Some(atlas::embed::Model::load(&base.model).map_err(|e| e.to_string())?) } else { None };
+    if let Some(m) = &model {
+        let t0 = std::time::Instant::now();
+        let n = embed_store(&frozen, m, base.embed_threads)?;
+        println!("(s) embedded {n} pending record vectors of the frozen store first in {:.1} s", t0.elapsed().as_secs_f64());
+    }
+    checkpoint(&frozen)?;
+    let mut kinds: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
+    for st in &starts {
+        let k = kinds.entry(st.kind.as_str()).or_default();
+        k.0 += 1;
+        k.1 += st.needs.iter().filter(|n| is_kind_rule(&n.key)).count();
+        k.2 += st.needs.iter().filter(|n| !is_kind_rule(&n.key)).count();
+    }
+    println!(
+        "(s) subagent starts: {} starts ({}), {} needs; informational, no pass bar yet",
+        starts.len(),
+        kinds.iter().map(|(k, (s, r, o))| format!("{s} {k}, {r} agent-kind + {o} other needs")).collect::<Vec<_>>().join("; "),
+        starts.iter().map(|s| s.needs.len()).sum::<usize>()
+    );
+    let mut all: BTreeMap<&str, StartTally> = BTreeMap::new();
+    let mut by: BTreeMap<(&str, String), StartTally> = BTreeMap::new();
+    let mut lines: Vec<(&str, String)> = Vec::new();
+    let (mut rewound, mut whole) = (Rewound::default(), 0);
+    for st in &starts {
+        // The store as it stood when this start was launched.
+        let at = work.join(format!("{}-at.sqlite", st.id));
+        copy_store(&frozen, &at)?;
+        match &st.time {
+            Some(t) => rewound.add(&rewind_store(&at, t)?),
+            None => whole += 1,
+        }
+        if let Some(m) = &model {
+            embed_store(&at, m, base.embed_threads)?;
+        }
+        // As (b): every fact must be in its source record as of the start,
+        // or it tests nothing.
+        let mut st = st.clone();
+        {
+            let mem = atlas::memory::MemoryStore::open(&at).map_err(|e| e.to_string())?;
+            let mut bad = Vec::new();
+            for n in &mut st.needs {
+                match mem.head(&n.key).map_err(|e| e.to_string())? {
+                    Some(h) if holds(&norm(&format!("{}\n{}", h.title, h.body)), std::slice::from_ref(&n.fact)) => n.title = h.title,
+                    _ => bad.push(format!("{} need {}: the record does not hold {:?} at the start", st.id, n.key, n.fact)),
+                }
+            }
+            if !bad.is_empty() {
+                return Err(format!("{} invalid start needs: {}", bad.len(), bad.join("; ")));
+            }
+        }
+        checkpoint(&at)?;
+        let mut used = vec![at.clone()];
+        for (name, mode) in START_MODES {
+            let (ctx, s) = fire_start(&st, &at, base, &work, name, mode, cwd)?;
+            used.push(s.store.clone());
+            server.set_memory(s);
+            let agent = format!("{}-start-{name}", st.id);
+            let sc = score_start(&st, &ctx, &mut |t, a| {
+                announce(server, &agent, t);
+                server.answer(t, a).map(|x| x.into_text()).unwrap_or_else(|e| format!("error: {e}"))
+            });
+            all.entry(name).or_default().add(&sc);
+            by.entry((name, st.kind.clone())).or_default().add(&sc);
+            if rows {
+                let (r, o) = (sc.rules, sc.other);
+                lines.push((
+                    name,
+                    format!(
+                        "(s) row\t{name}\t{}\t{}\t{}\tagent-kind {}/{}/{}/{}\tother {}/{}/{}/{}",
+                        st.id, st.kind, sc.bytes, r.present, r.named, r.informed, r.needs, o.present, o.named, o.informed, o.needs
+                    ),
+                ));
+                for (k, [p, n, i]) in &sc.each {
+                    let f = |b: &bool| if *b { "y" } else { "-" };
+                    lines.push((name, format!("(s) need\t{name}\t{}\t{k}\t{}{}{}", st.id, f(p), f(n), f(i))));
+                }
+            }
+            if show.contains(&st.id) {
+                println!("(s) show {} {name}, {} bytes:\n{ctx}", st.id, ctx.len());
+            }
+        }
+        server.set_memory(base.clone());
+        for p in used {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", p.display()));
+            }
+            let _ = std::fs::remove_file(atlas::memory::jsonl_path(&p));
+        }
+    }
+    println!(
+        "(s) each start scored on the store as it stood at its start: {} later records and {} later versions taken out across {} starts; {whole} starts with no time used the frozen store whole",
+        rewound.records,
+        rewound.versions,
+        starts.len() - whole
+    );
+    if rows {
+        println!("(s) row\tmode\tid\tkind\tbytes\tagent-kind present/named/informed/needs\tother present/named/informed/needs");
+    }
+    for name in START_REPORT {
+        for (_, l) in lines.iter().filter(|(n, _)| *n == name) {
+            println!("{l}");
+        }
+        if let Some(t) = all.get(name) {
+            println!("(s) {}", t.line(name, bpt));
+        }
+        for ((_, k), t) in by.iter().filter(|((n, _), _)| *n == name) {
+            println!("    {}", t.line(k, bpt));
+        }
+    }
+    Ok(())
 }
 
 /// Lowercase `D-` thread files under each vault's Discussions folder.
@@ -1709,9 +1988,488 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
     Ok(ok)
 }
 
+/// One subagent start of the (s) set: a real launch brief and the facts the
+/// agent then needed from atlas that its brief did not name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Start {
+    /// `S01`.
+    pub id: String,
+    /// The brief's `Kind:` (builder, reviewer, research).
+    pub kind: String,
+    /// The launch's `subagent_type`, which the start carries as its agent
+    /// type (default: `kind`).
+    pub agent_type: String,
+    /// When the agent started (UTC), so it is scored on the store as it
+    /// stood then; `None` uses the frozen store whole.
+    pub time: Option<String>,
+    /// The brief, as the launch sent it.
+    pub brief: String,
+    /// The facts needed, each a record key and an accepted spelling.
+    pub needs: Vec<Need>,
+}
+
+/// A fact a started agent needed: a phrase of the record `key`, which the
+/// agent recalled by key in its transcript and its brief did not name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Need {
+    /// The record's key.
+    pub key: String,
+    /// A phrase of the record's head, matched as (b) matches a fact.
+    pub fact: String,
+    /// The record's title at the start (filled from the store; empty in
+    /// the file), for [`NeedCounts::named`].
+    pub title: String,
+}
+
+/// Whether a need is an `agent-kind:` rule: every agent's own system prompt
+/// tells it to recall its kind's rule, and no start mode is meant to carry
+/// it, so (s) counts those apart from the rest.
+pub fn is_kind_rule(key: &str) -> bool {
+    key.starts_with("agent-kind:")
+}
+
+/// Parses a starts file: one JSON object a line, `{"id", "kind", "brief",
+/// "needs": [{"key", "fact"}]}` with optional `agent_type` and `time`
+/// (other fields ignored), blank lines skipped.
+///
+/// # Errors
+///
+/// A message naming the line, for bad JSON, a missing field or a duplicate id.
+pub fn parse_starts(text: &str) -> Result<Vec<Start>, String> {
+    let mut out: Vec<Start> = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v = atlas::json::parse(line).map_err(|e| format!("starts line {}: {e}", n + 1))?;
+        let opt = |k: &str| v.get(k).and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string);
+        let s = |k: &str| opt(k).ok_or_else(|| format!("starts line {}: needs {k}", n + 1));
+        let mut needs = Vec::new();
+        for x in v.get("needs").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+            let f = |k: &str| {
+                x.get(k).and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("starts line {}: a need without {k}", n + 1))
+            };
+            needs.push(Need { key: f("key")?, fact: f("fact")?, title: String::new() });
+        }
+        let kind = s("kind")?;
+        let st = Start {
+            id: s("id")?,
+            agent_type: opt("agent_type").unwrap_or_else(|| kind.clone()),
+            kind,
+            time: opt("time"),
+            brief: s("brief")?,
+            needs,
+        };
+        if out.iter().any(|o| o.id == st.id) {
+            return Err(format!("{}: duplicate id", st.id));
+        }
+        out.push(st);
+    }
+    Ok(out)
+}
+
+/// Counts of needs by how far a start's injection carries them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NeedCounts {
+    /// Needs asked.
+    pub needs: usize,
+    /// Found in the injection alone.
+    pub present: usize,
+    /// Present, or the injection lists the need's key or title.
+    pub named: usize,
+    /// Found in the injection or by the one informed follow-up.
+    pub informed: usize,
+}
+
+impl NeedCounts {
+    fn add(&mut self, o: &NeedCounts) {
+        self.needs += o.needs;
+        self.present += o.present;
+        self.named += o.named;
+        self.informed += o.informed;
+    }
+
+    fn line(&self) -> String {
+        format!("present {}/{n}, named {}/{n}, informed {}/{n}", self.present, self.named, self.informed, n = self.needs)
+    }
+}
+
+/// One start's score in one mode.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StartScore {
+    /// The bytes the start injected.
+    pub bytes: usize,
+    /// The `agent-kind:` needs ([`is_kind_rule`]).
+    pub rules: NeedCounts,
+    /// Every other need.
+    pub other: NeedCounts,
+    /// Each need's key and whether it was present, named and informed, in
+    /// the start's order.
+    pub each: Vec<(String, [bool; 3])>,
+}
+
+impl StartScore {
+    /// Both kinds of need together.
+    pub fn all(&self) -> NeedCounts {
+        let mut a = self.rules;
+        a.add(&self.other);
+        a
+    }
+}
+
+/// Scores one start's injection by (b)'s rule: each need is a question
+/// whose source is its record, asked of the injection as a hook answer, with
+/// the one informed follow-up (`recall {key}` when the injection lists the
+/// key). Present: found in the injection alone; named: present, or its key
+/// or title is in the injection; informed: found by the follow-up at the
+/// latest.
+pub fn score_start(st: &Start, injection: &str, call: &mut Call<'_>) -> StartScore {
+    let mut out = StartScore { bytes: injection.len(), ..StartScore::default() };
+    let hay = norm(injection);
+    for (i, n) in st.needs.iter().enumerate() {
+        let q = need_question(st, i, n);
+        let s = score_after(&q, injection, Policy::Informed, call);
+        let present = s.pass && s.calls == 1;
+        let named = present || injection.contains(&n.key) || (!n.title.trim().is_empty() && hay.contains(&norm(&n.title)));
+        let c = if is_kind_rule(&n.key) { &mut out.rules } else { &mut out.other };
+        c.needs += 1;
+        c.present += present as usize;
+        c.named += named as usize;
+        c.informed += s.pass as usize;
+        out.each.push((n.key.clone(), [present, named, s.pass]));
+    }
+    out
+}
+
+/// A need as a question of (b): a hook answer, its source the record.
+fn need_question(st: &Start, i: usize, n: &Need) -> Question {
+    Question {
+        id: format!("{}-{}", st.id, i + 1),
+        kind: st.kind.clone(),
+        ask: st.brief.clone(),
+        source: format!("record:{}", n.key),
+        tool: "hook".into(),
+        args: Value::Null,
+        facts: vec![vec![n.fact.clone()]],
+        in_vault: false,
+        source_records: HashSet::new(),
+    }
+}
+
+/// Sums of [`StartScore`]s, with the bytes kept for the median and max.
+#[derive(Debug, Clone, Default)]
+pub struct StartTally {
+    /// Starts added.
+    pub starts: usize,
+    /// Bytes injected, one per start.
+    pub bytes: Vec<usize>,
+    /// The `agent-kind:` needs.
+    pub rules: NeedCounts,
+    /// Every other need.
+    pub other: NeedCounts,
+    /// Starts with every need found by the informed follow-up.
+    pub whole: usize,
+    /// Starts given nothing.
+    pub empty: usize,
+}
+
+impl StartTally {
+    /// Adds one start's score.
+    pub fn add(&mut self, s: &StartScore) {
+        self.starts += 1;
+        self.bytes.push(s.bytes);
+        self.rules.add(&s.rules);
+        self.other.add(&s.other);
+        let a = s.all();
+        self.whole += (a.informed == a.needs) as usize;
+        self.empty += (s.bytes == 0) as usize;
+    }
+
+    fn line(&self, name: &str, bpt: f64) -> String {
+        let n = self.starts.max(1) as f64;
+        let total: usize = self.bytes.iter().sum();
+        let mut a = self.rules;
+        a.add(&self.other);
+        format!(
+            "{name}: {} starts; bytes injected mean {:.0}, median {:.0}, max {} ({:.0} tokens per start); given nothing {}; agent-kind needs {}; other needs {}; all needs {}; starts with every need informed {}/{}",
+            self.starts,
+            total as f64 / n,
+            median(self.bytes.iter().map(|&b| b as f64).collect()),
+            self.bytes.iter().max().copied().unwrap_or(0),
+            total as f64 / bpt / n,
+            self.empty,
+            self.rules.line(),
+            self.other.line(),
+            a.line(),
+            self.whole,
+            self.starts
+        )
+    }
+}
+
+/// One start fired in one mode ([`start_context`]) on its own fresh copy of
+/// `at` (the store as it stood at the start), so no other start or mode
+/// sees the launch brief it files. The hooks get the server route's setup
+/// ([`atlas::hooks::Hooks::serve_setup`]); the settings returned name the
+/// copy, for the follow-ups.
+///
+/// # Errors
+///
+/// The copy or the hooks failing to open, as text.
+pub fn fire_start(
+    st: &Start,
+    at: &Path,
+    base: &atlas::memory::settings::Settings,
+    work: &Path,
+    name: &str,
+    mode: atlas::memory::settings::SubagentContext,
+    cwd: &str,
+) -> Result<(String, atlas::memory::settings::Settings), String> {
+    let mut s = base.clone();
+    s.store = work.join(format!("{}-{name}.sqlite", st.id));
+    copy_store(at, &s.store)?;
+    s.recall.subagent_context = mode;
+    // Orchestration off: its caps would refuse launches past the
+    // concurrency limit (no start here ever stops), and none of its lines
+    // is the store's context.
+    s.orchestrate.enabled = false;
+    let mut hooks = atlas::hooks::Hooks::open(s.clone()).map_err(|e| e.to_string())?;
+    hooks.set_offer_paths(None);
+    hooks.serve_setup();
+    Ok((start_context(&mut hooks, st, name, cwd), s))
+}
+
+/// The context a subagent start is given through the hook route a server
+/// runs ([`atlas::hooks::Hooks::serve_setup`]): the launch's PreToolUse of
+/// the Agent tool, then the agent's SubagentStart, each its own session.
+fn start_context(hooks: &mut atlas::hooks::Hooks, st: &Start, mode: &str, cwd: &str) -> String {
+    let sid = format!("eval-start-{mode}-{}", st.id);
+    let launch = atlas::json!({
+        "event": "PreToolUse", "session_id": sid.clone(), "tool_name": "Agent", "tool_use_id": format!("{sid}-launch"), "cwd": cwd,
+        "tool_input": {"prompt": st.brief.clone(), "subagent_type": st.agent_type.clone(), "description": format!("memory eval start {}", st.id)}
+    });
+    let _ = hooks.handle(&atlas::hooks::HookEvent::from_value(&launch));
+    let start = atlas::json!({"event": "SubagentStart", "session_id": sid.clone(), "agent_id": format!("{sid}-agent"), "agent_type": st.agent_type.clone(), "cwd": cwd});
+    hooks.handle(&atlas::hooks::HookEvent::from_value(&start)).context
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STARTS: &str = "{\"id\": \"S01\", \"kind\": \"builder\", \"agent_type\": \"brief-writer\", \"time\": \"2026-11-16T14:13:43.911Z\", \"lane\": \"L-1\", \"brief\": \"Kind: builder\\nLane: L-1\\nBuild it.\", \"needs\": [{\"key\": \"journal:L-1:0002\", \"fact\": \"sixty four frames\"}, {\"key\": \"agent-kind:builder\", \"fact\": \"work only in a fresh worktree\"}]}\n\n{\"id\": \"S02\", \"kind\": \"reviewer\", \"brief\": \"Kind: reviewer\\nReview it.\", \"needs\": []}\n";
+
+    /// The follow-up server of the start fixtures: `recall {key}` answers
+    /// the record, anything else nothing.
+    fn records(t: &str, a: &Value) -> String {
+        match (t, a.get("key").and_then(Value::as_str)) {
+            ("recall", Some("journal:L-1:0002")) => "== journal:L-1:0002 journal/decision\nThe ruling: sixty four frames a second.".into(),
+            ("recall", Some("agent-kind:builder")) => {
+                "== agent-kind:builder rule\n- Builder agents: work only in a fresh worktree of your own.".into()
+            }
+            _ => "nothing".into(),
+        }
+    }
+
+    #[test]
+    fn the_starts_file_parses_and_rejects_duplicates() {
+        let st = parse_starts(STARTS).unwrap();
+        assert_eq!(st.len(), 2);
+        assert_eq!((st[0].id.as_str(), st[0].kind.as_str(), st[0].agent_type.as_str()), ("S01", "builder", "brief-writer"));
+        assert_eq!(st[0].time.as_deref(), Some("2026-11-16T14:13:43.911Z"));
+        assert_eq!(
+            st[0].needs[1],
+            Need { key: "agent-kind:builder".into(), fact: "work only in a fresh worktree".into(), title: String::new() }
+        );
+        // No agent type: the Kind; no time: the frozen store whole.
+        assert_eq!((st[1].agent_type.as_str(), st[1].time.as_deref()), ("reviewer", None));
+        assert!(st[1].needs.is_empty());
+        let one = STARTS.lines().next().unwrap();
+        assert!(parse_starts(&format!("{one}\n{one}\n")).unwrap_err().contains("duplicate"));
+        assert!(parse_starts("{\"id\": \"S03\"}\n").unwrap_err().contains("needs kind"));
+    }
+
+    /// The same start in three modes: recall carries one fact and points at
+    /// the other; binding gives a block that holds neither and names neither
+    /// key, so it must score lower; off gives nothing. The `agent-kind:`
+    /// need is counted apart from the other.
+    #[test]
+    fn a_start_that_loses_a_needed_fact_scores_lower() {
+        let st = &parse_starts(STARTS).unwrap()[0];
+        let recall = "atlas lane L-1\n== journal:L-1:0002 journal/decision lane=L-1\nThe ruling: sixty four frames a second.\n- agent-kind:builder: Builder agents (compile and commit)\n";
+        let binding = "atlas binding: lane L-1\n- task: Build it.\n";
+        let mut asked = Vec::new();
+        let mut call = |t: &str, a: &Value| -> String {
+            asked.push(a.get("key").and_then(Value::as_str).unwrap_or("").to_string());
+            records(t, a)
+        };
+        let r = score_start(st, recall, &mut call);
+        let n = |needs, present, named, informed| NeedCounts { needs, present, named, informed };
+        assert_eq!((r.other, r.rules, r.bytes), (n(1, 1, 1, 1), n(1, 0, 1, 1), recall.len()));
+        assert_eq!(r.all(), n(2, 1, 2, 2));
+        // Only the pointer was followed, once, by key.
+        assert_eq!(asked, vec!["agent-kind:builder".to_string()]);
+        let b = score_start(st, binding, &mut |t, a| records(t, a));
+        assert_eq!(b.all(), n(2, 0, 0, 0));
+        let o = score_start(st, "", &mut |t, a| records(t, a));
+        assert_eq!((o.all(), o.bytes), (n(2, 0, 0, 0), 0));
+        // The tallies say the same, and count the empty start.
+        let (mut tr, mut tb, mut to) = (StartTally::default(), StartTally::default(), StartTally::default());
+        tr.add(&r);
+        tb.add(&b);
+        to.add(&o);
+        assert_eq!((tr.rules.informed, tr.other.informed, tr.whole, tr.empty), (1, 1, 1, 0));
+        assert_eq!((tb.rules.informed, tb.other.informed, tb.whole, tb.empty), (0, 0, 0, 0));
+        assert_eq!((to.whole, to.empty), (0, 1));
+        let l = tr.line("recall", 4.0);
+        assert!(
+            l.contains("agent-kind needs present 0/1, named 1/1, informed 1/1; other needs present 1/1, named 1/1, informed 1/1; all needs present 1/2, named 2/2, informed 2/2"),
+            "{l}"
+        );
+    }
+
+    /// A key named in passing is not a listed record: only a `== KEY` or
+    /// `- KEY:` line is followed, as in (b). It is named, and so is a
+    /// record the injection gives by its title alone.
+    #[test]
+    fn a_need_is_followed_only_from_a_listed_key() {
+        let st = &parse_starts(STARTS).unwrap()[0];
+        let prose = "see journal:L-1:0002 and agent-kind:builder for the rules\n";
+        let s = score_start(st, prose, &mut |_, _| panic!("no follow-up"));
+        assert_eq!((s.all().present, s.all().named, s.all().informed), (0, 2, 0));
+        let mut st = st.clone();
+        st.needs[0].title = "The Frame Target".into();
+        let s = score_start(&st, "lane L-1: the frame target, ruled\n", &mut |_, _| panic!("no follow-up"));
+        assert_eq!((s.other.named, s.rules.named), (1, 0));
+    }
+
+    /// A fresh folder for one test.
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("atlas-memory-eval-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn draft(title: &str, body: &str) -> atlas::memory::Draft {
+        atlas::memory::Draft {
+            title: title.into(),
+            body: body.into(),
+            reason: "test".into(),
+            author: "t".into(),
+            client: "t".into(),
+            ..Default::default()
+        }
+    }
+
+    /// S2: a start is scored on the store as it stood at its start: a record
+    /// made after it is gone, a record revised after it is back at its
+    /// earlier head, a retirement after it is undone, and the store's
+    /// append-only guards are back.
+    #[test]
+    fn a_store_rewinds_to_a_start_s_time() {
+        let d = scratch("rewind");
+        let path = d.join("m.sqlite");
+        {
+            let mut m = atlas::memory::MemoryStore::open(&path).unwrap();
+            let mut w = m.writer().unwrap();
+            w.create("rule:a", "rule", "", "", &draft("a one", "the first text"), None).unwrap();
+            w.create("rule:c", "rule", "", "", &draft("c", "kept"), None).unwrap();
+            w.commit().unwrap();
+        }
+        let mid = atlas::memory::now();
+        // The store's times are to the millisecond.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        {
+            let mut m = atlas::memory::MemoryStore::open(&path).unwrap();
+            let mut w = m.writer().unwrap();
+            w.revise("rule:a", None, &draft("a two", "the second text")).unwrap();
+            w.create("rule:b", "rule", "", "", &draft("b", "later"), None).unwrap();
+            w.retire("rule:c", "gone").unwrap();
+            w.commit().unwrap();
+        }
+        checkpoint(&path).unwrap();
+        assert_eq!(rewind_store(&path, &mid).unwrap(), Rewound { records: 1, versions: 2 });
+        {
+            let m = atlas::memory::MemoryStore::open(&path).unwrap();
+            let a = m.head("rule:a").unwrap().unwrap();
+            assert_eq!((a.title.as_str(), a.seq), ("a one", 1));
+            assert!(m.head("rule:b").unwrap().is_none());
+            assert_eq!(m.head("rule:c").unwrap().unwrap().status, "active");
+        }
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let fts: String = c
+            .query_row("SELECT title FROM records_fts WHERE rowid = (SELECT rid FROM records WHERE key = 'rule:a')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, "a one");
+        assert!(c.execute("DELETE FROM versions", []).is_err(), "the guards are back");
+        drop(c);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The launch entries filed in lane L-1 of a store.
+    fn launches(store: &Path) -> usize {
+        atlas::memory::MemoryStore::open(store).unwrap().lane("L-1").unwrap().into_iter().filter(|h| h.sub == "launch").count()
+    }
+
+    /// S5: real starts through the server's hook route on a tiny store.
+    /// Recall lists the lane's entry (so the launch and the start share a
+    /// session, and the context is SubagentStart's, not the launch's),
+    /// binding is the block `binding::compile` gives, off is empty, and each
+    /// start and mode fires on a store of its own: the one launch it filed
+    /// is the only one there, though recall runs after binding and off, and
+    /// S02 after S01.
+    #[test]
+    fn starts_fire_through_the_hook_route_each_on_a_fresh_store() {
+        let d = scratch("fire");
+        let mut s = atlas::memory::settings::Settings::from_config(None, &d.join("state").join("index.sqlite")).unwrap();
+        s.snapshot_secs = 0;
+        {
+            let mut m = atlas::memory::MemoryStore::open(&s.store).unwrap();
+            let mut w = m.writer().unwrap();
+            let body = "The ruling: the exporter writes sixty four frames a second.\n";
+            w.create("journal:L-1:0001", "journal", "decision", "L-1", &draft("frame rate ruled", body), None).unwrap();
+            w.commit().unwrap();
+        }
+        checkpoint(&s.store).unwrap();
+        let start = |id: &str, task: &str| Start {
+            id: id.into(),
+            kind: "builder".into(),
+            agent_type: "builder".into(),
+            time: None,
+            brief: format!("Kind: builder\nLane: L-1\n{task}"),
+            needs: Vec::new(),
+        };
+        let starts = [start("S01", "Build the alpha exporter."), start("S02", "Build the beta exporter.")];
+        let work = d.join("work");
+        let mut got: BTreeMap<(String, &str), String> = BTreeMap::new();
+        for st in &starts {
+            for (name, mode) in START_MODES {
+                let (ctx, fs) = fire_start(st, &s.store, &s, &work, name, mode, &d.to_string_lossy()).unwrap();
+                got.insert((st.id.clone(), name), ctx);
+                assert_eq!(launches(&fs.store), 1, "{} {name}: launches in its store", st.id);
+            }
+        }
+        let want = atlas::binding::compile(&atlas::memory::MemoryStore::open(&s.store).unwrap(), &starts[0].brief, "L-1")
+            .unwrap()
+            .expect("a block for L-1")
+            .text;
+        for st in &starts {
+            let recall = &got[&(st.id.clone(), "recall")];
+            assert!(recall.contains("journal:L-1:0001"), "{}: {recall}", st.id);
+            assert!(!recall.contains("alpha exporter") && !recall.contains("beta exporter"), "{}: a filed brief leaked: {recall}", st.id);
+            assert_eq!(got[&(st.id.clone(), "off")], "", "{}", st.id);
+        }
+        assert_eq!(got[&("S01".to_string(), "binding")], want);
+        // Two starts of one lane, matching its entry alike, get one view.
+        assert_eq!(got[&("S02".to_string(), "recall")], got[&("S01".to_string(), "recall")]);
+        // The same start again, on the same path, gives the same context and
+        // holds only its own launch: no order dependence.
+        let (again, fs) = fire_start(&starts[0], &s.store, &s, &work, "recall", START_MODES[2].1, &d.to_string_lossy()).unwrap();
+        assert_eq!(&again, &got[&("S01".to_string(), "recall")]);
+        assert_eq!(launches(&fs.store), 1, "launches in the store fired again");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     const SET: &str = "# a comment\nQ001 ruling\nask: What is the frame target?\nsource: record:frame-target\ncall: recall {\"query\": \"frame target\"}\nfact: 240\nfact: 120 | one twenty\n\nQ002 id\nask: What is X-001?\nsource: file:v:Notes/X-001 A note.md\ncall: lookup {\"id\": \"X-001\"}\nfact: a note\n";
 
@@ -1825,6 +2583,15 @@ mod tests {
     fn keys_come_from_records_and_pointers() {
         let t = "== intent:r00059 rule active v1 2026-10-31T12:52\n- body line\n- corpse-baking-is-off: Corpse baking is off\n- journal:TURF:0010 12.5: Hand-back\n+4 more over budget_tokens\n";
         assert_eq!(keys_in(t), vec!["intent:r00059", "corpse-baking-is-off", "journal:TURF:0010"]);
+    }
+
+    /// A Binding block's lines carry `KEY@sha12` refs, after `- ` or after
+    /// its `handoff: `, `open: ` and `next: ` leads; each is a listed key,
+    /// the hash dropped, so the informed follow-up reads it.
+    #[test]
+    fn keys_come_from_binding_lines_too() {
+        let t = "atlas binding: lane L (recall KEY for full text; these bind this task)\nnamed: journal:M:0001@0c1d2e3f4a5b: A named one\nhandoff: handoff:L:002@9a1c0b2d3e4f: Where it stands\n- journal:L:0002@fd529cca502a: \"the owner's words\"\nopen: journal:L:0005@a1b2c3d4e5f6: Which way?\nnext: journal:L:0006@b2c3d4e5f6a7: Do it\nnext: write the test first\n+3 more decisions: recall lane=L\n";
+        assert_eq!(keys_in(t), vec!["journal:M:0001", "handoff:L:002", "journal:L:0002", "journal:L:0005", "journal:L:0006"]);
     }
 
     #[test]

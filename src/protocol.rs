@@ -336,6 +336,24 @@ pub fn serve_with_hooks(
     input: impl BufRead + Send + 'static,
     output: impl Write + Send + 'static,
 ) -> io::Result<()> {
+    serve_with_hooks_every(server, hooks, index, input, output, crate::restart::REFRESH_EVERY)
+}
+
+/// [`serve_with_hooks`] with the restart point refreshed every `every`
+/// (tests use a short one).
+///
+/// # Errors
+///
+/// As [`serve_with_hooks`].
+#[doc(hidden)]
+pub fn serve_with_hooks_every(
+    server: &mut Server,
+    hooks: Option<crate::memory::settings::Settings>,
+    index: Option<crate::hooks::StoreOpener>,
+    input: impl BufRead + Send + 'static,
+    output: impl Write + Send + 'static,
+    every: std::time::Duration,
+) -> io::Result<()> {
     use std::sync::{mpsc, Arc, Mutex};
     let out = Arc::new(Mutex::new(output));
     let (main_tx, main_rx) = mpsc::channel::<(Incoming, u64)>();
@@ -364,9 +382,12 @@ pub fn serve_with_hooks(
                                 // A hook over this route may come from anyone's
                                 // tools/call, and the server outlives any one
                                 // session: nothing says a user is there to answer.
-                                h.set_unattended(true);
+                                h.serve_setup();
                                 h.set_index_opener(index.take());
-                                h.set_binding(Some(crate::hooks::binding_compiler()));
+                                // The restart point the shutdown catch writes (#221).
+                                h.enable_restart_point();
+                                // Its advance warning: a restart pending or scheduled.
+                                h.set_restart_warnings(crate::restart_warn::start());
                                 if let Some(w) = h.binding_warning() {
                                     eprintln!("{w}");
                                 }
@@ -383,22 +404,50 @@ pub fn serve_with_hooks(
                         }
                     }
                 };
-                for msg in rx {
+                // The restart point's refresh is a deadline, not a timeout
+                // per message (#221): steady hook traffic still refreshes it,
+                // after a hook's answer is out, never on its path.
+                let mut due = std::time::Instant::now() + every;
+                let refresh = |hooks: &mut Option<crate::hooks::Hooks>, due: &mut std::time::Instant| {
+                    if let Some(h) = hooks.as_mut() {
+                        h.refresh_restart_point();
+                    }
+                    *due = std::time::Instant::now() + every;
+                };
+                loop {
+                    let msg = match rx.recv_timeout(due.saturating_duration_since(std::time::Instant::now())) {
+                        Ok(m) => m,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            refresh(&mut hooks, &mut due);
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     open(&mut hooks, &mut failed);
                     let Some((id, args)) = msg else { continue };
                     let ev = crate::hooks::HookEvent::from_value(&args);
-                    let text = match (hooks.as_mut(), &failed) {
-                        (Some(h), _) => h.handle(&ev).to_json(&ev.event),
-                        (None, Some(e)) => notice.answer(e, &ev),
-                        (None, None) => String::new(),
+                    // A panic in hook code (#253) answers empty and drops the
+                    // hook state; `open` reopens it on the next message.
+                    let (text, panicked) = match (hooks.as_mut(), &failed) {
+                        (Some(h), _) => crate::hooks::guard(&settings, &ev, || h.handle(&ev).to_json(&ev.event)),
+                        (None, Some(e)) => (notice.answer(e, &ev), false),
+                        (None, None) => (String::new(), false),
                     };
+                    if panicked {
+                        hooks = None;
+                    }
                     let r = ok(id, content(text, false));
                     if let Ok(mut w) = o.lock() {
                         let _ = write_line(&mut *w, &r);
                     }
                     // Re-indexing an edited file waits until the answer is out.
                     if let Some(h) = hooks.as_mut() {
-                        h.after();
+                        if crate::hooks::guard(&settings, &ev, || h.after()).1 {
+                            hooks = None;
+                        }
+                    }
+                    if std::time::Instant::now() >= due {
+                        refresh(&mut hooks, &mut due);
                     }
                 }
             })?;
@@ -418,7 +467,11 @@ pub fn serve_with_hooks(
         let mut buf = Vec::new();
         loop {
             match read_incoming(&mut input, &mut buf).map_err(|e| on("stdin read", e))? {
-                Incoming::Eof => return Ok(()),
+                Incoming::Eof => {
+                    // Its time goes to the shutdown log (#221, Q10).
+                    crate::restart::stdin_closed();
+                    return Ok(());
+                }
                 Incoming::Message(m) => {
                     if let (Some(tx), Some(call)) = (&hook_tx, hook_call(&m)) {
                         let args = call.1.clone();
@@ -478,6 +531,7 @@ pub fn serve_with_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn a_hook_call_is_marked_by_its_meta_not_its_arguments() {
@@ -486,5 +540,106 @@ mod tests {
         assert_eq!(args.get(crate::hooks::TOOL_USE_ARG), Some(&Value::Bool(true)), "a model's tool call");
         let (_, args) = hook_call(&call(Value::Null)).unwrap();
         assert_eq!(args.get(crate::hooks::TOOL_USE_ARG), Some(&Value::Bool(false)), "a hook");
+    }
+
+    /// A `Write` the test reads back after the server is done with it.
+    #[derive(Clone, Default)]
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().map_err(|_| io::Error::other("poisoned"))?.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A server over one vault in a fresh temp folder, and the hook
+    /// settings over its index. The server has no memory store, so a hook
+    /// that falls through to the main thread is answered with an error: an
+    /// answer without one came from the `atlas-hooks` worker.
+    fn served(tag: &str) -> (std::path::PathBuf, Server, crate::memory::settings::Settings) {
+        let dir = std::env::temp_dir().join(format!("atlas-proto-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("A.md"), "# A\n\nalpha\n").unwrap();
+        let db = dir.join("state").join("vaults.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let mut store = crate::store::Store::open(&db, crate::paths::Vaults::new(&[("v".into(), vault)]).unwrap()).unwrap();
+        store.rescan().unwrap();
+        let server = Server::new(store);
+        let settings = crate::memory::settings::Settings::from_config(None, &db).unwrap();
+        (dir, server, settings)
+    }
+
+    fn hook_msg(id: &str, tool: &str) -> String {
+        let args =
+            crate::json!({"event": "PreToolUse", "session_id": "S", "tool_name": tool, "tool_input": {"todos": []}, "tool_use_id": id});
+        crate::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "hook", "arguments": args}}).to_string()
+    }
+
+    /// Each answer by id: (its text, whether it is an error).
+    fn answers(out: &Shared) -> HashMap<String, (String, bool)> {
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let mut m = HashMap::new();
+        for l in text.lines() {
+            let v = crate::json::parse(l).unwrap();
+            let id = match &v["id"] {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let r = &v["result"];
+            let err = v.get("error").is_some() || r["isError"] == Value::Bool(true);
+            m.insert(id, (r["content"][0]["text"].as_str().unwrap_or("").to_string(), err));
+        }
+        m
+    }
+
+    fn panic_misses(db: &std::path::Path) -> i64 {
+        let c = rusqlite::Connection::open(db).unwrap();
+        c.query_row("SELECT count(*) FROM misses WHERE query LIKE 'hook panic %' AND client = 'atlas-hook'", [], |r| r.get(0)).unwrap()
+    }
+
+    /// #253: a panic while answering a hook passes that call through
+    /// untouched; later hooks and tool calls are answered as before.
+    #[test]
+    fn a_panicking_hook_answers_empty_and_the_server_goes_on() {
+        let (dir, mut server, settings) = served("hook-panic");
+        let db = settings.index_db.clone();
+        let call = crate::json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "note", "arguments": {"vault": "v", "path": "A.md"}}}).to_string();
+        let msgs = [hook_msg("h1", crate::hooks::TEST_PANIC_TOOL), hook_msg("h2", "TodoWrite"), call];
+        let input = io::Cursor::new((msgs.join("\n") + "\n").into_bytes());
+        let out = Shared::default();
+        serve_with_hooks(&mut server, Some(settings), None, input, out.clone()).unwrap();
+        let a = answers(&out);
+        assert_eq!(a.get("h1"), Some(&(String::new(), false)), "{a:?}");
+        assert_eq!(a.get("h2").map(|x| x.1), Some(false), "{a:?}");
+        let note = a.get("7").unwrap_or_else(|| panic!("no tools/call answer: {a:?}"));
+        assert!(!note.1 && note.0.contains("alpha"), "{note:?}");
+        assert_eq!(panic_misses(&db), 1);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Many panicking hooks in one stream: each is answered by the one
+    /// worker, which reopens its hook state after each panic.
+    #[test]
+    fn many_panicking_hooks_are_each_answered_by_the_worker() {
+        let (dir, mut server, settings) = served("hook-panic-many");
+        let db = settings.index_db.clone();
+        let msgs: Vec<String> = (0..200).map(|i| hook_msg(&format!("p{i}"), crate::hooks::TEST_PANIC_TOOL)).collect();
+        let input = io::Cursor::new((msgs.join("\n") + "\n").into_bytes());
+        let out = Shared::default();
+        serve_with_hooks(&mut server, Some(settings), None, input, out.clone()).unwrap();
+        let a = answers(&out);
+        assert_eq!(a.len(), 200, "{a:?}");
+        // No answer came from the main thread's fallback (an error here).
+        assert!(a.values().all(|x| x == &(String::new(), false)), "{a:?}");
+        assert_eq!(panic_misses(&db), 200);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

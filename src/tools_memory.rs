@@ -72,8 +72,9 @@ fn refs(a: &Map) -> Result<Vec<(String, String)>> {
 
 use crate::memory::{short_title, title_and_body, TITLE_CHARS};
 
-/// The longest memory summary (its index hook).
-const SUMMARY_CHARS: usize = 200;
+/// The longest memory summary (its index hook). The `remember` schema's
+/// description of `summary` states it.
+pub(super) const SUMMARY_CHARS: usize = 200;
 
 /// A title or summary given as its own argument: one line of at most `max`
 /// characters, refused rather than cut, since nothing else keeps the rest.
@@ -230,7 +231,12 @@ impl Server {
                     m.hooks = Some(h);
                 }
                 let h = m.hooks.as_mut().ok_or_else(|| Error::Db("hooks".into()))?;
-                Ok(Answer::Text(h.handle(&ev).to_json(&ev.event)))
+                // As in `protocol` (#253): a panic answers empty and drops the hook state.
+                let (text, panicked) = crate::hooks::guard(&m.settings, &ev, || h.handle(&ev).to_json(&ev.event));
+                if panicked {
+                    m.hooks = None;
+                }
+                Ok(Answer::Text(text))
             }
             "recall" => {
                 // The sources the store is synced from, refreshed first (a
@@ -244,7 +250,19 @@ impl Server {
             }
             "journal_status" => self.journal_status(a).map(Answer::Text),
             "memory_log" => self.memory_log(a).map(Answer::Text),
-            "remember" | "supersede" | "journal" | "handoff" => self.memory_write(name, a).map(Answer::Text),
+            "journal" | "handoff" => {
+                let mut out = self.memory_write(name, a)?;
+                // The style rule (#274), once per writing context (the
+                // agent the hooks name, else the server process): on its
+                // first journal or handoff write that succeeds.
+                let context = self.writer.clone().unwrap_or_else(|| crate::tools::dedup::PROCESS.to_string());
+                if self.style_shown.insert(context) {
+                    out.push_str(crate::tools::STYLE);
+                    out.push('\n');
+                }
+                Ok(Answer::Text(out))
+            }
+            "remember" | "supersede" => self.memory_write(name, a).map(Answer::Text),
             _ => Err(Error::NotFound(format!("tool {name:?}"))),
         }
     }

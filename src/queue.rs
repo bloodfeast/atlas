@@ -1231,7 +1231,7 @@ pub fn cli(
             if let Some(t) = flag(args, "--transcript") {
                 let dir = crate::orchestrate::subagents_dir(&t);
                 let r = crate::orchestrate::Agents::new(None)
-                    .running(orch, &dir, std::time::SystemTime::now())
+                    .running(orch, &dir, Some(&*store), std::time::SystemTime::now())
                     .map_err(|e| format!("{}: {e}", dir.display()))?;
                 running = holders(&r, &dir, &[], &orch.lanes, &|_| None);
             } else {
@@ -1334,7 +1334,7 @@ pub fn cli(
                         .ok_or_else(|| format!("no agent {bare} under {}; name its session with --transcript PATH", projects.display()))?
                 }
             };
-            println!("{}", crate::orchestrate::release(&dir, bare, force, std::time::SystemTime::now())?);
+            println!("{}", crate::orchestrate::release(store, &dir, bare, force, std::time::SystemTime::now())?);
             Ok(ExitCode::SUCCESS)
         }
         "-h" | "--help" | "help" => {

@@ -1,19 +1,36 @@
-`cargo test -j 4`. Every hard property has one: each confinement rejection for reads, writes and folders, a
-junction escape (Windows) and symlink escapes (Linux), no delete or rename tool, byte-identical body after
-`set_frontmatter` (LF and CRLF), the stale-sha refusal, twelve real processes allocating 120 ids and appending
-120 history lines into one note with no duplicate and no lost update, the binary round-trip over pipes,
-database deletion and rebuild, the audit JSONL surviving it, external edits, the reason rule on every write
-tool, discussion threads, cross-vault links and every index rule; and for the atlas layer the definition
-heuristic, lookup ordering, `ids` filters, section search, the deny-list and globs, sources being unreachable by
-every write tool, freshness (`off`, `check`, `auto`, removal, a new name re-reading every document), misses
-surviving a deleted database, the recall check (passing, matching an independent regex scan, and failing when
-an index row is removed), and the binary serving from a config. Tests build their own corpus in a temp folder.
+`cargo xtask test-gate` (plain `cargo test -j 4` runs the same tests, slower). Every hard property has one: each
+confinement rejection for reads, writes and folders, a junction escape (Windows) and symlink escapes (Linux), no
+delete or rename tool, byte-identical body after `set_frontmatter` (LF and CRLF), the stale-sha refusal, twelve
+real processes allocating 120 ids and appending 120 history lines into one note with no duplicate and no lost
+update, the binary round-trip over pipes, database deletion and rebuild, the audit JSONL surviving it, external
+edits, the reason rule on every write tool, discussion threads, cross-vault links and every index rule; and for the
+atlas layer the definition heuristic, lookup ordering, `ids` filters, section search, the deny-list and globs,
+sources being unreachable by every write tool, freshness (`off`, `check`, `auto`, removal, a new name re-reading
+every document), misses surviving a deleted database, the recall check (passing, matching an independent regex
+scan, and failing when an index row is removed), and the binary serving from a config. Tests build their own corpus
+in a temp folder.
+
+The gate before a pull request runs the workspace's tests with cargo-nextest (`cargo install --locked
+cargo-nextest`; the gate fails at once, saying so, when it is missing):
+
+```sh
+cargo xtask test-gate                        # cargo nextest run --workspace --locked --no-fail-fast --test-threads 16, then cargo test --workspace --locked --doc
+cargo xtask test-gate -- -E 'test(name)'     # arguments after -- go to nextest: a filter, --no-capture
+```
+
+nextest runs every test in its own process, 16 at a time, so the slowest test binary no longer sets the wall time;
+the doc tests, which nextest does not run, follow as a second step. The 16 is a cap, not one per core: the suite
+starts servers and processes of its own. Builds take `CARGO_BUILD_JOBS` (4 when unset, never above 16).
+`.config/nextest.toml` gives every slot to the two tests a loaded machine would fail, so they run alone: one times
+itself against a bar (`admit_at_300_metas_is_cheap`), the other counts lock waits that drop a change after 5 s
+(`state_changes_from_many_processes_are_never_lost`). Both steps run even when the first fails, and the last line
+sums them up (`test-gate: PASS in 277s; nextest ok 271s; doctest ok 5s`).
 
 On Linux from any machine with Docker (Docker Desktop on Windows and macOS), the public CI's Linux checks on the
 checkout:
 
 ```sh
-cargo xtask linux-test               # cargo test --workspace --locked --no-fail-fast --release, then both clippy runs
+cargo xtask linux-test               # the test-gate's two steps in release, then both clippy runs
 cargo xtask linux-test --debug       # the tests in the dev profile (a faster build, not what the public CI runs)
 cargo xtask linux-test -- NAME       # only the tests matching NAME (clippy still runs; --no-clippy skips it)
 cargo xtask linux-test --clean       # remove this checkout's Linux build volume
@@ -24,16 +41,17 @@ Commit first. It tests the working tree as it is, edits that are not committed i
 carries only what is committed; a result quoted for a pull request is a run on its clean head.
 
 It runs in the official `rust:<channel>` image for the toolchain `rust-toolchain.toml` pins, with the pinned clippy
-added (a local image built on the first run), at 4 CPUs and `CARGO_BUILD_JOBS=4`. The checkout is mounted
+and the pinned cargo-nextest added (a local image built on the first run; nextest is its release's prebuilt binary,
+its sha256 checked), at 4 CPUs and `CARGO_BUILD_JOBS=4`. The checkout is mounted
 read-only. `CARGO_HOME` is one named Docker volume every checkout shares, Cargo's package-cache lock with it, so two
 runs at once from two checkouts take turns on the download as two cargo processes on one machine do; the Linux
 build lives in a named volume per checkout, so the second run is incremental and the host's `target` folder is never
 touched. A linked git worktree gets its repository's git folder mounted read-only too, so the tests that read the
 checkout's git history work. The first run pulls the image and builds everything in release (about 10 minutes at 4
 CPUs); later runs rebuild only what changed, and the release test run itself takes about 6.5 minutes. Every step
-runs, `cargo test` goes on past a failing test binary (`--no-fail-fast`, unlike the public CI, so one run names every
-failure), the last line sums them up (`linux-test: PASS in 396s; test ok (1473 passed, 0 failed) 394s; clippy
-all-targets dev ok 1s; clippy default ok 0s`), and the exit code is non-zero when any failed. It is the gate before
+runs, the tests go on past a failure (`--no-fail-fast`, unlike the public CI, so one run names every failure), the
+last line sums them up (`linux-test: PASS in 250s; test ok (1715 passed, 0 failed) 239s; doctest ok (2 passed, 0
+failed) 4s; clippy all-targets dev ok 5s; clippy default ok 1s`), and the exit code is non-zero when any failed. It is the gate before
 every pull request (see [[Releasing]]): a Windows or macOS machine never compiles the `cfg(target_os = "linux")`
 code, and the development repository's CI does not run the tests.
 

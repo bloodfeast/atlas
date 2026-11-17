@@ -1207,10 +1207,8 @@ pub fn run(args: Vec<String>) -> R {
     // GitHub's own addresses come with releases merged through a pull
     // request (see release_ci.rs); any other is refused, co-authors
     // included, and never printed.
-    let other = crate::release_ci::other_addresses(&log, &public_email);
-    if !other.is_empty() {
-        return Err(format!("the public history carries {} that may not be there (author, committer or Co-authored-by)", crate::release_ci::refused(&other)));
-    }
+    crate::public_contrib::other_addresses_on(&log, &public_email, crate::public_repo::api().as_ref(), &public_repo)
+        .refuse("the public history carries", " (author, committer or Co-authored-by)")?;
     let (addrs, withheld) = crate::release_ci::printed_addresses(&log, &public_email);
     let mut addresses = addrs.join(" ");
     if withheld > 0 {
@@ -1510,7 +1508,20 @@ pub(crate) fn model_rows(template: &str) -> Vec<ModelRow> {
 /// them (an export-ignore rule or a lost file would drop them silently).
 /// The rules templates are among them: atlas embeds them with
 /// `include_str!`, so a public tree without them would not build.
-pub const PUBLIC_FILES: &[&str] = &[".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/CODEOWNERS", "SECURITY.md", "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "wiki/Home.md", "templates/CLAUDE.md", "templates/atlas-rules.md"];
+pub const PUBLIC_FILES: &[&str] = &[
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    ".github/CODEOWNERS",
+    "SECURITY.md",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "wiki/Home.md",
+    "templates/CLAUDE.md",
+    "templates/atlas-rules.md",
+];
 
 pub(crate) fn check_public_files(tree: &Path) -> R {
     let gone: Vec<&str> = PUBLIC_FILES.iter().copied().filter(|f| !tree.join(f).is_file()).collect();

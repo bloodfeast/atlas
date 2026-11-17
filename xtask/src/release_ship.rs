@@ -8,7 +8,9 @@
 //!
 //!     run 1 (no pull request yet): refuses unless the checkout is clean at
 //!         the development repository's main (`checkout_guard`, OnMain::Tip)
-//!         and its origin is github.com/bloodfeast/atlas-dev; runs
+//!         and its origin is github.com/bloodfeast/atlas-dev, and while the
+//!         public main holds a change HEAD lacks, which the export would
+//!         revert (`public_contrib::export_guard`: run `release import`); runs
 //!         `release check` unless a current stamp stands (three release
 //!         builds); shows the plan; asks nothing at the terminal (the
 //!         owner's approval of the public pull request on GitHub is the gate
@@ -31,7 +33,9 @@
 //!         squash-merges with the head pinned (GitHub picks the author);
 //!         checks every address of the public history up to the merge
 //!         commit, co-authors included (here, and on any later run that
-//!         finds the pull request merged); watches the release workflow;
+//!         finds the pull request merged), an outside pull request's author
+//!         on its own squash commit passing on GitHub's word
+//!         (`public_contrib::outside_pr`); watches the release workflow;
 //!         then checks the draft (it must target the merge commit) and runs
 //!         `release sign`, whose one prompt `publish vX.Y.Z` covers the
 //!         signature, the upload, the push of main and the wiki, and the
@@ -70,7 +74,9 @@ use atlas::json::Value;
 
 use crate::release::{env, mkdir, output, read_text, say, status, write};
 use crate::release_check::Confirm;
-use crate::release_ci::{checkout_guard, clone, git_out, other_addresses, refused, same_code, short, sign, version_of, Draft, Ident, OnMain, Releases, Sign, ADDRESS_LOG};
+use crate::release_ci::{
+    checkout_guard, clone, git_out, same_code, short, sign, version_of, Draft, Ident, OnMain, Releases, Sign, ADDRESS_LOG,
+};
 
 type R<T = ()> = Result<T, String>;
 
@@ -903,6 +909,14 @@ fn open(s: &Ship, reexport: Option<&PrInfo>) -> R<Done> {
     }
     crate::version::refuse_pending(&s.root)?;
     crate::release_check::refuse_stale_readme(&s.root, &version)?;
+    // The export puts HEAD's tree on top of the public main: a public change
+    // HEAD lacks would be reverted. Before the check and the dispatch.
+    let public = s.stage.join("ship").join("public");
+    clone(&s.remote, &public)?;
+    crate::public_contrib::export_guard(&s.root, &head, &public, "HEAD", &s.ident.email, &s.stage.join("ship").join("guard"))?;
+    // The address check the release makes after its merge, over every
+    // public commit it carries: refused now, not halfway.
+    crate::public_contrib::address_guard(&public, "HEAD", &s.ident.email, s.api, &s.repo)?;
     let last = State::read(&s.state_file())?.filter(|st| st.tag == *tag);
     let moved = last.as_ref().filter(|st| st.commit != head);
     let key = crate::release_check::current_key(&s.root, &s.denylist, s.accepted.as_deref())?.1;
@@ -1044,15 +1058,13 @@ fn merge_addresses(s: &Ship, commit: &str) -> R {
     if git_out(&public, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_err() {
         return Err(format!("the merge commit {} is not in {}: run ship again once it is", short(commit), s.remote));
     }
-    let other = other_addresses(&git_out(&public, &["log", ADDRESS_LOG, commit])?, &s.ident.email);
-    if !other.is_empty() {
-        return Err(format!(
-            "the merge commit {} left {} in the public history that may not be there (author, committer or Co-authored-by, in {} or before it). Stop: nothing more is done, and nothing is built or signed on it",
-            short(commit),
-            refused(&other),
-            commit
-        ));
-    }
+    let c = crate::public_contrib::other_addresses_on(&git_out(&public, &["log", ADDRESS_LOG, commit])?, &s.ident.email, s.api, &s.repo);
+    let stop = "Stop: nothing more is done, and nothing is built or signed on it";
+    c.refuse(
+        &format!("the merge commit {} left", short(commit)),
+        &format!(" in the public history (author, committer or Co-authored-by, in {commit} or before it). {stop}"),
+    )
+    .map_err(|e| if c.other.is_empty() { format!("merge commit {}: {e}. {stop} until then", short(commit)) } else { e })?;
     say(&format!("merge commit {}: every address in the public history is allowed, co-authors included", short(commit)));
     Ok(())
 }
@@ -1351,6 +1363,15 @@ mod tests {
         rel: StubReleases,
         hub: FakeHub,
         checks: Cell<u32>,
+        /// GitHub's REST answers by path (none: every call fails, as NoApi).
+        gh: RefCell<std::collections::HashMap<String, String>>,
+    }
+
+    struct Answers<'a>(&'a RefCell<std::collections::HashMap<String, String>>);
+    impl crate::public_repo::Api for Answers<'_> {
+        fn get(&self, path: &str) -> R<String> {
+            self.0.borrow().get(path).cloned().ok_or(format!("no network in tests ({path})"))
+        }
     }
 
     fn world(name: &str) -> World {
@@ -1358,7 +1379,7 @@ mod tests {
         let dev = dev_checkout(&fx.d);
         let rel = StubReleases(fx.stub.clone());
         let hub = FakeHub::new(&fx.stub);
-        World { fx, dev, rel, hub, checks: Cell::new(0) }
+        World { fx, dev, rel, hub, checks: Cell::new(0), gh: RefCell::default() }
     }
 
     impl World {
@@ -1407,7 +1428,7 @@ mod tests {
                 trusted,
                 test_key: "2".repeat(64),
                 ident: Ident { name: "P".into(), email: "pub@example.invalid".into() },
-                api: &NoApi,
+                api: &Answers(&self.gh),
                 rel: &self.rel,
                 hub: &self.hub,
                 confirm,
@@ -1659,6 +1680,8 @@ mod tests {
         let head = sh(&x, &["rev-parse", "HEAD"]);
         *w.hub.pr.borrow_mut() = Some(ready(&head));
         w.hub.rel_runs.borrow_mut().push(run_of("in_progress", ""));
+        // GitHub ties it to no merged outside pull request.
+        w.gh.borrow_mut().insert(format!("repos/{REPO}/commits/{head}/pulls"), "[]".into());
         let e = w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap_err();
         assert!(e.contains(&format!("merge commit {}", short(&head))) && e.contains(" 1 address ") && !e.contains("o@other.invalid"), "{e}");
         assert_eq!((w.hub.count("merge"), w.hub.count("release-runs")), (1, 0));
@@ -2163,5 +2186,169 @@ mod tests {
         sh(&other, &["remote", "set-url", "origin", "https://github.com/bloodfeast/atlas.git"]);
         assert!(placement("the denylist", &other.join("private/deny.txt"), &checkout).unwrap_err().contains("inside a clone of bloodfeast/atlas ("));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    const OUT: &str = "out@example.invalid";
+
+    /// An outside pull request merged on the public main since the last
+    /// release: run 1 refuses before the check and the dispatch, naming it.
+    #[test]
+    fn run_1_refuses_while_the_public_main_holds_an_outside_change() {
+        let w = world("ship-outside");
+        w.no_draft();
+        *w.hub.opens.borrow_mut() = Some(ready(&w.head()));
+        // A change to a file: an empty commit has nothing to revert, so it is held.
+        let x = w.fx.d.join("side-outside");
+        sh(&w.fx.d, &["clone", "-q", &w.fx.bare.to_string_lossy(), x.to_str().unwrap()]);
+        std::fs::write(
+            x.join("OUTSIDE.md"),
+            "an outside change
+",
+        )
+        .unwrap();
+        sh(&x, &["add", "-A"]);
+        sh(
+            &x,
+            &[
+                "-c",
+                "user.name=GitHub",
+                "-c",
+                "user.email=noreply@github.com",
+                "commit",
+                "-q",
+                "--author",
+                &format!("A <{OUT}>"),
+                "-m",
+                "docs: more (#13)",
+            ],
+        );
+        sh(&x, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        let sha = sh(&x, &["rev-parse", "HEAD"]);
+        let e = w.ship(&No, None).unwrap_err();
+        assert!(e.contains(short(&sha)) && e.contains("docs: more (#13)") && e.contains("cargo xtask release import"), "{e}");
+        assert!(!e.contains(OUT), "no address: {e}");
+        assert_eq!((w.hub.count("dispatch"), w.checks.get()), (0, 0), "nothing checked or dispatched");
+        // Held by a trailer in the development history: run 1 goes on.
+        crate::release_ci::tests::commit_files(
+            &w.dev,
+            &[(
+                "marker.txt",
+                "x
+",
+            )],
+            &format!(
+                "import
+
+Public-commit: {sha}"
+            ),
+        );
+        // The address check before the dispatch asks GitHub about its author.
+        let e = w.ship(&No, None).unwrap_err();
+        assert!(e.contains(short(&sha)) && e.contains("could not be verified"), "{e}");
+        assert_eq!(w.hub.count("dispatch"), 0);
+        outside_answers(&w, &sha);
+        assert_eq!(w.ship(&No, None).unwrap(), Done::Opened("https://github.com/acme/tool/pull/5".into()));
+        w.done();
+    }
+
+    /// GitHub's answers for `sha`, outside pull request #13's squash commit.
+    fn outside_answers(w: &World, sha: &str) {
+        let mut gh = w.gh.borrow_mut();
+        gh.insert(
+            format!("repos/{REPO}/commits/{sha}/pulls"),
+            format!(r#"[{{"number": 13, "merged_at": "2026-11-16T10:00:00Z", "merge_commit_sha": "{sha}", "user": {{"login": "outsider", "type": "User"}}, "base": {{"ref": "main", "repo": {{"full_name": "{REPO}"}}}}}}]"#),
+        );
+        gh.insert(
+            format!("repos/{REPO}/commits/{sha}"),
+            r#"{"author": {"login": "outsider"}, "committer": {"login": "web-flow"}, "parents": [{"sha": "x"}]}"#.into(),
+        );
+    }
+
+    /// S1a: an imported outside change whose squash commit kept a foreign
+    /// Co-authored-by line: run 1 refuses before the check and the
+    /// dispatch, naming the commit and the slot, never the address.
+    #[test]
+    fn run_1_refuses_a_public_commit_the_address_check_refuses() {
+        let w = world("ship-outside-coauthor");
+        w.no_draft();
+        *w.hub.opens.borrow_mut() = Some(ready(&w.head()));
+        let x = w.fx.d.join("side-coauthor");
+        sh(&w.fx.d, &["clone", "-q", &w.fx.bare.to_string_lossy(), x.to_str().unwrap()]);
+        std::fs::write(x.join("OUTSIDE.md"), "an outside change\n").unwrap();
+        sh(&x, &["add", "-A"]);
+        let msg = "docs: more (#13)\n\nCo-authored-by: Tool <ai@tool.example.invalid>";
+        sh(
+            &x,
+            &[
+                "-c",
+                "user.name=GitHub",
+                "-c",
+                "user.email=noreply@github.com",
+                "commit",
+                "-q",
+                "--author",
+                &format!("A <{OUT}>"),
+                "-m",
+                msg,
+            ],
+        );
+        sh(&x, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        let sha = sh(&x, &["rev-parse", "HEAD"]);
+        crate::release_ci::tests::commit_files(&w.dev, &[("marker.txt", "x\n")], &format!("import\n\nPublic-commit: {sha}"));
+        outside_answers(&w, &sha);
+        let e = w.ship(&No, None).unwrap_err();
+        assert!(e.contains(&format!("public #13 {}", short(&sha))) && e.contains("its Co-authored-by refused"), "{e}");
+        assert!(!e.contains("example.invalid"), "no address: {e}");
+        assert_eq!((w.hub.count("dispatch"), w.checks.get()), (0, 0), "nothing checked or dispatched");
+        w.done();
+    }
+
+    /// An outside pull request's squash commit in the public history: its
+    /// author's address passes the merge's address check when GitHub ties
+    /// the commit to a merged outside pull request, and only then; the
+    /// refusal still counts it and never prints it.
+    #[test]
+    fn an_outside_authors_address_passes_on_github_facts() {
+        let w = world("ship-outside-addr");
+        w.no_draft();
+        let outside = public_commit(&w, "main", OUT, "noreply@github.com", "docs: more (#13)");
+        let good = public_commit(
+            &w,
+            "good",
+            BOT,
+            "noreply@github.com",
+            "atlas v1.2.3 (#5)
+
+Co-authored-by: P <pub@example.invalid>",
+        );
+        *w.hub.pr.borrow_mut() = Some(merged(&w.fx.target, &good));
+        let e = w.ship(&No, None).unwrap_err();
+        assert!(
+            e.contains(&format!("merge commit {}", short(&good)))
+                && e.contains("could not verify 1 commit")
+                && !e.contains(" 1 address ")
+                && !e.contains(OUT),
+            "{e}"
+        );
+        assert!(e.contains("Stop: nothing more is done"), "{e}");
+        {
+            let mut gh = w.gh.borrow_mut();
+            gh.insert(
+                format!("repos/{REPO}/commits/{outside}/pulls"),
+                format!(r#"[{{"number": 13, "merged_at": "2026-11-16T10:00:00Z", "merge_commit_sha": "{outside}", "user": {{"login": "outsider", "type": "User"}}, "base": {{"ref": "main", "repo": {{"full_name": "{REPO}"}}}}}}]"#),
+            );
+            gh.insert(
+                format!("repos/{REPO}/commits/{outside}"),
+                r#"{"author": {"login": "outsider"}, "committer": {"login": "web-flow"}, "parents": [{"sha": "x"}]}"#.into(),
+            );
+        }
+        let e = w.ship(&No, None).unwrap_err();
+        assert!(e.starts_with("no release workflow run on the merge commit"), "the address check passed: {e}");
+        // The owner's own pull request: refused as before.
+        let owners =
+            w.gh.borrow()[&format!("repos/{REPO}/commits/{outside}/pulls")].replace(r#""login": "outsider""#, r#""login": "acme""#);
+        w.gh.borrow_mut().insert(format!("repos/{REPO}/commits/{outside}/pulls"), owners);
+        assert!(w.ship(&No, None).unwrap_err().contains(" 1 address "));
+        w.done();
     }
 }

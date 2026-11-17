@@ -26,9 +26,13 @@
 //!   total for all sessions, never per session or turn.
 //!
 //! A turn is one UserPromptSubmit: the distinct seconds of a main
-//! session's UserPromptSubmit rows in `hook_inject`. A prompt that injected
+//! session's UserPromptSubmit rows in `hook_inject` ([`Turns`], the rule
+//! the report's injections per prompt use too). A prompt that injected
 //! nothing leaves no row, so turns are undercounted and the cost per turn
 //! errs high. A subagent has no prompts: its unit is the agent.
+//!
+//! The net table holds one row no ledger row has: the rulebook's measured
+//! credit (#219, [`Cost::rulebook`]), when the caller measured it.
 //!
 //! Transcripts are read only, and only their events at or before the
 //! ledger's last row, so both sides cover the same window. Without them,
@@ -231,12 +235,13 @@ pub fn rereads<'t>(t: &'t Transcript, time: &str) -> impl Iterator<Item = &'t Re
 }
 
 /// The bytes a session start sends: the tool list and the instructions'
-/// habits paragraph ([`crate::tools::GUIDE`]). The instructions'
+/// habits paragraph ([`crate::tools::GUIDE`]) and style line
+/// ([`crate::tools::STYLE`]), each after a line break. The instructions'
 /// first line names the served vaults, which depend on the configuration;
 /// it is left out, so this is a floor.
 pub fn start_bytes() -> usize {
     let tools = Value::Array(crate::tools::tool_list());
-    tools.to_string().len() + crate::tools::GUIDE.len()
+    tools.to_string().len() + 1 + crate::tools::GUIDE.len() + 1 + crate::tools::STYLE.len()
 }
 
 /// The definition bytes of one atlas tool by name (its listed schema, else
@@ -278,6 +283,49 @@ pub fn spread(mut v: Vec<f64>) -> Spread {
     }
 }
 
+/// A main session's turns, by the turn rule: the distinct seconds of its
+/// `UserPromptSubmit` rows in `hook_inject`. A prompt that injected nothing
+/// leaves no row, so turns are undercounted. The one rule for the cost per
+/// turn ([`measure`]) and the injections per prompt
+/// ([`crate::tokens::inject_report`], #212).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Turns(Vec<String>);
+
+impl Turns {
+    /// The turns of one main session's rows, each `(time, hook)`.
+    pub fn of<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let mut turns: Vec<String> =
+            rows.into_iter().filter(|(_, hook)| *hook == "UserPromptSubmit").map(|(time, _)| second(time).to_string()).collect();
+        turns.sort();
+        turns.dedup();
+        Turns(turns)
+    }
+
+    /// How many turns.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the session has no turn.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The turn a time falls in: the last turn at or before its second. A
+    /// time before the first prompt counts in the first turn.
+    #[must_use]
+    pub fn index(&self, time: &str) -> usize {
+        self.0.partition_point(|t| t.as_str() <= second(time)).max(1) - 1
+    }
+}
+
+/// A timestamp to the second.
+fn second(time: &str) -> &str {
+    time.get(..19).unwrap_or(time)
+}
+
 /// The cost side, in tokens.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Cost {
@@ -317,9 +365,48 @@ pub struct Cost {
     pub without_transcript: i64,
     /// Whether transcripts were asked for.
     pub transcripts: bool,
+    /// The rulebook's measured credit, in tokens (#219): the per-agent
+    /// pre-atlas read ([`crate::tokens::brief_measured`]) times the agents
+    /// in both the brief and the injection tables. Set by the caller, never
+    /// by [`measure`]; `None` when not measured, and then it is no row of
+    /// the net table (the rulebook's file size never is).
+    pub rulebook: Option<f64>,
+    /// Ledger credit, in tokens, of the recall answers that read records
+    /// where they are written (`recall {key}` and `{lane}`,
+    /// [`crate::tokens::recall_records_credit`]). Such an answer's
+    /// counterfactual can be the same rulebook window a measured rulebook
+    /// already credits, and `token_log` records no agent or export per
+    /// answer to tell which, so the rulebook's net row is reduced by it, to
+    /// 0 at most ([`net_rows`]). It errs low: main-session recalls and other
+    /// exports are taken off too.
+    pub rulebook_overlap: f64,
 }
 
 impl Cost {
+    /// Sets the measured rulebook credit from the brief-vs-injections match
+    /// (the agents both tables hold), `None` without one, and the
+    /// recall-by-record credit it overlaps ([`Cost::rulebook_overlap`]).
+    /// Net counts the rulebook only as measured, never its file size.
+    pub fn credit_rulebook(&mut self, matched: Option<&crate::tokens::MatchRow>, recall_records: f64) {
+        self.rulebook = matched.and_then(|m| m.rulebook);
+        self.rulebook_overlap = recall_records.max(0.0);
+    }
+
+    /// The rulebook's credit in Net: the measured credit less the
+    /// recall-by-record credit that may stand for the same reads, never
+    /// below 0; `None` when not measured.
+    #[must_use]
+    pub fn rulebook_net_credit(&self) -> Option<f64> {
+        self.rulebook.map(|rb| rb - rb.min(self.rulebook_overlap))
+    }
+
+    /// The part of the measured rulebook credit taken off for recall by
+    /// record ([`Cost::rulebook_overlap`]): 0 when not measured.
+    #[must_use]
+    pub fn rulebook_taken_off(&self) -> f64 {
+        self.rulebook.map_or(0.0, |rb| rb.min(self.rulebook_overlap))
+    }
+
     /// Every bucket's tokens, the re-read price-weighted.
     pub fn total(&self) -> f64 {
         self.a() + self.b() + self.c()
@@ -485,20 +572,14 @@ pub fn measure(conn: &Connection, bytes_per_token: f64, transcripts: Option<&Pat
             }
         }
         if agent.is_empty() {
-            // Turns: the distinct seconds of the session's prompts.
-            let mut turns: Vec<String> =
-                list.iter().filter(|r| r.hook == "UserPromptSubmit").map(|r| r.time.get(..19).unwrap_or(&r.time).to_string()).collect();
-            turns.sort();
-            turns.dedup();
+            let turns = Turns::of(list.iter().map(|r| (r.time.as_str(), r.hook.as_str())));
             if turns.is_empty() {
                 continue;
             }
             c.turns += turns.len() as i64;
             let mut cost = vec![0.0f64; turns.len()];
             for (time, v) in &events {
-                // An event before the first prompt counts in the first turn.
-                let i = turns.partition_point(|t| t.as_str() <= time.get(..19).unwrap_or(time)).max(1) - 1;
-                cost[i] += v;
+                cost[turns.index(time)] += v;
             }
             per_turn.extend(cost);
         } else {
@@ -537,7 +618,12 @@ pub const DEFINITIONS: &str = "tool definitions (A)";
 
 /// The net table: every ledger row but the double logs, credit beside cost
 /// (C for a tool, B for a `hook:<event>` row), then bucket A, which no tool
-/// row holds. Totals are the sums of these rows.
+/// row holds, and the measured rulebook ([`RULEBOOK`]) when there is one.
+/// Totals are the sums of these rows. No source is credited twice: a
+/// measured rulebook replaces the `hook:SubagentStart` row's hit credit
+/// (#217), which then credits 0; without one, the hit credit stands. The
+/// measured rulebook is credited less the recall-by-record credit
+/// ([`Cost::rulebook_overlap`]), which may read the same rulebook windows.
 pub fn net_rows(cost: &Cost, by_tool: &[crate::tokens::ReportRow]) -> Vec<NetRow> {
     use crate::token_report::{DOUBLE_LOGGED, ROUTED};
     let mut rows: Vec<NetRow> = Vec::new();
@@ -546,7 +632,10 @@ pub fn net_rows(cost: &Cost, by_tool: &[crate::tokens::ReportRow]) -> Vec<NetRow
             Some(event) => cost.hook(event),
             None => cost.output.get(&t.key).copied().unwrap_or(0.0),
         };
-        rows.push(NetRow { key: t.key.clone(), credit: t.counterfactual, cost: c });
+        // A measured rulebook replaces the subagent-start hit credit: both
+        // credit what those injections saved, so only one may count.
+        let credit = if t.key == START_HOOK && cost.rulebook.is_some() { 0.0 } else { t.counterfactual };
+        rows.push(NetRow { key: t.key.clone(), credit, cost: c });
     }
     // Cost with no ledger row (a hook event that never logged a row).
     for event in cost.sent.keys().chain(cost.framing.keys()).chain(cost.reread_priced.keys()) {
@@ -561,8 +650,22 @@ pub fn net_rows(cost: &Cost, by_tool: &[crate::tokens::ReportRow]) -> Vec<NetRow
         }
     }
     rows.push(NetRow { key: DEFINITIONS.into(), credit: 0.0, cost: cost.a() });
+    // Recall by key or lane may credit the same rulebook windows: the
+    // rulebook row is reduced by that credit, so neither counts it twice.
+    if let Some(credit) = cost.rulebook_net_credit() {
+        rows.push(NetRow { key: RULEBOOK.into(), credit, cost: 0.0 });
+    }
     rows
 }
+
+/// The name of the measured rulebook's row in the net table (#219): its
+/// credit only; the injections that replace it are the `hook:SubagentStart`
+/// row's cost.
+pub const RULEBOOK: &str = "rulebook (measured)";
+
+/// The subagent-start hook's ledger row, whose hit credit a measured
+/// rulebook replaces.
+pub const START_HOOK: &str = "hook:SubagentStart";
 
 /// Total credit, total cost and the net, over [`net_rows`].
 pub fn totals(rows: &[NetRow]) -> (f64, f64, f64) {
@@ -982,5 +1085,68 @@ mod tests {
             assert!(!out.contains(FLOOR), "{out}");
             assert!(!out.contains("upper bound") && !out.contains("upper-bound"), "{out}");
         }
+    }
+
+    /// #212: the turn rule, one helper for the cost per turn and the
+    /// injections per prompt. Only UserPromptSubmit rows make turns, one per
+    /// distinct second; a time falls in the last turn at or before it, and
+    /// one before the first prompt in the first.
+    #[test]
+    fn the_turn_rule_is_distinct_prompt_seconds_and_a_row_falls_in_the_last_turn_before_it() {
+        let rows = [
+            ("2026-11-15T10:00:00.100Z", "UserPromptSubmit"),
+            ("2026-11-15T10:00:00.900Z", "UserPromptSubmit"),
+            ("2026-11-15T10:00:05Z", "UserPromptSubmit"),
+            ("2026-11-15T10:00:02Z", "PreToolUse"),
+            ("2026-11-15T09:59:00Z", "SessionStart"),
+        ];
+        let turns = Turns::of(rows);
+        assert_eq!((turns.len(), turns.is_empty()), (2, false));
+        assert_eq!(turns.index("2026-11-15T09:59:00Z"), 0);
+        assert_eq!(turns.index("2026-11-15T10:00:00.500Z"), 0);
+        assert_eq!(turns.index("2026-11-15T10:00:04.999Z"), 0);
+        assert_eq!(turns.index("2026-11-15T10:00:05.700Z"), 1);
+        assert_eq!(turns.index("2026-11-16T00:00:00Z"), 1);
+        assert!(Turns::of([("2026-11-15T10:00:00Z", "PreToolUse")]).is_empty());
+    }
+
+    /// #219: the measured rulebook is one row of the net table, credit only,
+    /// and in the totals; without a measurement there is no such row.
+    #[test]
+    fn the_measured_rulebook_is_a_net_row_and_counts_in_the_totals() {
+        let by_tool = [row("recall", 1000.0)];
+        let mut cost = Cost { transcripts: true, ..Cost::default() };
+        assert!(!net_rows(&cost, &by_tool).iter().any(|r| r.key == RULEBOOK));
+        cost.rulebook = Some(500.0);
+        let rows = net_rows(&cost, &by_tool);
+        let r = rows.iter().find(|r| r.key == RULEBOOK).unwrap();
+        assert_eq!((r.credit, r.cost), (500.0, 0.0));
+        assert_eq!(totals(&rows).0, 1500.0);
+        assert!(tsv(&cost, &by_tool, 4.0).contains("rulebook (measured)\t500\t0\t500\n"));
+    }
+
+    /// Review of #277, finding 1: recall by key credits the window of the
+    /// rulebook a record sits in, and the measured rulebook credits the
+    /// same reading, so the rulebook row is reduced by the recall-by-record
+    /// credit, never below 0; the recall row keeps its ledger credit.
+    #[test]
+    fn recall_by_record_is_taken_off_the_rulebook_once() {
+        let by_tool = [row("recall", 1000.0)];
+        for (rulebook, overlap, want) in [(500.0, 200.0, 300.0), (500.0, 900.0, 0.0), (500.0, 0.0, 500.0)] {
+            let mut cost = Cost { transcripts: true, ..Cost::default() };
+            let m = crate::tokens::MatchRow { agents: 5, rulebook: Some(rulebook), whole: 0.0, injected: 0.0, start: 0.0 };
+            cost.credit_rulebook(Some(&m), overlap);
+            let rows = net_rows(&cost, &by_tool);
+            let r = rows.iter().find(|r| r.key == RULEBOOK).unwrap();
+            assert_eq!(r.credit, want, "rulebook {rulebook}, recall by record {overlap}");
+            assert_eq!(rows.iter().find(|r| r.key == "recall").unwrap().credit, 1000.0);
+            assert_eq!(totals(&rows).0, 1000.0 + want);
+            assert_eq!(cost.rulebook_taken_off(), rulebook - want);
+        }
+        // The wiring: no match, no rulebook row, whatever recall credited.
+        let mut cost = Cost::default();
+        cost.credit_rulebook(None, 900.0);
+        assert_eq!((cost.rulebook, cost.rulebook_taken_off()), (None, 0.0));
+        assert!(!net_rows(&cost, &by_tool).iter().any(|r| r.key == RULEBOOK));
     }
 }

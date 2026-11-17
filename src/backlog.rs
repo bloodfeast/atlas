@@ -1233,7 +1233,9 @@ pub fn cli(args: &[String], store: &mut MemoryStore, index_db: Option<&Path>, s:
     let mut running = Vec::new();
     if let Some(tr) = flag(args, "--transcript") {
         let dir = crate::orchestrate::subagents_dir(&tr);
-        let r = crate::orchestrate::Agents::new(None).running(orch, &dir, std::time::SystemTime::now()).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let r = crate::orchestrate::Agents::new(None)
+            .running(orch, &dir, Some(&*store), std::time::SystemTime::now())
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
         running = r.iter().map(|x| crate::orchestrate::brief_of(&dir.join(format!("agent-{}.jsonl", x.id))).unwrap_or_default()).collect();
     }
     let all = args.iter().any(|a| a == "--all");

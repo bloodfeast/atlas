@@ -369,6 +369,74 @@ fn recall_answers_carry_a_counterfactual_and_writes_do_not() {
     assert_eq!(rows[3], ("journal".to_string(), None, None));
 }
 
+/// The style rule (#274): a line of the server instructions, and echoed in
+/// the first `journal` or `handoff` answer of a session only; a new session
+/// echoes it once again.
+#[test]
+fn the_style_rule_is_in_the_instructions_and_echoed_on_a_sessions_first_write_only() {
+    let style = atlas::tools::STYLE;
+    let f = fixture("mem-style");
+    let (mut s, _fx) = server(&f);
+    assert!(s.instructions().lines().any(|l| l == style), "{}", s.instructions());
+    let first = text(call(&mut s, "journal", json!({"lane": "style-1", "entry": "note", "text": "first"})));
+    assert!(first.starts_with("ok journal:style-1:0001 v1") && first.contains(style), "{first}");
+    let second = text(call(&mut s, "journal", json!({"lane": "style-1", "entry": "note", "text": "second"})));
+    assert!(second.starts_with("ok journal:style-1:0002 v1") && !second.contains(style), "{second}");
+    let h = text(call(&mut s, "handoff", json!({"lane": "style-1", "title": "stop", "text": "Done."})));
+    assert!(h.starts_with("ok handoff:style-1:") && !h.contains(style), "{h}");
+    // A refused write does not use up the echo.
+    let (mut s2, _fx2) = server(&f);
+    let _ = call_err(&mut s2, "journal", json!({"lane": "style-2", "entry": "nonsense", "text": "x"}));
+    let h1 = text(call(&mut s2, "handoff", json!({"lane": "style-2", "title": "first stop", "text": "Halfway."})));
+    assert!(h1.starts_with("ok handoff:style-2:") && h1.contains(style), "{h1}");
+    let h2 = text(call(&mut s2, "handoff", json!({"lane": "style-2", "title": "second stop", "text": "Done."})));
+    assert!(!h2.contains(style), "{h2}");
+    let j = text(call(&mut s2, "journal", json!({"lane": "style-2", "entry": "note", "text": "after"})));
+    assert!(!j.contains(style), "{j}");
+    // Other writes never carry it.
+    let (mut s3, _fx3) = server(&f);
+    let r = text(call(&mut s3, "remember", json!({"kind": "memory", "key": "style-free", "body": "No echo here."})));
+    assert!(r.starts_with("ok style-free v1") && !r.contains(style), "{r}");
+    let sup_args = json!({"old": ["style-free"], "kind": "memory", "key": "style-free-2", "title": "B", "summary": "b", "sub": "project", "body": "No echo."});
+    let sup = text(call(&mut s3, "supersede", sup_args));
+    assert!(sup.starts_with("ok ") && !sup.contains(style), "{sup}");
+}
+
+/// The style rule's echo is once per writing context (#274 review S1): one
+/// server serves a session and all its subagents, so each agent the hooks
+/// name, and the main session, gets the rule on its own first `journal` or
+/// `handoff` write.
+#[test]
+fn the_style_rule_is_echoed_once_per_agent() {
+    let style = atlas::tools::STYLE;
+    let f = fixture("mem-style-agents");
+    let (mut s, _fx) = server(&f);
+    let write = |s: &mut atlas::tools::Server, agent: &str, tool: &str, args: Value| {
+        let hook = json!({"event": "PreToolUse", "session_id": "S", "agent_id": agent, "tool_name": format!("mcp__atlas__{tool}"), "tool_input": args.clone()});
+        s.answer("hook", &hook).unwrap();
+        s.answer(tool, &args).unwrap().into_text()
+    };
+    let j = |lane: &str, t: &str| json!({"lane": lane, "entry": "note", "text": t});
+    let a1 = write(&mut s, "agent-a", "journal", j("style-a", "a first"));
+    assert!(a1.starts_with("ok journal:style-a:0001") && a1.contains(style), "{a1}");
+    let b1 = write(&mut s, "agent-b", "journal", j("style-b", "b first"));
+    assert!(b1.starts_with("ok journal:style-b:0001") && b1.contains(style), "{b1}");
+    let a2 = write(&mut s, "agent-a", "journal", j("style-a", "a second"));
+    assert!(a2.starts_with("ok journal:style-a:0002") && !a2.contains(style), "{a2}");
+    let b2 = write(&mut s, "agent-b", "handoff", json!({"lane": "style-b", "title": "stop", "text": "Done."}));
+    assert!(b2.starts_with("ok handoff:style-b:") && !b2.contains(style), "{b2}");
+    // The main session (no agent id) is a writing context of its own.
+    let m1 = write(&mut s, "", "journal", j("style-m", "main first"));
+    assert!(m1.contains(style), "{m1}");
+    let m2 = write(&mut s, "", "journal", j("style-m", "main second"));
+    assert!(!m2.contains(style), "{m2}");
+    // Another session's agent of the same id is another context.
+    let hook = json!({"event": "PreToolUse", "session_id": "T", "agent_id": "agent-a", "tool_name": "mcp__atlas__journal"});
+    s.answer("hook", &hook).unwrap();
+    let t1 = s.answer("journal", &j("style-t", "other session")).unwrap().into_text();
+    assert!(t1.contains(style), "{t1}");
+}
+
 #[test]
 fn lane_journal_recall_order_and_budget() {
     let f = fixture("mem-lane");
@@ -964,6 +1032,30 @@ fn a_first_line_longer_than_a_title_is_kept_in_the_body() {
     assert!(h.body.contains("the tail that must survive") && h.body.contains("the handoff"), "{h:?}");
     let decided = store.heads(Some("decision"), None).unwrap();
     assert!(decided.iter().any(|d| d.body.contains("the tail that must survive") && d.title.chars().count() <= atlas::memory::TITLE_CHARS), "{decided:?}");
+}
+
+/// `remember` refuses a memory's or a rule's `title` and a memory's `summary`
+/// past a length. The help names each length on the argument it bounds, so a
+/// model reads it there and not in a refused call.
+#[test]
+fn the_help_states_the_lengths_remember_refuses_past() {
+    let f = fixture("mem-given-lengths");
+    drop(import_all(&f));
+    let (mut s, _fx) = server(&f);
+    let title_max = atlas::memory::TITLE_CHARS;
+    let memory = |key: &str, title: String, summary: String| json!({"kind": "memory", "key": key, "sub": "project", "title": title, "summary": summary, "reason": "the length test", "body": "- the text"});
+    let e = s.answer("remember", &memory("long-title", "t".repeat(title_max + 1), "short".into())).unwrap_err().to_string();
+    assert!(e.contains(&format!("at most {title_max} characters")), "{e}");
+    let e = s.answer("remember", &memory("long-summary", "short".into(), "s".repeat(201))).unwrap_err().to_string();
+    assert!(e.contains("at most 200 characters"), "{e}");
+    // At the length itself both are taken.
+    s.answer("remember", &memory("at-the-length", "t".repeat(title_max), "s".repeat(200))).unwrap();
+    // The help's `remember` section says the same two numbers, each on its own argument.
+    let help = atlas::tools::help();
+    let section = help.split("### remember\n").nth(1).expect("the help has a remember section").split("\n### ").next().unwrap();
+    let arg = |name: &str| section.lines().find(|l| l.starts_with(&format!("- `{name}` "))).unwrap_or_else(|| panic!("no `{name}` in:\n{section}"));
+    assert!(arg("title").contains(&format!("at most {title_max} characters")), "{}", arg("title"));
+    assert!(arg("summary").contains("at most 200 characters"), "{}", arg("summary"));
 }
 
 /// `journal` with `amend: KEY` rewrites an entry's title and body as a new

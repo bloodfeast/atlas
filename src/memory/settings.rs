@@ -201,9 +201,11 @@ pub struct Settings {
     pub bytes_per_token: f64,
     /// The index database, for the token log.
     pub index_db: PathBuf,
-    /// The rulebook whose size at each subagent start is logged as the
-    /// "brief without atlas" (see [`crate::tokens::log_brief`]): the
-    /// configured `memory.brief_reference`, else the first `items` export.
+    /// The rulebook: its pre-atlas reads are the measured "brief without
+    /// atlas" ([`crate::tokens::brief_measured`], matched by path text), and
+    /// its size at each subagent start is logged as the "if read whole"
+    /// line (see [`crate::tokens::log_brief`]). The configured
+    /// `memory.brief_reference`, else the first `items` export.
     pub brief_reference: Option<PathBuf>,
     /// The configuration's `lean` section (see [`crate::config::Config::lean`]).
     pub lean: Option<crate::json::Value>,
@@ -266,11 +268,13 @@ pub const DEFAULT_POINTER_ANCHORS: bool = false;
 /// used.
 pub const DEFAULT_PROMPT_POINTERS: usize = 2;
 
-/// The default [`RecallSettings::inject_floor`], from
-/// `atlas --hook-report --tune-floor 1` ([`crate::hook_hits::tune`]): the
-/// cosine that maximises the tokens hits save less the tokens injected (see
-/// the script for the objective and the data it was run on).
-pub const DEFAULT_INJECT_FLOOR: f32 = 0.0;
+/// The default [`RecallSettings::inject_floor`] (journal:ATLAS-EFFICIENCY:0004).
+/// On 14 days of live hook data (`atlas --hook-report --rows`, see
+/// [`crate::hook_hits::tune`]) 0.60 dropped 3,480 pointer rows, about 37k
+/// tokens a week, for 8.3% of the hits, and left the memory eval and its
+/// hook replay unchanged (61/70 informed, 52/70 strict); 0.66 lost 2
+/// informed and 1 strict replay answers.
+pub const DEFAULT_INJECT_FLOOR: f32 = 0.60;
 
 /// The default least number of distinct query words in a recalled record.
 pub const DEFAULT_MIN_TERMS: usize = 3;

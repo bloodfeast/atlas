@@ -17,7 +17,7 @@
     ],
     "SubagentStop": [
       {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
-                  "input": {"event": "SubagentStop", "session_id": "${session_id}", "agent_id": "${agent_id}", "agent_type": "${agent_type}", "transcript_path": "${transcript_path}", "last_assistant_message": "${last_assistant_message}", "stop_hook_active": "${stop_hook_active}"}}]}
+                  "input": {"event": "SubagentStop", "session_id": "${session_id}", "agent_id": "${agent_id}", "agent_type": "${agent_type}", "transcript_path": "${transcript_path}", "last_assistant_message": "${last_assistant_message}", "stop_hook_active": "${stop_hook_active}", "background_tasks": "${background_tasks}"}}]}
     ],
     "Stop": [
       {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",

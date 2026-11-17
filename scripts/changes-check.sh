@@ -9,7 +9,8 @@
 # pulls/N/files API).
 #
 # Fails a build-path pull request that adds neither changes/PR.md (or
-# changes/PR-slug.md) nor changes/PR.none, unless it removes fragments and
+# changes/PR-slug.md, or an imported outside pull request's
+# changes/public-N.md) nor changes/PR.none, unless it removes fragments and
 # writes CHANGELOG.md and Cargo.toml (the `cargo xtask version` commit);
 # fails one that adds both; and fails any file
 # it adds or changes in changes/ that is not a well-formed fragment, a marker
@@ -29,7 +30,9 @@ if ! command -v iconv >/dev/null 2>&1; then
 fi
 
 # The fragment format: prints why a fragment is malformed and fails, or
-# prints nothing. UTF-8 without a byte order mark first, as the parser.
+# prints nothing. UTF-8 without a byte order mark first, as the parser. The
+# second argument is 1 for an imported fragment (changes/public-N.md), which
+# alone takes, and must have, `author: <GitHub login>`.
 check_fragment() {
     if ! iconv -f UTF-8 -t UTF-8 "$1" >/dev/null 2>&1; then
         echo "not UTF-8 text: save it as UTF-8"
@@ -53,7 +56,7 @@ check_fragment() {
         echo "a control character other than a tab or a line ending, which GitHub can read as a line break or hide text with: remove it"
         return 1
     fi
-    awk '
+    awk -v public="$2" '
         # A fence line: up to three spaces, then three or more backticks or
         # tildes (fence_run in xtask/src/release.rs). Sets fc, fn_, fk (its
         # indent) and frest.
@@ -120,6 +123,12 @@ check_fragment() {
                     print "section must be highlight, breaking, upgrade, feature, fix, security or known-limit, not " v; bad = 1; exit
                 }
                 section = v
+            } else if (k == "author") {
+                if (public != 1) { print "author is only for an imported fragment, changes/public-<n>.md"; bad = 1; exit }
+                if (length(v) > 39 || v !~ /^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$/) {
+                    print "author must be a GitHub login (letters, digits and single hyphens, at most 39), not " v; bad = 1; exit
+                }
+                author = v
             } else { print "unknown front matter key " k " (only bump and section)"; bad = 1; exit }
             next
         }
@@ -156,6 +165,7 @@ check_fragment() {
             if (bad) exit 1
             if (NR == 0) { print "the front matter must open with ---"; exit 1 }
             if (!closed) { print "the front matter has no closing ---"; exit 1 }
+            if (public == 1 && author == "") { print "no author in the front matter: an imported fragment names its pull request'"'"'s author"; exit 1 }
             # An upgrade note may leave its bump out; no other section may.
             if (bump == "" && section != "upgrade") { print "no bump in the front matter"; exit 1 }
             if (section == "") { print "no section in the front matter"; exit 1 }
@@ -192,15 +202,19 @@ while IFS= read -r f; do
         [ "$name" != "$pr.none" ] || none=1
         continue
     fi
-    if ! printf '%s\n' "$name" | grep -Eq '^[1-9][0-9]*(-[a-z0-9]+)*\.md$'; then
-        echo "::error file=$safe::$safe: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md or changes/<pr>.none)"
+    if ! printf '%s\n' "$name" | grep -Eq '^(public-)?[1-9][0-9]*(-[a-z0-9]+)*\.md$'; then
+        echo "::error file=$safe::$safe: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md, changes/<pr>.none or an imported changes/public-<n>.md)"
         fail=1
         continue
     fi
+    # An import's pull request carries the outside pull request's fragment
+    # as its own (`cargo xtask release import`).
+    public=0
     case $name in
         "$pr.md" | "$pr"-*) own=1 ;;
+        public-*) own=1; public=1 ;;
     esac
-    if ! msg=$(check_fragment "$root/$f"); then
+    if ! msg=$(check_fragment "$root/$f" "$public"); then
         echo "::error file=$safe::$safe: $msg"
         fail=1
     fi
@@ -209,7 +223,7 @@ $present
 EOF
 
 # A fold removes other pull requests' fragments; removing its own does not count.
-folded=$(printf '%s\n' "$listing" | grep -E "^removed${tab}changes/[1-9][0-9]*(-[a-z0-9]+)*\.(md|none)$" \
+folded=$(printf '%s\n' "$listing" | grep -E "^removed${tab}changes/((public-)?[1-9][0-9]*(-[a-z0-9]+)*\.md|[1-9][0-9]*(-[a-z0-9]+)*\.none)$" \
     | grep -vE "^removed${tab}changes/$pr(-[a-z0-9]+)*\.(md|none)$" || true)
 # A fold also writes CHANGELOG.md and Cargo.toml: deleting another pull
 # request's fragment is not a way around adding one's own.

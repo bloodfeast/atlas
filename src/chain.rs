@@ -163,19 +163,15 @@ fn classes() -> &'static [crate::regex::Regex] {
 }
 
 /// The entities of `text`, class by class in [`CLASSES`] order, each class
-/// in text order (repeats kept). A sha needs a digit and a letter.
-fn entities(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    for (k, rx) in classes().iter().enumerate() {
-        for m in rx.find_iter(text) {
-            let e = m.as_str();
-            if CLASSES[k].0 == "sha" && !(e.bytes().any(|b| b.is_ascii_digit()) && e.bytes().any(|b| b.is_ascii_lowercase())) {
-                continue;
-            }
-            out.push(e);
-        }
-    }
-    out
+/// in text order (repeats kept). A sha needs a digit and a letter. Lazy: a
+/// caller that stops early (a digest whose reserve is full, a heading with
+/// its names) never scans the text for the later classes.
+fn entities(text: &str) -> impl Iterator<Item = &str> {
+    classes().iter().enumerate().flat_map(move |(k, rx)| {
+        rx.find_iter(text)
+            .map(|m| m.as_str())
+            .filter(move |e| CLASSES[k].0 != "sha" || (e.bytes().any(|b| b.is_ascii_digit()) && e.bytes().any(|b| b.is_ascii_lowercase())))
+    })
 }
 
 /// A digest: the entities of `text` not in `skip` (or seen), class by
@@ -266,6 +262,129 @@ pub fn records(seg: &[u8], base: u64) -> Vec<Rec> {
         out.push(Rec { off, vis, text });
     }
     out
+}
+
+/// The most memory [`records_cached`] keeps, its entries' [`parsed_size`]
+/// summed; a range whose own size is over this is parsed and not kept.
+const RECORDS_CACHE_BYTES: usize = 16 << 20;
+
+/// The most ranges [`records_cached`] keeps.
+const RECORDS_CACHE_ENTRIES: usize = 4;
+
+/// How long [`records_cached`] keeps a range nobody asked for again: a
+/// session's old ranges do not wait for four newer ones to push them out.
+const RECORDS_IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// One parsed range.
+#[derive(Debug)]
+struct Parsed {
+    /// Its first byte's offset in the transcript.
+    base: u64,
+    /// Its bytes.
+    seg: Vec<u8>,
+    /// Its records.
+    recs: std::sync::Arc<Vec<Rec>>,
+    /// Its [`parsed_size`].
+    size: usize,
+    /// When it was last asked for.
+    used: std::time::Instant,
+}
+
+/// The memory a parsed range holds, estimated: its bytes, and per record
+/// the struct and the lengths of its two texts (lengths, not the strings'
+/// capacities, and not the allocator's own overhead).
+fn parsed_size(seg: &[u8], recs: &[Rec]) -> usize {
+    seg.len() + recs.iter().map(|r| std::mem::size_of::<Rec>() + r.vis.len() + r.text.len()).sum::<usize>()
+}
+
+/// [`records`] of `seg` (starting at byte `base`), remembered: resolving
+/// several keys of one sub-segment (a link's listing, then each group it
+/// lists) reads the same bytes each time, and parsing them (a JSON parse,
+/// the redaction and a hash per record) is the cost of a reply. An entry
+/// is found by its offset and its bytes, compared whole, so a transcript
+/// that changed under a key is parsed again; [`records`] reads nothing
+/// else that can change while the process runs (its denylist is read
+/// once). The newest few ranges are kept, bytes and parse together up to
+/// [`RECORDS_CACHE_BYTES`]; a range not asked for in [`RECORDS_IDLE`] is
+/// dropped at the next lookup. (No timer thread drops it sooner: a server
+/// that never resolves another chain key keeps at most the budget.)
+fn records_cached(seg: Vec<u8>, base: u64) -> std::sync::Arc<Vec<Rec>> {
+    static CACHE: std::sync::Mutex<Vec<Parsed>> = std::sync::Mutex::new(Vec::new());
+    records_in(&CACHE, seg, base, RECORDS_CACHE_BYTES)
+}
+
+/// Drops the entries of `cache` last used `idle` or longer before `now`.
+fn drop_idle(cache: &std::sync::Mutex<Vec<Parsed>>, now: std::time::Instant, idle: std::time::Duration) {
+    let mut c = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    c.retain(|e| now.saturating_duration_since(e.used) < idle);
+}
+
+/// [`records_cached`] over the cache `cache`, keeping at most `budget`.
+fn records_in(cache: &std::sync::Mutex<Vec<Parsed>>, seg: Vec<u8>, base: u64, budget: usize) -> std::sync::Arc<Vec<Rec>> {
+    drop_idle(cache, std::time::Instant::now(), RECORDS_IDLE);
+    let lock = || cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let mut c = lock();
+        if let Some(i) = c.iter().position(|e| e.base == base && e.seg == seg) {
+            let mut e = c.remove(i);
+            e.used = std::time::Instant::now();
+            let recs = e.recs.clone();
+            c.insert(0, e);
+            return recs;
+        }
+    }
+    // Parsed outside the lock: another thread's lookup does not wait on it.
+    let recs = std::sync::Arc::new(records(&seg, base));
+    let size = parsed_size(&seg, &recs);
+    if size <= budget {
+        let mut c = lock();
+        c.insert(0, Parsed { base, seg, recs: recs.clone(), size, used: std::time::Instant::now() });
+        let mut kept = 0;
+        let n = c.iter().take(RECORDS_CACHE_ENTRIES).take_while(|e| {
+            kept += e.size;
+            kept <= budget
+        });
+        let n = n.count();
+        c.truncate(n);
+    }
+    recs
+}
+
+/// The most group replies [`remember_reply`] keeps.
+const REPLIES_KEPT: usize = 32;
+
+/// One remembered group reply: the parsed range it was built from (held
+/// weakly, so the memo never keeps records alive), its key, the reply.
+type Remembered = (std::sync::Weak<Vec<Rec>>, String, Reply);
+
+fn replies() -> std::sync::MutexGuard<'static, Vec<Remembered>> {
+    static REPLIES: std::sync::Mutex<Vec<Remembered>> = std::sync::Mutex::new(Vec::new());
+    REPLIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The reply to group key `key` already built from `recs`, the very
+/// parse [`records_cached`] handed out (so the same transcript bytes): a
+/// group's reply is a function of its key and those records alone, and its
+/// digest (every entity class run over the group's later pieces) is the
+/// cost of building it. Asked again, as a card's groups are, it is found
+/// here.
+fn remembered_reply(recs: &std::sync::Arc<Vec<Rec>>, key: &str) -> Option<Reply> {
+    let mut m = replies();
+    let i = m.iter().position(|(w, k, _)| k == key && std::ptr::eq(w.as_ptr(), std::sync::Arc::as_ptr(recs)))?;
+    let e = m.remove(i);
+    let r = e.2.clone();
+    m.insert(0, e);
+    Some(r)
+}
+
+/// Keeps `r`, the reply to `key` built from `recs`, for
+/// [`remembered_reply`]: the newest [`REPLIES_KEPT`], dropping any whose
+/// records are gone.
+fn remember_reply(recs: &std::sync::Arc<Vec<Rec>>, key: &str, r: &Reply) {
+    let mut m = replies();
+    m.retain(|(w, _, _)| w.strong_count() > 0);
+    m.insert(0, (std::sync::Arc::downgrade(recs), key.to_string(), r.clone()));
+    m.truncate(REPLIES_KEPT);
 }
 
 // ---- pieces and groups
@@ -1010,7 +1129,7 @@ pub fn resolve_parts(dir: &Path, key: &str) -> std::result::Result<Reply, Miss> 
 fn reply_in(path: &Path, key: &str, k: &Key, s8: &str) -> std::result::Result<Reply, Miss> {
     let len = std::fs::metadata(path).map_err(|_| unreadable(key))?.len();
     let ls = links(path, s8, len).ok_or_else(|| unreadable(key))?;
-    let recs_of = |from: u64, to: u64| read_range(path, from, to).map(|b| records(&b, from)).ok_or_else(|| unreadable(key));
+    let recs_of = |from: u64, to: u64| read_range(path, from, to).map(|b| records_cached(b, from)).ok_or_else(|| unreadable(key));
     let out = match k.clone() {
         Key::Link { off, hash, .. } => {
             let i = ls.iter().position(|l| l.off == off).ok_or_else(|| dangling(key, "no link starts there"))?;
@@ -1036,6 +1155,9 @@ fn reply_in(path: &Path, key: &str, k: &Key, s8: &str) -> std::result::Result<Re
                 return Err(dangling(key, "the range leaves its sub-segment"));
             }
             let recs = recs_of(from, to)?;
+            if let Some(r) = remembered_reply(&recs, key) {
+                return Ok(r);
+            }
             let (i, j) = (recs.iter().position(|r| r.off == a), recs.iter().position(|r| r.off == b));
             let (Some(i), Some(j)) = (i, j) else { return Err(dangling(key, "no record starts at an end of the range")) };
             let rs = &recs[i..=j];
@@ -1045,7 +1167,9 @@ fn reply_in(path: &Path, key: &str, k: &Key, s8: &str) -> std::result::Result<Re
             let ps = pieces(s8, rs);
             let head = group_head(key, &ps);
             let (body, d) = group_body(&ps);
-            Reply { digest: d.map(|r| r.start + head.len()..r.end + head.len()), text: head + &body }
+            let r = Reply { digest: d.map(|r| r.start + head.len()..r.end + head.len()), text: head + &body };
+            remember_reply(&recs, key, &r);
+            r
         }
         Key::Part { off, k, hash, .. } => {
             let (from, to) = sub_segment(&ls, off, len);
@@ -1266,14 +1390,22 @@ mod tests {
     /// shas (digest entities), so a group's digest fills its reserve.
     fn full_record(i: usize) -> String {
         let mut t = format!("record {i} src/rec_{i}.rs\n");
+        // `est` of the text so far, kept as it grows: `t` always ends in a
+        // space or a newline and each word comes whole with its space, so
+        // the estimate adds up word by word (checked at the end).
+        let mut n = est(&t);
         let mut k = 0usize;
-        while est(&t) + 1 + 6 < ROOM - 1 {
-            t.push_str(&format!("{:07x}a ", i * 100_000 + k));
+        while n + 1 + 6 < ROOM - 1 {
+            let w = format!("{:07x}a ", i * 100_000 + k);
+            n += est(&w);
+            t.push_str(&w);
             k += 1;
             if k.is_multiple_of(16) {
                 t.push('\n');
+                n += 1;
             }
         }
+        assert_eq!(n, est(&t));
         t
     }
 
@@ -1283,6 +1415,59 @@ mod tests {
         v.push(boundary(&ts(51)));
         v.push(user("the head: src/after.rs", &ts(52)));
         v
+    }
+
+    #[test]
+    fn a_range_is_parsed_once_until_its_bytes_change() {
+        let cache = std::sync::Mutex::new(Vec::new());
+        let one = [user("one: src/cache_one.rs", &ts(0)), user("two: src/cache_two.rs", &ts(1))].join("\n") + "\n";
+        let all = RECORDS_CACHE_BYTES;
+        let a = records_in(&cache, one.clone().into_bytes(), 0, all);
+        let b = records_in(&cache, one.clone().into_bytes(), 0, all);
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "the same bytes are not parsed again");
+        assert_eq!(a.len(), 2);
+        // The same offset with other bytes (a transcript rewritten), or the
+        // same bytes at another offset, is parsed again.
+        let other = one.replace("cache_two", "cache_new");
+        let c = records_in(&cache, other.into_bytes(), 0, all);
+        assert!(!std::sync::Arc::ptr_eq(&a, &c) && c[1].vis.contains("cache_new"));
+        let d = records_in(&cache, one.clone().into_bytes(), 7, all);
+        assert!(!std::sync::Arc::ptr_eq(&a, &d) && d[0].off == 7);
+        // At most RECORDS_CACHE_ENTRIES ranges are kept, the newest first.
+        for i in 0..RECORDS_CACHE_ENTRIES as u64 + 2 {
+            records_in(&cache, one.clone().into_bytes(), 100 + i, all);
+        }
+        let c = cache.lock().unwrap();
+        assert_eq!(c.len(), RECORDS_CACHE_ENTRIES);
+        assert_eq!(c[0].base, 100 + RECORDS_CACHE_ENTRIES as u64 + 1);
+    }
+
+    #[test]
+    fn the_records_cache_holds_its_budget_parse_included() {
+        let cache = std::sync::Mutex::new(Vec::new());
+        let one = [user("one: src/budget_one.rs", &ts(0)), user("two: src/budget_two.rs", &ts(1))].join("\n") + "\n";
+        let size = parsed_size(one.as_bytes(), &records(one.as_bytes(), 0));
+        // The parse is counted, not only the bytes.
+        assert!(size > one.len() + 2 * std::mem::size_of::<Rec>(), "{size} for {} bytes", one.len());
+        let used = |c: &std::sync::Mutex<Vec<Parsed>>| c.lock().unwrap().iter().map(|e| e.size).sum::<usize>();
+        // A budget of two and a half entries keeps two, whose bytes alone
+        // would have let three in.
+        let budget = size * 5 / 2;
+        assert!(3 * one.len() <= budget);
+        for i in 0..4 {
+            records_in(&cache, one.clone().into_bytes(), i, budget);
+            assert!(used(&cache) <= budget, "{} over {budget}", used(&cache));
+        }
+        assert_eq!(cache.lock().unwrap().iter().map(|e| e.base).collect::<Vec<_>>(), [3, 2]);
+        // A range over the whole budget is parsed and not kept.
+        let r = records_in(&cache, one.clone().into_bytes(), 9, size - 1);
+        assert_eq!(r.len(), 2);
+        assert!(cache.lock().unwrap().iter().all(|e| e.base != 9));
+        // An entry not asked for in RECORDS_IDLE is dropped; a newer one stays.
+        let later = cache.lock().unwrap()[1].used + RECORDS_IDLE;
+        cache.lock().unwrap()[0].used = later;
+        drop_idle(&cache, later, RECORDS_IDLE);
+        assert_eq!(cache.lock().unwrap().iter().map(|e| e.base).collect::<Vec<_>>(), [3]);
     }
 
     #[test]

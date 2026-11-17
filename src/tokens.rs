@@ -45,12 +45,17 @@
 //! spent. With no calibration, or too little pre-atlas history, those
 //! tools are credited nothing (#218).
 //!
-//! Separately, each subagent start logs the "brief without atlas": the
-//! bytes of the rulebook a brief would otherwise tell the agent to read in
-//! full, at that moment (`brief_log`, see [`log_brief`]). It is reported on
-//! its own line, per agent ([`brief_report`]), beside the hooks' injections
-//! per agent ([`inject_report`]) and the two on the agents both tables hold
-//! ([`brief_vs_inject`]), and never enters a per-answer ratio.
+//! Separately, the "brief without atlas": what an agent spent reading the
+//! rulebook before atlas, measured from the calibration's pre-atlas
+//! subagent transcripts ([`brief_measured`], #219): the bytes of their
+//! `Read` calls of the rulebook over every such transcript. Agents never
+//! read it whole, so its size is not the yardstick. Each subagent start
+//! still logs the rulebook's size at that moment (`brief_log`, see
+//! [`log_brief`]): the agents counted ([`brief_report`]) and an "if read
+//! whole" line. The measured read is reported per agent, beside the hooks'
+//! injections (main sessions per prompt, subagents per agent,
+//! [`inject_report`], #212) and against them on the agents both tables hold
+//! ([`brief_vs_inject`]); it never enters a per-answer ratio.
 //!
 //! Bytes become tokens by one ratio, `bytes_per_token` in the configuration
 //! (default [`DEFAULT_BYTES_PER_TOKEN`]). The ratio is recalibrated by a
@@ -66,7 +71,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::Result;
 
@@ -119,7 +124,8 @@ pub fn lookup_cap(conn: &Connection) -> Result<Option<i64>> {
 /// The SQL expression for one `token_log` row's credited counterfactual in
 /// bytes (0 for a row without one): `grep + read`, capped at `cap` for the
 /// [`CAPPED`] tools, and 0 for them with no cap; 0 for `route:Read` (the
-/// ledger cannot see the reads that follow it, #216); and at most
+/// ledger cannot see the reads that follow it, #216: the report adds its
+/// judged credit, [`read_credit`]); and at most
 /// [`SHOWN_CHARS`] bytes for any other `route:*` row (#215: a row logged
 /// before the cap holds the whole output's bytes, and the first 30,000
 /// characters are at least 30,000 bytes, so this errs low). A
@@ -144,7 +150,11 @@ CREATE TABLE IF NOT EXISTS token_log(
     tool TEXT NOT NULL,
     returned INTEGER NOT NULL,
     grep INTEGER,
-    read INTEGER
+    read INTEGER,
+    session TEXT,
+    transcript TEXT,
+    path TEXT,
+    tool_use TEXT
 );
 CREATE INDEX IF NOT EXISTS token_log_day ON token_log(day, tool);
 CREATE TABLE IF NOT EXISTS hook_inject(
@@ -623,8 +633,11 @@ pub fn record_read(mem: &crate::memory::MemoryStore, key: &str) -> usize {
     total
 }
 
-/// Logs one "brief without atlas" row: a subagent started, and reading the
-/// rulebook in full would have cost `bytes` at that moment.
+/// Logs one `brief_log` row: a subagent started, and reading the rulebook
+/// whole would have cost `bytes` at that moment. The report counts agents by
+/// these rows and keeps their sum as "if read whole"; what the brief
+/// without atlas costs is measured from pre-atlas reads
+/// ([`brief_measured`]).
 ///
 /// # Errors
 ///
@@ -638,8 +651,10 @@ pub fn log_brief(conn: &Connection, session: &str, agent: &str, bytes: u64) -> R
     })
 }
 
-/// The "brief without atlas" totals, per agent: the agents that started,
-/// and the tokens reading the rulebook in full once each would have cost.
+/// The `brief_log` totals, per agent: the agents that started, and the
+/// tokens reading the rulebook whole once each would have cost (the "if
+/// read whole" line, not a measurement: agents read parts of it, #219; the
+/// measured figure is [`brief_measured`]).
 ///
 /// The unit is the agent (a distinct session and agent id), and each agent
 /// reads the rulebook once, as it was at the agent's first start. Claude
@@ -658,8 +673,8 @@ pub struct BriefRow {
     /// `SubagentStart` rows logged: the first start of each agent and every
     /// resume after it.
     pub starts: i64,
-    /// Tokens, summed over the agents: the rulebook at each one's first
-    /// start.
+    /// Tokens, summed over the agents: the rulebook's size at each one's
+    /// first start ("if read whole").
     pub tokens: f64,
     /// The latest start's rulebook, in tokens.
     pub latest: f64,
@@ -682,8 +697,8 @@ impl BriefRow {
 /// Each agent's first start in `brief_log`: (session, agent, bytes).
 const FIRST_BRIEF: &str = "SELECT b.session, b.agent, b.bytes FROM brief_log b JOIN (SELECT MIN(id) AS id FROM brief_log GROUP BY session, agent) f ON b.id = f.id";
 
-/// The "brief without atlas" totals ([`BriefRow`], per agent), or `None`
-/// when none are logged.
+/// The `brief_log` totals ([`BriefRow`], per agent), or `None` when none
+/// are logged.
 ///
 /// # Errors
 ///
@@ -700,54 +715,185 @@ pub fn brief_report(conn: &Connection, bytes_per_token: f64) -> Result<Option<Br
     Ok(Some(BriefRow { agents, starts, tokens: sum.unwrap_or(0) as f64 / bytes_per_token, latest: latest as f64 / bytes_per_token }))
 }
 
-/// The brief and the injections on the same agents: those with a row in
-/// both `brief_log` and `hook_inject` (a main session logs no brief, and a
-/// subagent the hooks never injected into has no injection).
+/// The rulebook as agents read it before atlas (#219): measured from the
+/// calibration's pre-atlas transcripts, never from the file's size.
 #[derive(Debug, Clone, PartialEq)]
-pub struct MatchRow {
-    /// Agents in both tables.
-    pub agents: i64,
-    /// The rulebook at their first starts, in tokens, summed.
-    pub rulebook: f64,
-    /// What the hooks injected into them, in tokens, summed.
-    pub injected: f64,
+pub struct BriefMeasure {
+    /// Tokens per pre-atlas subagent: the reads' bytes over every
+    /// transcript, readers and non-readers alike.
+    pub per_agent: f64,
+    /// `Read` calls of the rulebook counted.
+    pub reads: i64,
+    /// Transcripts with at least one of them.
+    pub readers: i64,
+    /// Pre-atlas subagent transcripts: the denominator.
+    pub transcripts: i64,
+    /// The calibration's cutoff (the first atlas call).
+    pub cutoff: String,
 }
 
-impl MatchRow {
-    /// Rulebook tokens per injected token, or 0 with nothing injected.
-    #[must_use]
-    pub fn ratio(&self) -> f64 {
-        if self.injected > 0.0 {
-            self.rulebook / self.injected
-        } else {
-            0.0
+/// A path's text as the rulebook match compares it: backslashes made
+/// slashes, `.` and `..` folded, repeated slashes merged and ASCII case
+/// folded. Only the text is compared; no file is opened.
+fn path_key(p: &str) -> String {
+    let p = p.replace('\\', "/").to_ascii_lowercase();
+    let absolute = p.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                // Never above a drive or the root.
+                if parts.last().is_some_and(|l| !l.ends_with(':')) {
+                    parts.pop();
+                }
+            }
+            c => parts.push(c),
         }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
     }
 }
 
-/// [`MatchRow`]: the brief against the injections on the agents both
-/// tables hold, or `None` when no agent is in both.
+/// Whether a path's text is absolute: a leading slash or a drive letter.
+fn is_absolute_text(p: &str) -> bool {
+    let b = p.as_bytes();
+    p.starts_with('/') || p.starts_with('\\') || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+}
+
+/// The "brief without atlas" as measured (#219), or `None` when there is no
+/// calibration, no pre-atlas subagent transcript or no read of the
+/// rulebook among them.
+///
+/// The denominator is every pre-atlas subagent transcript, one per agent:
+/// a `calibrate_files` row whose path has a `subagents` folder and that
+/// holds at least one call before the `calibrate_state` cutoff. Main
+/// sessions are left out. The numerator is the bytes of the `Read` calls
+/// in those transcripts, before the cutoff, whose `file_path` is
+/// `reference`: slashes normalised, case folded, and a relative path joined
+/// to the call's working folder ([`path_key`]). The path text is matched;
+/// the file is never opened. A read: no table is made.
 ///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn brief_vs_inject(conn: &Connection, bytes_per_token: f64) -> Result<Option<MatchRow>> {
+pub fn brief_measured(conn: &Connection, reference: &Path, bytes_per_token: f64) -> Result<Option<BriefMeasure>> {
+    let has: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'calibrate_state')", [], |r| r.get(0))?;
+    if !has {
+        return Ok(None);
+    }
+    let cutoff: Option<String> = conn.query_row("SELECT cutoff FROM calibrate_state WHERE id = 1", [], |r| r.get(0)).optional()?;
+    let Some(cutoff) = cutoff else { return Ok(None) };
+    let subagent = |f: &str| f.replace('\\', "/").split('/').any(|c| c == "subagents");
+    let mut st = conn.prepare(
+        "SELECT f.file FROM calibrate_files f WHERE EXISTS(SELECT 1 FROM calibrate_calls c WHERE c.file = f.file AND c.time < ?1)",
+    )?;
+    let files: Vec<String> = st.query_map([&cutoff], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let files: std::collections::BTreeSet<String> = files.into_iter().filter(|f| subagent(f)).collect();
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let want = path_key(&reference.to_string_lossy());
+    let mut st = conn.prepare("SELECT file, cwd, input, bytes FROM calibrate_calls WHERE name = 'Read' AND time < ?1")?;
+    let rows = st.query_map([&cutoff], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i64>(3)?))
+    })?;
+    let (mut reads, mut bytes) = (0i64, 0i64);
+    let mut readers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in rows {
+        let (file, cwd, input, b) = row?;
+        if !files.contains(&file) {
+            continue;
+        }
+        let Some(path) = input
+            .as_deref()
+            .and_then(|i| crate::json::parse(i).ok())
+            .and_then(|v| v.get("file_path").and_then(crate::json::Value::as_str).map(str::to_string))
+        else {
+            continue;
+        };
+        let full = if is_absolute_text(&path) { path } else { format!("{cwd}/{path}") };
+        if path_key(&full) == want {
+            reads += 1;
+            bytes += b;
+            readers.insert(file);
+        }
+    }
+    if reads == 0 {
+        return Ok(None);
+    }
+    Ok(Some(BriefMeasure {
+        per_agent: bytes as f64 / bytes_per_token / files.len() as f64,
+        reads,
+        readers: readers.len() as i64,
+        transcripts: files.len() as i64,
+        cutoff,
+    }))
+}
+
+/// The brief and the injections on the same agents: those with a row in
+/// both `brief_log` and `hook_inject` (a main session logs no brief, and a
+/// subagent the hooks never injected into has no injection). The rulebook
+/// is the measured pre-atlas read ([`brief_measured`], #219) per agent; its
+/// file size is kept as `whole`, "if read whole", and is never a saving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchRow {
+    /// Agents in both tables.
+    pub agents: i64,
+    /// The rulebook as read before atlas, in tokens: the agents times the
+    /// measured per-agent read, or `None` when not measured.
+    pub rulebook: Option<f64>,
+    /// The rulebook's size at their first starts, in tokens, summed: what
+    /// reading it whole once each would have cost, not a measurement.
+    pub whole: f64,
+    /// What the hooks injected into them, in tokens, summed.
+    pub injected: f64,
+    /// Of that, what `SubagentStart` injected: the injections that stand in
+    /// for the rulebook.
+    pub start: f64,
+}
+
+impl MatchRow {
+    /// Measured rulebook tokens per injected token: `None` when not
+    /// measured or nothing was injected.
+    #[must_use]
+    pub fn ratio(&self) -> Option<f64> {
+        self.rulebook.filter(|_| self.injected > 0.0).map(|r| r / self.injected)
+    }
+}
+
+/// [`MatchRow`]: the brief against the injections on the agents both
+/// tables hold, or `None` when no agent is in both. `measured` is the
+/// per-agent pre-atlas read ([`brief_measured`]).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn brief_vs_inject(conn: &Connection, bytes_per_token: f64, measured: Option<&BriefMeasure>) -> Result<Option<MatchRow>> {
     conn.execute_batch(TOKEN_TABLE)?;
-    let (agents, rulebook, injected): (i64, Option<i64>, Option<i64>) = conn.query_row(
+    let (agents, whole, injected, start): (i64, Option<i64>, Option<i64>, Option<i64>) = conn.query_row(
         &format!(
-            "SELECT COUNT(*), SUM(f.bytes), SUM(i.bytes) FROM ({FIRST_BRIEF}) f
-             JOIN (SELECT session, agent, SUM(bytes) AS bytes FROM hook_inject GROUP BY session, agent) i ON i.session = f.session AND i.agent = f.agent"
+            "SELECT COUNT(*), SUM(f.bytes), SUM(i.bytes), SUM(i.start) FROM ({FIRST_BRIEF}) f
+             JOIN (SELECT session, agent, SUM(bytes) AS bytes, SUM(CASE WHEN hook = 'SubagentStart' THEN bytes ELSE 0 END) AS start
+                   FROM hook_inject GROUP BY session, agent) i ON i.session = f.session AND i.agent = f.agent"
         ),
         [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     if agents == 0 {
         return Ok(None);
     }
     Ok(Some(MatchRow {
         agents,
-        rulebook: rulebook.unwrap_or(0) as f64 / bytes_per_token,
+        rulebook: measured.map(|m| m.per_agent * agents as f64),
+        whole: whole.unwrap_or(0) as f64 / bytes_per_token,
         injected: injected.unwrap_or(0) as f64 / bytes_per_token,
+        start: start.unwrap_or(0) as f64 / bytes_per_token,
     }))
 }
 
@@ -781,6 +927,333 @@ fn log(conn: &Connection, r: &Record, cf: Option<Counterfactual>) -> Result<()> 
         ])?;
         Ok(())
     })
+}
+
+/// Where a routed Read was read (E4, journal:ATLAS-EFFICIENCY:0006): what
+/// the report needs to subtract the same agent's later Reads of the file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadAt<'a> {
+    /// The session id.
+    pub session: &'a str,
+    /// The transcript holding the Read: a subagent's own, else the session's.
+    pub transcript: &'a str,
+    /// The file read.
+    pub path: &'a str,
+    /// The Read's tool call id (empty when the hook was not told it).
+    pub tool_use: &'a str,
+}
+
+/// Logs a routed Read: the digest returned, the output it replaced (as
+/// `read`, `grep` NULL like the hook rows: [`credit_sql`] credits it 0 and
+/// its bytes stay out of the comparable ratio, since its credit is added
+/// outside the SQL) and where it was read ([`ReadAt`]). The report credits
+/// it by [`read_credit`].
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn log_read(conn: &Connection, returned: usize, replaced: usize, at: &ReadAt) -> Result<()> {
+    let time = crate::store::utc(SystemTime::now());
+    let day = time.get(..10).unwrap_or("").to_string();
+    crate::store::guarded(conn, || {
+        let insert = || {
+            conn.prepare_cached(
+                "INSERT INTO token_log(time, day, tool, returned, grep, read, session, transcript, path, tool_use) VALUES(?1, ?2, 'route:Read', ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+            )?
+            .execute(params![time, day, returned as i64, replaced as i64, at.session, at.transcript, at.path, at.tool_use])
+        };
+        // A store from before E4 lacks the columns, so the insert fails to
+        // prepare: they are added here, under the write lock (an ALTER is a
+        // schema change), its rows kept with the new columns NULL, and the
+        // row inserted again. A migrated store pays no extra statement.
+        if insert().is_err() {
+            add_read_columns(conn)?;
+            insert()?;
+        }
+        Ok(())
+    })
+}
+
+/// The columns [`log_read`] adds to a `token_log` made before E4.
+const READ_COLUMNS: [&str; 4] = ["session", "transcript", "path", "tool_use"];
+
+/// Adds the [`READ_COLUMNS`] a `token_log` lacks (none when it has them, so
+/// running it twice is harmless). The caller holds the write lock.
+fn add_read_columns(conn: &Connection) -> Result<()> {
+    let have = read_columns(conn)?;
+    for c in READ_COLUMNS {
+        if !have.iter().any(|h| h == c) {
+            conn.execute_batch(&format!("ALTER TABLE token_log ADD COLUMN {c} TEXT"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The columns `token_log` has (a read).
+fn read_columns(conn: &Connection) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare("SELECT name FROM pragma_table_info('token_log')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// A file path as transcripts and the ledger compare it: `/` separators,
+/// and case-folded on Windows.
+fn read_path_key(p: &str) -> String {
+    let s = p.trim().replace('\\', "/");
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// One `Read` call in a transcript: its id, file, time and result bytes.
+struct ReadUse {
+    id: String,
+    path: String,
+    time: String,
+    bytes: i64,
+}
+
+/// The `Read` calls of a transcript in order, with their results' bytes
+/// (the text as stored), or `None` when it cannot be read.
+fn transcript_reads(path: &Path) -> Option<Vec<ReadUse>> {
+    use crate::json::Value;
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut uses: Vec<ReadUse> = Vec::new();
+    let mut results: HashMap<String, i64> = HashMap::new();
+    for line in text.lines() {
+        if !line.contains("\"tool_use\"") && !line.contains("\"tool_result\"") {
+            continue;
+        }
+        let Ok(v) = crate::json::parse(line) else { continue };
+        let time = v.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        let Some(Value::Array(items)) = v.pointer("/message/content") else { continue };
+        for x in items {
+            match x.get("type").and_then(Value::as_str) {
+                Some("tool_use") if x.get("name").and_then(Value::as_str) == Some("Read") => {
+                    let file = x.pointer("/input/file_path").and_then(Value::as_str).unwrap_or("");
+                    let id = x.get("id").and_then(Value::as_str).unwrap_or("");
+                    uses.push(ReadUse { id: id.to_string(), path: read_path_key(file), time: time.to_string(), bytes: 0 });
+                }
+                Some("tool_result") => {
+                    let id = x.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                    let n = match x.get("content") {
+                        Some(Value::String(s)) => s.len(),
+                        Some(Value::Array(a)) => a.iter().filter_map(|c| c.get("text").and_then(Value::as_str)).map(str::len).sum(),
+                        _ => 0,
+                    };
+                    results.insert(id.to_string(), n as i64);
+                }
+                _ => {}
+            }
+        }
+    }
+    for u in &mut uses {
+        u.bytes = results.get(&u.id).copied().unwrap_or(0);
+    }
+    Some(uses)
+}
+
+/// The judged credit of the `route:Read` rows (E4).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReadCredit {
+    /// Rows logged with a session, transcript and path.
+    pub judged: i64,
+    /// Rows logged before E4 (no place columns): credited 0.
+    pub unjudged: i64,
+    /// Rows logged since E4 without a session, transcript or path (the hook
+    /// was not told them): credited 0.
+    pub unplaced: i64,
+    /// Judged rows whose transcript could not be read: credited 0.
+    pub missing: i64,
+    /// Judged rows whose stored verdict was used (their transcript not read).
+    pub stored: i64,
+    /// Transcripts read and parsed by this run.
+    pub parsed: i64,
+    /// Bytes the judged rows (transcript read) replaced.
+    pub replaced: i64,
+    /// Bytes of later Reads of the same file in the same transcript,
+    /// subtracted (at most each row's replaced bytes).
+    pub reread: i64,
+    /// Bytes credited: replaced less reread.
+    pub credit: i64,
+    /// Credit bytes by (`route:Read`, day), for [`add_hook_credit`].
+    pub by: std::collections::BTreeMap<(String, String), i64>,
+}
+
+/// How long a transcript must stay untouched before its rows' verdicts are
+/// stored: after that its session is taken as ended, so no later Read can
+/// change them, and the verdict outlives the transcript (Claude Code deletes
+/// old ones).
+pub const SETTLED: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// The stored verdicts: each settled `route:Read` row's re-read bytes, by
+/// its `token_log` id.
+const VERDICT_TABLE: &str = "CREATE TABLE IF NOT EXISTS read_verdict(id INTEGER PRIMARY KEY, reread INTEGER NOT NULL)";
+
+/// The judged credit of the `route:Read` rows: each row with a session,
+/// transcript and path is credited the output it replaced less the bytes of
+/// the later Reads of the same file in the same transcript (E3's method);
+/// every other row 0. A row whose transcript has been still for
+/// [`SETTLED`] has its verdict stored and is never judged again.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn read_credit(conn: &Connection) -> Result<ReadCredit> {
+    read_credit_at(conn, SystemTime::now(), SETTLED)
+}
+
+/// A `route:Read` row waiting for its verdict.
+struct Pending {
+    id: i64,
+    time: String,
+    day: String,
+    replaced: i64,
+    path: String,
+    tool_use: String,
+}
+
+/// [`read_credit`] as of `now`, storing the verdicts of transcripts still
+/// for `settled`.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn read_credit_at(conn: &Connection, now: SystemTime, settled: std::time::Duration) -> Result<ReadCredit> {
+    let mut c = ReadCredit::default();
+    let cols = read_columns(conn)?;
+    if cols.is_empty() {
+        return Ok(c);
+    }
+    // A store from before E4 has none of the columns: every row is old.
+    if !READ_COLUMNS.iter().all(|k| cols.iter().any(|h| h == k)) {
+        c.unjudged = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'route:Read'", [], |r| r.get(0))?;
+        return Ok(c);
+    }
+    conn.execute_batch(VERDICT_TABLE)?;
+    type Row = (i64, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>);
+    let rows: Vec<Row> = conn
+        .prepare(
+            "SELECT t.id, t.time, t.day, ifnull(t.read, 0), t.session, t.transcript, t.path, t.tool_use, v.reread \
+             FROM token_log t LEFT JOIN read_verdict v ON v.id = t.id WHERE t.tool = 'route:Read' ORDER BY t.id",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let credit = |c: &mut ReadCredit, day: String, replaced: i64, reread: i64| {
+        c.replaced += replaced;
+        c.reread += reread;
+        c.credit += replaced - reread;
+        *c.by.entry(("route:Read".to_string(), day)).or_default() += replaced - reread;
+    };
+    // The rows still to judge, by transcript: each transcript is read once.
+    let mut open: std::collections::BTreeMap<String, Vec<Pending>> = std::collections::BTreeMap::new();
+    for (id, time, day, replaced, session, transcript, path, tool_use, stored) in rows {
+        let (Some(session), Some(transcript), Some(path)) = (session, transcript, path) else {
+            c.unjudged += 1;
+            continue;
+        };
+        if session.is_empty() || transcript.is_empty() || path.is_empty() {
+            c.unplaced += 1;
+            continue;
+        }
+        c.judged += 1;
+        if let Some(reread) = stored {
+            c.stored += 1;
+            credit(&mut c, day, replaced, reread);
+            continue;
+        }
+        open.entry(transcript).or_default().push(Pending {
+            id,
+            time,
+            day,
+            replaced,
+            path: read_path_key(&path),
+            tool_use: tool_use.unwrap_or_default(),
+        });
+    }
+    let mut verdicts: Vec<(i64, i64)> = Vec::new();
+    for (transcript, rows) in open {
+        let p = Path::new(&transcript);
+        let still = std::fs::metadata(p)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|d| d >= settled);
+        let Some(uses) = transcript_reads(p) else {
+            c.missing += rows.len() as i64;
+            continue;
+        };
+        c.parsed += 1;
+        for (row, reread) in rows.iter().zip(judge(&rows, &uses)) {
+            credit(&mut c, row.day.clone(), row.replaced, reread);
+            if still {
+                verdicts.push((row.id, reread));
+            }
+        }
+    }
+    if !verdicts.is_empty() {
+        crate::store::guarded(conn, || {
+            let mut st = conn.prepare_cached("INSERT OR IGNORE INTO read_verdict(id, reread) VALUES(?1, ?2)")?;
+            for (id, reread) in &verdicts {
+                st.execute(params![id, reread])?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(c)
+}
+
+/// The re-read bytes of each routed row of one transcript (in `rows`
+/// order). Each row's own call is found by its id, else (no id) as the
+/// first Read of its file in the row's second (the call comes before the
+/// hook logs its row, and a re-read after it), else the last Read of the
+/// file before that second. Every other Read of a
+/// file is subtracted once, from the routed row of that file just before
+/// it, and each row's total is capped at what it replaced. A Read before
+/// every routed row of its file subtracts nothing.
+///
+/// Known limit: a re-read is counted at the result bytes the transcript
+/// stores, which carry the Read tool's line-number prefixes, while
+/// `replaced` is the file's own bytes; a full re-read so subtracts a few
+/// bytes a line more than it read back (the cap keeps it at most the row's
+/// replaced bytes, so the credit errs low).
+fn judge(rows: &[Pending], uses: &[ReadUse]) -> Vec<i64> {
+    // Seconds compared as text: `YYYY-MM-DDTHH:MM:SS` on both sides (the
+    // transcript adds milliseconds, the row does not).
+    let sec = |t: &str| t.get(..19).unwrap_or(t).to_string();
+    let at: Vec<Option<usize>> = rows
+        .iter()
+        .map(|r| {
+            let by_id = (!r.tool_use.is_empty()).then(|| uses.iter().position(|u| u.id == r.tool_use)).flatten();
+            let s = sec(&r.time);
+            by_id.or_else(|| {
+                uses.iter()
+                    .position(|u| u.path == r.path && sec(&u.time) == s)
+                    .or_else(|| uses.iter().rposition(|u| u.path == r.path && sec(&u.time) < s))
+            })
+        })
+        .collect();
+    let mut later = vec![0i64; rows.len()];
+    for (j, u) in uses.iter().enumerate() {
+        if at.contains(&Some(j)) {
+            continue;
+        }
+        // The routed row of this file whose call is the latest before `j`
+        // (a row whose call was not found stands before every Read).
+        let owner = rows
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| r.path == u.path && at[*i].is_none_or(|a| a < j))
+            .max_by_key(|(i, _)| (at[*i].map_or(0, |a| a + 1), *i))
+            .map(|(i, _)| i);
+        if let Some(i) = owner {
+            later[i] += u.bytes;
+        }
+    }
+    rows.iter().zip(later).map(|(r, l)| l.min(r.replaced)).collect()
 }
 
 /// One row of the token report.
@@ -831,6 +1304,34 @@ pub fn report(conn: &Connection, bytes_per_token: f64) -> Result<(Vec<ReportRow>
     Ok((q("tool")?, q("day")?))
 }
 
+/// The ledger credit, in tokens, of the `recall` answers that read records
+/// where they are written (`recall {key}` and `{lane}`, [`record_read`]),
+/// capped as [`report`] caps them. Their rows are the recall rows with no
+/// grep part and a read: a query's counterfactual greps first, and a query
+/// that matched nothing reads nothing. `token_log` records no agent and no
+/// export per answer, so this is every such answer, main sessions and
+/// subagents, any record: an upper bound on what overlaps the measured
+/// rulebook ([`crate::token_cost::Cost::rulebook_overlap`]).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`] on SQLite failure.
+pub fn recall_records_credit(conn: &Connection, bytes_per_token: f64) -> Result<f64> {
+    // A read: no table is made.
+    let has: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'token_log')", [], |r| r.get(0))?;
+    if !has {
+        return Ok(0.0);
+    }
+    let credit = credit_sql(lookup_cap(conn)?);
+    let bytes: i64 = conn.query_row(
+        &format!("SELECT ifnull(SUM({credit}), 0) FROM token_log WHERE tool = 'recall' AND grep = 0 AND read > 0"),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(bytes as f64 / bytes_per_token)
+}
+
 /// Adds the hooks' hit credit ([`crate::hook_hits::HitCredit::by`], bytes by
 /// `hook:<event>` and day) to report rows keyed by tool (`by_day` false) or
 /// by day (`by_day` true), in tokens.
@@ -874,29 +1375,31 @@ pub fn report_days_without(conn: &Connection, bytes_per_token: f64, without: &[&
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// The recall hooks' injections, judged against the "brief without atlas"
-/// row: what the pointers cost in all, per agent that got any, and the
-/// largest one agent got. The unit is the agent, as in [`BriefRow`]: a
-/// distinct session and agent id, so a main session (agent id empty) is
-/// one agent and each of its subagents another.
+/// The recall hooks' injections, main sessions and subagents apart (#212):
+/// a main session (agent id empty) lives for days and many prompts, a
+/// subagent for one task, so one figure per "agent" mixed the two. A main
+/// session is measured per prompt, by the turn rule of
+/// [`crate::token_cost::Turns`]; a subagent per agent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InjectRow {
     /// Keys injected.
     pub keys: i64,
-    /// Agents (main sessions and subagents) injected into.
-    pub agents: i64,
     /// Tokens injected, summed.
     pub tokens: f64,
-    /// The most tokens one agent was injected.
-    pub max_agent: f64,
-}
-
-impl InjectRow {
-    /// Tokens per agent.
-    #[must_use]
-    pub fn per_agent(&self) -> f64 {
-        self.tokens / self.agents.max(1) as f64
-    }
+    /// Main sessions injected into.
+    pub sessions: i64,
+    /// Their prompts, by the turn rule.
+    pub prompts: i64,
+    /// Tokens injected per prompt of a main session.
+    pub per_prompt: crate::token_cost::Spread,
+    /// Subagents injected into.
+    pub subagents: i64,
+    /// Tokens injected per subagent.
+    pub per_agent: crate::token_cost::Spread,
+    /// The most one main session or one subagent received in all, in tokens.
+    pub largest: f64,
+    /// Whether [`InjectRow::largest`] is a main session's.
+    pub largest_main: bool,
 }
 
 /// The hooks' injection totals, or `None` when none are logged.
@@ -906,17 +1409,61 @@ impl InjectRow {
 /// [`crate::Error::Db`].
 pub fn inject_report(conn: &Connection, bytes_per_token: f64) -> Result<Option<InjectRow>> {
     conn.execute_batch(TOKEN_TABLE)?;
-    let (keys, agents, sum): (i64, i64, Option<i64>) =
-        conn.query_row("SELECT COUNT(*), COUNT(DISTINCT session || '/' || agent), SUM(bytes) FROM hook_inject", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let mut st = conn.prepare("SELECT session, agent, time, hook, bytes FROM hook_inject ORDER BY id")?;
+    let rows = st.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?))
+    })?;
+    // Per (session, agent): its rows as (time, hook, bytes).
+    type Rows = Vec<(String, String, i64)>;
+    let mut scopes: std::collections::BTreeMap<(String, String), Rows> = std::collections::BTreeMap::new();
+    let mut keys = 0i64;
+    for row in rows {
+        let (session, agent, time, hook, bytes) = row?;
+        keys += 1;
+        scopes.entry((session, agent)).or_default().push((time, hook, bytes));
+    }
     if keys == 0 {
         return Ok(None);
     }
-    let max: Option<i64> = conn.query_row("SELECT MAX(b) FROM (SELECT SUM(bytes) AS b FROM hook_inject GROUP BY session, agent)", [], |r| r.get(0))?;
+    let tok = |b: i64| b as f64 / bytes_per_token;
+    let (mut per_prompt, mut per_agent) = (Vec::new(), Vec::new());
+    let (mut sessions, mut prompts, mut total) = (0i64, 0i64, 0i64);
+    let (mut largest, mut largest_main) = (0i64, false);
+    for ((_, agent), list) in &scopes {
+        let sum: i64 = list.iter().map(|r| r.2).sum();
+        total += sum;
+        let main = agent.is_empty();
+        // Ties go to the first scope met (sessions sort before their agents).
+        if sum > largest {
+            (largest, largest_main) = (sum, main);
+        }
+        if main {
+            sessions += 1;
+            let turns = crate::token_cost::Turns::of(list.iter().map(|r| (r.0.as_str(), r.1.as_str())));
+            if turns.is_empty() {
+                continue;
+            }
+            prompts += turns.len() as i64;
+            let mut cost = vec![0i64; turns.len()];
+            for (time, _, b) in list {
+                cost[turns.index(time)] += b;
+            }
+            per_prompt.extend(cost.into_iter().map(tok));
+        } else {
+            per_agent.push(tok(sum));
+        }
+    }
+    let per_agent = crate::token_cost::spread(per_agent);
     Ok(Some(InjectRow {
         keys,
-        agents,
-        tokens: sum.unwrap_or(0) as f64 / bytes_per_token,
-        max_agent: max.unwrap_or(0) as f64 / bytes_per_token,
+        tokens: tok(total),
+        sessions,
+        prompts,
+        per_prompt: crate::token_cost::spread(per_prompt),
+        subagents: per_agent.n as i64,
+        per_agent,
+        largest: tok(largest),
+        largest_main,
     }))
 }
 
@@ -1092,7 +1639,7 @@ mod tests {
     fn brief_and_injections_count_agents_and_a_resume_is_not_a_second_read() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(TOKEN_TABLE).unwrap();
-        assert_eq!(brief_vs_inject(&conn, 4.0).unwrap(), None);
+        assert_eq!(brief_vs_inject(&conn, 4.0, None).unwrap(), None);
         // a1: first start at 8000 bytes, then two resumes (the rulebook grew).
         log_brief(&conn, "s", "a1", 8000).unwrap();
         log_brief(&conn, "s", "a1", 8400).unwrap();
@@ -1113,11 +1660,12 @@ mod tests {
         assert_eq!(b, BriefRow { agents: 2, starts: 4, tokens: 5000.0, latest: 3000.0 });
         assert_eq!((b.per_agent(), b.resumes()), (2500.0, 2));
         let i = inject_report(&conn, 4.0).unwrap().unwrap();
-        assert_eq!((i.keys, i.agents, i.tokens, i.max_agent, i.per_agent()), (3, 2, 1200.0, 1000.0, 600.0));
+        assert_eq!((i.keys, i.sessions, i.subagents, i.tokens, i.largest, i.largest_main), (3, 1, 1, 1200.0, 1000.0, true));
         // Only a1 is in both: a2 got no injection, the main session no brief.
-        let m = brief_vs_inject(&conn, 4.0).unwrap().unwrap();
-        assert_eq!(m, MatchRow { agents: 1, rulebook: 2000.0, injected: 200.0 });
-        assert_eq!(m.ratio(), 10.0);
+        // Not measured (#219): the file size is kept as `whole`, no ratio.
+        let m = brief_vs_inject(&conn, 4.0, None).unwrap().unwrap();
+        assert_eq!(m, MatchRow { agents: 1, rulebook: None, whole: 2000.0, injected: 200.0, start: 200.0 });
+        assert_eq!(m.ratio(), None);
     }
 
     #[test]
@@ -1302,6 +1850,249 @@ let Over = overflow;
         assert_eq!(report_days_without(&conn, 1.0, &[]).unwrap()[0].counterfactual, 62_000.0);
     }
 
+    /// A transcript line: one Read tool call.
+    fn read_use(id: &str, time: &str, path: &str, ranged: bool) -> String {
+        let input = if ranged { crate::json!({"file_path": path, "offset": 10, "limit": 50}) } else { crate::json!({"file_path": path}) };
+        format!(
+            "{}\n",
+            crate::json!({"type": "assistant", "timestamp": time, "message": {"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "Read", "input": input}]}})
+        )
+    }
+
+    /// A transcript line: one tool result of `n` bytes.
+    fn read_result(id: &str, time: &str, n: usize) -> String {
+        format!(
+            "{}\n",
+            crate::json!({"type": "user", "timestamp": time, "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "x".repeat(n)}]}})
+        )
+    }
+
+    /// E4 (journal:ATLAS-EFFICIENCY:0006): a route:Read row is credited the
+    /// output it replaced less the later Reads of the same file in the same
+    /// transcript; a row logged before E4 (no session, transcript or path)
+    /// is credited 0.
+    #[test]
+    fn route_read_credit_is_judged_against_later_reads_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("atlas-read-credit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out_a, out_b) = ("C:/u/p/s/tool-results/a.txt", "C:/u/p/s/tool-results/b.txt");
+        // a: digested, then read again whole (40,000 bytes back) and once
+        // ranged (2,000); b: digested and never read again; another file's
+        // Read and a Read of b in another transcript do not count.
+        let t1 = dir.join("sess.jsonl");
+        let lines = [
+            read_use("r1", "2026-11-16T10:00:00Z", out_a, false),
+            read_result("r1", "2026-11-16T10:00:01Z", 900),
+            read_use("r2", "2026-11-16T10:00:05Z", out_b, false),
+            read_result("r2", "2026-11-16T10:00:06Z", 800),
+            read_use("r3", "2026-11-16T10:01:00Z", out_a, false),
+            read_result("r3", "2026-11-16T10:01:01Z", 40_000),
+            read_use("r4", "2026-11-16T10:02:00Z", &out_a.replace('/', "\\"), true),
+            read_result("r4", "2026-11-16T10:02:01Z", 2_000),
+            read_use("r5", "2026-11-16T10:03:00Z", "C:/w/other.rs", false),
+            read_result("r5", "2026-11-16T10:03:01Z", 5_000),
+        ];
+        std::fs::write(&t1, lines.concat()).unwrap();
+        let t2 = dir.join("other.jsonl");
+        let later_b = [read_use("q1", "2026-11-16T10:04:00Z", out_b, false), read_result("q1", "2026-11-16T10:04:01Z", 30_000)];
+        std::fs::write(&t2, later_b.concat()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        let (s1, gone) = (t1.to_string_lossy().into_owned(), dir.join("gone.jsonl").to_string_lossy().into_owned());
+        fn place<'a>(path: &'a str, id: &'a str, t: &'a str) -> ReadAt<'a> {
+            ReadAt { session: "s1", transcript: t, path, tool_use: id }
+        }
+        log_read(&conn, 900, 40_000, &place(out_a, "r1", &s1)).unwrap();
+        log_read(&conn, 800, 30_000, &place(out_b, "r2", &s1)).unwrap();
+        // An old row: logged before E4, with its replaced bytes but no place.
+        log_row(&conn, "route:Read", 700, Some(Counterfactual { grep: 0, read: 50_000 })).unwrap();
+        // A row whose transcript is gone.
+        log_read(&conn, 600, 20_000, &place(out_b, "z9", &gone)).unwrap();
+        let c = read_credit(&conn).unwrap();
+        assert_eq!((c.judged, c.unjudged, c.missing), (3, 1, 1));
+        // a nets about 0 (40,000 replaced, 42,000 read back: credit 0);
+        // b keeps its whole replaced output.
+        assert_eq!((c.replaced, c.reread, c.credit), (70_000, 40_000, 30_000));
+        let day = crate::store::utc(SystemTime::now())[..10].to_string();
+        assert_eq!(c.by.get(&("route:Read".to_string(), day)), Some(&30_000));
+        // In the report rows: added to route:Read's credit, nothing else.
+        let (mut by_tool, _) = report(&conn, 1.0).unwrap();
+        add_hook_credit(&mut by_tool, &c.by, false, 1.0);
+        let read = by_tool.iter().find(|r| r.key == "route:Read").unwrap();
+        assert_eq!((read.answers, read.counterfactual), (4, 30_000.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The columns a routed Read logs are added to an older `token_log`
+    /// in place, its rows kept.
+    #[test]
+    fn an_old_token_log_gains_the_read_columns_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_log(id INTEGER PRIMARY KEY, time TEXT NOT NULL, day TEXT NOT NULL, tool TEXT NOT NULL, returned INTEGER NOT NULL, grep INTEGER, read INTEGER);
+             INSERT INTO token_log(time, day, tool, returned, grep, read) VALUES('2026-11-01T00:00:00Z', '2026-11-01', 'route:Read', 300, 0, 9000);",
+        )
+        .unwrap();
+        assert_eq!(read_credit(&conn).unwrap().unjudged, 1, "an old store is read without its columns");
+        log_read(&conn, 100, 5000, &ReadAt { session: "s", transcript: "/t/x.jsonl", path: "/f", tool_use: "id" }).unwrap();
+        let rows: Vec<(i64, Option<String>, Option<String>)> = conn
+            .prepare("SELECT returned, session, path FROM token_log ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(300, None, None), (100, Some("s".into()), Some("/f".into()))]);
+    }
+
+    /// Running the E4 migration again (a second server, a second call) adds
+    /// nothing and fails nothing; a second routed Read on a migrated old
+    /// store needs no migration.
+    #[test]
+    fn the_read_column_migration_runs_twice_harmlessly() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_log(id INTEGER PRIMARY KEY, time TEXT NOT NULL, day TEXT NOT NULL, tool TEXT NOT NULL, returned INTEGER NOT NULL, grep INTEGER, read INTEGER);",
+        )
+        .unwrap();
+        add_read_columns(&conn).unwrap();
+        add_read_columns(&conn).unwrap();
+        let at = ReadAt { session: "s", transcript: "/t/x.jsonl", path: "/f", tool_use: "id" };
+        log_read(&conn, 100, 5000, &at).unwrap();
+        log_read(&conn, 100, 5000, &at).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM token_log WHERE session = 's'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// A route:Read row logged at `time` (`YYYY-MM-DDTHH:MM:SSZ`).
+    fn routed_at(conn: &Connection, time: &str, transcript: &str, path: &str, tool_use: &str, replaced: i64) {
+        conn.execute(
+            "INSERT INTO token_log(time, day, tool, returned, grep, read, session, transcript, path, tool_use) VALUES(?1, substr(?1, 1, 10), 'route:Read', 500, NULL, ?2, 's', ?3, ?4, ?5)",
+            params![time, replaced, transcript, path, tool_use],
+        )
+        .unwrap();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atlas-read-credit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// S3 and N7: without the call's id the routed call is found by time:
+    /// the first Read of the file in the row's second (the routed call comes
+    /// before the hook logs its row), and a re-read later in that same
+    /// second still counts. A Read before the routed call is not subtracted.
+    #[test]
+    fn without_an_id_the_routed_call_is_found_by_its_second() {
+        let dir = scratch("time");
+        let a = "C:/u/p/a.txt";
+        let t = dir.join("t.jsonl");
+        let lines = [
+            read_use("e0", "2026-11-16T09:59:00.000Z", a, false),
+            read_result("e0", "2026-11-16T09:59:00.500Z", 2_000),
+            read_use("u1", "2026-11-16T10:00:00.100Z", a, false),
+            read_result("u1", "2026-11-16T10:00:00.300Z", 500),
+            read_use("u2", "2026-11-16T10:00:00.900Z", a, false),
+            read_result("u2", "2026-11-16T10:00:00.950Z", 5_000),
+            read_use("u3", "2026-11-16T10:00:30.000Z", a, true),
+            read_result("u3", "2026-11-16T10:00:30.100Z", 3_000),
+        ];
+        std::fs::write(&t, lines.concat()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        routed_at(&conn, "2026-11-16T10:00:00Z", &t.to_string_lossy(), a, "", 40_000);
+        let c = read_credit(&conn).unwrap();
+        assert_eq!((c.judged, c.reread, c.credit), (1, 8_000, 32_000), "{c:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3 and N4: a Read before a routed row is not subtracted from it, and
+    /// each re-read is subtracted once, from the routed row of its file just
+    /// before it; another routed call is not a re-read. N6: a row the hook
+    /// logged without its place is counted apart from the rows before E4.
+    #[test]
+    fn each_reread_is_subtracted_once_and_earlier_reads_never() {
+        let dir = scratch("once");
+        let a = "C:/u/p/a.txt";
+        let t = dir.join("t.jsonl");
+        let lines = [
+            read_use("e0", "2026-11-16T10:00:00Z", a, false),
+            read_result("e0", "2026-11-16T10:00:01Z", 7_000),
+            read_use("r1", "2026-11-16T10:01:00Z", a, false),
+            read_result("r1", "2026-11-16T10:01:01Z", 500),
+            read_use("x1", "2026-11-16T10:02:00Z", a, true),
+            read_result("x1", "2026-11-16T10:02:01Z", 4_000),
+            read_use("r2", "2026-11-16T10:03:00Z", a, false),
+            read_result("r2", "2026-11-16T10:03:01Z", 500),
+            read_use("x2", "2026-11-16T10:04:00Z", a, true),
+            read_result("x2", "2026-11-16T10:04:01Z", 6_000),
+        ];
+        std::fs::write(&t, lines.concat()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        let ts = t.to_string_lossy().into_owned();
+        routed_at(&conn, "2026-11-16T10:01:01Z", &ts, a, "r1", 5_000);
+        routed_at(&conn, "2026-11-16T10:03:01Z", &ts, a, "r2", 40_000);
+        log_read(&conn, 100, 9_000, &ReadAt { session: "", transcript: "", path: a, tool_use: "" }).unwrap();
+        let c = read_credit(&conn).unwrap();
+        assert_eq!((c.judged, c.unjudged, c.unplaced), (2, 0, 1), "{c:?}");
+        // r1 replaced 5,000, so a second subtraction of x2 from it would show.
+        assert_eq!((c.reread, c.credit), (10_000, 35_000), "r1 less x1, r2 less x2: {c:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S2: a settled transcript's verdicts are stored, so the credit stands
+    /// after Claude Code deletes the transcript, and a stored verdict is
+    /// never judged again; an open transcript's are not stored. A report
+    /// over many rows reads each transcript once.
+    #[test]
+    fn a_stored_verdict_outlives_its_transcript_and_each_transcript_is_read_once() {
+        let dir = scratch("stored");
+        let (a, b, c3) = ("C:/u/p/a.txt", "C:/u/p/b.txt", "C:/u/p/c.txt");
+        let (t1, t2) = (dir.join("t1.jsonl"), dir.join("t2.jsonl"));
+        let one = [
+            read_use("r1", "2026-11-16T10:00:00Z", a, false),
+            read_result("r1", "2026-11-16T10:00:01Z", 500),
+            read_use("r2", "2026-11-16T10:00:02Z", b, false),
+            read_result("r2", "2026-11-16T10:00:03Z", 500),
+            read_use("r3", "2026-11-16T10:00:04Z", c3, false),
+            read_result("r3", "2026-11-16T10:00:05Z", 500),
+            read_use("x1", "2026-11-16T10:01:00Z", a, false),
+            read_result("x1", "2026-11-16T10:01:01Z", 10_000),
+        ];
+        std::fs::write(&t1, one.concat()).unwrap();
+        let two = [
+            read_use("q1", "2026-11-16T11:00:00Z", b, false),
+            read_result("q1", "2026-11-16T11:00:01Z", 500),
+            read_use("q2", "2026-11-16T11:00:02Z", a, false),
+            read_result("q2", "2026-11-16T11:00:03Z", 500),
+        ];
+        std::fs::write(&t2, two.concat()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        let (s1, s2) = (t1.to_string_lossy().into_owned(), t2.to_string_lossy().into_owned());
+        for (t, path, id) in [(&s1, a, "r1"), (&s1, b, "r2"), (&s1, c3, "r3"), (&s2, b, "q1"), (&s2, a, "q2")] {
+            log_read(&conn, 500, 30_000, &ReadAt { session: "s", transcript: t, path, tool_use: id }).unwrap();
+        }
+        let now = SystemTime::now();
+        let open = std::time::Duration::from_secs(1_000_000);
+        let first = read_credit_at(&conn, now, open).unwrap();
+        assert_eq!((first.judged, first.parsed, first.stored, first.credit), (5, 2, 0, 140_000), "{first:?}");
+        let again = read_credit_at(&conn, now, open).unwrap();
+        assert_eq!((again.parsed, again.stored), (2, 0), "an open transcript's verdicts are not stored: {again:?}");
+        let settled = read_credit_at(&conn, now + std::time::Duration::from_secs(1), std::time::Duration::ZERO).unwrap();
+        assert_eq!(settled.credit, first.credit);
+        std::fs::remove_file(&t1).unwrap();
+        std::fs::remove_file(&t2).unwrap();
+        let after = read_credit_at(&conn, now + std::time::Duration::from_secs(1), std::time::Duration::ZERO).unwrap();
+        assert_eq!((after.judged, after.missing, after.parsed, after.stored), (5, 0, 0, 5), "{after:?}");
+        assert_eq!((after.credit, after.by.clone()), (first.credit, first.by.clone()), "the credit does not fade");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn crlf_lines_print_without_the_cr() {
         let c = measure_file("f", b"a TK\r\nb\r\n", b"tk");
@@ -1336,6 +2127,133 @@ let Over = overflow;
         assert_eq!(k.iter().map(|r| (r.query.as_str(), r.count)).collect::<Vec<_>>(), vec![("big", 2), ("small", 1)]);
         assert_eq!(k[0].tokens, 200.0);
         let i = inject_report(&conn, 4.0).unwrap().unwrap();
-        assert_eq!((i.keys, i.agents, i.tokens, i.max_agent), (3, 2, 210.0, 110.0));
+        assert_eq!((i.keys, i.sessions, i.subagents, i.tokens, i.largest, i.largest_main), (3, 2, 0, 210.0, 110.0, true));
+    }
+
+    /// #219: the brief is measured from the pre-atlas reads of the
+    /// rulebook, over every pre-atlas subagent transcript, never from the
+    /// file's size. Four pre-cutoff subagent transcripts: a1 reads it by a
+    /// relative path joined to its working folder (8 KB), a2 with
+    /// backslashes and other case (4 KB), a3 reads another file, a4 reads
+    /// nothing. A main-session transcript that reads it is left out, and so
+    /// is a1's read after the cutoff. 12 KB over 4 agents is 3 KB each; the
+    /// file size (760 KB a start) stays the "if read whole" figure.
+    #[test]
+    fn the_brief_is_measured_from_pre_atlas_subagent_reads_not_the_file_size() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        let reference = Path::new("W:/work/app/.rules/RULES.md");
+        // No calibration: not measured.
+        assert_eq!(brief_measured(&conn, reference, 1.0).unwrap(), None);
+        conn.execute_batch(crate::calibrate::TABLES).unwrap();
+        assert_eq!(brief_measured(&conn, reference, 1.0).unwrap(), None);
+        conn.execute(
+            "INSERT INTO calibrate_state(id, cutoff, source, time) VALUES(1, '2026-10-08T19:20:26.776Z', 'the first atlas call', 'now')",
+            [],
+        )
+        .unwrap();
+        let mut seq = 0;
+        let mut call = |file: &str, time: &str, cwd: &str, name: &str, path: &str, bytes: i64| {
+            conn.execute("INSERT OR IGNORE INTO calibrate_files(file, cwd) VALUES(?1, ?2)", params![file, cwd]).unwrap();
+            let input = format!("{{\"file_path\":\"{}\"}}", path.replace('\\', "\\\\"));
+            seq += 1;
+            conn.execute(
+                "INSERT INTO calibrate_calls(file, seq, id, time, cwd, name, input, bytes) VALUES(?1, ?2, 'id', ?3, ?4, ?5, ?6, ?7)",
+                params![file, seq, time, cwd, name, input, bytes],
+            )
+            .unwrap();
+        };
+        let sub = |a: &str| format!("C:/u/.claude/projects/W--work/s1/subagents/agent-{a}.jsonl");
+        let before = "2026-10-01T10:00:00.000Z";
+        call(&sub("a1"), before, "W:\\work\\app", "Read", ".rules/RULES.md", 8000);
+        call(&sub("a1"), "2026-10-09T10:00:00.000Z", "W:\\work\\app", "Read", "W:/work/app/.rules/RULES.md", 9000);
+        call(&sub("a2"), before, "W:/work", "Read", "w:\\WORK\\App\\.rules\\rules.md", 4000);
+        call(&sub("a3"), before, "W:/work", "Read", "W:/work/app/docs/NOTES.md", 5000);
+        call(&sub("a4"), before, "W:/work", "Bash", "", 100);
+        // A main session reads it: not a subagent, left out.
+        call("C:/u/.claude/projects/W--work/s1.jsonl", before, "W:/work", "Read", "W:/work/app/.rules/RULES.md", 7000);
+        // A subagent whose every call is after the cutoff: not pre-atlas.
+        call(&sub("a5"), "2026-10-10T10:00:00.000Z", "W:/work", "Read", "W:/work/app/.rules/RULES.md", 6000);
+        let m = brief_measured(&conn, reference, 1.0).unwrap().unwrap();
+        assert_eq!(m, BriefMeasure { per_agent: 3000.0, reads: 2, readers: 2, transcripts: 4, cutoff: "2026-10-08T19:20:26.776Z".into() });
+        // Another reference: no read of it, not measured.
+        assert_eq!(brief_measured(&conn, Path::new("W:/other/RULES.md"), 1.0).unwrap(), None);
+        // The brief at 760 KB a start: the file size, kept as "if read whole".
+        for a in ["a1", "a2"] {
+            log_brief(&conn, "s", a, 760_000).unwrap();
+            conn.execute(
+                "INSERT INTO hook_inject(time, session, agent, transcript, hook, key, fts, cos, bytes, read) VALUES('t', 's', ?1, '', 'SubagentStart', 'k', NULL, NULL, 1500, 0)",
+                params![a],
+            )
+            .unwrap();
+        }
+        let b = brief_report(&conn, 1.0).unwrap().unwrap();
+        assert_eq!(b.per_agent(), 760_000.0);
+        let x = brief_vs_inject(&conn, 1.0, Some(&m)).unwrap().unwrap();
+        assert_eq!(x, MatchRow { agents: 2, rulebook: Some(6000.0), whole: 1_520_000.0, injected: 3000.0, start: 3000.0 });
+        assert_eq!(x.ratio(), Some(2.0));
+        // Not measured: no rulebook and no ratio; the file size is not one.
+        let y = brief_vs_inject(&conn, 1.0, None).unwrap().unwrap();
+        assert_eq!((y.rulebook, y.ratio(), y.whole), (None, None, 1_520_000.0));
+    }
+
+    /// #212: main sessions per prompt and subagents per agent, apart. One
+    /// main session with 10 prompts at 1k tokens each, three subagents at
+    /// 2k, 3k and 4k: per prompt p50 and max 1k, per subagent p50 3k and
+    /// max 4k, and the largest is the main session at 10k.
+    #[test]
+    fn injections_split_main_sessions_per_prompt_from_subagents_per_agent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        let inj = |time: &str, agent: &str, hook: &str, bytes: i64| {
+            conn.execute(
+                "INSERT INTO hook_inject(time, session, agent, transcript, hook, key, fts, cos, bytes, read) VALUES(?1, 'main', ?2, '', ?3, 'k', NULL, NULL, ?4, 0)",
+                params![time, agent, hook, bytes],
+            )
+            .unwrap();
+        };
+        for p in 0..10 {
+            // Each prompt: 3000 bytes at the prompt, 1000 by a tool call after it.
+            inj(&format!("2026-11-15T10:{p:02}:00.000Z"), "", "UserPromptSubmit", 3000);
+            inj(&format!("2026-11-15T10:{p:02}:30.000Z"), "", "PreToolUse", 1000);
+        }
+        for (a, kb) in [("a1", 2), ("a2", 3), ("a3", 4)] {
+            inj("2026-11-15T10:05:10.000Z", a, "SubagentStart", kb * 4000);
+        }
+        let i = inject_report(&conn, 4.0).unwrap().unwrap();
+        assert_eq!((i.keys, i.sessions, i.prompts, i.subagents), (23, 1, 10, 3));
+        assert_eq!((i.per_prompt.n, i.per_prompt.p50, i.per_prompt.max), (10, 1000.0, 1000.0));
+        assert_eq!((i.per_agent.n, i.per_agent.p50, i.per_agent.max), (3, 3000.0, 4000.0));
+        assert_eq!((i.largest, i.largest_main), (10_000.0, true));
+        assert_eq!(i.tokens, 19_000.0);
+    }
+
+    /// Review of #277, finding 1: the recall answers that read records
+    /// (grep 0, a read) are told apart from recall by query (grep first)
+    /// and from a query that matched nothing, and are capped as the report
+    /// caps them.
+    #[test]
+    fn recall_by_record_credit_is_the_recall_rows_with_a_read_and_no_grep() {
+        let conn = Connection::open_in_memory().unwrap();
+        // No ledger yet: nothing, and no table made.
+        assert_eq!(recall_records_credit(&conn, 4.0).unwrap(), 0.0);
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        // No calibration: the capped tools are credited nothing.
+        log_row(&conn, "recall", 100, Some(Counterfactual { grep: 0, read: 4000 })).unwrap();
+        assert_eq!(recall_records_credit(&conn, 4.0).unwrap(), 0.0);
+        conn.execute_batch(
+            "CREATE TABLE baseline_log(id INTEGER PRIMARY KEY, time TEXT NOT NULL, before TEXT NOT NULL, transcripts INTEGER NOT NULL, used INTEGER NOT NULL, episodes INTEGER NOT NULL, mean REAL NOT NULL, median REAL NOT NULL, p90 REAL NOT NULL, total INTEGER NOT NULL);
+             INSERT INTO baseline_log(time, before, transcripts, used, episodes, mean, median, p90, total) VALUES('2026-11-08T11:40:52Z', '2026-10-08T19:20:49Z', 10, 5, 50, 5000.0, 3000.0, 10000.0, 250000);",
+        )
+        .unwrap();
+        // By key, capped at the p90 episode (10,000 bytes).
+        log_row(&conn, "recall", 100, Some(Counterfactual { grep: 0, read: 40_000 })).unwrap();
+        // By query, a query that matched nothing, a handle slice, and a
+        // read_note whole file: none of them count.
+        log_row(&conn, "recall", 100, Some(Counterfactual { grep: 300, read: 2000 })).unwrap();
+        log_row(&conn, "recall", 100, Some(Counterfactual { grep: 0, read: 0 })).unwrap();
+        log_row(&conn, "recall", 100, None).unwrap();
+        log_row(&conn, "read_note", 100, Some(Counterfactual { grep: 0, read: 8000 })).unwrap();
+        assert_eq!(recall_records_credit(&conn, 4.0).unwrap(), (4000.0 + 10_000.0) / 4.0);
     }
 }

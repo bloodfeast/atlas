@@ -185,6 +185,40 @@ fn a_path_already_read_in_this_session_passes_whole() {
     }
 }
 
+/// E4 (journal:ATLAS-EFFICIENCY:0006): a routed Read logs its session, the
+/// transcript that holds it (a subagent's own), the file and the tool call,
+/// so the report can subtract later Reads of the file (judged credit).
+#[test]
+fn a_routed_read_logs_where_it_was_read_for_the_judged_credit() {
+    let t = Temp::new("rr-where");
+    let db = t.path().join("index.sqlite");
+    let mut r = Router::with_db(&db, None);
+    let parent = "C:/p/sess.jsonl";
+    let mut main = whole(WIN_OUT, 40_000);
+    main.transcript_path = parent.into();
+    main.tool_use_id = "toolu_main".into();
+    assert!(routed(&mut r, &main));
+    let mut sub = whole(POSIX_TASK, 30_000);
+    sub.transcript_path = parent.into();
+    sub.agent_id = "a7".into();
+    sub.tool_use_id = "toolu_sub".into();
+    assert!(routed(&mut r, &sub));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    type Row = (String, String, String, String, Option<i64>, Option<i64>);
+    let rows: Vec<Row> = conn
+        .prepare("SELECT session, transcript, path, tool_use, grep, read FROM token_log WHERE tool = 'route:Read' ORDER BY id")
+        .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect())
+        .unwrap();
+    let sub_transcript = atlas::hooks::subagent_transcript(parent, "a7").to_string_lossy().into_owned();
+    assert_eq!(
+        rows,
+        vec![
+            ("s1".into(), parent.into(), WIN_OUT.into(), "toolu_main".into(), None, Some(40_000)),
+            ("s1".into(), sub_transcript, POSIX_TASK.into(), "toolu_sub".into(), None, Some(30_000)),
+        ]
+    );
+}
+
 #[test]
 fn a_routed_read_is_logged_without_a_counterfactual() {
     let t = Temp::new("rr-ledger");
@@ -209,7 +243,11 @@ fn a_routed_read_is_logged_without_a_counterfactual() {
     let (tool, returned, grep, read) = &rows[0];
     assert_eq!(tool, "route:Read");
     assert!(*returned > 0);
-    assert_eq!((*grep, *read), (None, None), "route:Read is logged with no saving credited");
+    // The output it replaced is logged, but the ledger's SQL credit stays 0:
+    // the report judges it against later Reads (E4, ATLAS-EFFICIENCY:0006).
+    assert_eq!((*grep, *read), (None, Some(40_000)), "route:Read logs the output it replaced, grep NULL like a hook row");
+    let (by_tool, _) = atlas::tokens::report(&conn, 1.0).unwrap();
+    assert_eq!(by_tool.iter().find(|r| r.key == "route:Read").unwrap().counterfactual, 0.0, "no credit in SQL");
     // The shell route keeps its counterfactual, capped at what Claude Code
     // shows of a Bash output: its first 30,000 characters (#215).
     assert_eq!(rows[1].0, "route:Bash");

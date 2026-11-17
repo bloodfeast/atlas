@@ -52,6 +52,10 @@ mod none {
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) use none::Backend;
 
+pub(crate) mod boot;
+pub(crate) mod registry;
+pub(crate) mod shutdown;
+
 /// Child-process control for the code indexer: lowering a child's
 /// priority and ending one that ran past its timeout. Owned FFI, no crate.
 pub(crate) mod process {
@@ -479,6 +483,23 @@ pub(crate) mod process {
             let n = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".EXE")).unwrap_or(name);
             n.eq_ignore_ascii_case("cargo") && !mine.contains(pid)
         })
+    }
+
+    /// This process's parent pid, when it can be read.
+    pub(crate) fn parent() -> Option<u32> {
+        #[cfg(unix)]
+        {
+            Some(std::os::unix::process::parent_id())
+        }
+        #[cfg(windows)]
+        {
+            let me = std::process::id();
+            processes().into_iter().find(|p| p.0 == me).map(|p| p.1)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
     }
 
     /// Whether a `cargo` process other than this one's ancestors runs.

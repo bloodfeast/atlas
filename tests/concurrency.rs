@@ -8,7 +8,7 @@ mod common;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -256,12 +256,15 @@ fn stress_servers_killed_mid_write_leave_the_store_and_its_copy_agreeing() {
     assert!(failed.is_empty(), "kill stress: {} of {runs} runs failed: {failed:?}", failed.len());
 }
 
-/// How many calls each writer makes beside the checks at most. The checks
-/// stop the writers when they end; this caps them too, so on a slow machine
-/// the store (and with it each check) cannot grow for as long as the checks
-/// take. Enough that writes still overlap the checks: each test asserts the
-/// store grew between the first check and the last.
+/// How many calls each writer makes at full speed beside the checks. Past
+/// it a writer slows to one call per [`CHECK_TRICKLE`] until it is stopped,
+/// so on a slow machine the store (and with it each check) does not grow
+/// for as long as the checks take, yet the writes never stop before the
+/// checks end.
 const CHECK_WRITES: usize = 400;
+
+/// A writer's pause between calls past [`CHECK_WRITES`].
+const CHECK_TRICKLE: Duration = Duration::from_millis(100);
 
 /// The wall-clock bound over the whole of [`checks_beside_writers`]: every
 /// `--memory-check`, every writer's wait for an answer and every writer's
@@ -341,9 +344,29 @@ struct Beside {
     during: i64,
 }
 
-/// `--memory-check` run `count` times beside two writers, all of it bounded
-/// by [`CHECK_DEADLINE`].
+/// One writer beside the checks: its thread, and how many of its writes
+/// have been answered so far.
+struct Writer {
+    answered: Arc<AtomicUsize>,
+    thread: std::thread::JoinHandle<Wrote>,
+}
+
+/// What a writer came to: the calls it made and its longest wait for an
+/// answer, or the stage that failed.
+type Wrote = Result<(usize, Duration), String>;
+
+/// `--memory-check` run `count` times (at least 2) beside two writers, all
+/// of it bounded by [`CHECK_DEADLINE`].
+///
+/// Both guards the tests assert hold by construction, however loaded the
+/// machine: the counted checks start only once each writer has had a write
+/// answered (so the store grew from the check before the writers), the last
+/// counted check starts only once a writer has had a write answered that it
+/// sent after the first counted check ended (so the store grew between the
+/// first counted check and the last), and the writers are stopped only after
+/// the check after them, never on a count of their own.
 fn checks_beside_writers(cfg: &Path, count: usize, plant: impl FnOnce(&Path)) -> Beside {
+    assert!(count >= 2, "the first and the last check must differ");
     let t0 = Instant::now();
     let deadline = t0 + CHECK_DEADLINE;
     let reap = Reap::owner();
@@ -367,42 +390,95 @@ fn checks_beside_writers(cfg: &Path, count: usize, plant: impl FnOnce(&Path)) ->
     plant(&root);
     let before = versions_in(&check("the check before the writers").1);
     let stop = Arc::new(AtomicBool::new(false));
-    // Handoffs and journal entries alone: each server stops after
-    // `CHECK_WRITES` calls, or when told to.
-    let writers: Vec<_> = (0..2)
+    // Handoffs and journal entries alone, until told to stop (slowly past
+    // `CHECK_WRITES` calls).
+    let writers: Vec<Writer> = (0..2)
         .map(|p| {
-            let (cfg, stop, reap) = (cfg.to_path_buf(), stop.clone(), reap.share());
-            std::thread::spawn(move || keep_writing(&cfg, p, &stop, deadline, &reap))
+            let (cfg, stop, reap, answered) = (cfg.to_path_buf(), stop.clone(), reap.share(), Arc::new(AtomicUsize::new(0)));
+            let counter = answered.clone();
+            Writer { answered, thread: std::thread::spawn(move || keep_writing(&cfg, p, &stop, &counter, deadline, &reap)) }
         })
         .collect();
+    // The writers stopped and joined: each one's line for the log. A writer
+    // that failed (or stopped before it was told to) fails the test, naming
+    // its stage.
+    let settle = |writers: Vec<Writer>, why: Option<&str>| -> Vec<String> {
+        stop.store(true, Ordering::SeqCst);
+        let mut calls = Vec::new();
+        for w in writers {
+            match w.thread.join().expect("a writer panicked") {
+                Ok((n, wait)) => calls.push(format!("{n} calls, longest answer {:.1} s", wait.as_secs_f64())),
+                Err(stage) => {
+                    panic!("checks beside writers: {stage} ({} s after the start): every child is killed", t0.elapsed().as_secs())
+                }
+            }
+        }
+        if let Some(why) = why {
+            panic!("checks beside writers: a writer stopped before {why} ({})", calls.join("; "));
+        }
+        calls
+    };
+    // Waits until the writers' answered counts meet `done`: false if a
+    // writer ended first (it failed), and a panic at the deadline.
+    let wait = |writers: &[Writer], what: &str, done: &dyn Fn(&[usize]) -> bool| -> bool {
+        loop {
+            let n: Vec<usize> = writers.iter().map(|w| w.answered.load(Ordering::SeqCst)).collect();
+            if done(&n) {
+                return true;
+            }
+            if writers.iter().any(|w| w.thread.is_finished()) {
+                return false;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "checks beside writers: still waiting for {what} {} s after the start (answered: {n:?}): every child is killed",
+                    CHECK_DEADLINE.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let first_writes = "each writer's first answered write";
+    if !wait(&writers, first_writes, &|n| n.iter().all(|&a| a >= 1)) {
+        settle(writers, Some(first_writes));
+        unreachable!();
+    }
     let mut runs = Vec::new();
     let mut seen = Vec::new();
+    let mut marks: Vec<usize> = Vec::new();
     for i in 0..count {
+        if i + 1 == count {
+            // A writer's call answered at the mark + 2 was sent after its
+            // call at the mark + 1 was answered, so after the first check
+            // ended: it committed after the first check read the store.
+            let after_first = "a write sent after the first check ended";
+            if !wait(&writers, after_first, &|n| n.iter().zip(&marks).any(|(&a, &m)| a >= m + 2)) {
+                settle(writers, Some(after_first));
+                unreachable!();
+            }
+        }
         let (ok, text) = check(&format!("check {} of {count}", i + 1));
+        if i == 0 {
+            marks = writers.iter().map(|w| w.answered.load(Ordering::SeqCst)).collect();
+        }
         let problems: Vec<String> = text.lines().skip(1).filter(|l| !l.starts_with("warning:")).map(str::to_string).collect();
         assert_eq!(ok, problems.is_empty(), "{text}");
         seen.push(versions_in(&text));
         runs.push(problems);
     }
     let after = versions_in(&check("the check after the writers").1);
-    stop.store(true, Ordering::Relaxed);
-    let mut calls = Vec::new();
-    for w in writers {
-        match w.join().expect("a writer panicked") {
-            Ok((n, wait)) => calls.push(format!("{n} calls, longest answer {:.1} s", wait.as_secs_f64())),
-            Err(stage) => panic!("checks beside writers: {stage} ({} s after the start): every child is killed", t0.elapsed().as_secs()),
-        }
-    }
-    eprintln!("checks beside writers: {count} checks in {:.1} s; writers (cap {CHECK_WRITES} calls): {}", t0.elapsed().as_secs_f64(), calls.join("; "));
+    let calls = settle(writers, None);
+    eprintln!("checks beside writers: {count} checks in {:.1} s; writers: {}", t0.elapsed().as_secs_f64(), calls.join("; "));
     Beside { runs, grown: after - before, during: seen.last().copied().unwrap_or(0) - seen.first().copied().unwrap_or(0) }
 }
 
-/// One server writing until told to stop, or `CHECK_WRITES` calls, through
-/// every export a writer may touch: a handoff (its own lane) and a journal
-/// entry. Each answer and the exit are waited for until `deadline` only:
-/// the error names the stage that was stuck. The number of calls made, and
-/// the longest wait for an answer (a writer starved by the other shows).
-fn keep_writing(cfg: &Path, proc: usize, stop: &AtomicBool, deadline: Instant, reap: &Reap) -> Result<(usize, Duration), String> {
+/// One server writing until told to stop (slowly past [`CHECK_WRITES`]
+/// calls), through every export a writer may touch: a handoff (its own lane) and a journal entry. `answered`
+/// counts the writes answered so far. Each answer and the exit are waited
+/// for until `deadline` only: the error names the stage that was stuck. The
+/// number of calls made, and the longest wait for an answer (a writer
+/// starved by the other shows).
+fn keep_writing(cfg: &Path, proc: usize, stop: &AtomicBool, answered: &AtomicUsize, deadline: Instant, reap: &Reap) -> Wrote {
     let mut child = Command::new(bin()).arg("--config").arg(cfg).current_dir(cfg.parent().unwrap()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let out = child.stdout.take().unwrap();
@@ -426,6 +502,12 @@ fn keep_writing(cfg: &Path, proc: usize, stop: &AtomicBool, deadline: Instant, r
                 Ok(Ok(line)) => {
                     let m = atlas::json::parse(line.trim()).map_err(|e| format!("writer {proc}: an answer that is not JSON ({e})"))?;
                     if m["id"].as_i64() == Some(id as i64) {
+                        if m["result"]["isError"] == json!(true) {
+                            return Err(format!(
+                                "writer {proc}: call {id} was answered with an error: {}",
+                                m["result"]["content"][0]["text"].as_str().unwrap_or("")
+                            ));
+                        }
                         longest = longest.max(asked.elapsed());
                         return Ok(());
                     }
@@ -438,13 +520,17 @@ fn keep_writing(cfg: &Path, proc: usize, stop: &AtomicBool, deadline: Instant, r
     };
     ask(0, json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "writer"}}}))?;
     let mut i = 1;
-    while i <= CHECK_WRITES && !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::SeqCst) {
         let call = if i % 2 == 0 {
             json!({"name": "handoff", "arguments": {"lane": "SHARED", "title": format!("h {proc} {i}"), "text": format!("handoff {proc} {i}")}})
         } else {
             json!({"name": "journal", "arguments": {"lane": "SHARED", "entry": "note", "text": format!("note {proc} {i}")}})
         };
         ask(i, json!({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": call}))?;
+        answered.store(i, Ordering::SeqCst);
+        if i >= CHECK_WRITES {
+            std::thread::sleep(CHECK_TRICKLE);
+        }
         i += 1;
     }
     drop(ask);

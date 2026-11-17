@@ -436,18 +436,23 @@ impl Updater {
     /// saw). A finished swap, with its own Highlights and plugin release,
     /// is kept.
     fn write_state(&self, latest: Option<&Manifest>) {
-        update_state(&self.state_dir, |s| {
+        let r = update_state(&self.state_dir, |s| {
             s.checked = unix_now();
             s.latest = latest.map(|m| m.version.clone());
             s.plugin_changed_in = latest.and_then(|m| m.plugin_changed_in.clone());
             s.highlights = latest.map(|m| m.highlights.clone()).unwrap_or_default();
         });
+        if let Err(e) = r {
+            eprintln!("atlas: update check not recorded (the next check runs again): {e}");
+        }
     }
 
     /// Records a swap onto `m`, with what its notice shows.
     fn record_swap(&self, m: &Manifest) {
         let swap = Swap { from: self.current.clone(), to: m.version.clone(), highlights: m.highlights.clone(), plugin_changed_in: m.plugin_changed_in.clone() };
-        update_state(&self.state_dir, |s| s.updated = Some(swap));
+        if let Err(e) = update_state(&self.state_dir, |s| s.updated = Some(swap)) {
+            eprintln!("atlas: the update to {} is installed, but its notice was not recorded: {e}", m.version);
+        }
     }
 
     /// Runs the check to the end: see the module documentation.
@@ -718,19 +723,116 @@ pub fn read_state(dir: &Path) -> Option<State> {
 }
 
 /// How long a state change waits for another process changing the file.
-const STATE_WAIT: Duration = Duration::from_secs(5);
+pub const STATE_WAIT: Duration = Duration::from_secs(5);
 
 /// Changes the state in `dir` under its lock (every server, start check
 /// and hook of this user shares the file), starting from an empty state
-/// when there is none. The state is a cache: a change that cannot take the
-/// lock or write is dropped.
-pub fn update_state(dir: &Path, f: impl FnOnce(&mut State)) {
-    let _ = fs::create_dir_all(dir);
+/// when there is none, waiting at most [`STATE_WAIT`] in all.
+///
+/// # Errors
+///
+/// A message when the change did not land: the wait passed (another
+/// process held the file all along), or the folder or file could not be
+/// written. The change is then not applied at all, never half applied.
+pub fn update_state(dir: &Path, f: impl FnOnce(&mut State)) -> Result<(), String> {
+    update_state_within(dir, STATE_WAIT, f)
+}
+
+/// [`update_state`], waiting at most `wait` in all.
+///
+/// The threads of one process take turns first, in the order they came
+/// (see [`StateTurns`]), so they never race each other for the file lock:
+/// that lock is polled, and a thread polling it among many could lose
+/// every round until its wait ran out. The file lock is then only
+/// contended by other processes, for what is left of `wait`.
+///
+/// # Errors
+///
+/// As [`update_state`].
+pub fn update_state_within(dir: &Path, wait: Duration, f: impl FnOnce(&mut State)) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + wait;
     let path = dir.join(STATE_FILE);
-    let Ok(_held) = crate::fsio::FileLock::acquire_within(&path, STATE_WAIT) else { return };
+    let _turn = StateTurns::global().take(deadline).ok_or_else(|| {
+        format!("{}: other threads of this process held the update state for {} ms; not saved", path.display(), wait.as_millis())
+    })?;
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let _held = crate::fsio::FileLock::acquire_or_time_out(&path, left)?.ok_or_else(|| {
+        format!("{}: another atlas process held its lock for the whole {} ms wait; nothing written", path.display(), wait.as_millis())
+    })?;
     let mut s = read_state(dir).unwrap_or_default();
     f(&mut s);
-    let _ = crate::fsio::replace_atomic(&path, s.to_text().as_bytes());
+    crate::fsio::replace_atomic(&path, s.to_text().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The turns of one process's threads at the update state: a ticket queue,
+/// served in the order taken. A thread whose deadline passes leaves the
+/// queue (its ticket is skipped when its turn comes), so no thread waits
+/// past its own deadline and none waits on one that gave up.
+#[derive(Debug, Default)]
+pub struct StateTurns {
+    q: Mutex<TurnQueue>,
+    turned: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct TurnQueue {
+    /// The next ticket handed out.
+    next: u64,
+    /// The ticket whose turn it is.
+    serving: u64,
+    /// Tickets whose holders gave up before their turn.
+    left: std::collections::BTreeSet<u64>,
+}
+
+/// A thread's turn at the update state, until dropped.
+#[derive(Debug)]
+pub struct Turn<'a> {
+    turns: &'a StateTurns,
+}
+
+impl StateTurns {
+    fn global() -> &'static StateTurns {
+        static TURNS: std::sync::OnceLock<StateTurns> = std::sync::OnceLock::new();
+        TURNS.get_or_init(StateTurns::default)
+    }
+
+    fn queue(&self) -> std::sync::MutexGuard<'_, TurnQueue> {
+        self.q.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Waits for this thread's turn until `deadline`; `None` when it did
+    /// not come by then.
+    pub fn take(&self, deadline: std::time::Instant) -> Option<Turn<'_>> {
+        let mut q = self.queue();
+        let mine = q.next;
+        q.next += 1;
+        while q.serving != mine {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                q.left.insert(mine);
+                return None;
+            }
+            q = self.turned.wait_timeout(q, deadline - now).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+        Some(Turn { turns: self })
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut q = self.turns.queue();
+        // The next ticket still waiting: those that gave up are skipped.
+        loop {
+            q.serving += 1;
+            let s = q.serving;
+            if !q.left.remove(&s) {
+                break;
+            }
+        }
+        drop(q);
+        self.turns.turned.notify_all();
+    }
 }
 
 /// The file in the state folder that remembers which notices the session

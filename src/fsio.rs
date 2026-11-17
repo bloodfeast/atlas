@@ -215,6 +215,22 @@ impl FileLock {
     /// A message naming the lock file when it cannot be opened or stays held
     /// past `wait`: the caller writes nothing.
     pub fn acquire_within(target: &Path, wait: std::time::Duration) -> std::result::Result<FileLock, String> {
+        FileLock::acquire_or_time_out(target, wait)?.ok_or_else(|| {
+            format!(
+                "{}: another atlas command held this lock for {} ms; nothing written. Run the command again when it has finished",
+                lock_path(target).display(),
+                wait.as_millis()
+            )
+        })
+    }
+
+    /// [`FileLock::acquire_within`], with `None` when the lock stayed held
+    /// past `wait`, so a caller can word that case itself.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the lock file when it cannot be opened or locked.
+    pub fn acquire_or_time_out(target: &Path, wait: std::time::Duration) -> std::result::Result<Option<FileLock>, String> {
         let path = lock_path(target);
         if let Some(d) = path.parent() {
             fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -224,16 +240,16 @@ impl FileLock {
         let mut said = false;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(FileLock { _file: Some(file) }),
+                Ok(()) => return Ok(Some(FileLock { _file: Some(file) })),
                 Err(fs::TryLockError::WouldBlock) => {}
                 Err(fs::TryLockError::Error(e)) if e.kind() == ErrorKind::Unsupported => {
                     eprintln!("atlas: this file system has no file locks, so {} guards nothing; going on without it", path.display());
-                    return Ok(FileLock { _file: None });
+                    return Ok(Some(FileLock { _file: None }));
                 }
                 Err(fs::TryLockError::Error(e)) => return Err(format!("{}: {e}", path.display())),
             }
             if start.elapsed() >= wait {
-                return Err(format!("{}: another atlas command held this lock for {} s; nothing written. Run the command again when it has finished", path.display(), wait.as_secs()));
+                return Ok(None);
             }
             if !said {
                 said = true;

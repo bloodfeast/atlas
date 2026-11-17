@@ -66,7 +66,12 @@ Keep it lean. A brief is a work order, not a copy of the rulebook.
    it only warns on what it infers. A planned item's brief adds `Queue: <key>` so its launch takes it off the queue.
 3. **The rulings that apply,** named by their recall key, a heading or a line hint, never pasted whole. "Read
    the whole rulebook" costs tens of thousands of tokens before any work starts. The agent pulls exactly what it
-   needs with `recall`, `lookup` or `search`.
+   needs with `recall`, `lookup` or `search`. Write the brief as compact Gherkin: a Context line, Given
+   lines with the facts, a Scenario per acceptance criterion (its Then lines each a test that fails
+   first), a Spike per research question (its Then names the answer: a table, a verdict against a bar,
+   a number with its unit), one Rules line. Declare each key as a tag, in full every time
+   (`@journal:LANE:0012`, pinned `@journal:LANE:0012#a1b2c3d4`), above Feature or above the scenario it
+   serves; the agent's start lists each by key and title. Not `0012, 0013` after a key, nor `0140 onward`.
 4. **Scope:** the files or modules it owns, what it must not touch, and what it is safe to do without asking.
 5. **Verification:** the exact command that proves the work, and the numbers it must match.
 6. **Journal and limits:** "Journal to lane `<id>`. From your handoff point, wrap up at the next clean stopping

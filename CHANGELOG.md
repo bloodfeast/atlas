@@ -14,6 +14,74 @@ Sections are not written here by hand. Each pull request adds a fragment, `chang
 and section, and `cargo xtask version` folds the pending fragments into one section for the next release, in
 the order above, and sets the version by replaying them in merge order (`changes/README.md`).
 
+## v0.7.0
+
+### Highlights
+
+- **Agents survive a restart, and the first outside contribution.** A shutdown, logoff, closed terminal or
+  scheduled system restart now leaves a restart point (running agents, lanes, launch briefs, worktrees) that the
+  next session offers, and atlas warns ahead of a pending restart. Every agent's launch brief is kept on its lane,
+  so an agent killed early can be relaunched from `recall lane=NAME`. Agent context is leaner: two tool schemas are
+  deferred, weak injections are dropped, repository lines appear only where they help, and the binding subagent
+  mode now informs agents at least as well as recall at about an eighth of its tokens. This release also carries
+  atlas's first public contribution: podman's secret values file is now denied, thanks to @serkankose (#13).
+
+### Features
+
+- **Every agent's launch brief is kept.** At each agent's start atlas files its brief, secrets redacted, on the agent's lane, so an agent killed before its first journal entry can be relaunched from `recall lane=NAME` alone.
+- **atlas asks for terse writing.** The server instructions, the bundled skill and each agent's first journal or handoff answer carry one style rule: telegraphic, every key, number, path, commit, error line and quoted ruling kept exact. Journal and handoff text comes back as recall answers, the largest share of atlas tokens, so shorter entries cost less on every read. The tool list is unchanged. The rule costs about 60 tokens at every agent start, through the instructions, and about 60 more in each agent's first journal or handoff answer.
+- **A restart point before the machine shuts down.** On Windows, Linux and macOS a shutdown, logoff or closed terminal writes a small restart point (running agents, lanes, launch briefs, worktrees), and the next session offers it; best effort, it never delays the shutdown.
+- **Fewer tool schemas and fewer weak injections in every agent's context.** `lookup` and `symbol` are now
+  deferred behind the client's tool search like the write tools, so their 627 bytes of schema leave every agent's
+  first turn (they were called 12 times a week); the server instructions and the skill say how to load them.
+  `recall.inject_floor` now defaults to 0.60: on 14 days of hook data that drops 3,480 low-cosine pointers, about
+  37k tokens a week, with the memory eval and its hook replay unchanged (61/70 informed, 52/70 strict).
+  `atlas --hook-report --tune-floor` now starts its curve and its recommendation at the active floor: the hook
+  logs only what it injected, so the data cannot speak below it. The UserPromptSubmit hook was eval-gated at
+  0.60; SubagentStart pointers in `recall` mode are filtered by the same floor and are not yet gated.
+- **Repo lines only where they help, and routed Reads credited honestly.** A prompt or subagent brief that names a repository now gets its project-graph line only when neither the text nor the working directory already says where the repository is (a path in its checkout, or a cwd in it or in a worktree of it), and the line now carries the checkout's path. A routed Read now logs its session, transcript and file, and the token report credits it the output it replaced less the later Reads of the same file in the same transcript; rows logged before this upgrade are credited 0, and a row's verdict is stored once its transcript has been still for six hours, so the credit stays when Claude Code deletes old transcripts. The report's routing block and "Where the savings live" row say so. Older stores gain the new `token_log` columns in place, their rows kept.
+- **Warning of a scheduled restart.** atlas notices a pending or scheduled system restart and says so while agents run, writing a restart point first.
+- **Outside pull requests on the public repository are welcome.** Merged there and tested by the public CI, they are
+  brought into the next release with their author kept and credited in the changelog; see `CONTRIBUTING.md`.
+- **A subagent started with `recall.subagent_context = "binding"` now gets what the brief points at.** The
+  Binding block lists every record the brief names, key and title (Gherkin tags such as `@journal:LANE:0012`,
+  pinned `@journal:LANE:0012#a1b2c3d4`, a scenario's tags under its name, refs, bare keys, and short
+  continuations like `journal:LANE:0004 and 0005` or `0004 through 0009` in the key's sentence), then its lane's handoff and
+  rulings, which keep their room however many records the brief names, then the newest handoff and rulings of
+  each other lane a named record is filed in. A brief with no lane still gets the records it names. On 30 real
+  launches it informs as many needs as `recall` for every kind (builder 3 vs 2, reviewer 11 vs 11, research 4
+  vs 4) at about 200 tokens a start against recall's 1,679.
+
+### Fixes
+
+- **`remember`'s help says how long a title and a summary may be.** A memory's or a rule's `title` past 120
+  characters and a memory's `summary` past 200 are refused, and a model used to learn that from the refused call.
+  `atlas://help`, `note` with `op: "help"` and the skill's reference now state both limits on the arguments they
+  bound. The listed tools/list schema is unchanged.
+- **Compaction figures count reads of private paths.** A read whose path looked secret was stored blank and left out of the post-compaction window figures; it is now stored as its tool and a redacted target, and counted.
+- **A bug in hook code no longer takes the server down.** A panic while answering a hook is caught: that tool call passes through untouched, a miss is recorded, and later hooks and tool calls are answered as before.
+- **Agents freed after a full disk stay freed correctly.** A disk-full error among parallel tool results is recognised, an agent still waiting on its own background work keeps its lane, and atlas's release records live in its store instead of files beside Claude Code's.
+- **Chain keys resolve faster on long sessions.** A `turn:` or `compact:` key no longer re-reads and re-parses its
+  part of the transcript each time: the server keeps the last few parsed ranges, checked against the transcript's
+  bytes, and a group asked for again is answered from the reply it already built. A link's digest also stops
+  reading once its reserve is full. The kept ranges hold at most 16 MiB, parse included, and one unused for ten
+  minutes is let go at the next lookup.
+- **An update check or installed update is never forgotten without a word.** When several atlas processes
+  record an update check at once, each waits its turn, and one that still cannot record it within five seconds
+  says so on stderr instead of dropping it silently.
+- **The token report says where the savings live.** The rulebook brief is now measured from pre-atlas reads (1.68k tokens per agent over 65 pre-atlas subagent transcripts), with the file size kept as "if read whole"; hook injections are split into main sessions per prompt and subagents per agent; `read_note` is marked 1x by design, with `section` the cheaper read; and a new "Where the savings live" block shows credit, cost and net per source, with Net now counting the measured rulebook saving in place of the SubagentStart hit credit, less what recall by key or lane already credits, since both may read the same records; other lookups that open the rulebook may still overlap it, and the report bounds that overlap by the rulebook row's credit. On a store with a memory store this can lower Net, since the measured rulebook is smaller than the hit credit it replaces.
+
+### Security hardening
+
+- **podman's secret values are never read.** `secretsdata.json`, where podman's file secret driver keeps
+  every secret's value in plain JSON, joins the deny-list beside `secrets.json`, so atlas never reads,
+  indexes or keeps a handle of it.
+  Thanks to @serkankose (#13).
+
+### Known limits
+
+- **The macOS shutdown path is checked, not run.** Its signal code is shared with Linux and tested there; on macOS it is compile-checked only.
+
 ## v0.6.1
 
 ### Highlights

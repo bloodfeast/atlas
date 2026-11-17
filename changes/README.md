@@ -10,6 +10,12 @@ a version.
 `changes/<pr>.md`, named for its own pull request's number. A pull request with lines for more than one section
 adds one file per section: `changes/<pr>-<slug>.md`, the slug in lowercase letters, digits and `-`.
 
+An outside pull request merged on the public repository comes in through `cargo xtask release import`, which
+renames its `changes/<n>.md` to `changes/public-<n>.md` (`changes/public-<n>-<slug>.md` for a slug), `<n>` its
+public number, and adds `author: <login>`, its author's GitHub login, to the front matter. Only such a fragment
+takes, and must have, `author`; the fold ends each of its list items with `Thanks to @<login> (#<n>).`. The
+import's own pull request needs no other fragment.
+
 ```markdown
 ---
 bump: feature
@@ -20,7 +26,7 @@ section: feature
 ```
 
 The file is UTF-8 with no byte order mark. The front matter holds two keys, each once, and nothing else (an
-upgrade note may leave `bump` out):
+upgrade note may leave `bump` out; an imported fragment holds `author` too):
 
 - `bump`: which part of the version, Release.Feature.Patch, the change raises.
   - `breaking`: a user must change something (a removed or renamed tool, setting or flag, a changed default

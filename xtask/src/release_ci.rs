@@ -11,7 +11,9 @@
 //!     release/vX.Y.Z of URL with the exported tree on top of its main
 //!     (bin/ kept as main has it), pushed,
 //!     and a pull request into main whose body is the release notes. No
-//!     tests and no builds: the public CI tests the pull request.
+//!     tests and no builds: the public CI tests the pull request. Refused
+//!     before the push while the public main holds a change the export
+//!     would revert (`public_contrib::export_guard`).
 //! cargo xtask release assets --dir DIR --notes FILE [--expect vX.Y.Z]
 //!     In the public repository (the release workflow, after the merge):
 //!     DIR holds the five binaries; writes DIR/manifest.json (the one
@@ -32,6 +34,10 @@
 //!     makes again from the changelog at the draft's commit and the verified
 //!     binaries (no attestation covers the draft's body), which creates
 //!     the tag as the owner. --dry-run stops before signing and pushing.
+//! cargo xtask release import [--remote URL] [--dry-run]
+//!     In the development repository: outside pull requests merged on the
+//!     public main, brought in as development pull requests with their
+//!     authors kept: see `public_contrib.rs`.
 //! cargo xtask release check [--force]
 //! cargo xtask release gate --dir DIR [--export]
 //! cargo xtask release accept-hit FILE... [--print]
@@ -79,6 +85,7 @@ pub const USAGE: &str = "usage: cargo xtask release --pr --remote URL [--expect 
        cargo xtask release assets --dir DIR --notes FILE [--expect vX.Y.Z]
        cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
        cargo xtask release ship vX.Y.Z
+       cargo xtask release import [--remote URL] [--dry-run]
        cargo xtask release check [--force]
        cargo xtask release gate --dir DIR [--export]
        cargo xtask release accept-hit FILE... [--print]";
@@ -89,7 +96,8 @@ pub const PENDING_BINARIES: &str = "| Every platform | built by the release work
 
 /// Whether `release` arguments ask for a CI mode.
 pub fn wants(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("assets" | "sign" | "ship" | "check" | "gate" | "accept-hit")) || args.iter().any(|a| a == "--pr")
+    matches!(args.first().map(String::as_str), Some("assets" | "sign" | "ship" | "import" | "check" | "gate" | "accept-hit"))
+        || args.iter().any(|a| a == "--pr")
 }
 
 /// Whether an address may appear in the public history: the public one,
@@ -103,7 +111,7 @@ pub fn address_allowed(addr: &str, public_email: &str) -> bool {
 /// from the merger's account, not the public one; Brandon accepted them in
 /// history as they are (2026-11-04), so the check passes over these commits
 /// and nothing else.
-const ACCEPTED_MERGES: [&str; 2] = [
+pub(crate) const ACCEPTED_MERGES: [&str; 2] = [
     "ffd0eb1ee745af6bd89f7ddf0f93f66aef612786", // atlas v0.2.1 (#4)
     "006539d2ee2f170ab9749ddcfc1990266bc661c2", // atlas v0.2.1 (#5)
 ];
@@ -138,27 +146,15 @@ pub fn log_addresses(log: &str) -> Vec<(String, Vec<String>)> {
 /// The addresses in `git log` output in [`ADDRESS_LOG`] format that may not
 /// appear in the public history, trailers included, sorted and once each.
 /// For the count in an error: an address refused here is never printed.
+/// An outside pull request's author passes only through
+/// [`crate::public_contrib::other_addresses_with`], with GitHub's word;
+/// this is that check with GitHub saying no to every commit, for the tests.
+#[cfg(test)]
 pub fn other_addresses(log: &str, public_email: &str) -> Vec<String> {
-    let mut other = Vec::new();
-    for (sha, addrs) in log_addresses(log) {
-        if ACCEPTED_MERGES.contains(&sha.as_str()) {
-            continue;
-        }
-        // A commit without both addresses is refused: the log is not what
-        // was asked for.
-        if addrs.len() < 2 || !is_full_sha(&sha) {
-            other.push("<malformed>".to_string());
-        }
-        for a in addrs.iter().filter(|a| !address_allowed(a, public_email)) {
-            other.push(if a.is_empty() { "<empty>".to_string() } else { a.clone() });
-        }
-    }
-    other.sort();
-    other.dedup();
-    other
+    crate::public_contrib::other_addresses_with(log, public_email, &|_| Ok(false)).other
 }
 
-fn is_full_sha(s: &str) -> bool {
+pub(crate) fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -502,6 +498,7 @@ pub fn run(args: Vec<String>) -> R {
     match args.first().map(String::as_str) {
         Some("check" | "gate" | "accept-hit") => crate::release_check::run(&root, args),
         Some("ship") => crate::release_ship::run(&root, args),
+        Some("import") => crate::public_contrib::run(&root, args, &repo, api.as_ref()),
         Some("assets") => {
             let (mut dir, mut notes, mut expect) = (None, None, None);
             let mut it = args.into_iter().skip(1);
@@ -783,6 +780,9 @@ pub fn pr(p: &Pr) -> R<PrMade> {
     let branch = format!("release/{tag}");
     let has_main = git_out(&public, &["rev-parse", "-q", "--verify", "refs/remotes/origin/main"]).is_ok();
     if has_main {
+        // The exported tree replaces main's: a public change the
+        // development tree lacks would be reverted.
+        crate::public_contrib::export_guard(root, &head, &public, "refs/remotes/origin/main", &p.ident.email, &p.stage.join("guard"))?;
         git_out(&public, &["checkout", "-q", "-B", &branch, "origin/main"])?;
     } else {
         git_out(&public, &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])?;
@@ -1323,10 +1323,8 @@ pub fn sign(s: &Sign) -> R<Signed> {
         }
         say("main already has this release's binaries commit (an earlier run); checking it");
     }
-    let other = other_addresses(&git_out(&public, &["log", ADDRESS_LOG])?, &s.ident.email);
-    if !other.is_empty() {
-        return Err(format!("the public history carries {} that may not be there (author, committer or Co-authored-by)", refused(&other)));
-    }
+    crate::public_contrib::other_addresses_on(&git_out(&public, &["log", ADDRESS_LOG])?, &s.ident.email, s.api, &s.repo)
+        .refuse("the public history carries", " (author, committer or Co-authored-by)")?;
 
     let bin = public.join("bin");
     if !resumed {
@@ -2693,6 +2691,38 @@ Signed-off-by: S <s@example.invalid>");
         let mut wrong = mk(true);
         wrong.expect = Some("v9.9.9".into());
         assert!(pr(&wrong).unwrap_err().contains("asked to release v9.9.9"));
+        // An outside pull request merged on the public main that the
+        // development tree lacks: refused before the push, named.
+        std::fs::write(
+            seed.join("gone.txt"),
+            "an outside change
+",
+        )
+        .unwrap();
+        sh(&seed, &["add", "-A"]);
+        sh(
+            &seed,
+            &[
+                "-c",
+                "user.name=GitHub",
+                "-c",
+                "user.email=noreply@github.com",
+                "commit",
+                "-q",
+                "--author",
+                "Out <out@example.invalid>",
+                "-m",
+                "docs: outside (#13)",
+            ],
+        );
+        sh(&seed, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        let outside = sh(&seed, &["rev-parse", "HEAD"]);
+        let pushed = sh(&bare, &["rev-parse", &branch]);
+        for dry_run in [true, false] {
+            let e = pr(&mk(dry_run)).unwrap_err();
+            assert!(e.contains(short(&outside)) && e.contains("docs: outside (#13)") && e.contains("cargo xtask release import"), "{e}");
+        }
+        assert_eq!(sh(&bare, &["rev-parse", &branch]), pushed, "nothing pushed");
         // The tag already out stops it.
         sh(&seed, &["tag", &tag]);
         sh(&seed, &["push", "-q", "origin", &format!("refs/tags/{tag}")]);

@@ -58,19 +58,25 @@ On an Agent PreToolUse, while caps are on:
      running, and an interim task notification, an agent waiting on its own background work, undoes it). This
      is atlas's own record: an agent that dies on a full disk (ENOSPC) never gets its `"finished": true`
      written, and before #204 it held its lane, slot and resources for `stale_minutes`. The stop is kept in the
-     hook server's memory and, best effort, as a release record on disk (below) for other processes; on a
-     full disk that write fails too, and `atlas queue next`, `atlas backlog` and command hooks see the agent
-     until `disk_full_minutes` or `stale_minutes`;
-   - no release record (`agent-<id>.atlas-released` beside the meta file, written by `atlas queue release
-     AGENT`) is newer than its last write. The command refuses an agent that wrote in the last 5 minutes unless
-     `--force`, finds the agent under Claude Code's projects folder or in the session `--transcript PATH` names,
-     and never edits the meta file. An agent that writes after its release counts again;
-   - its transcript's last message line (`user` or `assistant`; the hook attachments, `api-request` and
-     `system` lines Claude Code writes after a tool result, and a torn last line, are passed over) is not a
-     tool error saying the disk is full (`ENOSPC`, "no space left", or Windows' "not enough space on the
-     disk" / "os error 112", in any case), or it changed within `disk_full_minutes` (default 10; 0 turns the
-     rule off). A live agent answers a tool error within seconds, so ten quiet minutes after one means it died
-     there. The end is read from 64 KiB, further back up to 4 MiB while no message line is whole in it.
+     hook server's memory and, best effort, as a release record in the memory store (below) for other
+     processes; on a full disk that write fails too, and `atlas queue next`, `atlas backlog` and command hooks
+     see the agent until `disk_full_minutes` or `stale_minutes`. A SubagentStop whose `background_tasks` is
+     not empty (the agent waits on its own background work; Claude Code 2.1.325 puts the field in
+     SubagentStop's input as in Stop's) records no finish (#222);
+   - no release record (a row of the memory store's `agent_releases(agent, time)` table, written at a
+     SubagentStop and by `atlas queue release AGENT`) is newer than its last write. The command refuses an
+     agent that wrote in the last 5 minutes unless `--force`, finds the agent under Claude Code's projects
+     folder or in the session `--transcript PATH` names, and never edits the meta file. An agent that writes
+     after its release counts again, and its row goes. The `agent-<id>.atlas-released` files atlas 0.6.1 and
+     earlier wrote beside the meta files are read into the table once and deleted;
+   - the `user` lines after its transcript's last `assistant` line (one per result of parallel tool calls;
+     the hook attachments, `api-request` and `system` lines Claude Code writes after a tool result, and a
+     torn last line, are passed over) hold no tool error saying the disk is full (`ENOSPC`, "no space left",
+     or Windows' "not enough space on the disk" / "os error 112", in any case), or it changed within
+     `disk_full_minutes` (default 10; 0 turns the rule off). A live agent answers a tool error within seconds,
+     so ten quiet minutes after one means it died there. The end is read from 64 KiB, further back up to 4 MiB
+     while no `assistant` line is whole in it, and the answer is kept until the transcript's length or time
+     changes.
 3. **Add admitted launches whose agent has not started yet.** Each admitted launch leaves a pending record, so
    two Agent calls in one message cannot both slip under the cap. The record ends when its agent starts: the
    SubagentStart event pairs it (by the meta's `toolUseId` when the record has the launch's `tool_use_id`, else

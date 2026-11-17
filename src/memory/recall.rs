@@ -384,7 +384,8 @@ pub fn gated(store: &MemoryStore, query: &str, budget: usize, g: &Gate, sem: Opt
 }
 
 /// A lane's state, in the order a fresh agent needs it: the latest handoff,
-/// the brief, open questions, the latest next step, then decisions,
+/// the brief, open questions, the latest next step, the newest launch brief
+/// atlas filed (`launch`), then decisions,
 /// measurements and commits newest first; anything past the byte budget is
 /// counted on a `+N more` line.
 ///
@@ -392,7 +393,7 @@ pub fn gated(store: &MemoryStore, query: &str, budget: usize, g: &Gate, sem: Opt
 ///
 /// [`crate::Error::Db`].
 pub fn lane(store: &MemoryStore, lane: &str, budget: usize) -> Result<String> {
-    Ok(lane_with(store, lane, budget, None)?.text)
+    Ok(lane_with(store, lane, budget, None, true)?.text)
 }
 
 /// A lane view as [`lane_with`] built it.
@@ -474,11 +475,16 @@ pub fn lane_head(store: &MemoryStore, lane: &str) -> Result<Option<String>> {
 /// quote of it is still the record's own text. A line after them says how
 /// many were trimmed and that `recall {key}` reads one whole.
 ///
+/// `launches` keeps the `launch` entries atlas files at each agent's start
+/// (#220): `recall lane=` shows the newest, so a dead agent is relaunched
+/// from it; the hook's lane brief leaves them out (and out of its count), so
+/// an agent is not handed an earlier agent's launch prompt.
+///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&str, usize)>) -> Result<LaneView> {
-    let all = store.lane_family(lane)?;
+pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&str, usize)>, launches: bool) -> Result<LaneView> {
+    let all: Vec<Head> = store.lane_family(lane)?.into_iter().filter(|h| launches || !(h.kind == "journal" && h.sub == "launch")).collect();
     if all.is_empty() {
         return Ok(LaneView::default());
     }
@@ -489,6 +495,9 @@ pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&
         ("brief", sub("brief").into_iter().take(1).collect()),
         ("open questions", sub("question").into_iter().filter(|h| open.contains(&h.key)).collect()),
         ("next", sub("next").into_iter().take(1).collect()),
+        // atlas's record of the newest agent launch (only with `launches`):
+        // a dead agent is relaunched from it (#220).
+        ("launch", sub("launch").into_iter().take(1).collect()),
         ("decisions", sub("decision")),
         ("measurements", sub("measurement")),
         ("commits", sub("commit")),
@@ -589,7 +598,7 @@ mod tests {
             w.create(key, "journal", "decision", "L", &dr, None).unwrap();
             w.commit().unwrap();
         }
-        let out = lane_with(&s, "L", 1 << 20, Some(("walrus yak", 200))).unwrap().text;
+        let out = lane_with(&s, "L", 1 << 20, Some(("walrus yak", 200)), false).unwrap().text;
         assert!(out.contains("The walrus opens the body."), "{out}");
         let long = out.split("journal:L:0002").nth(1).unwrap_or("");
         assert!(long.contains("yak tail clause") && !long.contains(&headline), "{out}");

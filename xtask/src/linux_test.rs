@@ -11,20 +11,28 @@
 //! Linux-only failure used to surface first on the public repository's
 //! release pull request. This runs, in the official `rust:<channel>` image
 //! (`<channel>` read from `rust-toolchain.toml`, the toolchain the public CI
-//! installs) with the pinned clippy added (a local image,
-//! `atlas-linux-test:rust-<channel>-clippy-<channel>`, built on the first
-//! run):
+//! installs) with the pinned clippy and the pinned cargo-nextest added (a
+//! local image,
+//! `atlas-linux-test:rust-<channel>-clippy-<channel>-nextest-<version>`,
+//! built on the first run; nextest is the release's prebuilt binary, its
+//! sha256 checked before it is unpacked):
 //!
-//! 1. `cargo test --workspace --locked --no-fail-fast --release`, as the
-//!    public CI's `test` job runs it but going on past a failing test binary
-//!    so one run reports every failure (`--debug` drops `--release`;
-//!    arguments after `--` go to the test binaries, a filter for example);
-//! 2. `cargo +<channel> clippy --workspace --locked --all-targets --features
+//! 1. the tests as `cargo xtask test-gate` runs them, in release: `cargo
+//!    nextest run --workspace --locked --no-fail-fast --test-threads 16
+//!    --release`, going on past a failing test so one run reports every
+//!    failure (`--debug` drops `--release`; arguments after `--` go to the
+//!    tests in libtest's form, a filter for example);
+//! 2. `cargo test --workspace --locked --doc --release`, the doc tests,
+//!    which nextest does not run (the same arguments after `--`);
+//! 3. `cargo +<channel> clippy --workspace --locked --all-targets --features
 //!    atlas/dev -- -D warnings` and
-//! 3. `cargo +<channel> clippy --workspace --locked -- -D warnings`, the
+//! 4. `cargo +<channel> clippy --workspace --locked -- -D warnings`, the
 //!    public CI's `clippy` job (`--no-clippy` skips both).
 //!
-//! The checkout is mounted read-only at `/src`; nothing in it is written.
+//! The checkout is mounted read-only at `/src`; nothing in it is written
+//! (nextest's store, `target/nextest` under the workspace root whatever
+//! `CARGO_TARGET_DIR` says, is moved to the build volume by a tool config
+//! the image carries).
 //! `CARGO_HOME` is the named volume `atlas-linux-cargo-home`, shared by every
 //! checkout: the registry, the git dependencies and Cargo's package-cache
 //! lock all live on it, so two runs at once (two checkouts) take turns on
@@ -185,15 +193,11 @@ pub fn clean_volumes(hash: &str, all: bool) -> Vec<String> {
 /// One step: its name and the cargo arguments.
 pub fn steps(a: &Args, channel: &str) -> Vec<(&'static str, Vec<String>)> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    let mut test = s(&["cargo", "test", "--workspace", "--locked", "--no-fail-fast"]);
-    if !a.debug {
-        test.push("--release".into());
-    }
-    if !a.test_args.is_empty() {
-        test.push("--".into());
-        test.extend(a.test_args.iter().cloned());
-    }
-    let mut out = vec![("test", test)];
+    let store = ["--tool-config-file".to_string(), format!("atlas-linux-test:{NEXTEST_TOOL_CONFIG}")];
+    let mut out: Vec<(&'static str, Vec<String>)> = crate::test_gate::commands(!a.debug, &store, &a.test_args)
+        .into_iter()
+        .map(|(name, cmd)| (if name == "nextest" { "test" } else { name }, cmd))
+        .collect();
     if !a.no_clippy {
         let plus = format!("+{channel}");
         out.push((
@@ -281,7 +285,7 @@ pub fn pump(mut r: impl BufRead, mut sink: impl FnMut(&str)) -> (String, Option<
                 log.push('\n');
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return (log, Some(format!("reading docker's output: {e}"))),
+            Err(e) => return (log, Some(format!("reading the output: {e}"))),
         }
     }
 }
@@ -304,9 +308,10 @@ pub struct Step {
 pub fn step_detail(name: &str, log: &str, err: Option<&str>) -> String {
     let mut d = String::new();
     if name == "test" {
-        let (passed, failed) = test_totals(log);
+        d = crate::test_gate::nextest_detail(log);
+    } else if name == "doctest" {
+        let ((passed, failed), names) = (test_totals(log), failed_tests(log));
         d = format!("{passed} passed, {failed} failed");
-        let names = failed_tests(log);
         if !names.is_empty() {
             d.push_str(&format!(": {}", names.join(", ")));
         }
@@ -342,18 +347,34 @@ pub fn summary(steps: &[Step], secs: u64) -> (bool, String) {
 /// child is always waited on, and its container removed when the output
 /// could not be read to the end.
 fn run_step(args: &[String], name: &str) -> (bool, String, Option<String>) {
-    let mut child = match Command::new("docker").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).spawn() {
+    let mut child = match Command::new("docker").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
         Ok(c) => c,
         Err(e) => return (false, String::new(), Some(format!("docker: {e}"))),
     };
-    let (log, mut err) = match child.stdout.take() {
+    // nextest reports on stderr, libtest on stdout: both are read (stderr
+    // on its own thread, so neither pipe fills while the other is read)
+    // and the step's log is the two together.
+    let errs = child.stderr.take().map(|e| std::thread::spawn(move || pump(BufReader::new(e), |l| eprintln!("{l}"))));
+    let (mut log, mut err) = match child.stdout.take() {
         Some(out) => pump(BufReader::new(out), |l| println!("{l}")),
         None => (String::new(), None),
     };
     if err.is_some() {
         // The client may be blocked writing to a pipe nobody reads; the
-        // container would outlive it.
+        // container would outlive it (and the stderr reader with it).
         let _ = Command::new("docker").args(["rm", "-f", name]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    match errs.map(|h| h.join()) {
+        Some(Ok((e_log, e_err))) => {
+            log.push_str(&e_log);
+            if let Some(e) = e_err {
+                err.get_or_insert(e);
+            }
+        }
+        Some(Err(_)) => {
+            err.get_or_insert("reading docker's output: the stderr reader panicked".into());
+        }
+        None => {}
     }
     let ok = match child.wait() {
         Ok(s) => s.success(),
@@ -365,18 +386,59 @@ fn run_step(args: &[String], name: &str) -> (bool, String, Option<String>) {
     (ok && err.is_none(), log, err)
 }
 
+/// The cargo-nextest the image installs, pinned.
+pub const NEXTEST_VERSION: &str = "0.9.118";
+
+/// The sha256 of each Linux build of that release's prebuilt archive
+/// (`cargo-nextest-<version>-<arch>-unknown-linux-gnu.tar.gz`), as the
+/// release publishes it beside the archive; the image build refuses an
+/// archive that hashes otherwise.
+pub const NEXTEST_SHA256: [(&str, &str); 2] = [
+    ("x86_64", "1e60aac5de62391d2419bb6c5bfa467f4b27586b3f1b3ec07aa79f4632583450"),
+    ("aarch64", "1b89b3cbac2e27095168f8edaa5165a344a83743b42dfb90a95b8896187807e8"),
+];
+
+/// A nextest tool config the image carries, given to the test step with
+/// `--tool-config-file`. nextest writes its store under the workspace root
+/// (`target/nextest`), not under `CARGO_TARGET_DIR`, and the workspace root
+/// is the read-only checkout; this moves the store to the build volume.
+pub const NEXTEST_TOOL_CONFIG: &str = "/usr/local/share/atlas-linux-test/nextest.toml";
+
+/// The revision of [`dockerfile`], in the image's tag: an image built
+/// before a change to what the image carries (2: the
+/// [`NEXTEST_TOOL_CONFIG`]) is not reused.
+pub const IMAGE_REVISION: u32 = 2;
+
 /// The local image the steps run in: `base` with the pinned clippy added,
 /// as the public CI's clippy job installs it (the official `rust` images
-/// carry no clippy). Named after both, so another channel on the same base
-/// is another image. Built once and then reused from Docker's image store.
+/// carry no clippy), the pinned cargo-nextest and its tool config. Named
+/// after all three and [`IMAGE_REVISION`], so another channel or nextest on
+/// the same base is another image. Built
+/// once and then reused from Docker's image store.
 pub fn image_tag(base: &str, channel: &str) -> String {
     let safe: String = base.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '-' }).collect();
-    format!("atlas-linux-test:{safe}-clippy-{channel}")
+    format!("atlas-linux-test:{safe}-clippy-{channel}-nextest-{NEXTEST_VERSION}-r{IMAGE_REVISION}")
 }
 
-/// The Dockerfile of that image.
+/// The Dockerfile of that image. nextest is the release's prebuilt binary
+/// for the image's architecture, checked against [`NEXTEST_SHA256`] before
+/// it is unpacked into `/usr/local/bin` (`CARGO_HOME` is a volume at run
+/// time, so its `bin` would not hold it). The tool config sets nextest's
+/// store to `/target/nextest`, on the build volume.
 pub fn dockerfile(base: &str, channel: &str) -> String {
-    format!("FROM {base}\nRUN rustup toolchain install {channel} --profile minimal -c clippy\n")
+    let v = NEXTEST_VERSION;
+    let cases: String = NEXTEST_SHA256.iter().map(|(arch, sum)| format!("{arch}) sum={sum} ;; ")).collect();
+    format!(
+        "FROM {base}\n\
+         RUN rustup toolchain install {channel} --profile minimal -c clippy\n\
+         RUN set -eu; arch=\"$(uname -m)\"; case \"$arch\" in {cases}*) echo \"no cargo-nextest build for $arch\" >&2; exit 1 ;; esac; \
+         f=cargo-nextest-{v}-$arch-unknown-linux-gnu.tar.gz; \
+         curl -fsSL -o /tmp/$f https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{v}/$f; \
+         echo \"$sum  /tmp/$f\" | sha256sum -c -; tar -xzf /tmp/$f -C /usr/local/bin; rm /tmp/$f; cargo-nextest nextest --version\n\
+         RUN mkdir -p {dir} && \
+         printf '[store]\\ndir = \"/target/nextest\"\\n' > {NEXTEST_TOOL_CONFIG}\n",
+        dir = NEXTEST_TOOL_CONFIG.rsplit_once('/').map_or("/", |(d, _)| d)
+    )
 }
 
 fn ensure_image(base: &str, channel: &str) -> Result<String, String> {
@@ -633,24 +695,74 @@ mod tests {
         for bad in ["", "rust:1\nRUN x", "rust 1", "--privileged"] {
             assert!(check_image(bad).is_err(), "{bad:?}");
         }
+        let d = dockerfile("rust:1.99.0", "1.99.0");
+        assert!(d.starts_with("FROM rust:1.99.0\nRUN rustup toolchain install 1.99.0 --profile minimal -c clippy\nRUN "), "{d}");
+        assert_eq!(d.lines().count(), 4, "{d}");
+        assert!(d.ends_with('\n'));
+    }
+
+    #[test]
+    fn the_image_installs_the_pinned_nextest_and_checks_its_sha256() {
+        let d = dockerfile("rust:1", "1.99.0");
+        let run = d.lines().nth(2).unwrap();
+        assert!(run.starts_with("RUN set -eu; "), "{run}");
+        assert!(run.contains("https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.118/$f"), "{run}");
+        assert!(run.contains("f=cargo-nextest-0.9.118-$arch-unknown-linux-gnu.tar.gz"), "{run}");
+        for (arch, sum) in NEXTEST_SHA256 {
+            assert_eq!(sum.len(), 64);
+            assert!(run.contains(&format!("{arch}) sum={sum} ;;")), "{run}");
+        }
+        // The check comes before the unpack, and an unknown arch stops the build.
+        let (check, unpack) = (run.find("sha256sum -c -").unwrap(), run.find("tar -xzf").unwrap());
+        assert!(check < unpack, "{run}");
+        assert!(run.contains("*) echo \"no cargo-nextest build for $arch\" >&2; exit 1 ;;"), "{run}");
+    }
+
+    #[test]
+    fn nextest_keeps_its_store_off_the_read_only_checkout() {
+        // nextest's store dir is `target/nextest` under the workspace root,
+        // whatever CARGO_TARGET_DIR says: in the container that is
+        // /src/target/nextest, on the read-only checkout, and the test step
+        // failed before it ran a test. The image carries a tool config that
+        // moves it to the writable build volume, and the step names it.
+        let d = dockerfile("rust:1", "1.99.0");
+        let run = d.lines().nth(3).unwrap();
         assert_eq!(
-            dockerfile("rust:1.99.0", "1.99.0"),
-            "FROM rust:1.99.0\nRUN rustup toolchain install 1.99.0 --profile minimal -c clippy\n"
+            run,
+            "RUN mkdir -p /usr/local/share/atlas-linux-test && \
+             printf '[store]\\ndir = \"/target/nextest\"\\n' > /usr/local/share/atlas-linux-test/nextest.toml"
         );
+        assert!(NEXTEST_TOOL_CONFIG.starts_with("/usr/local/share/atlas-linux-test/"));
+        let s = steps(&Args::default(), "1.99.0");
+        let i = s[0].1.iter().position(|x| x == "--tool-config-file").unwrap();
+        assert_eq!(s[0].1[i + 1], format!("atlas-linux-test:{NEXTEST_TOOL_CONFIG}"));
+        // The doc tests and clippy are cargo's, which take no such flag.
+        assert!(s[1..].iter().all(|(_, c)| !c.iter().any(|x| x.contains("tool-config"))));
     }
 
     #[test]
     fn steps_match_the_public_ci_in_release_and_never_stop_early() {
         let a = Args::default();
         let s = steps(&a, "1.99.0");
-        assert_eq!(s.len(), 3);
-        assert_eq!(s[0].1.join(" "), "cargo test --workspace --locked --no-fail-fast --release");
-        assert_eq!(s[1].1.join(" "), "cargo +1.99.0 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings");
-        assert_eq!(s[2].1.join(" "), "cargo +1.99.0 clippy --workspace --locked -- -D warnings");
+        assert_eq!(s.len(), 4);
+        assert_eq!(s.iter().map(|x| x.0).collect::<Vec<_>>(), ["test", "doctest", "clippy all-targets dev", "clippy default"]);
+        assert_eq!(
+            s[0].1.join(" "),
+            "cargo nextest run --workspace --locked --no-fail-fast --test-threads 16 --release \
+             --tool-config-file atlas-linux-test:/usr/local/share/atlas-linux-test/nextest.toml"
+        );
+        assert_eq!(s[1].1.join(" "), "cargo test --workspace --locked --doc --release");
+        assert_eq!(s[2].1.join(" "), "cargo +1.99.0 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings");
+        assert_eq!(s[3].1.join(" "), "cargo +1.99.0 clippy --workspace --locked -- -D warnings");
         let a = Args { debug: true, no_clippy: true, test_args: v(&["x"]), ..Args::default() };
         let s = steps(&a, "1.99.0");
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].1.join(" "), "cargo test --workspace --locked --no-fail-fast -- x");
+        assert_eq!(s.len(), 2);
+        assert_eq!(
+            s[0].1.join(" "),
+            "cargo nextest run --workspace --locked --no-fail-fast --test-threads 16 \
+             --tool-config-file atlas-linux-test:/usr/local/share/atlas-linux-test/nextest.toml -- x"
+        );
+        assert_eq!(s[1].1.join(" "), "cargo test --workspace --locked --doc -- x");
     }
 
     #[test]
@@ -673,8 +785,8 @@ mod tests {
 
     #[test]
     fn image_tag_is_a_valid_tag_and_names_the_channel() {
-        assert_eq!(image_tag("rust:1.99.0", "1.99.0"), "atlas-linux-test:rust-1.99.0-clippy-1.99.0");
-        assert_eq!(image_tag("ghcr.io/x/y:1", "nightly"), "atlas-linux-test:ghcr.io-x-y-1-clippy-nightly");
+        assert_eq!(image_tag("rust:1.99.0", "1.99.0"), "atlas-linux-test:rust-1.99.0-clippy-1.99.0-nextest-0.9.118-r2");
+        assert_eq!(image_tag("ghcr.io/x/y:1", "nightly"), "atlas-linux-test:ghcr.io-x-y-1-clippy-nightly-nextest-0.9.118-r2");
         assert_ne!(image_tag("rust:1", "1.99.0"), image_tag("rust:1", "1.98.0"));
     }
 
@@ -725,7 +837,7 @@ mod tests {
             "atlas-linux-test-abc",
             "vol",
             &v(&["type=bind,src=/g,dst=/git-common,readonly"]),
-            &v(&["cargo", "test"]),
+            &v(&["cargo", "nextest", "run"]),
         );
         let j = d.join(" ");
         assert!(j.starts_with("run --rm --init --name atlas-linux-test-abc --cpus 4 "), "{j}");
@@ -736,12 +848,12 @@ mod tests {
         assert!(j.contains("--mount type=bind,src=/g,dst=/git-common,readonly"));
         assert!(j.contains("-e CARGO_BUILD_JOBS=4"));
         assert!(!j.contains(" -v "), "--mount only");
-        assert!(j.ends_with("rust:1 cargo test"));
+        assert!(j.ends_with("rust:1 cargo nextest run"));
     }
 
     #[test]
     fn docker_args_keep_a_windows_path_with_spaces_in_one_argument() {
-        let d = docker_args(Path::new(r"C:\My Work\atlas"), "rust:1", "n", "vol", &[], &v(&["cargo", "test"]));
+        let d = docker_args(Path::new(r"C:\My Work\atlas"), "rust:1", "n", "vol", &[], &v(&["cargo", "nextest", "run"]));
         let i = d.iter().position(|x| x.contains("dst=/src")).unwrap();
         assert_eq!(d[i], r"type=bind,src=C:\My Work\atlas,dst=/src,readonly");
         assert_eq!(d[i - 1], "--mount");
@@ -780,9 +892,16 @@ mod tests {
     #[test]
     fn step_detail_counts_names_failures_and_carries_an_error() {
         let log = "test a ... ok\ntest b ... FAILED\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n";
-        assert_eq!(step_detail("test", log, None), "1 passed, 1 failed: b");
+        // The test step is nextest's: a libtest log holds no summary of its.
+        assert_eq!(step_detail("test", log, None), "0 passed, 0 failed");
         assert_eq!(step_detail("clippy default", "", None), "");
         assert_eq!(step_detail("clippy default", "", Some("docker: not found")), "docker: not found");
+        assert_eq!(step_detail("doctest", log, None), "1 passed, 1 failed: b");
+        let nx = "        FAIL [   0.004s] atlas::hooks a\n     Summary [   1.000s] 3 tests run: 2 passed, 1 failed, 0 skipped\n";
+        assert_eq!(step_detail("test", nx, None), "2 passed, 1 failed: atlas::hooks a");
+        // A pass on a retry is shown as one.
+        let nx = "  TRY 1 FAIL [   0.3s] (───) atlas::orchestrate admit\n  TRY 2 PASS [   0.2s] (2/2) atlas::orchestrate admit\n     Summary [   1.000s] 2 tests run: 2 passed (1 flaky), 0 failed, 0 skipped\n   FLAKY 2/2 [   0.2s] (2/2) atlas::orchestrate admit\n";
+        assert_eq!(step_detail("test", nx, None), "2 passed (1 flaky: atlas::orchestrate admit), 0 failed");
         assert_eq!(step_detail("test", "", Some("reading docker's output: x")), "0 passed, 0 failed, reading docker's output: x");
     }
 

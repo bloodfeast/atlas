@@ -1347,10 +1347,26 @@ impl MissTracker {
     }
 }
 
-/// A target as `compact_miss` stores it: redacted, at most [`SIG_CAP`]
-/// characters. A shell target's words are redacted already.
-fn stored_sig(sig: &str) -> String {
-    let s = if sig.starts_with("$ ") { sig.to_string() } else { crate::redact::redact(sig) };
+/// A target as `compact_miss` stores it: redacted against the leak
+/// denylist, at most [`SIG_CAP`] characters (see [`stored_sig_with`]).
+pub fn stored_sig(sig: &str) -> String {
+    stored_sig_with(sig, crate::redact::denylist())
+}
+
+/// [`stored_sig`] against the given terms. The first word is a fixed tool
+/// word ([`lookup_sig`]) and is kept, so a read of a path that looks secret
+/// is stored `read [redacted]` and still counts as a read in [`totals`]; only
+/// the target after it is redacted. A shell target's words are redacted
+/// already.
+pub fn stored_sig_with(sig: &str, deny: &[String]) -> String {
+    let s = if sig.starts_with("$ ") {
+        sig.to_string()
+    } else {
+        match sig.split_once(' ') {
+            Some((tool, target)) => format!("{tool} {}", crate::redact::redact_with(target, deny)),
+            None => crate::redact::redact_with(sig, deny),
+        }
+    };
     s.chars().take(SIG_CAP).collect()
 }
 
@@ -1494,6 +1510,25 @@ mod tests {
         assert_ne!(shell_sig("PowerShell", &v), Some(s));
         assert_eq!(shell_sig("Read", &v), None);
         assert_eq!(shell_sig("Bash", &crate::json::parse(r#"{"command": "  "}"#).unwrap()), None);
+    }
+
+    /// journal:ATLAS-RELEASE:0048: a read of a path that looks secret keeps
+    /// its tool word, so the window figures still count it.
+    #[test]
+    fn a_redacted_read_keeps_its_tool_word_and_is_counted() {
+        let deny = ["zebra".to_string()];
+        let sig = stored_sig_with("read c:/x/zebra/a.rs", &deny);
+        assert_eq!(sig, format!("read {}", crate::redact::REDACTED));
+        assert_eq!(stored_sig_with("read c:/x/plain/a.rs", &deny), "read c:/x/plain/a.rs");
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MISS_TABLE).unwrap();
+        c.execute(
+            "INSERT INTO compact_miss(time, session, sig, kind, calls) VALUES('2026-11-14T00:00:00Z', 's', ?1, 'miss', 3)",
+            params![sig],
+        )
+        .unwrap();
+        let t = totals(&c, 4.0).unwrap().unwrap();
+        assert_eq!((t.window_lookups, t.window_repeats, t.window_misses), (1, 1, 1));
     }
 
     #[test]

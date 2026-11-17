@@ -31,9 +31,8 @@ processed 290 more times. Measured on real sessions:
 
 | | Without atlas | With atlas |
 |---|---|---|
-| The tool list, loaded with every session | 47 tools, 5,930 tokens (v0.1) | 14 tools, 6,057 bytes (about 1,514 tokens at 4 bytes a token, measured at v0.6.0); the full reference is one fetched resource |
+| The tool list, loaded with every session | 47 tools, 5,930 tokens (v0.1) | 14 tools, 6,118 bytes (about 1,530 tokens at 4 bytes a token, measured at v0.6.1); the full reference is one fetched resource |
 | A lookup (7,067 answers against 96 lookups done before atlas, measured at v0.6.0) | grep, then read the files | 6.4x fewer tokens in all (ratio of sums); 10.9x median per answer |
-| Rules and memory at an agent's start (1,560 agents, measured at v0.6.0) | the whole rulebook read once per agent | the relevant records injected as pointers: 108.4x fewer tokens |
 | Memory questions (100-question evaluation, at v0.6.0) | the whole rulebook loaded | 100/100 answered when the agent follows a result to its source, 99/100 reading only the first result; median 506 tokens each |
 
 Shell reads are 36% of what a builder session processes and startup context another 35%; those are the

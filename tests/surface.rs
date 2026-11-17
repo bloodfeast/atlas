@@ -4,8 +4,12 @@
 use atlas::json;
 
 /// The ceiling, in tokens at the default ratio of bytes per token. Raised from
-/// 1500 to 1515 when the journal description began naming its arguments (#225).
-const BUDGET_TOKENS: f64 = 1515.0;
+/// 1500 to 1515 when the journal description began naming its arguments (#225),
+/// and from 1515 to 1530 when the `note` description began steering a
+/// one-heading read to `section` (#213: 6,057 to 6,118 bytes, 1,529.5 tokens).
+/// Lowered to 1511 when `lookup` and `symbol` lost their always-loaded mark
+/// (journal:ATLAS-EFFICIENCY:0004: 6,118 to 6,042 bytes, 1,510.5 tokens).
+const BUDGET_TOKENS: f64 = 1511.0;
 
 #[test]
 fn tools_list_fits_its_budget() {
@@ -23,6 +27,31 @@ fn tools_list_fits_its_budget() {
 
 mod common;
 use common::*;
+
+/// The fixed bytes an agent start is charged (`token_cost::start_bytes`)
+/// are the tools list and the instructions after their per-project head
+/// line: the guide and the style rule (#274).
+#[test]
+fn start_bytes_are_the_tools_and_the_instructions_without_their_head() {
+    let fx = Fx::new("start-bytes");
+    let s = fx.server();
+    let ins = s.instructions();
+    let head = ins.lines().next().unwrap_or("").len();
+    let tools = json::Value::Array(atlas::tools::tool_list()).to_string().len();
+    assert!(ins.ends_with(atlas::tools::STYLE), "{ins}");
+    assert_eq!(atlas::token_cost::start_bytes(), tools + ins.len() - head, "{ins}");
+}
+
+/// The style rule is paid at every agent start and in each writing
+/// context's first journal or handoff answer: it stays short (#274: about
+/// 40 words).
+#[test]
+fn the_style_rule_stays_short() {
+    let style = atlas::tools::STYLE;
+    let words = style.split_whitespace().count();
+    assert!(style.len() <= 260 && words <= 45, "STYLE is {} bytes, {words} words; the cap is 260 bytes, 45 words: {style}", style.len());
+    assert!(!style.contains('\n'), "one line of the instructions");
+}
 
 #[test]
 fn every_listed_argument_is_taken_by_an_op_of_its_tool() {
@@ -368,4 +397,19 @@ fn the_hook_worker_sets_the_binding_compiler() {
     let start = text.lines().map(|l| atlas::json::parse(l).unwrap()).find(|v| v["id"] == json!("h2")).unwrap_or_else(|| panic!("no answer h2 in {text}"));
     let said = start["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
     assert!(said.contains("journal:ALPHA:0003"), "{said}");
+}
+
+/// The hook's relevance floor defaults to 0.60 (journal:ATLAS-EFFICIENCY:0004):
+/// on 14 days of hook data it drops 3,480 pointer rows (about 37k tokens a
+/// week) and leaves the memory eval and its hook replay unchanged. An
+/// explicit 0 is honoured, not read as unset.
+#[test]
+fn the_inject_floor_defaults_to_0_60_and_an_explicit_0_stays_0() {
+    let db = std::env::temp_dir().join("atlas-floor-default").join("x.sqlite");
+    let s = atlas::memory::settings::Settings::from_config(None, &db).unwrap();
+    assert_eq!(s.recall.inject_floor, 0.60);
+    let base = std::env::temp_dir().join("atlas-floor-default");
+    let c = atlas::config::Config::parse(r#"{"recall": {"inject_floor": 0}}"#, &base).unwrap();
+    let s = atlas::memory::settings::Settings::from_config(Some(&c), &db).unwrap();
+    assert_eq!(s.recall.inject_floor, 0.0);
 }

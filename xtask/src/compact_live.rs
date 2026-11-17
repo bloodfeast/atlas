@@ -722,7 +722,7 @@ fn index_as_of(db: &Path) -> Result<String, String> {
 /// eval store, synced from the snapshot's sources, holds no refs).
 /// The `.jsonl` copy is emptied: it would hold the dropped versions.
 /// Returns (versions, records) dropped.
-fn prune_store(path: &Path, as_of: &str) -> Result<(usize, usize), String> {
+pub(crate) fn prune_store(path: &Path, as_of: &str) -> Result<(usize, usize), String> {
     prune_store_keeping(path, as_of, "")
 }
 

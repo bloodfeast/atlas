@@ -114,8 +114,9 @@ is indexed on its own; one whose package changes marks its users for re-indexing
 references the indexers resolve, not `talks_to`: a service that calls another over the network shares no
 package with it, and two repositories that share a package need not list each other.
 
-`role` and `talks_to` are optional: a prompt that names a repository gets one line from the graph (its role,
-what it talks to and depends on, what uses it), `lookup NAME` answers the same, and recall puts records about
+`role` and `talks_to` are optional: a prompt that names a repository gets one line from the graph (its checkout
+path, its role, what it talks to and depends on, what uses it) unless the prompt already names a path in its
+checkout or the working directory is in it or in a worktree of it, `lookup NAME` answers the same, and recall puts records about
 the session's active repository and its neighbours first. The active repository is the one the session's tool
 calls touched most recently and most (file paths in hook events); the working directory is the fallback.
 Recall's boost follows a record's tag, not its words: `repo: NAME` in a memory's frontmatter, else the `repo`

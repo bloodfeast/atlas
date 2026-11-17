@@ -144,6 +144,64 @@ fn a_subagent_gets_recall_from_the_parents_brief_and_its_lane() {
     assert!(second.context.is_empty());
 }
 
+/// E4 (journal:ATLAS-EFFICIENCY:0006): a repository the text names gets its
+/// project-graph line only when neither the text nor the working directory
+/// already says where it is, and then the line carries its path.
+#[test]
+fn a_repo_line_is_sent_only_when_unplaced_and_then_carries_its_path() {
+    let t = Temp::new("hook-repo-line");
+    let mut s = settings(t.path());
+    let remote = "git@git.example:acme/widgets.git";
+    let co = t.path().join("checkouts").join("widgets");
+    std::fs::create_dir_all(co.join("src")).unwrap();
+    std::fs::create_dir_all(co.join(".git").join("worktrees").join("wt")).unwrap();
+    std::fs::write(co.join(".git").join("config"), format!("[remote \"origin\"]\n\turl = {remote}\n")).unwrap();
+    // A worktree of the same repository somewhere else.
+    let wt = t.path().join("worktrees").join("wt");
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}\n", co.join(".git").join("worktrees").join("wt").display())).unwrap();
+    std::fs::write(co.join(".git").join("worktrees").join("wt").join("commondir"), "../..\n").unwrap();
+    let other = t.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    let repo = atlas::project::Repo {
+        name: "widgets".into(),
+        path: Some(co.clone()),
+        remote: Some(atlas::project::normalize_remote(remote)),
+        role: "the widget service".into(),
+        talks_to: Vec::new(),
+    };
+    let graph = atlas::project::Graph { name: "acme".into(), repos: vec![repo], ..atlas::project::Graph::default() };
+    s.graph = Some(std::sync::Arc::new(graph));
+    let mut h = Hooks::open(s).unwrap();
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let dir = |p: &Path| p.to_string_lossy().into_owned();
+    let prompt = |h: &mut Hooks, session: &str, text: String, cwd: &Path| {
+        h.handle(&HookEvent { prompt: text, session_id: session.into(), cwd: dir(cwd), ..ev("UserPromptSubmit") }).context
+    };
+    // The prompt names a path inside the checkout, with either separator.
+    let a = prompt(&mut h, "s-path", format!("fix the widgets parser in {}/src/parse.rs", slash(&co)), &other);
+    assert!(!a.contains("repo widgets"), "a brief that names the repo's path gets no line: {a}");
+    let a = prompt(&mut h, "s-back", format!("fix the widgets parser in {}", co.join("src").display()), &other);
+    assert!(!a.contains("repo widgets"), "backslashes name it too: {a}");
+    // The working directory is inside the checkout, or in a worktree of it.
+    let a = prompt(&mut h, "s-cwd", "fix the widgets parser".into(), &co.join("src"));
+    assert!(!a.contains("repo widgets"), "a cwd inside the repo gets no line: {a}");
+    let a = prompt(&mut h, "s-wt", "fix the widgets parser".into(), &wt.join("src"));
+    assert!(!a.contains("repo widgets"), "a cwd in a worktree of the repo gets no line: {a}");
+    // Named by word only, from elsewhere: the line, with the path.
+    let a = prompt(&mut h, "s-word", "fix the widgets parser".into(), &other);
+    assert!(a.contains(&format!("repo widgets at {}: the widget service", slash(&co))), "an unplaced repo gets a line with its path: {a}");
+    // A subagent's brief follows the same rule.
+    let start = |h: &mut Hooks, agent: &str, brief: String, cwd: &Path| {
+        h.handle(&HookEvent { tool_name: "Agent".into(), tool_prompt: brief, cwd: dir(cwd), ..ev("PreToolUse") });
+        h.handle(&HookEvent { agent_id: agent.into(), agent_type: "general-purpose".into(), cwd: dir(cwd), ..ev("SubagentStart") }).context
+    };
+    let a = start(&mut h, "a-path", format!("Kind: builder\nfix the widgets parser in {}", slash(&co)), &other);
+    assert!(!a.contains("repo widgets"), "{a}");
+    let a = start(&mut h, "a-word", "Kind: builder\nfix the widgets parser".into(), &other);
+    assert!(a.contains(&format!("repo widgets at {}", slash(&co))), "{a}");
+}
+
 /// Two more widget-cache records, so one widget prompt passes three.
 fn seed_widgets(s: &Settings) {
     let mut store = MemoryStore::open(&s.store).unwrap();
@@ -1138,7 +1196,9 @@ fn a_lookup_made_again_after_a_compaction_is_a_logged_miss() {
     // The old series is unchanged: one row per repeat.
     assert_eq!(legacy_misses(&s.index_db), 1);
     let rows = miss_rows(&s.index_db);
-    assert_eq!(rows, [("miss".to_string(), sig_of("Read", &read_of(&a).tool_input), 1), ("lookup".to_string(), String::new(), 2)]);
+    // Stored as `compact_miss` keeps it: a target that looks secret is redacted.
+    let stored = atlas::compact::stored_sig(&sig_of("Read", &read_of(&a).tool_input));
+    assert_eq!(rows, [("miss".to_string(), stored, 1), ("lookup".to_string(), String::new(), 2)]);
     // The target only: never the file's contents.
     assert!(rows.iter().all(|r| !r.1.contains("secret_body_of_a")), "{rows:?}");
 }
@@ -2939,28 +2999,28 @@ fn the_binding_answer_is_cut_at_whole_lines_under_the_cap() {
 
 /// The lane comes only from a `Lane:` line or an exact upper-case id after
 /// "lane": a brief that only mentions a lower-case lane or the word
-/// "session" compiles nothing.
+/// "session" is compiled with no lane (`""`), for the keys it names.
 #[test]
 fn a_binding_lane_comes_only_from_a_declared_lane() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     let t = Temp::new("bo2-lane");
     let s = context_settings(t.path(), SubagentContext::Binding);
     seed(&s);
     let a = Agents::new(t.path());
     let mut h = Hooks::open(s).unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
     let c2 = calls.clone();
     h.set_binding(Some(Box::new(move |_, _, lane| {
-        c2.fetch_add(1, Ordering::SeqCst);
-        Ok(format!("atlas binding: lane {lane}\n"))
+        c2.lock().unwrap().push(lane.to_string());
+        Ok(if lane.is_empty() { String::new() } else { format!("atlas binding: lane {lane}\n") })
     })));
     let loose = "Fix the session lane bug the build-7 work found in the gadget exporter.";
     a.launch(&mut h, "tA", loose);
     a.agent("x", Some("tA"), loose);
     assert_eq!(a.start(&mut h, "x").context, "");
     assert_eq!(a.tool(&mut h, "x").context, "");
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let lanes = calls.lock().unwrap().clone();
+    assert!(!lanes.is_empty() && lanes.iter().all(String::is_empty), "{lanes:?}");
     let id = "Journal under lane ALPHA when done.";
     a.launch(&mut h, "tB", id);
     a.agent("y", Some("tB"), id);
@@ -3186,6 +3246,17 @@ fn binding_with_no_compiler_is_warned_at_setup() {
     h.set_binding(Some(stub_binding()));
     assert_eq!(h.binding_warning(), None);
     assert_eq!(Hooks::open(context_settings(t.path(), SubagentContext::Recall)).unwrap().binding_warning(), None);
+}
+
+/// The server route's setup sets the Binding compiler, so `"binding"` is
+/// never silently `"off"` there (or in the memory eval, which uses it).
+#[test]
+fn the_server_setup_sets_the_binding_compiler() {
+    let t = Temp::new("bo2-serve-setup");
+    let mut h = Hooks::open(context_settings(t.path(), SubagentContext::Binding)).unwrap();
+    assert!(h.binding_warning().is_some());
+    h.serve_setup();
+    assert_eq!(h.binding_warning(), None);
 }
 
 /// BO-1 wiring: the compiler the server sets is `binding::compile`, so a

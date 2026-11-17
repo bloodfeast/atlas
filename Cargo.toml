@@ -1,6 +1,6 @@
 [package]
 name = "atlas"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "A local, stdio-only MCP index and memory store for agents over Obsidian vaults and read-only Markdown sources: identifiers, sections, a code index, semantic recall. No network at query time."
 authors = ["Brandon White"]
@@ -29,6 +29,10 @@ path = "src/main.rs"
 # the options only they read). Off by default and in release builds; `cargo
 # xtask` turns it on for the benches and verify-macos.
 dev = []
+# Test seams: ATLAS_TEST_RESTART_SEED (#221). Never in a shipped build:
+# only the integration tests turn it on (the dev-dependency on atlas
+# itself below), in debug or release (linux-test runs in release).
+test-seams = []
 
 [dependencies]
 # Two named exceptions to the no-dependency rule, everything else owned
@@ -41,3 +45,8 @@ dev = []
 rusqlite = { version = "0.40", features = ["bundled"] }
 ed25519-compact = { version = "2.6", default-features = false }
 
+[dev-dependencies]
+# atlas itself, with its test seams on: the integration tests build the
+# binary they run with them (resolver 2 turns a dev-dependency's features
+# on only for test builds). Not a new crate.
+atlas = { path = ".", features = ["test-seams"] }

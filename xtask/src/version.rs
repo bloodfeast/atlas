@@ -208,12 +208,24 @@ pub struct Fragment {
     pub section: Section,
     /// Its body, blank lines at both ends trimmed.
     pub body: String,
+    /// The outside pull request's author (`author:`), in an imported
+    /// fragment, `changes/public-<n>.md`, only.
+    pub author: Option<String>,
+}
+
+/// The name prefix of an imported fragment, `changes/public-<n>.md`.
+pub const PUBLIC: &str = "public-";
+
+/// Whether `s` is a GitHub login: letters, digits and single hyphens, not
+/// at either end, at most 39 characters.
+pub fn login_ok(s: &str) -> bool {
+    s.len() <= 39 && !s.is_empty() && s.split('-').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// What a name in `changes/` is, or why it is none of them.
 pub fn entry(name: &str) -> R<Entry> {
     let bad = || {
-        format!("changes/{name}: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md or changes/<pr>.none; see changes/README.md)")
+        format!("changes/{name}: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md, changes/<pr>.none or an imported changes/public-<n>.md; see changes/README.md)")
     };
     let pr_of = |s: &str| number(s).filter(|_| !s.starts_with('0'));
     if name == "README.md" {
@@ -223,6 +235,8 @@ pub fn entry(name: &str) -> R<Entry> {
         return pr_of(stem).map(Entry::None).ok_or_else(bad);
     }
     let stem = name.strip_suffix(".md").ok_or_else(bad)?;
+    // An outside pull request's fragment, imported: its public number.
+    let stem = stem.strip_prefix(PUBLIC).unwrap_or(stem);
     let (num, slug) = match stem.split_once('-') {
         Some((n, s)) => (n, Some(s)),
         None => (stem, None),
@@ -251,6 +265,7 @@ pub fn parse_fragment(name: &str, text: &str) -> R<Fragment> {
         _ => return Err(format!("changes/{name}: not a fragment name")),
     };
     let err = |why: &str| format!("changes/{name}: {why}");
+    let public = name.starts_with(PUBLIC);
     if text.starts_with('\u{feff}') {
         return Err(err("starts with a byte order mark (BOM): save it as UTF-8 without one"));
     }
@@ -261,7 +276,7 @@ pub fn parse_fragment(name: &str, text: &str) -> R<Fragment> {
     if lines.next() != Some("---") {
         return Err(err("the front matter must open with ---"));
     }
-    let (mut bump, mut section, mut seen, mut closed) = (None, None, Vec::new(), false);
+    let (mut bump, mut section, mut seen, mut closed, mut author) = (None, None, Vec::new(), false, None);
     for l in lines.by_ref() {
         if l == "---" {
             closed = true;
@@ -288,6 +303,11 @@ pub fn parse_fragment(name: &str, text: &str) -> R<Fragment> {
                     err(&format!("section must be highlight, breaking, upgrade, feature, fix, security or known-limit, not {v}"))
                 })?)
             }
+            "author" if !public => return Err(err("author is only for an imported fragment, changes/public-<n>.md")),
+            "author" if !login_ok(v) => {
+                return Err(err(&format!("author must be a GitHub login (letters, digits and single hyphens, at most 39), not {v}")))
+            }
+            "author" => author = Some(v.to_string()),
             _ => return Err(err(&format!("unknown front matter key {k} (only bump and section)"))),
         }
     }
@@ -327,6 +347,9 @@ pub fn parse_fragment(name: &str, text: &str) -> R<Fragment> {
     if !closed {
         return Err(err("the front matter has no closing ---"));
     }
+    if public && author.is_none() {
+        return Err(err("no author in the front matter: an imported fragment names its pull request's author"));
+    }
     // `bump` is the value written, `Some(None)` for `bump: none`; an upgrade
     // note may leave it out.
     if bump.is_none() && section != Some(Section::Upgrade) {
@@ -352,7 +375,7 @@ pub fn parse_fragment(name: &str, text: &str) -> R<Fragment> {
         _ => {}
     }
     let end = body.iter().rposition(|l| !l.trim().is_empty()).map_or(start, |e| e + 1);
-    Ok(Fragment { name: name.to_string(), pr, bump, section, body: body[start..end].join("\n") })
+    Ok(Fragment { name: name.to_string(), pr, bump, section, body: body[start..end].join("\n"), author })
 }
 
 /// A version's three numbers.
@@ -468,6 +491,30 @@ fn tight(body: &str) -> String {
     out.join("\n")
 }
 
+/// An imported fragment's body with its author credited at the end of each
+/// list item (`Thanks to @login (#n).`, a continuation line); any other
+/// fragment's as it is.
+fn credited(body: &str, f: &Fragment) -> String {
+    let Some(login) = &f.author else { return body.to_string() };
+    let credit = format!("  Thanks to @{login} (#{}).", f.pr);
+    let mut out: Vec<&str> = Vec::new();
+    let mut fence = Fence::default();
+    let mut open = false;
+    for l in body.lines() {
+        if !fence.opaque(l) && l.starts_with("- ") {
+            if open {
+                out.push(&credit);
+            }
+            open = true;
+        }
+        out.push(l);
+    }
+    if open {
+        out.push(&credit);
+    }
+    out.join("\n")
+}
+
 /// The CHANGELOG with the fragments folded into a new `## v<version>`
 /// section above the newest one: its parts in [`SECTIONS`] order, each
 /// part's lines by pull request number, then file name, with no blank line
@@ -490,7 +537,7 @@ pub fn fold(changelog: &str, version: &str, frags: &[Fragment]) -> R<String> {
     sorted.sort_by(|a, b| (a.pr, &a.name).cmp(&(b.pr, &b.name)));
     let mut section = String::new();
     for (s, _, title) in SECTIONS {
-        let bodies: Vec<String> = sorted.iter().filter(|f| f.section == s).map(|f| tight(&f.body)).collect();
+        let bodies: Vec<String> = sorted.iter().filter(|f| f.section == s).map(|f| credited(&tight(&f.body), f)).collect();
         if !bodies.is_empty() {
             section.push_str(&format!("### {title}\n\n{}\n\n", bodies.join("\n")));
         }
@@ -871,7 +918,8 @@ mod tests {
                 pr: 12,
                 bump: Some(Feature),
                 section: Section::Feature,
-                body: "- **A thing.** It does\n  more.\n- Another.".into()
+                body: "- **A thing.** It does\n  more.\n- Another.".into(),
+                author: None
             }
         );
         // CRLF, blank front matter lines, spaces around the colon, and a fenced block with a `#` line.
@@ -1806,5 +1854,129 @@ mod tests {
         std::fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
         std::fs::write(root.join(".github/workflows/release.yml"), "name: release\n").unwrap();
         assert_eq!(dev_pr_changes_job(&root), None);
+    }
+
+    // ------------------------------------------------ outside pull requests
+
+    const PUBLIC_FRAG: &str = "---
+bump: patch
+section: security
+author: out-sider
+---
+- **Podman's secrets file is denied.** atlas never indexes it.
+- And a second line.
+";
+
+    #[test]
+    fn imported_fragments_have_their_own_names_and_an_author() {
+        assert_eq!(entry("public-13.md"), Ok(Entry::Fragment(13)));
+        assert_eq!(entry("public-13-docs.md"), Ok(Entry::Fragment(13)));
+        for bad in ["public-13.none", "public-.md", "public-013.md", "Public-13.md", "public-13-Docs.md", "public13.md", "public-x.md"] {
+            assert!(entry(bad).unwrap_err().contains("not a fragment name"), "{bad}");
+        }
+        let f = parse_fragment("public-13.md", PUBLIC_FRAG).unwrap();
+        assert_eq!((f.pr, f.author.as_deref()), (13, Some("out-sider")));
+        assert_eq!(parse_fragment("13.md", &frag("patch", "fix", "- a")).unwrap().author, None);
+        for (name, text, why) in public_refusals() {
+            assert_eq!(parse_fragment(name, &text).unwrap_err(), format!("changes/{name}: {why}"), "{text:?}");
+        }
+    }
+
+    /// The refusals of the author rule, with the text both checks give.
+    fn public_refusals() -> Vec<(&'static str, String, &'static str)> {
+        vec![
+            ("13.md", PUBLIC_FRAG.to_string(), AUTHOR_ONLY_PUBLIC),
+            ("public-13.md", frag("patch", "fix", "- a"), NO_AUTHOR),
+            ("public-13.md", PUBLIC_FRAG.replace("out-sider", "out--sider"), "author must be a GitHub login (letters, digits and single hyphens, at most 39), not out--sider"),
+            ("public-13.md", PUBLIC_FRAG.replace("out-sider", "@out"), "author must be a GitHub login (letters, digits and single hyphens, at most 39), not @out"),
+            ("public-13.md", PUBLIC_FRAG.replace("out-sider", &"a".repeat(40)), "author must be a GitHub login (letters, digits and single hyphens, at most 39), not aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ]
+    }
+    const AUTHOR_ONLY_PUBLIC: &str = "author is only for an imported fragment, changes/public-<n>.md";
+    const NO_AUTHOR: &str = "no author in the front matter: an imported fragment names its pull request's author";
+
+    #[test]
+    fn the_fold_credits_an_outside_author_on_each_line() {
+        let frags = [parsed("12.md", "patch", "highlight", "- shines"), parse_fragment("public-13.md", PUBLIC_FRAG).unwrap()];
+        let out = fold(
+            "# Changelog
+
+## v0.5.0
+
+- old
+",
+            "0.5.1",
+            &frags,
+        )
+        .unwrap();
+        let section = crate::release::changelog_section(&out, "v0.5.1");
+        // The section is read trimmed, and Security is its last part.
+        assert!(
+            section.ends_with(
+                "### Security hardening
+
+- **Podman's secrets file is denied.** atlas never indexes it.
+  Thanks to @out-sider (#13).
+- And a second line.
+  Thanks to @out-sider (#13)."
+            ),
+            "{section}"
+        );
+        assert!(
+            !section.contains(
+                "shines
+  Thanks"
+            ),
+            "a development fragment is not credited"
+        );
+    }
+
+    #[test]
+    fn version_accepts_an_imported_fragment() {
+        let d = repo("public", &[("12.md", &frag("patch", "highlight", "- shines")), ("public-13.md", PUBLIC_FRAG)]);
+        assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.5.1");
+        assert_eq!(run_in(&d, false, &To::Replay).unwrap(), "0.5.1");
+        let log = read_text(&d.join("CHANGELOG.md")).unwrap();
+        assert!(
+            log.contains(
+                "  Thanks to @out-sider (#13).
+"
+            ),
+            "{log}"
+        );
+        assert!(!d.join("changes/public-13.md").exists(), "folded and deleted");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_dev_pr_check_takes_an_imported_fragment_as_the_parser_does() {
+        let src = ("modified", "src/lib.rs");
+        // An import's pull request carries the outside fragment as its own.
+        let (ok, out) =
+            check("public", "301", true, &[src, ("added", "changes/public-13.md")], &[("changes/public-13.md", PUBLIC_FRAG.as_bytes())]);
+        assert!(ok, "{out}");
+        for (i, (name, text, why)) in public_refusals().into_iter().enumerate() {
+            let path = format!("changes/{name}");
+            let (ok, out) =
+                check(&format!("public-bad-{i}"), "301", true, &[src, ("added", path.as_str())], &[(path.as_str(), text.as_bytes())]);
+            assert!(
+                !ok && out.contains(&format!(
+                    "{path}: {why}
+"
+                )),
+                "{text:?}: {out}"
+            );
+        }
+        let (ok, out) = check("public-none", "301", false, &[("added", "changes/public-13.none")], &[("changes/public-13.none", b"")]);
+        assert!(!ok && out.contains("not a fragment name"), "{out}");
+        // A fold removes imported fragments too.
+        let (ok, out) = check(
+            "public-fold",
+            "302",
+            true,
+            &[("modified", "Cargo.toml"), ("modified", "CHANGELOG.md"), ("removed", "changes/public-13.md")],
+            &[],
+        );
+        assert!(ok, "{out}");
     }
 }

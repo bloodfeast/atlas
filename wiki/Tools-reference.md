@@ -1,6 +1,6 @@
 ## Fourteen listed tools, every full tool behind them
 
-`tools/list` names 14 tools (about 1,480 tokens; it was 47 tools and 5,930 tokens). `lookup`, `search`,
+`tools/list` names 14 tools (about 1,510 tokens; it was 47 tools and 5,930 tokens). `lookup`, `search`,
 `section`, `grep`, `symbol`, `recall`, `remember`, `journal`, `handoff` and `hook` keep their names; the rest
 of the surface sits behind four tools with an `op` argument:
 
@@ -18,12 +18,15 @@ reference, every tool and argument described, is one fetched text: the MCP resou
 `note {op: "help"}` for a client without resources. The full tool names (the table below) still work as tool
 names for this release, so existing calls and hooks keep running; the server's instructions point at the help.
 
-## Six are always loaded
+## Four are always loaded
 
-`lookup`, `search`, `recall`, `section`, `grep` and `symbol` are marked always-loaded
+`search`, `recall`, `section` and `grep` are marked always-loaded
 (`_meta["anthropic/alwaysLoad"]: true` in `tools/list`, Claude Code 2.1.285 and later), so their schemas are
 in context from the first turn and the model calls them without a tool search first. Every other tool stays
-deferred: only its name is in context until the model searches for it.
+deferred: only its name is in context until the model searches for it. `lookup` and `symbol` (the identifier
+and code indexes) are deferred too: 12 calls a week did not pay for their 627 bytes in every agent's context,
+so an agent loads them by a tool search (in Claude Code, `ToolSearch` with `select:` and the tool's name) before
+its first call.
 
 ## Answers are compact text
 
@@ -70,16 +73,29 @@ export files, and `recall {key}` or `{lane}` reads the record where it is writte
 another record's text plus 40 lines either side in its export; a lane's every record), the rule the hooks use.
 Writes, `journal` among them, log no counterfactual.
 
-Each subagent start also logs the "brief without atlas": the bytes of the rulebook (`memory.brief_reference`)
-at that moment, what a brief that says "read it in full" costs. `--token-report` prints it on its own line,
-per agent (a distinct session and agent id): agents, tokens, tokens per agent, and the raw start count. Each
-agent is counted once, at the rulebook of its first start: Claude Code fires `SubagentStart` again whenever an
+The "brief without atlas" is what an agent spent on the rulebook (`memory.brief_reference`) before atlas,
+measured from the calibration's pre-atlas transcripts: the bytes of their `Read` calls of that path (matched as
+text, slashes and case folded, a relative path joined to the call's folder) over every pre-atlas subagent
+transcript, readers and non-readers alike; main sessions are left out. Agents read parts of it, so its size is
+not the yardstick. With no calibration, or no such read, the report says "not measured" and gives no ratio.
+Each subagent start logs the rulebook's size at that moment; `--token-report` counts agents by those rows (a
+distinct session and agent id) and keeps their sum as one `if read whole` line, the size once per agent, not a
+measurement. Each agent is counted once, at its first start: Claude Code fires `SubagentStart` again whenever an
 agent resumes (a `SendMessage`, or a background task waking it), and a resumed agent keeps its context, so the
 report gives those repeats as `resumes` and does not count them as reads. It never enters a per-answer ratio.
-Beside it, `hook injections` sums what the recall hooks injected, in the same unit (keys, agents, tokens, per
-agent and the largest agent; a main session is one agent): the pointers an agent gets in place of that brief.
-`brief vs injections` then compares the two on the agents both tables hold: the rulebook they would have read,
-what the hooks injected into them, and the ratio.
+Beside it, `hook injections` sums what the recall hooks injected: a main session (it lives for many prompts)
+per prompt, by the turn rule of the cost section, and a subagent per agent, each as p50, p95 and max, then the
+largest one main session or subagent received. `brief vs injections` then compares the measured rulebook with
+what the hooks injected on the agents both tables hold, and the ratio. A `Where the savings live` block, right
+after the headline, gives credit, cost and net per source (lookups, routing, the rulebook at subagent starts,
+prompts and tool calls, memory and note reads, tool definitions, the rest), each against its yardstick; the rows
+sum to the net, whose credit counts the rulebook only when it is measured. No source is credited twice: a measured
+rulebook replaces the `SubagentStart` hit credit, and is credited less the credit of `recall` by key or lane, which
+may read the same records. Other lookups that open the rulebook may still overlap it; the ledger records no agent
+or file per answer, so the block's header bounds that overlap by the rulebook row's credit instead of measuring
+it. A `PreToolUse` injection is costed by event, so a subagent's lands on the prompts and tool calls row.
+`read_note` is 1x by design: its
+counterfactual is the whole file it returns, and `section` is the cheaper read for one heading.
 `recall.inject_floor` (a cosine threshold) and `recall.session_budget_tokens` (a cap per session) bound it.
 Then a `context selection` line says what `recall.select` did to those injections: how many were sent whole,
 trimmed to their matching clauses or collapsed into a ref to a near-duplicate, the tokens each would have taken
@@ -128,7 +144,7 @@ Every key a hook injects is logged to `hook_inject` with its scores, bytes and c
 messages: the key in a tool input (a `recall key=`, a lookup, a grep), its source read (a memory's file, or a
 `Grep` of its export file whose pattern matches it), or a quoted run of 8 of its words; and prints the hit rate
 per hook. `--transcripts DIR --since TIME` adds injections reconstructed from past transcripts (rescored by the
-hook's own gate), `--rows` lists every key, and `--tune-floor SCALE` prints the relevance-floor curve and the
+hook's own gate), `--rows` lists every key, and `--tune-floor SCALE` prints the relevance-floor curve from the active floor up and the
 floor that maximises the bytes the kept hits save net of the bytes injected (SCALE is the share of a hit's
 counterfactual credited: 1 for the full ledger credit).
 

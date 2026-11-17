@@ -47,6 +47,12 @@ pub const GUIDE_BUDGET: usize = 200;
 /// `bpe::tokens`' error on prose at p90 (the prose row of `bpe.rs`'s table:
 /// 10.75%): it uses the card's factor, so the estimate is held this far
 /// under [`GUIDE_BUDGET`] for the real count to stay within it.
+///
+/// [`guide_cap`] divides by 1 + this error (180) rather than multiplying by
+/// 1 - it (178). That
+/// holds, about 198 real tokens against [`GUIDE_BUDGET`]'s 200, only because
+/// the card factor overestimates prose: were the estimate to undercount by
+/// the full error, the cap would let the paragraph pass its budget.
 pub const PROSE_P90: f64 = 0.1075;
 
 /// The most estimated tokens ([`crate::bpe::tokens`]) the paragraph may
@@ -108,14 +114,15 @@ fn flags(text: &str) -> BTreeSet<String> {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).filter(|w| w.len() > 2 && w.starts_with("--")).map(str::to_string).collect()
 }
 
-/// A usage text's alternatives, parted at ` | ` outside brackets.
+/// A usage text's alternatives, parted at ` | ` outside brackets and
+/// parentheses.
 fn alternatives(inner: &str) -> Vec<String> {
     let (mut out, mut depth, mut cur) = (Vec::new(), 0i32, String::new());
     let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '[' => depth += 1,
-            ']' => depth -= 1,
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
             // ` | ` parts the commands; `FILE|-` is one argument.
             '|' if depth == 0 && cur.ends_with(' ') && chars.peek() == Some(&' ') => {
                 out.push(cur.trim().to_string());
@@ -212,8 +219,18 @@ pub fn run(args: Vec<String>) -> R {
     if t > cap {
         return Err(format!("the instructions' guide (atlas::tools::GUIDE) is {t} estimated tokens; the cap is {cap} ({GUIDE_BUDGET} real less the estimate's p90 error on prose)"));
     }
-    println!("the instructions' guide is {t} of {cap} estimated tokens ({GUIDE_BUDGET} real); the prose names exist");
+    if !names_style(&read(&root.join(SKILL))?) {
+        return Err(format!("{SKILL} does not carry the style rule (atlas::tools::STYLE) word for word"));
+    }
+    println!("the instructions' guide is {t} of {cap} estimated tokens ({GUIDE_BUDGET} real); the prose names exist; {SKILL} carries the style rule");
     Ok(())
+}
+
+/// Whether `text` holds the style rule ([`atlas::tools::STYLE`]) word for
+/// word, its whitespace and line breaks aside.
+pub fn names_style(text: &str) -> bool {
+    let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat(text).contains(&flat(atlas::tools::STYLE))
 }
 
 /// What `SKILL.md` and the server instructions put in backticks that the
@@ -222,10 +239,87 @@ pub fn stale_names(root: &Path) -> R<Vec<String>> {
     let known = Known::new(root);
     let mut bad = Vec::new();
     for (what, text) in [(SKILL, read(&root.join(SKILL))?), ("atlas::tools::GUIDE", atlas::tools::GUIDE.to_string())] {
-        let spans = code_spans(&text).map_err(|e| format!("{what}: {e}"))?;
-        bad.extend(spans.iter().filter_map(|s| known.unknown(s)).map(|e| format!("{what}: {e}")));
+        bad.extend(stale_in(&known, what, &text)?);
     }
     Ok(bad)
+}
+
+/// [`stale_names`] for one Markdown `text`, named `what` in each line.
+pub fn stale_in(known: &Known, what: &str, text: &str) -> R<Vec<String>> {
+    let spans = code_spans(text).map_err(|e| format!("{what}: {e}"))?;
+    let mut bad: Vec<String> = spans.iter().filter_map(|s| known.unknown(s)).map(|e| format!("{what}: {e}")).collect();
+    // A fenced launch-line example is no span: it is read as a brief's
+    // first lines are.
+    for b in fenced_blocks(text).iter().filter(|b| b.lines().any(|l| l.trim_start().starts_with("Kind:"))) {
+        if let Some(e) = launch_problem(b) {
+            bad.push(format!("{what}: the fenced launch lines {e}:\n{b}"));
+        }
+    }
+    Ok(bad)
+}
+
+/// Why the launch lines `block` do not read as a brief's (`Kind:`,
+/// `Lane:`, `Priority:` and `Uses:`; `Repo:` and `Branch:` are optional),
+/// or `None`.
+fn launch_problem(block: &str) -> Option<String> {
+    let d = atlas::lanes::declared(block);
+    let mut lack = Vec::new();
+    if atlas::orchestrate::brief_kind(block).is_none() {
+        lack.push("Kind:");
+    }
+    for (line, read) in [("Lane:", d.lane.is_some()), ("Priority:", d.priority.is_some()), ("Uses:", d.uses.is_some())] {
+        if !read {
+            lack.push(line);
+        }
+    }
+    (!lack.is_empty()).then(|| format!("give no {}", lack.join(", ")))
+}
+
+/// The run of three or more backticks or tildes `line` starts with after
+/// its indent: the character, the run's length, the indent and the rest.
+fn fence(line: &str) -> Option<(char, usize, usize, &str)> {
+    let t = line.trim_start();
+    let c = t.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let n = t.chars().take_while(|x| *x == c).count();
+    let rest = &t[n..];
+    // A backtick fence's info string has no backtick (CommonMark).
+    (n >= 3 && !(c == '`' && rest.contains('`'))).then_some((c, n, line.len() - t.len(), rest))
+}
+
+/// Markdown `text` parted into its prose lines (each with its line number)
+/// and its fenced blocks (each without its fence lines, the opening fence's
+/// indent taken off). A fence opens on three or more backticks or tildes and
+/// closes on at least as many of the same character with nothing after
+/// them; one left open runs to the end.
+fn split_fences(text: &str) -> (Vec<(usize, &str)>, Vec<String>) {
+    let (mut prose, mut blocks) = (Vec::new(), Vec::new());
+    // The open fence: its character, length, indent and body so far.
+    let mut open: Option<(char, usize, usize, String)> = None;
+    for (i, l) in text.lines().enumerate() {
+        match open.as_mut() {
+            None => match fence(l) {
+                Some((c, n, indent, _)) => open = Some((c, n, indent, String::new())),
+                None => prose.push((i + 1, l)),
+            },
+            Some((c, n, indent, body)) => {
+                if fence(l).is_some_and(|(c2, n2, _, rest)| c2 == *c && n2 >= *n && rest.trim().is_empty()) {
+                    blocks.push(std::mem::take(body));
+                    open = None;
+                } else {
+                    let cut = l.bytes().take_while(|b| matches!(b, b' ' | b'\t')).count();
+                    body.push_str(&l[cut.min(*indent)..]);
+                    body.push('\n');
+                }
+            }
+        }
+    }
+    blocks.extend(open.map(|o| o.3));
+    (prose, blocks)
+}
+
+/// The fenced blocks of Markdown `text`, each without its fence lines.
+pub fn fenced_blocks(text: &str) -> Vec<String> {
+    split_fences(text).1
 }
 
 /// The names the code knows, for checking hand-written prose.
@@ -324,14 +418,39 @@ impl Known {
 
     /// Why the command `span` (`<what> <sub> ...`) names a subcommand or a
     /// `--flag` that `alts` (its usage's alternatives) lack.
+    ///
+    /// Each word after the first, up to the first flag, is a subcommand
+    /// when the alternatives so far name subcommands at its place and no
+    /// argument (`release assets` and `release sign`, but `set ID`); a
+    /// placeholder (upper case, `<..>`) ends the walk.
     fn command(span: &str, what: &str, rest: &[&str], alts: &[String]) -> Option<String> {
         let sub = *rest.first()?;
-        let of: Vec<&String> = alts.iter().filter(|a| a.split_whitespace().next() == Some(sub)).collect();
+        let mut of: Vec<Vec<&str>> =
+            alts.iter().map(|a| a.split_whitespace().collect::<Vec<_>>()).filter(|a| a.first() == Some(&sub)).collect();
         if of.is_empty() {
             return Some(format!("`{span}`: {what} has no command {sub}"));
         }
+        let is_sub = |t: &str| {
+            t.starts_with(|c: char| c.is_ascii_lowercase()) && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        };
+        let mut path = vec![sub];
+        for (at, w) in rest.iter().copied().enumerate().skip(1) {
+            if w.starts_with('-') || w.starts_with('<') || w.chars().any(|c| c.is_ascii_uppercase()) {
+                break;
+            }
+            let tokens: Vec<&str> = of.iter().filter_map(|a| a.get(at).map(|t| t.trim_start_matches(['[', '(']))).collect();
+            if tokens.iter().any(|t| !t.starts_with('-') && !is_sub(t)) || !tokens.iter().any(|t| is_sub(t)) {
+                break;
+            }
+            if !tokens.contains(&w) {
+                return Some(format!("`{span}`: {what} {} has no command {w}", path.join(" ")));
+            }
+            of.retain(|a| a.get(at).map(|t| t.trim_start_matches(['[', '('])) == Some(w));
+            path.push(w);
+        }
+        let of: Vec<String> = of.iter().map(|a| a.join(" ")).collect();
         let flag = rest[1..].iter().filter(|w| w.starts_with("--")).map(|w| w.split('=').next().unwrap_or(w)).find(|f| !of.iter().any(|a| flags(a).contains(*f)))?;
-        Some(format!("`{span}`: {what} {sub} takes no flag {flag}"))
+        Some(format!("`{span}`: {what} {} takes no flag {flag}", path.join(" ")))
     }
 
     /// Why `span` (one inline code span) names something the code does not
@@ -383,30 +502,59 @@ impl Known {
     }
 }
 
-/// The inline code spans of Markdown `text`, fenced blocks left out.
+/// The inline code spans of Markdown `text`, fenced blocks (backtick or
+/// tilde, [`split_fences`]) left out, each with its whitespace runs made one
+/// space. A span opens on a run of backticks and closes on the next run of
+/// the same length, so ``` `` a`b `` ``` is the one span ``a`b``. Not a full
+/// CommonMark reader: what it does not read, it refuses.
 ///
 /// # Errors
 ///
-/// An odd number of backticks outside the fences: a stray one would pair
+/// A run of backticks no run of its length closes: a stray one would pair
 /// every later span with the prose between spans and switch the check off.
+/// A backslash before a backtick outside a span: an escaped backtick would
+/// pair the same way, so it is refused with the way to write it instead.
 pub fn code_spans(text: &str) -> R<Vec<String>> {
-    let mut prose = String::new();
-    let mut fenced = false;
-    for l in text.lines() {
-        if l.trim_start().starts_with("```") {
-            fenced = !fenced;
-            continue;
-        }
-        if !fenced {
-            prose.push_str(l);
-            prose.push('\n');
+    let (lines, _) = split_fences(text);
+    let (mut prose, mut starts) = (String::new(), Vec::new());
+    for (n, l) in lines {
+        starts.push((prose.len(), n));
+        prose.push_str(l);
+        prose.push('\n');
+    }
+    let line = |at: usize| starts.iter().rev().find(|(s, _)| *s <= at).map_or(0, |(_, n)| *n);
+    let b = prose.as_bytes();
+    let run = |at: usize| b[at..].iter().take_while(|c| **c == b'`').count();
+    let (mut spans, mut i) = (Vec::new(), 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if b.get(i + 1) == Some(&b'`') => {
+                return Err(format!(
+                    "line {}: an escaped backtick (\\`) outside a code span is not read; put the backtick inside a double-backtick span instead (`` a`b ``)",
+                    line(i)
+                ));
+            }
+            // A backslash escapes the next character (`\\` is one backslash).
+            b'\\' => i += 2,
+            b'`' => {
+                let n = run(i);
+                let mut j = i + n;
+                while j < b.len() && !(b[j] == b'`' && run(j) == n) {
+                    j += if b[j] == b'`' { run(j) } else { 1 };
+                }
+                if j >= b.len() {
+                    return Err(format!(
+                        "line {}: a run of {n} backtick(s) that no run of {n} closes: one is stray, and the spans after it would not be checked",
+                        line(i)
+                    ));
+                }
+                spans.push(prose[i + n..j].split_whitespace().collect::<Vec<_>>().join(" "));
+                i = j + n;
+            }
+            _ => i += 1,
         }
     }
-    let n = prose.matches('`').count();
-    if n % 2 == 1 {
-        return Err(format!("{n} backticks outside the fences: one is stray, and the spans after it would not be checked"));
-    }
-    Ok(prose.split('`').skip(1).step_by(2).map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")).collect())
+    Ok(spans)
 }
 
 #[cfg(test)]
@@ -539,6 +687,71 @@ mod tests {
         assert!(code_spans("a `b`\n```text\nx ` y\n```\nc `d`").is_ok(), "a backtick in a fence does not count");
     }
 
+    /// The launch-line example in SKILL.md is fenced, so no span check sees
+    /// it: it is read as a brief's first lines instead, and a misspelt line
+    /// in it is caught.
+    #[test]
+    fn the_fenced_launch_lines_read_as_launch_lines() {
+        let s = skill();
+        let blocks: Vec<String> =
+            fenced_blocks(&s).into_iter().filter(|b| b.lines().any(|l| l.trim_start().starts_with("Kind:"))).collect();
+        assert_eq!(blocks.len(), 1, "one fenced block holds the launch lines: {blocks:?}");
+        let d = atlas::lanes::declared(&blocks[0]);
+        assert!(d.lane.is_some() && d.priority.is_some() && d.uses.is_some(), "{d:?} from {}", blocks[0]);
+        assert!(atlas::orchestrate::brief_kind(&blocks[0]).is_some(), "no kind in {}", blocks[0]);
+        let known = Known::new(&root());
+        assert_eq!(stale_in(&known, SKILL, &s).unwrap(), Vec::<String>::new());
+        let typo = s.replace("  Kind: builder\n", "  Kind: buildr\n");
+        assert_ne!(typo, s, "SKILL.md has the fenced `Kind: builder` line");
+        assert!(!stale_in(&known, SKILL, &typo).unwrap().is_empty(), "a fenced `Kind: buildr` passed");
+    }
+
+    /// A `~~~` fence is a fence, a double-backtick span is one span (and its
+    /// names are checked), and an escaped backtick is refused with the way
+    /// to write it.
+    #[test]
+    fn tilde_fences_and_double_backtick_spans_are_read() {
+        let known = Known::new(&root());
+        let text = "a `journal`\n~~~text\nx ` y\n```\n~~~\nb `journals`\n";
+        assert_eq!(code_spans(text).unwrap(), ["journal", "journals"]);
+        assert!(!stale_in(&known, "t", text).unwrap().is_empty(), "a stale name after a tilde fence passed");
+        let text = "a ``recall lanes=`x` `` b\n";
+        assert_eq!(code_spans(text).unwrap(), ["recall lanes=`x`"]);
+        assert!(!stale_in(&known, "t", text).unwrap().is_empty(), "a stale name in a double-backtick span passed");
+        let e = code_spans("a \\` b `journal`\n").unwrap_err();
+        assert!(e.contains("escaped backtick") && e.contains("double-backtick span"), "{e}");
+    }
+
+    /// A parenthesised group's ` | ` stays inside one alternative.
+    #[test]
+    fn a_bar_inside_parentheses_does_not_split_a_usage() {
+        assert_eq!(alternatives("a [--x | --y] (DIR | --yes) | b"), ["a [--x | --y] (DIR | --yes)", "b"]);
+        assert!(
+            settings_commands().iter().any(|c| c.starts_with("add-project ") && c.ends_with("(DIR | --yes)")),
+            "{:?}",
+            settings_commands()
+        );
+    }
+
+    /// The words after a command's first are checked when its usage names
+    /// subcommands there; a placeholder argument is not one.
+    #[test]
+    fn a_second_subcommand_word_is_checked() {
+        let known = Known::new(&root());
+        for ok in [
+            "cargo xtask release assets --dir DIR",
+            "cargo xtask release sign v0.6.1",
+            "cargo xtask release sign vX.Y.Z",
+            "atlas queue release AGENT",
+            "atlas settings set ID VALUE",
+        ] {
+            assert_eq!(known.unknown(ok), None, "{ok}");
+        }
+        for bad in ["cargo xtask release nosuch", "cargo xtask release asset --dir DIR"] {
+            assert!(known.unknown(bad).is_some(), "{bad} passed");
+        }
+    }
+
     /// One entry per `atlas queue` command; `FILE|-` stays one argument.
     #[test]
     fn the_queue_commands_split_on_the_usage_line_s_bars() {
@@ -574,6 +787,14 @@ mod tests {
             assert!(g.contains(w), "the instructions name {w}: {g}");
         }
         assert!(!g.contains('\n'), "one paragraph");
+    }
+
+    /// The style rule (#274) is in SKILL.md word for word (its line breaks
+    /// aside), and the check `cargo xtask skill` runs says so.
+    #[test]
+    fn the_skill_carries_the_style_rule() {
+        assert!(names_style(&skill()), "SKILL.md carries atlas::tools::STYLE: {}", atlas::tools::STYLE);
+        assert!(!names_style("Style for what you write into atlas: anything goes."));
     }
 
     /// The handoff habit, in the skill and in the rules template the setup

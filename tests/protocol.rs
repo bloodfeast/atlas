@@ -52,21 +52,26 @@ fn round_trip_through_the_binary() {
     assert_eq!(init["protocolVersion"], json!("2025-06-18"));
     assert_eq!(init["serverInfo"]["name"], json!("atlas"));
     let instr = init["instructions"].as_str().unwrap();
-    // Two lines: what is served, then the habits paragraph (#186), whose
-    // budget xtask/src/skill.rs checks. No user rule is injected.
-    let (served, guide) = instr.split_once('\n').unwrap_or_else(|| panic!("the served line, then the guide: {instr}"));
+    // Three lines: what is served, the habits paragraph (#186), whose
+    // budget xtask/src/skill.rs checks, and the style rule (#274). No user
+    // rule is injected.
+    let lines: Vec<&str> = instr.lines().collect();
+    let [served, guide, style] = lines[..] else { panic!("the served line, the guide, then the style rule: {instr}") };
     assert!(served.starts_with("Markdown vaults served: perf (Research Log)"), "{instr}");
     assert_eq!(guide, atlas::tools::GUIDE, "{instr}");
+    assert_eq!(style, atlas::tools::STYLE, "{instr}");
     assert!(guide.contains("recall") && guide.contains("handoff") && guide.contains("atlas://help"), "{instr}");
     let tools = out[1]["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 14, "the listed tools; the full tools behind their ops stay callable");
     assert!(tools.iter().any(|t| t["name"] == json!("section")) && tools.iter().any(|t| t["name"] == json!("grep")), "the core read verbs");
     assert!(tools.iter().any(|t| t["name"] == json!("symbol")), "the code index answers through symbol");
-    // The core verbs are always loaded; every other tool stays deferred.
+    // The core verbs are always loaded; every other tool stays deferred,
+    // lookup and symbol among them (journal:ATLAS-EFFICIENCY:0004: 12 calls a
+    // week for 627 bytes in every agent's context).
     let mut always: Vec<&str> = tools.iter().filter(|t| t["_meta"]["anthropic/alwaysLoad"] == json!(true)).map(|t| t["name"].as_str().unwrap()).collect();
     always.sort_unstable();
-    assert_eq!(always, ["grep", "lookup", "recall", "search", "section", "symbol"]);
-    assert_eq!(tools.iter().filter(|t| t.get("_meta").is_some()).count(), 6);
+    assert_eq!(always, ["grep", "recall", "search", "section"]);
+    assert_eq!(tools.iter().filter(|t| t.get("_meta").is_some()).count(), 4);
     for t in tools {
         let d = t["description"].as_str().unwrap();
         assert!(d.len() < 300, "long description for {}", t["name"]);
@@ -191,8 +196,23 @@ fn no_network_code() {
         assert!(!lock.contains(&format!("name = \"{bad}\"")), "network crate {bad} in Cargo.lock");
     }
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    let deps = manifest.split("[dependencies]").nth(1).unwrap();
-    let names: Vec<&str> = deps.lines().filter_map(|l| l.split_once('=').map(|x| x.0.trim())).filter(|n| !n.is_empty()).collect();
+    let section = |name: &str| {
+        let s = manifest.split(name).nth(1).unwrap_or("");
+        s.split("\n[").next().unwrap_or("").to_string()
+    };
+    let keys = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_once('=').map(|x| x.0.trim().to_string()))
+            .filter(|n| !n.is_empty())
+            .collect()
+    };
+    // The only dev-dependency is atlas itself (its test seams), not a crate.
+    let dev = section("[dev-dependencies]");
+    assert_eq!(keys(&dev), vec!["atlas".to_string()], "{dev}");
+    assert!(dev.contains("path = \".\""), "{dev}");
+    let deps = section("[dependencies]");
+    let names = keys(&deps);
     // The two named exceptions: bundled SQLite, and the ed25519 check on
     // release manifests with its default features (random, PEM, X25519) off,
     // so it brings no dependency of its own.
@@ -232,10 +252,14 @@ fn no_network_code() {
         // `gh webhook forward` and `gh api` for the repository hooks
         // (`atlas pr-events serve`, command line only); the worktree ledger lists worktrees
         // with local `git worktree list` (an admitted Agent launch that declares
-        // `Uses: worktree:NAME`, and `atlas worktrees`; no network). Nothing else spawns. Unsafe code lives only in the platform FFI and the
+        // `Uses: worktree:NAME`, and `atlas worktrees`; no network). The restart point reads each
+        // running agent's worktree head and status with local `git` (the server's
+        // own thread, after a SubagentStart or SubagentStop; no network). The scheduled-restart
+        // watch runs `needs-restarting -r` (Linux, where installed) and `softwareupdate --list --no-scan`
+        // (macOS, hourly; the last background scan, no network) on its own thread. Nothing else spawns. Unsafe code lives only in the platform FFI and the
         // SIMD kernels (scan, embedding GEMM).
         let platform = path.parent().is_some_and(|p| p.ends_with("platform"));
-        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || path.ends_with("pr_supervise.rs") || path.ends_with("worktree_ledger.rs") || platform;
+        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || path.ends_with("pr_supervise.rs") || path.ends_with("worktree_ledger.rs") || path.ends_with("restart.rs") || path.ends_with("restart_warn.rs") || platform;
         let ffi = platform || path.ends_with("scan.rs") || path.ends_with("gemm.rs");
         // Only the server's code: not the test modules, not comments.
         let body = src.split("\n#[cfg(test)]\nmod ").next().unwrap_or(&src);

@@ -14,10 +14,11 @@
 //! cargo xtask version [--dry-run] [--release | --set X.Y.Z]
 //! cargo xtask skill [--check]
 //! cargo xtask verify-macos
+//! cargo xtask test-gate [-- NEXTEST_ARGS...]
 //! cargo xtask linux-test [--debug] [--no-clippy] [--image IMAGE] [-- TEST_ARGS...]
 //! cargo xtask linux-test --clean [--all]
 //! cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
-//! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--rows] [--show QID ...]
+//! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--starts DIR] [--rows] [--show QID ...]
 //! cargo xtask memory-tree-check --config CONFIG [--dir DIR]
 //! cargo xtask digest-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS]
 //! cargo xtask report-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS] [--budget BYTES]
@@ -65,6 +66,9 @@
 //!   and `sign` are the CI release (see `release_ci.rs`).
 //! * `verify-macos` runs the suite, the fixture checks and the benches and
 //!   prints what to paste back (see `verify_macos.rs`).
+//! * `test-gate` runs the workspace's tests on cargo-nextest, 16 at once,
+//!   then the doc tests: the test gate before a pull request (see
+//!   `test_gate.rs`).
 //! * `linux-test` runs the tests and both clippy runs of the public CI in a
 //!   Docker Linux container, the gate before a pull request (see
 //!   `linux_test.rs`).
@@ -99,6 +103,7 @@ mod lanes_eval;
 mod report_eval;
 mod restore_clipped;
 mod resume_eval;
+mod public_contrib;
 mod public_repo;
 mod py;
 mod release;
@@ -108,6 +113,7 @@ mod release_ship;
 mod secret_scan;
 mod skill;
 mod tar;
+mod test_gate;
 mod ucd;
 mod usage;
 mod verify_macos;
@@ -130,10 +136,11 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
        cargo xtask version [--dry-run] [--release | --set X.Y.Z]
        cargo xtask skill [--check]
        cargo xtask verify-macos
+       cargo xtask test-gate [-- NEXTEST_ARGS...]
        cargo xtask linux-test [--debug] [--no-clippy] [--image IMAGE] [-- TEST_ARGS...]
        cargo xtask linux-test --clean [--all]
        cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
-       cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--rows] [--show QID ...]
+       cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--starts DIR] [--rows] [--show QID ...]
        cargo xtask rules-eval --config CONFIG --holds FILE [--project NAME] [--cwd DIR] [--rows] [--dump DIR]
        cargo xtask memory-tree-check --config CONFIG [--dir DIR]
        cargo xtask digest-eval --cases FILE [--rows] [--show ID ...] [--gate ROWS]
@@ -197,6 +204,7 @@ fn main() -> ExitCode {
         },
         "langs-bench" => langs_bench::run(args),
         "hook-bench" => hook_bench::run(args),
+        "test-gate" => test_gate::run(args),
         "linux-test" => linux_test::run(args),
         "verify-macos" => match verify_macos::run() {
             Ok(0) => Ok(()),
@@ -298,7 +306,7 @@ fn rules_eval(args: Vec<String>) -> Result<(), String> {
 }
 
 fn memory_eval(args: Vec<String>) -> Result<(), String> {
-    let mut o = memory_eval::Opts { config: PathBuf::new(), questions: PathBuf::new(), fresh_from: None, floors: Vec::new(), rows: false, show: Vec::new(), project: None, cwd: None, offtopic: None };
+    let mut o = memory_eval::Opts { config: PathBuf::new(), questions: PathBuf::new(), fresh_from: None, floors: Vec::new(), rows: false, show: Vec::new(), project: None, cwd: None, offtopic: None, starts: None };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || {
@@ -317,6 +325,7 @@ fn memory_eval(args: Vec<String>) -> Result<(), String> {
             "--cwd" => o.cwd = Some(PathBuf::from(val()?)),
             "--floor" => o.floors.push(val()?.parse().map_err(|e| format!("--floor: {e}"))?),
             "--offtopic" => o.offtopic = Some(PathBuf::from(val()?)),
+            "--starts" => o.starts = Some(PathBuf::from(val()?)),
             "--rows" => o.rows = true,
             "--show" => o.show.push(val()?),
             _ => return Err(USAGE.into()),

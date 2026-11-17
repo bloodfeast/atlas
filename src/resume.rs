@@ -155,7 +155,7 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
     if let Some(p) = prev.as_ref().filter(|_| cleared) {
         dir = crate::orchestrate::subagents_dir(&p.to_string_lossy());
         let at = crate::queue::system_time(now).unwrap_or_else(SystemTime::now);
-        running = crate::orchestrate::Agents::new(None).running(orch, &dir, at).unwrap_or_default();
+        running = crate::orchestrate::Agents::new(None).running(orch, &dir, Some(store), at).unwrap_or_default();
     }
 
     if !running.is_empty() {

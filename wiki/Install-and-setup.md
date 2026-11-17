@@ -184,6 +184,9 @@ cargo build --release --locked
 
 and copy `target/release/atlas` (`atlas.exe` on Windows) into the plugin's `bin` folder as
 `atlas-<arch>-<os>` (for example `atlas-aarch64-unknown-linux-gnu`), or as `atlas.exe` on Windows.
+Build it last, after any test run: `cargo test --release` (or `cargo build --all-targets`) rebuilds that same
+`target/release/atlas` with the tests' `test-seams` feature on, so if you ran the tests, run the plain
+`cargo build --release --locked` again before you copy.
 With a local-folder (directory) marketplace, Claude Code runs the plugin from the clone itself, not from its
 plugin cache, so the binary goes into the clone's `bin/` folder; a copy in the plugin cache is not found and the
 server fails to start (seen on Claude Code 2.1.325). Put the binary in place before the first session: a start
@@ -200,6 +203,7 @@ without it begins Claude Code's 15-minute hold on the server (see [As a Claude C
 
 ```sh
 CARGO_TARGET_DIR=<target dir> cargo test -j 4
+CARGO_TARGET_DIR=<target dir> cargo xtask test-gate   # contributors: the gate before a pull request (needs cargo-nextest)
 CARGO_TARGET_DIR=<target dir> cargo install -j 4 --path . --root . --locked   # -> bin/atlas(.exe)
 ```
 

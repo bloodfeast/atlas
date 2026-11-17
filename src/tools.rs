@@ -45,7 +45,7 @@ pub mod dedup;
 
 #[path = "tools_surface.rs"]
 mod surface;
-pub use surface::{help, ops, GUIDE, HELP_URI};
+pub use surface::{help, ops, GUIDE, HELP_URI, STYLE};
 pub use memory_tools::MemState;
 use memory_tools::MEMORY_TOOLS;
 
@@ -127,7 +127,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "read_note",
-        description: "A note's text and sha256; lines or budget_tokens for part of it.",
+        description: "A note's whole text and sha256; lines or budget_tokens for part of it. For one heading, section is the cheaper read.",
         read_only: true,
         schema: || {
             obj(
@@ -429,7 +429,8 @@ const TOOLS: &[ToolDef] = &[
         read_only: false,
         schema: || {
             obj(
-                json!({"kind": e(&["memory", "rule", "decision"]), "key": s("Memory slug; rules and decisions get one."), "title": s("One line."), "summary": s("Memory: index description."), "body": s(""), "sub": s("Memory type (user, feedback, project, reference)."), "scope": s("user: the shared user layer, seen in every project (memories only)."), "refs": strs("kind:target, e.g. lane:x, commit:abc."), "expected_sha": s("Head sha (or its first 12+ hex digits), to revise."), "export": s("Export to place it in."), "after": s("Place right after this key."), "author": s("Who asked.")}),
+                json!({"kind": e(&["memory", "rule", "decision"]), "key": s("Memory slug; rules and decisions get one."), "title": s(&format!("One line; a memory's or a rule's is at most {} characters.", crate::memory::TITLE_CHARS)),
+                    "summary": s(&format!("Memory: index description, one line of at most {} characters.", memory_tools::SUMMARY_CHARS)), "body": s(""), "sub": s("Memory type (user, feedback, project, reference)."), "scope": s("user: the shared user layer, seen in every project (memories only)."), "refs": strs("kind:target, e.g. lane:x, commit:abc."), "expected_sha": s("Head sha (or its first 12+ hex digits), to revise."), "export": s("Export to place it in."), "after": s("Place right after this key."), "author": s("Who asked.")}),
                 &["kind", "body"],
             )
         },
@@ -644,10 +645,13 @@ fn input_schema(t: &ToolDef) -> Value {
     schema
 }
 
-/// The core read verbs, marked always-loaded (`_meta["anthropic/alwaysLoad"]`)
-/// so Claude Code puts their schemas in context at startup instead of
-/// deferring them behind a tool search. Every other tool stays deferred.
-pub const ALWAYS_LOADED: &[&str] = &["lookup", "search", "recall", "section", "grep", "symbol"];
+/// The tools marked always-loaded (`_meta["anthropic/alwaysLoad"]`), four of
+/// the read verbs, so Claude Code puts their schemas in context at startup
+/// instead of deferring them behind a tool search. Every other tool stays
+/// deferred, the read verbs `lookup` and `symbol` among them: 12 calls a week
+/// did not pay for their 627 bytes in every agent's context
+/// (journal:ATLAS-EFFICIENCY:0004).
+pub const ALWAYS_LOADED: &[&str] = &["search", "recall", "section", "grep"];
 
 /// One tool as `tools/list` writes it. A read-only tool says so; a write
 /// tool says it destroys nothing (the MCP default for a non-read-only tool
@@ -896,6 +900,14 @@ pub struct Server {
     /// Whether a `symbol` answer this session has carried the code roots'
     /// coverage notes (definitions only, scan only); later ones leave them out.
     symbol_coverage_shown: bool,
+    /// The writing contexts whose `journal` or `handoff` answer has carried
+    /// the style rule ([`STYLE`]); their later ones leave it out. A context is
+    /// the caller the hooks name (`session/agent`, see [`dedup`]), else the
+    /// server process ([`dedup::PROCESS`]).
+    style_shown: std::collections::HashSet<String>,
+    /// The caller of the call being answered (see [`Server::answer_call`]),
+    /// None outside it or when the hooks did not announce the call.
+    writer: Option<String>,
 }
 
 /// Semantic search state: the model and vectors, loaded on first use.
@@ -942,7 +954,7 @@ pub struct CodeState {
 impl Server {
     /// Wraps a store.
     pub fn new(store: Store) -> Server {
-        Server { store, client: "unknown".to_string(), reason: String::new(), discussion: String::new(), ledger: None, code: None, semantic: None, memory: None, dedup: dedup::Dedup::default(), hook_tool_use: false, symbol_coverage_shown: false }
+        Server { store, client: "unknown".to_string(), reason: String::new(), discussion: String::new(), ledger: None, code: None, semantic: None, memory: None, dedup: dedup::Dedup::default(), hook_tool_use: false, symbol_coverage_shown: false, style_shown: Default::default(), writer: None }
     }
 
     fn actor(&self) -> Actor {
@@ -961,8 +973,9 @@ impl Server {
     }
 
     /// The `initialize` instructions: one line naming the served vaults and
-    /// sources, then the habits paragraph ([`GUIDE`]). No user rule is
-    /// injected here; those stay in the user's own files.
+    /// sources, then the habits paragraph ([`GUIDE`]), then the style rule
+    /// ([`STYLE`]). No user rule is injected here; those stay in the user's
+    /// own files.
     pub fn instructions(&self) -> String {
         let names: Vec<String> = self.store.vaults().all().iter().map(|v| format!("{} ({})", v.name, v.folder)).collect();
         let sources: Vec<&str> = self.store.sources().iter().map(|s| s.name.as_str()).collect();
@@ -971,7 +984,7 @@ impl Server {
         } else {
             format!("Markdown vaults served: {}. Read-only sources: {}.", names.join(", "), sources.join(", "))
         };
-        format!("{head}\n{GUIDE}")
+        format!("{head}\n{GUIDE}\n{STYLE}")
     }
 
     fn vault(&self, name: &str) -> Result<Vault> {
@@ -1073,7 +1086,10 @@ impl Server {
             return Ok(Answer::Text(help()));
         };
         let (name, args) = (routed.as_str(), &routed_args);
-        let mut answer = match self.run(name, args, false)? {
+        self.writer = caller.clone();
+        let ran = self.run(name, args, false);
+        self.writer = None;
+        let mut answer = match ran? {
             Answer::Json(v) => Answer::JsonText(v.to_string()),
             a => a,
         };

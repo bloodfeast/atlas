@@ -26,6 +26,30 @@ use crate::memory::vectors::{self, RecVecs};
 use crate::memory::settings::{Settings, SubagentContext};
 use crate::memory::{Draft, MemoryStore};
 
+/// Runs hook work `f` for `ev` under a panic boundary (#253): a bug in
+/// hook code must not take the server down. Returns `f`'s value and
+/// `false`, or on a panic the default value (for an answer, `""`: the call
+/// passes through untouched) and `true`, which tells the caller to drop its
+/// [`Hooks`]: its state after the unwind is not trusted. A panic is recorded
+/// as one miss, `hook panic <event> <tool>`, through a fresh router; its
+/// reason is the message only when the payload is a `&'static str` (as the
+/// serve log's panic line keeps it).
+pub fn guard<T: Default>(settings: &Settings, ev: &HookEvent, f: impl FnOnce() -> T) -> (T, bool) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => (v, false),
+        Err(payload) => {
+            let reason = payload.downcast_ref::<&'static str>().copied().unwrap_or("payload omitted");
+            let query = format!("hook panic {} {}", ev.event, ev.tool_name);
+            crate::hook_rewrite::Router::new(settings).miss_reason(query.trim_end(), reason);
+            (T::default(), true)
+        }
+    }
+}
+
+/// A tool name whose hook panics in [`Hooks::handle`] (tests only).
+#[cfg(test)]
+pub const TEST_PANIC_TOOL: &str = "atlas_test_panic";
+
 /// One hook event, from either transport.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HookEvent {
@@ -68,7 +92,8 @@ pub struct HookEvent {
     pub last_message: String,
     /// Whether a stop hook already blocked this stop (SubagentStop).
     pub stop_hook_active: bool,
-    /// Stop's `background_tasks`, `Null` when the input lacks it.
+    /// Stop's and SubagentStop's `background_tasks` (Claude Code 2.1.325
+    /// builds both inputs with it), `Null` when the input lacks it.
     pub background_tasks: Value,
     /// Stop's `session_crons`, `Null` when the input lacks it.
     pub session_crons: Value,
@@ -381,6 +406,29 @@ struct AgentRun {
     start: String,
     /// The lanes it wrote journal entries or handoffs under, in order.
     wrote: Vec<String>,
+    /// The key of its `launch` journal entry, once filed (#220), for the
+    /// restart point (#221).
+    launch: Option<String>,
+    /// The resources its brief declares (`Uses:`), for the restart point.
+    uses: Vec<String>,
+}
+
+/// The journal entry kind atlas files an agent's launch brief as (#220). It
+/// is atlas's own: the `journal` tool refuses it (it is not in
+/// [`crate::memory::ENTRIES`]).
+pub const LAUNCH_ENTRY: &str = "launch";
+
+/// What [`Hooks::file_launch`] files for one agent's start.
+struct LaunchEntry<'a> {
+    agent: &'a str,
+    agent_type: &'a str,
+    model: &'a str,
+    description: &'a str,
+    brief: &'a str,
+    /// The session and its transcript, so a later session can tell which
+    /// session's agents did not finish (#221's crash case).
+    session: &'a str,
+    transcript: &'a str,
 }
 
 /// An Agent launch the hook let through, kept for its agent's start or
@@ -405,6 +453,10 @@ struct LaunchBrief {
     /// file could say (checked at that agent's first tool call), or one
     /// whose meta file has named it since. A held launch is not waiting.
     holder: Option<String>,
+    /// The launch's `model` (empty when it names none) and `description`,
+    /// for the `launch` journal entry its agent's start files (#220).
+    model: String,
+    description: String,
     /// How far into the session transcript a refusal of it can be: its
     /// length when the launch was let through, moved on past each scan
     /// that found none.
@@ -853,6 +905,22 @@ pub struct Hooks {
     /// Per session: the store stamp last looked at and the record id it has
     /// looked past for PR event notices (`docs/design/pr-events.md` section 5).
     pr_seen: HashMap<String, ((i64, u64), i64)>,
+    /// Each checkout's remote, read once for the repo-line check (E4).
+    remotes: crate::project::Remotes,
+    /// The resident server's restart point thread (#221); `None` in a
+    /// command hook.
+    restart: Option<crate::restart::Refresher>,
+    /// An agent started or stopped since the restart point was refreshed.
+    restart_due: bool,
+    /// Each session whose agents the restart point lists, by its transcript.
+    restart_sessions: HashMap<String, String>,
+    /// The resident server as its launch entries name it
+    /// ([`crate::restart::server_tag`]): while it runs, a crash offer skips
+    /// its agents. `None` in a command hook.
+    server: Option<String>,
+    /// The scheduled-restart warnings the resident server's poll leaves for
+    /// the main session's next prompt (#221); `None` in a command hook.
+    restart_warn: Option<crate::restart_warn::Notices>,
 }
 
 /// How the merge gate reads a PR's number and head sha, given the merge
@@ -877,8 +945,8 @@ pub fn repo_tag(meta: &str, tree: Option<&crate::memory::tree::TreeSpec>) -> Opt
 pub type StoreOpener = Box<dyn Fn() -> Result<crate::store::Store> + Send>;
 
 /// Compiles the Binding block of a brief for the lane it declares: given the
-/// store, the brief and the lane, the block as its agent will read it (empty
-/// for none). The seam BO-1's `binding::compile` plugs into
+/// store, the brief and the lane (`""` when it declares none), the block as
+/// its agent will read it (empty for none). The seam BO-1's `binding::compile` plugs into
 /// ([`Hooks::set_binding`]).
 pub type BindingFn = Box<dyn Fn(&MemoryStore, &str, &str) -> Result<String> + Send>;
 
@@ -963,7 +1031,111 @@ impl Hooks {
             ideas,
             main: crate::autocompact::MainWatch::default(),
             pr_seen: HashMap::new(),
+            remotes: Default::default(),
+            restart: None,
+            restart_due: false,
+            server: None,
+            restart_sessions: HashMap::new(),
+            restart_warn: None,
         })
+    }
+
+    /// Keeps the restart point current from now on (the resident server):
+    /// refreshed after each SubagentStart and SubagentStop, and on
+    /// [`Hooks::refresh_restart_point`] between hooks.
+    pub fn enable_restart_point(&mut self) {
+        if self.restart.is_none() {
+            self.restart = crate::restart::Refresher::start(self.settings.orchestrate.runq_root.clone());
+            self.server = Some(crate::restart::server_tag());
+        }
+    }
+
+    /// Takes the scheduled-restart warnings `n` (the resident server's poll,
+    /// [`crate::restart_warn::start`]): each is told once, in the main
+    /// session's next prompt.
+    pub fn set_restart_warnings(&mut self, n: crate::restart_warn::Notices) {
+        self.restart_warn = Some(n);
+    }
+
+    /// Hands the restart point to its thread, which reads each worktree's
+    /// git state and prepares the catch's bytes. A no-op unless enabled.
+    pub fn refresh_restart_point(&mut self) {
+        self.restart_due = false;
+        if self.restart.is_none() {
+            return;
+        }
+        let p = self.restart_point();
+        if let Some(r) = &self.restart {
+            r.send(p);
+        }
+    }
+
+    /// The restart point as this state knows it, git state not yet read:
+    /// the running agents of each session that started one, with their
+    /// lane, launch key, worktree (from the worktree ledger) and declared
+    /// resources, and the open lanes (the agents', and those with work
+    /// today).
+    pub fn restart_point(&mut self) -> crate::restart::Point {
+        let now = std::time::SystemTime::now();
+        let rows = crate::worktree_ledger::open_rows(self.store.conn()).unwrap_or_else(|e| {
+            eprintln!("atlas restart point: worktree ledger: {e}");
+            Vec::new()
+        });
+        let mut agents = Vec::new();
+        let sessions: Vec<(String, String)> = self.restart_sessions.iter().map(|(s, t)| (s.clone(), t.clone())).collect();
+        for (session, transcript) in sessions {
+            let dir = crate::orchestrate::subagents_dir(&transcript);
+            let running = match self.orch.running(&self.settings.orchestrate, &dir, Some(&self.store), now) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("atlas restart point: {}: {e}", dir.display());
+                    continue;
+                }
+            };
+            if running.is_empty() {
+                self.restart_sessions.remove(&session);
+            }
+            for r in running {
+                let run = self.agent_lane.get(&r.id).or_else(|| self.agent_lane.get(&format!("agent-{}", r.id)));
+                let lane =
+                    self.orch.sub_lane(&r.tool_use_id).map(str::to_string).or_else(|| run.and_then(|x| x.lane.clone())).unwrap_or_default();
+                let worktree = rows
+                    .iter()
+                    .find(|w| !r.tool_use_id.is_empty() && w.tool_use_id == r.tool_use_id)
+                    .or_else(|| rows.iter().find(|w| !lane.is_empty() && w.lane == lane))
+                    .map(|w| w.path.clone())
+                    .unwrap_or_default();
+                agents.push(crate::restart::AgentPoint {
+                    id: r.id.clone(),
+                    description: r.description.clone(),
+                    lane,
+                    launch: run.and_then(|x| x.launch.clone()).unwrap_or_default(),
+                    tool_use_id: r.tool_use_id.clone(),
+                    dir: dir.to_string_lossy().into_owned(),
+                    worktree,
+                    head: String::new(),
+                    dirty: None,
+                    uses: run.map(|x| x.uses.clone()).unwrap_or_default(),
+                });
+            }
+        }
+        let mut lanes: Vec<String> = agents.iter().map(|a| a.lane.clone()).filter(|l| !l.is_empty()).collect();
+        let today: String = crate::memory::now().chars().take(10).collect();
+        if !agents.is_empty() {
+            if let Ok(all) = self.store.lanes() {
+                lanes.extend(all.into_iter().filter(|l| l.last_work.starts_with(&today)).map(|l| l.lane));
+            }
+        }
+        lanes.sort();
+        lanes.dedup();
+        crate::restart::Point {
+            at: crate::memory::now(),
+            agents,
+            lanes,
+            holders: Vec::new(),
+            server: self.server.clone().unwrap_or_default(),
+            ..crate::restart::Point::default()
+        }
     }
 
     /// Replaces how the merge gate reads a PR's head (tests; the default asks
@@ -1016,6 +1188,10 @@ impl Hooks {
     /// vault or source is rescanned. Fails open: an error is logged as a miss
     /// and nothing else happens; the edit itself was never held.
     pub fn after(&mut self) {
+        // An agent started or stopped: the restart point follows (#221).
+        if self.restart_due {
+            self.refresh_restart_point();
+        }
         self.file_ideas();
         self.index_transcripts();
         for path in std::mem::take(&mut self.edited) {
@@ -1093,6 +1269,15 @@ impl Hooks {
     /// MCP `hook` tool sets it always, since a server cannot tell.
     pub fn set_unattended(&mut self, unattended: bool) {
         self.unattended = unattended;
+    }
+
+    /// The setup the MCP server's hook route gives its hooks
+    /// ([`crate::protocol::serve_with_hooks`]): unattended, with the Binding
+    /// compiler set. The memory eval's subagent starts use it too, so they
+    /// fire the route's own path.
+    pub fn serve_setup(&mut self) {
+        self.set_unattended(true);
+        self.set_binding(Some(binding_compiler()));
     }
 
     /// Turns on the project offer of a project-scoped configuration.
@@ -1201,6 +1386,11 @@ impl Hooks {
     /// Answers one event. Never fails: an error becomes an empty answer (a
     /// hook must not break the session), reported on stderr.
     pub fn handle(&mut self, ev: &HookEvent) -> HookAnswer {
+        // A test-only trigger for the panic boundary (see `guard`).
+        #[cfg(test)]
+        if ev.tool_name == TEST_PANIC_TOOL {
+            panic!("test hook panic");
+        }
         let mut a = match self.try_handle(ev) {
             Ok(a) => a,
             Err(e) => {
@@ -1261,6 +1451,16 @@ impl Hooks {
                 }
                 if ev.agent_id.is_empty() {
                     self.main_context(ev, &mut a);
+                    // A restart pending or scheduled (#221): once per change.
+                    if !ev.tool_use {
+                        if let Some(p) = self.restart_warn.as_ref().and_then(crate::restart_warn::Notices::take) {
+                            let n = self.restart_point().agents.len();
+                            if !a.context.is_empty() {
+                                a.context.push('\n');
+                            }
+                            a.context.push_str(&crate::restart_warn::line(&p, n));
+                        }
+                    }
                 }
                 // A session's first prompt: live atlas hooks that drifted from
                 // hooks/hooks.json (a hook every setup has, unlike SessionStart).
@@ -1281,6 +1481,11 @@ impl Hooks {
                     self.orch.started(&crate::orchestrate::subagents_dir(&ev.transcript_path), &ev.agent_id);
                 }
                 self.agent_lane.entry(ev.agent_id.clone()).or_insert_with(|| AgentRun { start: crate::memory::now(), ..AgentRun::default() });
+                // The restart point lists it once the answer is out (#221).
+                if !ev.transcript_path.is_empty() {
+                    self.restart_sessions.insert(ev.session_id.clone(), ev.transcript_path.clone());
+                }
+                self.restart_due = true;
                 // Its launch. Claude Code writes the meta file (its toolUseId)
                 // only after this hook answers (44 ms to 4.3 s later in every
                 // sample, journal:ATLAS-HOOK-VALUE:0006), so the launch is
@@ -1306,7 +1511,9 @@ impl Hooks {
                         None => (None, self.guess_launch(ev, &dir, now), true),
                     }
                 };
-                let sub_line = self.sub_lane_line(&ev.agent_id, launch_id.as_deref().or(brief.as_ref().map(|b| b.tool_use_id.as_str())));
+                let launch = launch_id.as_deref().or(brief.as_ref().map(|b| b.tool_use_id.as_str()));
+                let sub_lane = launch.and_then(|t| self.orch.sub_lane(t)).map(str::to_string);
+                let sub_line = self.sub_lane_line(&ev.agent_id, launch);
                 let told_sub = sub_line.is_some();
                 // A guess is checked at the first tool call (one with no tool
                 // use id cannot be, and stands); so is a start with no launch.
@@ -1314,11 +1521,29 @@ impl Hooks {
                 let stray = ev.agent_type.is_empty() && !ev.transcript_path.is_empty() && launch_id.is_none();
                 let unsettled = !stray && (given.is_some() || brief.is_none());
                 match brief {
-                    Some(LaunchBrief { brief: b, binding, .. }) => {
+                    Some(LaunchBrief { brief: b, binding, model, description, .. }) => {
                         self.note_lane(&ev.agent_id, &b);
                         let (t, k) = self.subagent_context(&ev.agent_id, &b, binding)?;
                         a.context = self.with_sub_line(t, sub_line, SUBAGENT_CONTEXT_CHARS);
                         keys = k;
+                        // After its context, so the agent is not handed its own brief.
+                        let l = LaunchEntry {
+                            agent: &ev.agent_id,
+                            agent_type: &ev.agent_type,
+                            model: &model,
+                            description: &description,
+                            brief: &b,
+                            session: &ev.session_id,
+                            transcript: &ev.transcript_path,
+                        };
+                        match self.file_launch(&l, sub_lane.as_deref()) {
+                            Ok(key) => {
+                                if let Some(run) = self.agent_lane.get_mut(&ev.agent_id) {
+                                    run.launch = Some(key);
+                                }
+                            }
+                            Err(e) => eprintln!("atlas hook: launch brief of agent {}: {e}", ev.agent_id),
+                        }
                     }
                     None => a.context = self.with_sub_line(String::new(), sub_line, SUBAGENT_CONTEXT_CHARS),
                 }
@@ -1342,8 +1567,18 @@ impl Hooks {
                     self.main_context(ev, &mut a);
                 }
                 if a.deny.is_none() && (ev.tool_name == "Agent" || ev.tool_name == "Task") {
-                    let brief = if ev.tool_prompt.is_empty() { ev.tool_input.get("prompt").and_then(Value::as_str).unwrap_or("") } else { &ev.tool_prompt };
-                    let launch = crate::orchestrate::Launch { transcript: &ev.transcript_path, tool_use_id: &ev.tool_use_id, input: &ev.tool_input, brief };
+                    let brief = if ev.tool_prompt.is_empty() {
+                        ev.tool_input.get("prompt").and_then(Value::as_str).unwrap_or("")
+                    } else {
+                        &ev.tool_prompt
+                    };
+                    let launch = crate::orchestrate::Launch {
+                        transcript: &ev.transcript_path,
+                        tool_use_id: &ev.tool_use_id,
+                        input: &ev.tool_input,
+                        brief,
+                        store: Some(&self.store),
+                    };
                     a.deny = self.orch.admit(&self.settings.orchestrate, &launch, std::time::SystemTime::now(), std::time::Instant::now());
                     let admitted = a.deny.is_none();
                     let kind_refused = self.orch.kind_refused();
@@ -1394,7 +1629,19 @@ impl Hooks {
                         // A refusal of it is written after this: the
                         // transcript is scanned for one from here on.
                         let offset = std::fs::metadata(&ev.transcript_path).map(|m| m.len()).unwrap_or(0);
-                        q.push_back(LaunchBrief { brief: ev.tool_prompt.clone(), tool_use_id: ev.tool_use_id.clone(), agent_type, at: std::time::Instant::now(), binding, holder: None, offset });
+                        let field = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+                        let (model, description) = (field("model"), field("description"));
+                        q.push_back(LaunchBrief {
+                            brief: ev.tool_prompt.clone(),
+                            tool_use_id: ev.tool_use_id.clone(),
+                            agent_type,
+                            at: std::time::Instant::now(),
+                            binding,
+                            holder: None,
+                            offset,
+                            model,
+                            description,
+                        });
                     }
                     // A subagent whose start could not confirm its launch: its
                     // first tool call, by when its meta file names the launch,
@@ -1433,20 +1680,26 @@ impl Hooks {
             // type: it is no agent's report, so it is neither filed nor sent back.
             "SubagentStop" if !ev.agent_id.is_empty() && !ev.agent_type.is_empty() => {
                 self.end_unsettled(ev);
+                self.restart_due = true;
                 a.block = self.report_backstop(&ev.agent_id, &ev.last_message, ev.stop_hook_active);
                 // atlas's own record of the finish (#204): Claude Code may
                 // never write `"finished": true` (a full disk), and a held
                 // lane must not wait `stale_minutes` for it. A stop sent back
                 // keeps running; an agent that writes again counts again.
-                // The record on disk is for other processes (`atlas queue
-                // next`, `atlas backlog`, a command hook): best effort, since
-                // on a full disk it fails and only this process knows.
-                if a.block.is_none() {
+                // The record in the store is for other processes (`atlas
+                // queue next`, `atlas backlog`, a command hook): best effort,
+                // since on a full disk it fails and only this process knows.
+                // An agent that stops while its own background work runs
+                // (`background_tasks` not empty) has not finished: it keeps
+                // its lane and slot (#222 R2). An input without the field
+                // files the finish as before.
+                let waiting = ev.background_tasks.as_array().is_some_and(|t| !t.is_empty());
+                if a.block.is_none() && !waiting {
                     let id = ev.agent_id.strip_prefix("agent-").unwrap_or(&ev.agent_id);
                     let now = std::time::SystemTime::now();
                     self.orch.finished(id, now);
-                    if !ev.transcript_path.is_empty() {
-                        let _ = crate::orchestrate::record_finish(&crate::orchestrate::subagents_dir(&ev.transcript_path), id, now);
+                    if let Err(e) = crate::orchestrate::record_finish(&self.store, id, now) {
+                        eprintln!("atlas agent cap: release record of {id}: {e}");
                     }
                 }
             }
@@ -1596,6 +1849,25 @@ impl Hooks {
                         a.context.push('\n');
                     }
                     a.context.push_str(&line);
+                }
+                // The restart point of a machine that went down, or of a
+                // session that ended with agents unfinished (#221): offered
+                // once, to a session with a user, at most OFFER_CHARS.
+                if !self.unattended && ev.agent_id.is_empty() && matches!(ev.source.as_str(), "startup" | "clear" | "resume") {
+                    match crate::restart::offer(
+                        &mut self.store,
+                        &ev.session_id,
+                        std::time::SystemTime::now(),
+                    ) {
+                        Ok(Some(line)) => {
+                            if !a.context.is_empty() {
+                                a.context.push('\n');
+                            }
+                            a.context.push_str(&line);
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("atlas restart point: {e}"),
+                    }
                 }
                 if ev.source == "compact" && self.settings.compact.enabled {
                     // The checkpoint card first, then the ref report.
@@ -1856,7 +2128,7 @@ impl Hooks {
             if capped {
                 budget = budget.min(r.main_lane_bytes);
             }
-            let v = recall::lane_with(&self.store, &lane, budget, trim)?;
+            let v = recall::lane_with(&self.store, &lane, budget, trim, false)?;
             out.push_str(&v.text);
             // A sub-lane agent (`X/2`) given its parent's view, which holds
             // its own records, has had its own lane's view too.
@@ -1870,14 +2142,19 @@ impl Hooks {
             let (how, full) = if v.trimmed > 0 { (Sel::Trimmed, bytes + v.trimmed_full - v.trimmed_sent) } else { (Sel::Whole, bytes) };
             keys.push(Injected { key: format!("lane:{}", lane), fts: None, cos: None, bytes, how, full });
         }
-        // A repository the text names gets its line from the project graph:
-        // what it is, what it talks to and depends on, what uses it.
+        // A repository the text names gets its line from the project graph
+        // (its path, what it is, what it talks to and depends on, what uses
+        // it), but only when neither the text nor the working directory says
+        // where it is already (E4, journal:ATLAS-EFFICIENCY:0006: E3 found
+        // the line informed almost no agent that had either).
         if let Some(g) = self.settings.graph.clone() {
             for r in g.named_in(text) {
-                let seen = self.injected.entry(scope.to_string()).or_default();
-                if !seen.insert(format!("repo:{}", r.name)) {
+                // Sent once per scope: a line already sent is not placed again.
+                let k = format!("repo:{}", r.name);
+                if self.injected.get(scope).is_some_and(|s| s.contains(&k)) || g.placed(r, text, &self.cwd, &mut self.remotes) {
                     continue;
                 }
+                self.injected.entry(scope.to_string()).or_default().insert(k);
                 if let Some(line) = g.describe(&r.name) {
                     let before = out.len();
                     out.push_str(&format!("atlas project {}: {line}\n", g.name));
@@ -2202,8 +2479,17 @@ impl Hooks {
         let sub_line = self.sub_lane_line(agent, own.as_deref());
         let text = launch.as_ref().map(|l| l.brief.clone()).or_else(|| first_user_text(&subagent_transcript(&ev.transcript_path, agent)));
         let (mut body, mut keys) = (String::new(), Vec::new());
+        // The agent's lane, launch key and resources are settled (or a
+        // wrong guess undone) here, not at its start: the restart point
+        // follows (#221), its session listed again in case the start found
+        // none of its files yet and dropped it.
+        self.restart_due = true;
+        if !ev.transcript_path.is_empty() {
+            self.restart_sessions.insert(u.session.clone(), ev.transcript_path.clone());
+        }
         if let Some(b) = text {
             self.note_lane(agent, &b);
+            self.correct_launch_entry(ev, &u, launch.as_ref(), own.as_deref(), &b);
             (body, keys) = self.subagent_context(agent, &b, launch.and_then(|l| l.binding))?;
         }
         let mut out = String::new();
@@ -2220,6 +2506,42 @@ impl Hooks {
             out.push_str(&rest);
         }
         Ok((out, keys))
+    }
+
+    /// The `launch` entry of an agent whose start guessed another launch, or
+    /// took none, made right at its first tool call (#221, the W4c caveat):
+    /// the entry its start filed from the wrong launch is retired, and its
+    /// own brief `brief` (from its launch, else its transcript) is filed,
+    /// so a restart offer names the right brief for the right agent.
+    fn correct_launch_entry(&mut self, ev: &HookEvent, u: &Unsettled, launch: Option<&LaunchBrief>, own: Option<&str>, brief: &str) {
+        let agent = ev.agent_id.as_str();
+        if u.given.is_some() {
+            if let Some(old) = self.agent_lane.get_mut(agent).and_then(|r| r.launch.take()) {
+                let retired = self.store.writer().and_then(|mut w| {
+                    w.retire(&old, "its agent's start was given another launch; corrected at the agent's first tool call")?;
+                    w.commit()
+                });
+                if let Err(e) = retired {
+                    eprintln!("atlas hook: launch entry {old} of agent {agent}: {e}");
+                }
+            }
+        }
+        if self.agent_lane.get(agent).is_some_and(|r| r.launch.is_some()) {
+            return;
+        }
+        let sub_lane = own.and_then(|t| self.orch.sub_lane(t)).map(str::to_string);
+        let (model, description) = launch.map_or(("", ""), |l| (l.model.as_str(), l.description.as_str()));
+        let agent_type = launch.map_or("", |l| l.agent_type.as_str());
+        let transcript = ev.transcript_path.clone();
+        let l = LaunchEntry { agent, agent_type, model, description, brief, session: &u.session, transcript: &transcript };
+        match self.file_launch(&l, sub_lane.as_deref()) {
+            Ok(key) => {
+                if let Some(run) = self.agent_lane.get_mut(agent) {
+                    run.launch = Some(key);
+                }
+            }
+            Err(e) => eprintln!("atlas hook: launch brief of agent {agent}: {e}"),
+        }
     }
 
     /// The tool use id of the one launch waiting in `session` whose brief is
@@ -2276,14 +2598,16 @@ impl Hooks {
     }
 
     /// The Binding block of `brief`, with `recall.subagent_context =
-    /// "binding"`, a compiler set and a declared lane ([`binding_lane`]);
-    /// `None` otherwise. A compiler error is logged and gives no block.
+    /// "binding"` and a compiler set, for its declared lane ([`binding_lane`],
+    /// `""` for none); `None` otherwise or when empty. A compiler error is
+    /// logged and gives no block.
     fn binding_for(&self, brief: &str) -> Option<String> {
         if self.settings.recall.subagent_context != SubagentContext::Binding {
             return None;
         }
         let f = self.binding.as_ref()?;
-        let lane = binding_lane(brief)?;
+        // With no lane, the keys the brief names are still bound.
+        let lane = binding_lane(brief).unwrap_or_default();
         match f(&self.store, brief, &lane) {
             Ok(b) => (!b.is_empty()).then_some(b),
             Err(e) => {
@@ -2299,6 +2623,58 @@ impl Hooks {
         if run.lane.is_none() {
             run.lane = lane;
         }
+        run.uses = crate::lanes::declared(brief).uses.unwrap_or_default();
+    }
+
+    /// Files an agent's launch brief as a `launch` journal entry (#220, ruling
+    /// journal:ATLAS-RELEASE:0066 Q5) on its lane: the sub-lane it was given,
+    /// else the brief's `Lane:` line, else `agent:<id>`. The brief goes
+    /// through [`crate::redact::redact`] first. When an active `launch` entry
+    /// in the lane or its sub-lanes already holds the same text, the entry is
+    /// one line naming it. Never a `brief` entry: a lane with one gives a
+    /// second writer no sub-lane ([`Hooks::assign_sub_lane`]).
+    fn file_launch(&mut self, l: &LaunchEntry<'_>, sub_lane: Option<&str>) -> Result<String> {
+        let agent = l.agent.strip_prefix("agent-").unwrap_or(l.agent);
+        let lane = match sub_lane {
+            Some(s) => s.to_string(),
+            None => crate::lanes::declared(l.brief).lane.unwrap_or_else(|| format!("agent:{agent}")),
+        };
+        let text = crate::redact::redact(l.brief);
+        let same = self
+            .store
+            .lane_family(crate::lanes::parent_lane(&lane))?
+            .into_iter()
+            .find(|h| h.kind == "journal" && h.sub == LAUNCH_ENTRY && h.status == "active" && h.body == text)
+            .map(|h| h.key);
+        let description = crate::redact::redact(l.description.trim());
+        let model = if l.model.is_empty() { "inherit" } else { l.model };
+        let server = self.server.as_deref().map_or(String::new(), |t| format!("server: {t}\n"));
+        let body = match &same {
+            Some(k) => format!("The same brief as {k}; recall {k} for its text.\n"),
+            None => text,
+        };
+        let d = crate::memory::Draft {
+            title: if description.is_empty() { format!("launch of agent {agent}") } else { format!("launch: {description}") },
+            meta: format!(
+                "agent: {agent}\ntype: {}\nmodel: {model}\ndescription: {description}\nstart: {}\nsession: {}\ntranscript: {}\n{server}",
+                l.agent_type,
+                crate::memory::now(),
+                l.session,
+                l.transcript
+            ),
+            body,
+            reason: "an agent's launch brief, filed by the SubagentStart hook".into(),
+            author: "hook".into(),
+            client: "atlas-hook".into(),
+            provenance: None,
+            time: None,
+        };
+        let mut w = self.store.writer()?;
+        let key = w.next_key(&format!("journal:{lane}:"), 4)?;
+        w.create(&key, "journal", LAUNCH_ENTRY, &lane, &d, None)?;
+        w.add_refs(&key, &[("lane".to_string(), lane.clone())])?;
+        w.commit()?;
+        Ok(key)
     }
 
     /// A `<task-notification>`: when a subagent really finished (not an
@@ -2310,11 +2686,11 @@ impl Hooks {
         let id = prompt.split("<task-id>").nth(1).and_then(|r| r.split("</task-id>").next()).unwrap_or("").trim().to_string();
         if !id.is_empty() && is_interim(prompt) {
             // The agent waits on its own background work: the finish its
-            // SubagentStop recorded is undone, in memory and on disk, so its
-            // lane and slot stay held through the wait (#207 review S1).
+            // SubagentStop recorded is undone, in memory and in the store, so
+            // its lane and slot stay held through the wait (#207 review S1).
             self.orch.unfinished(&id);
-            if !transcript.is_empty() {
-                crate::orchestrate::clear_finish(&crate::orchestrate::subagents_dir(transcript), &id);
+            if let Err(e) = crate::orchestrate::clear_finish(&self.store, &id) {
+                eprintln!("atlas agent cap: release record of {id}: {e}");
             }
         }
         if id.is_empty() || is_interim(prompt) {
@@ -2410,7 +2786,7 @@ impl Hooks {
         let dir = crate::orchestrate::subagents_dir(transcript);
         let running = match self.orch.take_seen(&dir) {
             Some(r) => Ok(r),
-            None => self.orch.running(&self.settings.orchestrate, &dir, std::time::SystemTime::now()),
+            None => self.orch.running(&self.settings.orchestrate, &dir, Some(&self.store), std::time::SystemTime::now()),
         };
         match running {
             Ok(r) => {
@@ -2758,7 +3134,8 @@ bytes: {}", report.len()),
         let lanes: Vec<String> = if run.wrote.is_empty() { run.lane.into_iter().collect() } else { run.wrote };
         let Some(first) = lanes.first().cloned() else { return Ok(String::new()) };
         for lane in &lanes {
-            if self.store.lane(lane)?.iter().any(|h| h.time >= run.start) {
+            // The launch entry atlas filed at its start is not the agent's own.
+            if self.store.lane(lane)?.iter().any(|h| h.time >= run.start && h.sub != LAUNCH_ENTRY) {
                 return Ok(String::new());
             }
         }
@@ -3108,7 +3485,9 @@ bytes: {}", report.len()),
 /// file (meta and body); for each other record, its text plus 40 lines
 /// either side of it in its export (the window a reader opens); for a lane,
 /// every record of the lane. A subagent start also logs the size of the
-/// rulebook at that moment to `brief_log` (the "brief without atlas").
+/// rulebook at that moment to `brief_log`: the agents the report counts and
+/// its "if read whole" line. The "brief without atlas" itself is measured
+/// from pre-atlas reads ([`crate::tokens::brief_measured`], #219).
 fn start_log(s: &Settings) -> Option<(mpsc::Sender<LogRow>, std::thread::JoinHandle<()>)> {
     let db = s.index_db.clone();
     let store = s.store.clone();
@@ -3166,6 +3545,36 @@ impl Drop for Hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #253: a panic inside the guard answers empty, records exactly one
+    /// miss, and does not escape; a body that does not panic is untouched.
+    #[test]
+    fn a_panic_in_the_guard_answers_empty_and_is_one_miss() {
+        let dir = std::env::temp_dir().join(format!("atlas-hook-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let db = dir.join("vaults.sqlite");
+        drop(crate::store::Store::open(&db, crate::paths::Vaults::new(&[("v".into(), vault)]).unwrap()).unwrap());
+        let settings = Settings::from_config(None, &db).unwrap();
+        let ev = HookEvent { event: "PreToolUse".into(), tool_name: "Read".into(), ..HookEvent::default() };
+        let (text, panicked) = guard(&settings, &ev, || -> String { panic!("boom") });
+        assert_eq!((text.as_str(), panicked), ("", true));
+        let (text, panicked) = guard(&settings, &ev, || "kept".to_string());
+        assert_eq!((text.as_str(), panicked), ("kept", false));
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let rows: Vec<(String, String, String, String)> = c
+            .prepare("SELECT tool, query, reason, client FROM misses")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let want = [("route".to_string(), "hook panic PreToolUse Read".to_string(), "boom".to_string(), "atlas-hook".to_string())];
+        assert_eq!(rows, want);
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn derives_the_subagent_transcript() {
