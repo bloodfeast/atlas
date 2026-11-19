@@ -57,7 +57,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use rusqlite::OptionalExtension;
+use crate::db::OptionalExtension;
 
 use crate::compact::{self, Target};
 use crate::error::Result;

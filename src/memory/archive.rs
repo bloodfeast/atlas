@@ -24,8 +24,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use crate::db::types::Value as SqlValue;
+use crate::db::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::error::{Error, Result};
 
@@ -212,8 +212,8 @@ pub fn fold(archive: &Path, snap: &Path) -> Result<Folded> {
         let mut rows = st.query([])?;
         let mut ins = tx.prepare("INSERT OR IGNORE INTO records(key, kind, sub, scope, created) VALUES(?1, ?2, ?3, ?4, ?5)")?;
         while let Some(r) = rows.next()? {
-            let v: Vec<SqlValue> = (0..5).map(|i| r.get(i)).collect::<rusqlite::Result<_>>()?;
-            ins.execute(rusqlite::params_from_iter(v))?;
+            let v: Vec<SqlValue> = (0..5).map(|i| r.get(i)).collect::<crate::db::Result<_>>()?;
+            ins.execute(crate::db::params_from_iter(v))?;
         }
     }
     let mut versions = 0i64;
@@ -238,9 +238,9 @@ pub fn fold(archive: &Path, snap: &Path) -> Result<Folded> {
             if version_sha(&title, &meta, &body) != sha {
                 return Err(Error::Io(format!("{name}: {key} v{seq}: text does not match its sha; the snapshot is not folded")));
             }
-            let mut v: Vec<SqlValue> = (0..16).map(|i| r.get(i)).collect::<rusqlite::Result<_>>()?;
+            let mut v: Vec<SqlValue> = (0..16).map(|i| r.get(i)).collect::<crate::db::Result<_>>()?;
             v.push(SqlValue::Integer(sid));
-            added += ins.execute(rusqlite::params_from_iter(v))? as i64;
+            added += ins.execute(crate::db::params_from_iter(v))? as i64;
             versions += 1;
         }
     }
@@ -251,15 +251,15 @@ pub fn fold(archive: &Path, snap: &Path) -> Result<Folded> {
         let mut rows = st.query([])?;
         let mut ins = tx.prepare("INSERT OR IGNORE INTO supersedes(new_key, old_key, time, reason) VALUES(?1, ?2, ?3, ?4)")?;
         while let Some(r) = rows.next()? {
-            let v: Vec<SqlValue> = (0..4).map(|i| r.get(i)).collect::<rusqlite::Result<_>>()?;
-            ins.execute(rusqlite::params_from_iter(v))?;
+            let v: Vec<SqlValue> = (0..4).map(|i| r.get(i)).collect::<crate::db::Result<_>>()?;
+            ins.execute(crate::db::params_from_iter(v))?;
         }
         let mut st = s.prepare("SELECT r.key, f.kind, f.target FROM refs f JOIN records r ON r.rid = f.rid")?;
         let mut rows = st.query([])?;
         let mut ins = tx.prepare("INSERT OR IGNORE INTO refs(key, kind, target) VALUES(?1, ?2, ?3)")?;
         while let Some(r) = rows.next()? {
-            let v: Vec<SqlValue> = (0..3).map(|i| r.get(i)).collect::<rusqlite::Result<_>>()?;
-            ins.execute(rusqlite::params_from_iter(v))?;
+            let v: Vec<SqlValue> = (0..3).map(|i| r.get(i)).collect::<crate::db::Result<_>>()?;
+            ins.execute(crate::db::params_from_iter(v))?;
         }
     }
     // Every version of the snapshot is now in the archive, by key, number

@@ -50,6 +50,54 @@ pub fn guard<T: Default>(settings: &Settings, ev: &HookEvent, f: impl FnOnce() -
 #[cfg(test)]
 pub const TEST_PANIC_TOOL: &str = "atlas_test_panic";
 
+/// The answer to `event` when its time budget `limit` ran out before the
+/// hook's work ended (see [`crate::hook_budget`]): a gate ([`gated`])
+/// refuses the call, failing closed ([`GATE_OVERRUN`]); an event that takes
+/// context gets one line saying so; any other answer is empty (the call
+/// passes through).
+pub fn overrun_answer(ev: &HookEvent, limit: std::time::Duration) -> String {
+    let mut a = HookAnswer::default();
+    if gated(ev) {
+        a.deny = Some(GATE_OVERRUN.into());
+    } else if matches!(ev.event.as_str(), "UserPromptSubmit" | "SessionStart" | "SubagentStart") {
+        a.context = format!("atlas: hook time budget ({} ms) spent; skipped: the whole answer", limit.as_millis());
+    }
+    a.to_json(&ev.event)
+}
+
+/// The refusal of a gated call whose check ran past the hook's budget.
+pub const GATE_OVERRUN: &str = "atlas: gate check did not finish within its budget; refused, retry the call";
+
+impl Hooks {
+    /// The watchdog answered `ev` before the worker did (its budget ran out),
+    /// so the worker's own answer is dropped: an `Agent`/`Task` launch the
+    /// worker admitted was refused all the same and must hold no cap slot
+    /// nor sub-lane (review S1 of #329). Forgotten by its own tool use id,
+    /// never as the last launch admitted: a launch denied before `admit`
+    /// (the context cap) would free another session's pending launch (r3 S1).
+    /// An empty id would match every pending launch without one.
+    pub fn answer_lost(&mut self, ev: &HookEvent) {
+        if ev.event == "PreToolUse" && matches!(ev.tool_name.as_str(), "Agent" | "Task") && !ev.tool_use_id.is_empty() {
+            self.orch.forget_launch(&ev.tool_use_id);
+        }
+    }
+}
+
+/// Whether `ev`'s answer can refuse it, so that an answer cut at the budget
+/// refuses it too (fails closed): a PreToolUse of a subagent's tool other
+/// than the handoff (the context cap, and the report backstop of its
+/// hand-back), of an `Agent`/`Task` launch (the agent caps, queue, judge and
+/// classifier), of a `SendMessage` (the resume gate), and of a shell
+/// command with a `gh pr merge` (the review merge gate).
+pub fn gated(ev: &HookEvent) -> bool {
+    if ev.event != "PreToolUse" {
+        return false;
+    }
+    let tool = ev.tool_name.as_str();
+    let shell_merge = matches!(tool, "Bash" | "PowerShell") && ev.tool_input.get("command").and_then(Value::as_str).is_some_and(|c| !crate::reviews::merges(c).is_empty());
+    (!ev.agent_id.is_empty() && !passes_cap(tool)) || matches!(tool, "Agent" | "Task" | "SendMessage") || shell_merge
+}
+
 /// One hook event, from either transport.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HookEvent {
@@ -209,6 +257,9 @@ pub struct HookAnswer {
     /// Instructions for the compaction summary (PreCompact). Claude Code adds
     /// a PreCompact hook's plain reply to the summarizer's instructions.
     pub instructions: &'static str,
+    /// Text after the PreCompact instructions: the live agents with their
+    /// PRs, so the summary can copy exact numbers.
+    pub instructions_tail: String,
     /// A line shown to the user and never added to the model's context
     /// (top-level `systemMessage`): the update notice (issue #190).
     pub system_message: String,
@@ -218,33 +269,44 @@ impl HookAnswer {
     /// The reply Claude Code acts on: the hook JSON, a PreCompact's plain
     /// instructions, or an empty string for "nothing" (outside PreCompact plain
     /// text is not injected, so empty is a no-op).
+    ///
+    /// The one place a hook's text leaves atlas, so the one place it is made
+    /// safe ([`crate::hidden::scrub`]): the context, the user's line and
+    /// every reason lose their invisible characters and show their control
+    /// characters (the PreCompact instructions are atlas's own constant). `updatedToolOutput`
+    /// stays as the tool gave it (an exact `Edit` match needs its bytes).
+    /// `self` is left as built.
     pub fn to_json(&self, event: &str) -> String {
         if let Some(r) = &self.block {
+            let r = crate::hidden::scrub(r).into_owned();
             return crate::json::object(r.len() + 48, |w| {
-                w.field("decision", "block").field("reason", r);
+                w.field("decision", "block").field("reason", &r);
             });
         }
         if !self.instructions.is_empty() {
-            return self.instructions.to_string();
+            return format!("{}{}", self.instructions, crate::hidden::scrub(&self.instructions_tail));
         }
         let specific = !(self.deny.is_none() && self.context.is_empty() && self.updated_input.is_none() && self.updated_output.is_none());
         if !specific && self.system_message.is_empty() {
             return String::new();
         }
-        crate::json::object(self.context.len() + self.system_message.len() + 128, |w| {
-            if !self.system_message.is_empty() {
-                w.field("systemMessage", &self.system_message);
+        let context = crate::hidden::scrub(&self.context).into_owned();
+        let system_message = crate::hidden::scrub(&self.system_message).into_owned();
+        let deny = self.deny.as_deref().map(|r| crate::hidden::scrub(r).into_owned());
+        crate::json::object(context.len() + system_message.len() + 128, |w| {
+            if !system_message.is_empty() {
+                w.field("systemMessage", &system_message);
             }
             if !specific {
                 return;
             }
-            let inner = crate::json::object(self.context.len() + 96, |h| {
+            let inner = crate::json::object(context.len() + 96, |h| {
                 h.field("hookEventName", event);
-                if let Some(r) = &self.deny {
+                if let Some(r) = &deny {
                     h.field("permissionDecision", "deny").field("permissionDecisionReason", r);
                 }
-                if !self.context.is_empty() {
-                    h.field("additionalContext", &self.context);
+                if !context.is_empty() {
+                    h.field("additionalContext", &context);
                 }
                 if let Some(u) = &self.updated_input {
                     h.field("updatedInput", u);
@@ -290,7 +352,7 @@ impl RefusalNotice {
 /// The hook JSON that tells the user and the model atlas is off for this
 /// session because of `e`.
 pub fn refusal_json(e: &crate::Error, event: &str) -> String {
-    let text = format!("atlas is off for this session: {e}");
+    let text = crate::hidden::scrub(&format!("atlas is off for this session: {e}")).into_owned();
     crate::json::object(text.len() * 2 + 96, |w| {
         w.field("systemMessage", &text);
         let inner = crate::json::object(text.len() + 64, |h| {
@@ -417,6 +479,11 @@ struct AgentRun {
 /// is atlas's own: the `journal` tool refuses it (it is not in
 /// [`crate::memory::ENTRIES`]).
 pub const LAUNCH_ENTRY: &str = "launch";
+
+/// The newest of `all` (launch entries) that names agent `id`.
+fn newest_launch<'a>(all: &'a [crate::memory::Head], id: &str) -> Option<&'a crate::memory::Head> {
+    all.iter().filter(|h| crate::memory::import::front_value(&h.meta, "agent") == Some(id)).max_by(|a, b| a.time.cmp(&b.time))
+}
 
 /// What [`Hooks::file_launch`] files for one agent's start.
 struct LaunchEntry<'a> {
@@ -843,6 +910,11 @@ pub struct Hooks {
     unsettled: HashMap<String, Unsettled>,
     /// Each subagent's run: its lane, start and the lanes it wrote under.
     agent_lane: HashMap<String, AgentRun>,
+    /// Running agents the restart point found no launch entry for: not
+    /// scanned for again (#306 S1).
+    launch_unknown: HashSet<String>,
+    /// Launch-entry scans the restart point ran ([`Hooks::launch_scans`]).
+    launch_scans: usize,
     /// Agents whose long report was sent back once (Q-SD3).
     report_sent_back: HashSet<String>,
     warned: HashMap<PathBuf, u64>,
@@ -897,6 +969,8 @@ pub struct Hooks {
     orch: crate::orchestrate::Agents,
     /// Reads a PR's number and head for the merge gate (`gh pr view`).
     pr_head: PrHead,
+    /// Finds a live agent's open PR by branch for the card (`gh pr list`).
+    pr_list: std::sync::Arc<crate::card_agents::GhList>,
     /// Idea capture (`memory.ideas`); `None` when it is off, so an off store
     /// reads nothing, writes nothing and adds nothing to context.
     ideas: Option<crate::ideas::Live>,
@@ -914,6 +988,8 @@ pub struct Hooks {
     restart_due: bool,
     /// Each session whose agents the restart point lists, by its transcript.
     restart_sessions: HashMap<String, String>,
+    /// The sessions this server has seen an event of ([`Hooks::note_session`]).
+    sessions_seen: HashSet<String>,
     /// The resident server as its launch entries name it
     /// ([`crate::restart::server_tag`]): while it runs, a crash offer skips
     /// its agents. `None` in a command hook.
@@ -921,7 +997,15 @@ pub struct Hooks {
     /// The scheduled-restart warnings the resident server's poll leaves for
     /// the main session's next prompt (#221); `None` in a command hook.
     restart_warn: Option<crate::restart_warn::Notices>,
+    /// The event being answered's time budget and phase times.
+    budget: crate::hook_budget::Budget,
+    /// Session starts not yet written (another writer held the store),
+    /// tried again after each answer ([`Hooks::record_starts`]).
+    starts_owed: Vec<(String, std::time::SystemTime)>,
 }
+
+/// The most session starts kept owed; older ones are dropped.
+const STARTS_OWED_MAX: usize = 16;
 
 /// How the merge gate reads a PR's number and head sha, given the merge
 /// and the working folder.
@@ -984,6 +1068,8 @@ impl Hooks {
     ///
     /// [`crate::Error::Db`] if the store cannot be opened.
     pub fn open(settings: Settings) -> Result<Hooks> {
+        // MemoryStore::open binds its waits to the hook's deadline (30 s
+        // outside a hook).
         let store = MemoryStore::open(&settings.store)?;
         let (log, log_thread) = start_log(&settings).unzip();
         let router = crate::hook_rewrite::Router::new(&settings);
@@ -1000,6 +1086,8 @@ impl Hooks {
             unsettled: HashMap::new(),
             binding: None,
             agent_lane: HashMap::new(),
+            launch_unknown: HashSet::new(),
+            launch_scans: 0,
             report_sent_back: HashSet::new(),
             warned: HashMap::new(),
             usage_cache: HashMap::new(),
@@ -1028,6 +1116,7 @@ impl Hooks {
             roots: Vec::new(),
             orch: crate::orchestrate::Agents::default(),
             pr_head: crate::reviews::gh_head,
+            pr_list: crate::card_agents::default_gh(),
             ideas,
             main: crate::autocompact::MainWatch::default(),
             pr_seen: HashMap::new(),
@@ -1036,7 +1125,10 @@ impl Hooks {
             restart_due: false,
             server: None,
             restart_sessions: HashMap::new(),
+            sessions_seen: HashSet::new(),
             restart_warn: None,
+            budget: crate::hook_budget::Budget::timing_only(std::time::Instant::now()),
+            starts_owed: Vec::new(),
         })
     }
 
@@ -1082,41 +1174,15 @@ impl Hooks {
             Vec::new()
         });
         let mut agents = Vec::new();
+        let mut launches = None;
         let sessions: Vec<(String, String)> = self.restart_sessions.iter().map(|(s, t)| (s.clone(), t.clone())).collect();
         for (session, transcript) in sessions {
-            let dir = crate::orchestrate::subagents_dir(&transcript);
-            let running = match self.orch.running(&self.settings.orchestrate, &dir, Some(&self.store), now) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("atlas restart point: {}: {e}", dir.display());
-                    continue;
+            match self.session_agents(&transcript, &rows, &mut launches, now) {
+                Ok(a) if a.is_empty() => {
+                    self.restart_sessions.remove(&session);
                 }
-            };
-            if running.is_empty() {
-                self.restart_sessions.remove(&session);
-            }
-            for r in running {
-                let run = self.agent_lane.get(&r.id).or_else(|| self.agent_lane.get(&format!("agent-{}", r.id)));
-                let lane =
-                    self.orch.sub_lane(&r.tool_use_id).map(str::to_string).or_else(|| run.and_then(|x| x.lane.clone())).unwrap_or_default();
-                let worktree = rows
-                    .iter()
-                    .find(|w| !r.tool_use_id.is_empty() && w.tool_use_id == r.tool_use_id)
-                    .or_else(|| rows.iter().find(|w| !lane.is_empty() && w.lane == lane))
-                    .map(|w| w.path.clone())
-                    .unwrap_or_default();
-                agents.push(crate::restart::AgentPoint {
-                    id: r.id.clone(),
-                    description: r.description.clone(),
-                    lane,
-                    launch: run.and_then(|x| x.launch.clone()).unwrap_or_default(),
-                    tool_use_id: r.tool_use_id.clone(),
-                    dir: dir.to_string_lossy().into_owned(),
-                    worktree,
-                    head: String::new(),
-                    dirty: None,
-                    uses: run.map(|x| x.uses.clone()).unwrap_or_default(),
-                });
+                Ok(a) => agents.extend(a),
+                Err(e) => eprintln!("atlas restart point: {}: {e}", crate::orchestrate::subagents_dir(&transcript).display()),
             }
         }
         let mut lanes: Vec<String> = agents.iter().map(|a| a.lane.clone()).filter(|l| !l.is_empty()).collect();
@@ -1138,10 +1204,152 @@ impl Hooks {
         }
     }
 
+    /// The resources (`Uses:`) the brief of the launch entry `key` declares,
+    /// following a repeated brief's "The same brief as {k}" line to `k`
+    /// (#306 S2).
+    fn launch_uses(&self, key: &str) -> Vec<String> {
+        let Ok(Some(full)) = self.store.head(key) else { return Vec::new() };
+        let first =
+            full.body.strip_prefix("The same brief as ").and_then(|r| r.split_once(';')).map(|(k, _)| k.trim()).filter(|k| *k != key);
+        let body = match first.map(|k| self.store.head(k)) {
+            Some(Ok(Some(orig))) => orig.body,
+            _ => full.body,
+        };
+        crate::lanes::declared(&body).uses.unwrap_or_default()
+    }
+
+    /// Launch-entry scans the restart point ran since this state opened
+    /// (tests: an agent resolved once is not scanned for again).
+    #[doc(hidden)]
+    pub fn launch_scans(&self) -> usize {
+        self.launch_scans
+    }
+
+    /// The running agents of the session whose transcript is `transcript`,
+    /// as the restart point lists them, worktrees from the ledger `rows`.
+    /// An agent this server saw no start of (it restarted since) takes its
+    /// lane, launch key and resources from its newest `launch` entry, read
+    /// into `launches` once (#306).
+    fn session_agents(
+        &mut self,
+        transcript: &str,
+        rows: &[crate::worktree_ledger::Row],
+        launches: &mut Option<Vec<crate::memory::Head>>,
+        now: std::time::SystemTime,
+    ) -> std::io::Result<Vec<crate::restart::AgentPoint>> {
+        let dir = crate::orchestrate::subagents_dir(transcript);
+        let running = self.orch.running(&self.settings.orchestrate, &dir, Some(&self.store), now)?;
+        let mut out = Vec::new();
+        let mut older: Option<Vec<crate::memory::Head>> = None;
+        for r in running {
+            let run = self.agent_lane.get(&r.id).or_else(|| self.agent_lane.get(&format!("agent-{}", r.id)));
+            let mut lane =
+                self.orch.sub_lane(&r.tool_use_id).map(str::to_string).or_else(|| run.and_then(|x| x.lane.clone())).unwrap_or_default();
+            let mut launch = run.and_then(|x| x.launch.clone()).unwrap_or_default();
+            let mut uses = run.map(|x| x.uses.clone()).unwrap_or_default();
+            if launch.is_empty() && !self.launch_unknown.contains(&r.id) {
+                let all = launches.get_or_insert_with(|| {
+                    self.launch_scans += 1;
+                    self.store.active_entries_since_no_body(LAUNCH_ENTRY, &crate::restart::crash_floor(now)).unwrap_or_else(|e| {
+                        eprintln!("atlas restart point: launch entries: {e}");
+                        Vec::new()
+                    })
+                });
+                let mut own = newest_launch(all, &r.id);
+                if own.is_none() {
+                    // A launch older than the bound: one unbounded read per
+                    // refresh, only on a miss, and the result is cached
+                    // either way (#306 N1).
+                    let old = older.get_or_insert_with(|| {
+                        self.launch_scans += 1;
+                        self.store.active_entries_no_body(LAUNCH_ENTRY).unwrap_or_else(|e| {
+                            eprintln!("atlas restart point: launch entries: {e}");
+                            Vec::new()
+                        })
+                    });
+                    own = newest_launch(old, &r.id);
+                }
+                if let Some(h) = own {
+                    launch = h.key.clone();
+                    if lane.is_empty() {
+                        lane = h.scope.clone();
+                    }
+                    if uses.is_empty() {
+                        uses = self.launch_uses(&h.key);
+                    }
+                    // Resolved once: later refreshes read it here (#306 S1).
+                    let start = crate::memory::import::front_value(&h.meta, "start").unwrap_or("").to_string();
+                    let run = self.agent_lane.entry(r.id.clone()).or_insert_with(|| AgentRun { start, ..AgentRun::default() });
+                    run.launch = Some(launch.clone());
+                    if run.lane.is_none() && !lane.is_empty() {
+                        run.lane = Some(lane.clone());
+                    }
+                    if run.uses.is_empty() {
+                        run.uses = uses.clone();
+                    }
+                } else {
+                    self.launch_unknown.insert(r.id.clone());
+                }
+            }
+            let worktree = rows
+                .iter()
+                .find(|w| !r.tool_use_id.is_empty() && w.tool_use_id == r.tool_use_id)
+                .or_else(|| rows.iter().find(|w| !lane.is_empty() && w.lane == lane))
+                .map(|w| w.path.clone())
+                .unwrap_or_default();
+            out.push(crate::restart::AgentPoint {
+                id: r.id.clone(),
+                description: r.description.clone(),
+                lane,
+                launch,
+                tool_use_id: r.tool_use_id.clone(),
+                dir: dir.to_string_lossy().into_owned(),
+                worktree,
+                head: String::new(),
+                dirty: None,
+                uses,
+            });
+        }
+        Ok(out)
+    }
+
+    /// A session this server has not seen an event of yet: its agents join
+    /// the restart point, counted from its recorded start
+    /// ([`crate::orchestrate::session_start`]) where there is one. A server
+    /// restarted mid-session sees no SubagentStart of the agents still
+    /// running (a builder waiting on a CI monitor writes nothing), so its
+    /// first event of the session lists them (#306). Not in a command hook,
+    /// which keeps no point and would read the store at every event.
+    fn note_session(&mut self, session: &str, transcript: &str) {
+        if self.command_hook || session.is_empty() || transcript.is_empty() || !self.sessions_seen.insert(session.to_string()) {
+            return;
+        }
+        match crate::orchestrate::session_start(&self.store, session) {
+            Ok(Some(at)) => self.orch.set_opened(&crate::orchestrate::subagents_dir(transcript), at),
+            Ok(None) => {}
+            Err(e) => eprintln!("atlas agent cap: session start of {session}: {e}"),
+        }
+        self.restart_sessions.insert(session.to_string(), transcript.to_string());
+        self.restart_due = true;
+    }
+
+    /// Whether an event since the last refresh left the restart point due
+    /// (tests).
+    #[doc(hidden)]
+    pub fn restart_due(&self) -> bool {
+        self.restart_due
+    }
+
     /// Replaces how the merge gate reads a PR's head (tests; the default asks
     /// `gh pr view`).
     pub fn set_pr_head(&mut self, f: PrHead) {
         self.pr_head = f;
+    }
+
+    /// Replaces how the card finds a live agent's PR by branch (tests; the
+    /// default asks `gh pr list`).
+    pub fn set_pr_list(&mut self, f: std::sync::Arc<crate::card_agents::GhList>) {
+        self.pr_list = f;
     }
 
     /// Sets the Binding compiler the `"binding"` subagent context uses.
@@ -1188,6 +1396,9 @@ impl Hooks {
     /// vault or source is rescanned. Fails open: an error is logged as a miss
     /// and nothing else happens; the edit itself was never held.
     pub fn after(&mut self) {
+        if !self.starts_owed.is_empty() {
+            self.record_starts();
+        }
         // An agent started or stopped: the restart point follows (#221).
         if self.restart_due {
             self.refresh_restart_point();
@@ -1215,7 +1426,7 @@ impl Hooks {
     pub fn index_transcripts(&mut self) {
         for path in std::mem::take(&mut self.transcripts) {
             let r = crate::store::open_raw(&self.settings.index_db).and_then(|c| {
-                let _ = c.busy_timeout(std::time::Duration::from_secs(10));
+                let _ = crate::hook_budget::bound_within::<10>(&c);
                 crate::transcripts::index(&c, &path)
             });
             if let Err(e) = r {
@@ -1386,6 +1597,120 @@ impl Hooks {
     /// Answers one event. Never fails: an error becomes an empty answer (a
     /// hook must not break the session), reported on stderr.
     pub fn handle(&mut self, ev: &HookEvent) -> HookAnswer {
+        self.handle_from(ev, std::time::Instant::now())
+    }
+
+    /// [`Hooks::handle`] for an event that arrived at `arrived` (a server's
+    /// hook may wait behind another): its time budget counts from then.
+    pub fn handle_from(&mut self, ev: &HookEvent, arrived: std::time::Instant) -> HookAnswer {
+        self.budget = crate::hook_budget::Budget::from_env(arrived, self.settings.hook_budget);
+        // Every store wait on this thread ends at the deadline.
+        let active = crate::hook_budget::Active::set(&self.budget);
+        let mut a = self.handle_timed(ev);
+        drop(active);
+        self.budget.finish();
+        if crate::hook_budget::timings_on() {
+            eprintln!("{}", self.budget.trace_line(&ev.event));
+        }
+        if let Some(line) = self.budget.skip_line() {
+            if !a.context.is_empty() {
+                a.context.push('\n');
+            }
+            a.context.push_str(&line);
+        }
+        a
+    }
+
+    /// Writes the session starts owed, waiting on another writer for
+    /// [`crate::ideas::QUICK`] at most: the hook worker never waits on the
+    /// store's lock for this bookkeeping (on 2026-11-18 a 30 s wait here
+    /// held a prompt queued behind it past Claude Code's limit). A start the
+    /// lock refused stays owed and is tried after the next answer, with the
+    /// time it happened.
+    fn record_starts(&mut self) {
+        let _ = self.store.conn().busy_timeout(crate::ideas::QUICK);
+        let mut owed = std::mem::take(&mut self.starts_owed).into_iter();
+        while let Some((session, at)) = owed.next() {
+            match crate::orchestrate::record_session_start(&self.store, &session, at) {
+                // Its agents are counted from the start written (review S2
+                // of #329): the session's next event reads it again.
+                Ok(()) => {
+                    self.sessions_seen.remove(&session);
+                }
+                // Only another writer's lock keeps it owed (review N5).
+                Err(e) if !e.is_busy() => eprintln!("atlas agent cap: session start of {session}: {e}"),
+                Err(_) => {
+                    // The lock is still held: the rest wait too, untried
+                    // (one short wait per answer, however many are owed).
+                    self.starts_owed.push((session, at));
+                    self.starts_owed.extend(owed);
+                    break;
+                }
+            }
+        }
+        let over = self.starts_owed.len().saturating_sub(STARTS_OWED_MAX);
+        self.starts_owed.drain(..over);
+        let _ = crate::hook_budget::bound(self.store.conn());
+    }
+
+    /// A command hook's work after its answer: the session start the lock
+    /// refused is tried once more (the process ends after this: a start
+    /// still owed is not written).
+    pub fn after_command_hook(&mut self) {
+        if !self.starts_owed.is_empty() {
+            self.record_starts();
+        }
+    }
+
+    /// Session starts not yet written (tests).
+    #[doc(hidden)]
+    pub fn starts_owed(&self) -> usize {
+        self.starts_owed.len()
+    }
+
+    /// The session start the agent cap counts the agents of the session
+    /// with transcript `transcript` from (tests).
+    #[doc(hidden)]
+    pub fn session_opened(&self, transcript: &str) -> Option<std::time::SystemTime> {
+        self.orch.opened(&crate::orchestrate::subagents_dir(transcript))
+    }
+
+    /// Starts phase `name` of the event being answered: false once its
+    /// budget is spent (the phase is then skipped and named).
+    fn phase(&mut self, name: &'static str) -> bool {
+        self.budget.enter(name)
+    }
+
+    /// Worktree gc (`worktrees`): an hourly detached run, or one at once
+    /// after a merged PR event; never waited on. Run after the event's own
+    /// work, in a phase of its own (#351 F1): a busy store cannot spend
+    /// recall's budget on it, and a spent budget skips it (no stamp is
+    /// written, so the next event retries). The skip is housekeeping, so it
+    /// is in the trace and never in the model's context (#355 S2). Its line
+    /// (auto_gc off, stale space over `notify_gb`) is for SessionStart
+    /// only, and is read from the stored summary even when the tick is
+    /// skipped (#355 N4). Run once per event, also when the event's work
+    /// failed (#355 N2).
+    fn gc_tick(&mut self, ev: &HookEvent, a: &mut HookAnswer) {
+        if !self.settings.orchestrate.enabled || !matches!(ev.event.as_str(), "SessionStart" | "SubagentStop" | "UserPromptSubmit") {
+            return;
+        }
+        let line = if self.budget.enter_quiet("worktree_gc") {
+            crate::worktree_gc::tick(&self.store, &self.settings.worktrees, &ev.event)
+        } else if ev.event == "SessionStart" {
+            crate::worktree_gc::session_line(&self.store, &self.settings.worktrees)
+        } else {
+            None
+        };
+        if let Some(line) = line {
+            if !a.context.is_empty() {
+                a.context.push('\n');
+            }
+            a.context.push_str(&line);
+        }
+    }
+
+    fn handle_timed(&mut self, ev: &HookEvent) -> HookAnswer {
         // A test-only trigger for the panic boundary (see `guard`).
         #[cfg(test)]
         if ev.tool_name == TEST_PANIC_TOOL {
@@ -1395,6 +1720,9 @@ impl Hooks {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("atlas hook {}: {e}", ev.event);
+                // The event's work failed before its gc tick (#355 N2):
+                // the tick still runs; the answer stays empty.
+                self.gc_tick(ev, &mut HookAnswer::default());
                 HookAnswer::default()
             }
         };
@@ -1421,11 +1749,29 @@ impl Hooks {
         if !ev.cwd.is_empty() {
             self.cwd = ev.cwd.clone();
         }
+        if !ev.tool_use {
+            // Never skipped (review S1 of #329): a start lost here is not
+            // owed either, and its writes wait 50 ms at most.
+            self.budget.mark("session");
+            // A session's start is when its Claude Code process began: a
+            // server restarted later reads it (#306).
+            if ev.event == "SessionStart"
+                && ev.agent_id.is_empty()
+                && !ev.session_id.is_empty()
+                && matches!(ev.source.as_str(), "startup" | "clear" | "resume")
+            {
+                self.starts_owed.push((ev.session_id.clone(), std::time::SystemTime::now()));
+                self.record_starts();
+                self.sessions_seen.remove(&ev.session_id);
+            }
+            self.note_session(&ev.session_id, &ev.transcript_path);
+        }
         if matches!(ev.event.as_str(), "PreToolUse" | "PostToolUse") {
             if let Some(g) = self.settings.graph.clone() {
                 self.tracker.touch_input(&g, &ev.session_id, &ev.tool_input);
             }
         }
+        self.budget.mark("event");
         match ev.event.as_str() {
             "UserPromptSubmit" => {
                 if ev.prompt.starts_with("<task-notification>") {
@@ -1441,18 +1787,20 @@ impl Hooks {
                 } else {
                     // After recall, so it cannot recall itself, and whatever
                     // recall answered: an error or a spent budget files all the same.
-                    let recalled = self.recall(&ev.session_id, &ev.prompt);
-                    if let Some(i) = self.ideas.as_mut() {
-                        i.on_prompt(&mut self.store, &ev.session_id, &ev.prompt, &ev.transcript_path);
+                    let recalled = if self.phase("recall") { self.recall(&ev.session_id, &ev.prompt) } else { Ok((String::new(), Vec::new())) };
+                    if self.phase("ideas") {
+                        if let Some(i) = self.ideas.as_mut() {
+                            i.on_prompt(&mut self.store, &ev.session_id, &ev.prompt, &ev.transcript_path);
+                        }
                     }
                     let (t, k) = recalled?;
                     a.context = t;
                     keys = k;
                 }
-                if ev.agent_id.is_empty() {
+                if ev.agent_id.is_empty() && self.phase("main_context") {
                     self.main_context(ev, &mut a);
                     // A restart pending or scheduled (#221): once per change.
-                    if !ev.tool_use {
+                    if !ev.tool_use && self.phase("restart_warn") {
                         if let Some(p) = self.restart_warn.as_ref().and_then(crate::restart_warn::Notices::take) {
                             let n = self.restart_point().agents.len();
                             if !a.context.is_empty() {
@@ -1466,7 +1814,7 @@ impl Hooks {
                 // hooks/hooks.json (a hook every setup has, unlike SessionStart).
                 // A command hook is a new process per prompt, so it would tell
                 // every prompt: SessionStart tells that setup instead.
-                if !self.command_hook && self.drift_told.insert(ev.session_id.clone()) {
+                if !self.command_hook && self.phase("drift") && self.drift_told.insert(ev.session_id.clone()) {
                     if let Some(line) = self.drift_line() {
                         if !a.context.is_empty() {
                             a.context.push('\n');
@@ -1521,9 +1869,9 @@ impl Hooks {
                 let stray = ev.agent_type.is_empty() && !ev.transcript_path.is_empty() && launch_id.is_none();
                 let unsettled = !stray && (given.is_some() || brief.is_none());
                 match brief {
-                    Some(LaunchBrief { brief: b, binding, model, description, .. }) => {
+                    Some(LaunchBrief { brief: b, binding, model, description, agent_type, .. }) => {
                         self.note_lane(&ev.agent_id, &b);
-                        let (t, k) = self.subagent_context(&ev.agent_id, &b, binding)?;
+                        let (t, k) = self.subagent_context(&ev.agent_id, &b, &agent_type, binding)?;
                         a.context = self.with_sub_line(t, sub_line, SUBAGENT_CONTEXT_CHARS);
                         keys = k;
                         // After its context, so the agent is not handed its own brief.
@@ -1695,12 +2043,7 @@ impl Hooks {
                 // files the finish as before.
                 let waiting = ev.background_tasks.as_array().is_some_and(|t| !t.is_empty());
                 if a.block.is_none() && !waiting {
-                    let id = ev.agent_id.strip_prefix("agent-").unwrap_or(&ev.agent_id);
-                    let now = std::time::SystemTime::now();
-                    self.orch.finished(id, now);
-                    if let Err(e) = crate::orchestrate::record_finish(&self.store, id, now) {
-                        eprintln!("atlas agent cap: release record of {id}: {e}");
-                    }
+                    self.file_finish(&ev.agent_id);
                 }
             }
             "PostToolUse" if ev.tool_name == "AskUserQuestion" => {
@@ -1813,7 +2156,7 @@ impl Hooks {
                 // A /clear: the card of the checkpoint SessionEnd (reason
                 // clear) wrote from the ending transcript (advisory, as the
                 // resume card is).
-                if ev.source == "clear" && self.settings.compact.enabled {
+                if ev.source == "clear" && self.settings.compact.enabled && self.phase("clear_card") {
                     match self.clear_card(ev) {
                         Ok(Some(card)) => {
                             if !a.context.is_empty() {
@@ -1825,6 +2168,7 @@ impl Hooks {
                         Err(e) => eprintln!("atlas clear card: {e}"),
                     }
                 }
+                let fresh = fresh && self.phase("resume_card");
                 let mut ideas_line = if fresh { self.ideas.as_ref().and_then(|i| i.resume_line(&self.store)) } else { None };
                 if fresh && self.settings.resume_card {
                     match crate::resume::card_with(&self.store, &self.settings.orchestrate, &ev.transcript_path, &crate::memory::now(), ev.source == "clear", ideas_line.as_deref()) {
@@ -1853,7 +2197,7 @@ impl Hooks {
                 // The restart point of a machine that went down, or of a
                 // session that ended with agents unfinished (#221): offered
                 // once, to a session with a user, at most OFFER_CHARS.
-                if !self.unattended && ev.agent_id.is_empty() && matches!(ev.source.as_str(), "startup" | "clear" | "resume") {
+                if !self.unattended && ev.agent_id.is_empty() && matches!(ev.source.as_str(), "startup" | "clear" | "resume") && self.phase("restart_offer") {
                     match crate::restart::offer(
                         &mut self.store,
                         &ev.session_id,
@@ -1869,7 +2213,7 @@ impl Hooks {
                         Err(e) => eprintln!("atlas restart point: {e}"),
                     }
                 }
-                if ev.source == "compact" && self.settings.compact.enabled {
+                if ev.source == "compact" && self.settings.compact.enabled && self.phase("compact_card") {
                     // The checkpoint card first, then the ref report.
                     if let Some(h) = crate::checkpoint::newest(&self.store, &ev.session_id)? {
                         if !a.context.is_empty() {
@@ -1940,7 +2284,7 @@ impl Hooks {
                 // The model's own checkpoint entry for this segment. Without
                 // one, an automatic compaction inside the prompt zone waits
                 // once for it (ATLAS-CLEAR 0003, the backstop).
-                let model = crate::checkpoint::model_entry(&self.store, &ev.session_id, &t.start)?;
+                let model = crate::checkpoint::model_entry(&self.store, &ev.session_id, &t.start, Path::new(&ev.transcript_path))?;
                 if ev.trigger == "auto" && model.is_none() {
                     if let Some(reason) = self.main.wait_for_checkpoint(&self.settings, Path::new(&ev.transcript_path), &ev.session_id, &t.start, t.last_ctx) {
                         a.block = Some(reason);
@@ -1949,14 +2293,18 @@ impl Hooks {
                 }
                 self.misses.compact(&ev.session_id);
                 let trigger = if ev.trigger.is_empty() { "unknown" } else { ev.trigger.as_str() };
-                if self.write_checkpoint(&ev.session_id, &ev.transcript_path, trigger, &t, &from, model.as_ref(), t_pre)?.1 {
+                let (_, chain, live) = self.write_checkpoint(&ev.session_id, &ev.transcript_path, trigger, &t, &from, model.as_ref(), t_pre)?;
+                if chain {
                     // Only with a card: the text tells the summarizer to leave
                     // out what the card lists. A later error answers nothing.
                     a.instructions = crate::claude_settings::COMPACT_INSTRUCTIONS;
+                    a.instructions_tail = live;
                 }
             }
             _ => {}
         }
+        self.gc_tick(ev, &mut a);
+        self.budget.mark("notice");
         if let Some(line) = self.pr_notice(ev) {
             if !a.context.is_empty() {
                 a.context.push('\n');
@@ -2083,6 +2431,11 @@ impl Hooks {
         }
         // The scope is the session for a human prompt, else a subagent.
         let human = scope == self.session;
+        // The records a subagent's brief names (its Gherkin tags, `key@hash`
+        // refs and bare keys, as the Binding compiler reads them) are covered
+        // (#275): the brief already carries them, so neither the lane view
+        // nor a pointer sends them again, and their room goes to the next.
+        let covered = if human { HashSet::new() } else { crate::binding::named_keys(&self.store, text)? };
         // A scope this process has not seen yet starts from what was
         // pointed to in it before (a server restart, a command hook's
         // process per event): each key is pointed to once per session.
@@ -2128,7 +2481,7 @@ impl Hooks {
             if capped {
                 budget = budget.min(r.main_lane_bytes);
             }
-            let v = recall::lane_with(&self.store, &lane, budget, trim, false)?;
+            let v = recall::lane_with(&self.store, &lane, budget, trim, false, &covered)?;
             out.push_str(&v.text);
             // A sub-lane agent (`X/2`) given its parent's view, which holds
             // its own records, has had its own lane's view too.
@@ -2147,6 +2500,7 @@ impl Hooks {
         // it), but only when neither the text nor the working directory says
         // where it is already (E4, journal:ATLAS-EFFICIENCY:0006: E3 found
         // the line informed almost no agent that had either).
+        self.budget.mark("recall.graph");
         if let Some(g) = self.settings.graph.clone() {
             for r in g.named_in(text) {
                 // Sent once per scope: a line already sent is not placed again.
@@ -2167,8 +2521,11 @@ impl Hooks {
             *self.spent.entry(scope.to_string()).or_default() += out.len();
             return Ok((out, keys));
         }
-        let skip = self.injected.get(scope).cloned().unwrap_or_default();
+        let mut skip = self.injected.get(scope).cloned().unwrap_or_default();
+        skip.extend(covered.iter().cloned());
+        self.budget.mark("recall.vectors");
         self.refresh_vectors()?;
+        self.budget.mark("recall.embed");
         let qv = self.sem.as_mut().map(|s| s.model.embed_query_cut(text, r.query_tokens, &mut s.scratch));
         let sem = match (&self.sem, &qv) {
             (Some(s), Some(q)) => s.vecs.as_ref().map(|vecs| recall::Semantic { vecs, query: q, isa: s.model.isa }),
@@ -2191,6 +2548,7 @@ impl Hooks {
         let mut lines = String::new();
         let mut chosen = Vec::new();
         let mut more = 0usize;
+        self.budget.mark("recall.search");
         let mut passed: Vec<recall::Candidate> = recall::candidates(&self.store, text, &gate, sem.as_ref())?.into_iter().filter(|c| c.pass && !skip.contains(&c.head.key)).collect();
         // With a model, the prompt's best cosine sets the bar: a record more
         // than `cos_margin` below it is a word match, not the topic. Best
@@ -2226,6 +2584,22 @@ impl Hooks {
         // The records sent so far, for the collapse check.
         let mut sent: Vec<(i64, String, String)> = Vec::new();
         let headlines = r.rules == crate::memory::rules::Mode::Live;
+        // A near-duplicate of a covered record, as the collapse check judges
+        // it, is covered too: not a collapsed line, nothing.
+        let mut named: Vec<(i64, String)> = Vec::new();
+        if sel.enabled {
+            for k in &covered {
+                if let Some(h) = self.store.head(k)? {
+                    named.push((h.rid, crate::memory::select::record_words_text(&h)));
+                }
+            }
+        }
+        let near_dup = |rid: i64, t: &str, of: &[(i64, String)]| {
+            of.iter().any(|(o, ot)| {
+                sem.as_ref().and_then(|s| s.vecs.pair(s.isa, *o, rid)).is_some_and(|c| c >= sel.dup_cos)
+                    && crate::memory::select::overlap(ot, t) >= sel.dup_overlap
+            })
+        };
         for cand in passed {
             if human && r.prompt_pointers > 0 && chosen.len() >= r.prompt_pointers {
                 more += 1;
@@ -2237,6 +2611,9 @@ impl Hooks {
             let head_line = (headlines && crate::memory::rules::managed_kind(&cand.head.kind)).then(|| crate::memory::rules::pointer(&cand.head, &cand.tags));
             let (one, how) = if sel.enabled {
                 let rtext = crate::memory::select::record_words_text(&cand.head);
+                if near_dup(cand.head.rid, &rtext, &named) {
+                    continue;
+                }
                 let dup = sent.iter().find(|(rid, _, t)| {
                     let near = sem.as_ref().and_then(|s| s.vecs.pair(s.isa, *rid, cand.head.rid)).is_some_and(|c| c >= sel.dup_cos);
                     near && crate::memory::select::overlap(t, &rtext) >= sel.dup_overlap
@@ -2260,6 +2637,8 @@ impl Hooks {
                     None => (whole.clone(), Sel::Whole),
                 }
             };
+            // Measured as it goes out (the scrub can lengthen a line).
+            let one = crate::hidden::scrub(&one).into_owned();
             if POINTER_HEAD.len() + lines.len() + one.len() + 32 > budget {
                 more += 1;
                 if how != Sel::Collapsed {
@@ -2315,7 +2694,7 @@ impl Hooks {
             hook_ms: t0.elapsed().as_secs_f64() * 1e3,
         };
         if let Ok(conn) = crate::store::open_raw(&self.settings.index_db) {
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+            let _ = crate::hook_budget::bound_within::<10>(&conn);
             let _ = crate::compact::log(&conn, &logged);
         }
         Ok(report)
@@ -2345,6 +2724,10 @@ impl Hooks {
     /// characters, the sub-lane line kept and the body cut between lines.
     fn with_sub_line(&self, body: String, sub_line: Option<String>, max: usize) -> String {
         let capped = self.settings.recall.subagent_context == SubagentContext::Binding;
+        // Measured as it goes out: the scrub can lengthen text (a control
+        // character becomes `\u{1b}`), so the cap is on the scrubbed text.
+        let body = crate::hidden::scrub(&body).into_owned();
+        let sub_line = sub_line.map(|l| crate::hidden::scrub(&l).into_owned());
         let Some(line) = sub_line else {
             return if capped { cap_lines(&body, max) } else { body };
         };
@@ -2490,7 +2873,8 @@ impl Hooks {
         if let Some(b) = text {
             self.note_lane(agent, &b);
             self.correct_launch_entry(ev, &u, launch.as_ref(), own.as_deref(), &b);
-            (body, keys) = self.subagent_context(agent, &b, launch.and_then(|l| l.binding))?;
+            let agent_type = launch.as_ref().map_or_else(|| ev.agent_type.clone(), |l| l.agent_type.clone());
+            (body, keys) = self.subagent_context(agent, &b, &agent_type, launch.and_then(|l| l.binding))?;
         }
         let mut out = String::new();
         if u.given.is_some() && u.told {
@@ -2584,10 +2968,27 @@ impl Hooks {
 
     /// What a subagent with brief `brief` is given from the store
     /// (`recall.subagent_context`): today's recall, its launch's Binding
-    /// block (`stashed`, else compiled now), or nothing.
-    fn subagent_context(&mut self, agent_id: &str, brief: &str, stashed: Option<String>) -> Result<(String, Vec<Injected>)> {
+    /// block (`stashed`, else compiled now), or nothing. In the recall mode a
+    /// reviewer or research start (its kind as the cap classifier reads it:
+    /// the brief's `Kind:` line, else its launch's `agent_type` in
+    /// `orchestrate.types` or the built-in map, so `Explore` and `Plan` are
+    /// research, else the default kind) gets no lane view and no pointers
+    /// (#275, ruling journal:ATLAS-RELEASE:0156 Q2): its brief carries what
+    /// it reads, and a reviewer that needs history recalls it. Isolation is
+    /// not kept with a launch; a worktree agent with no `Kind:` line or
+    /// mapped type falls to the default kind.
+    fn subagent_context(
+        &mut self,
+        agent_id: &str,
+        brief: &str,
+        agent_type: &str,
+        stashed: Option<String>,
+    ) -> Result<(String, Vec<Injected>)> {
         match self.settings.recall.subagent_context {
-            SubagentContext::Recall => self.recall(agent_id, brief),
+            SubagentContext::Recall => match crate::orchestrate::classify(&self.settings.orchestrate, brief, agent_type, "") {
+                crate::orchestrate::Kind::Reviewer | crate::orchestrate::Kind::Research => Ok((String::new(), Vec::new())),
+                _ => self.recall(agent_id, brief),
+            },
             SubagentContext::Off => Ok((String::new(), Vec::new())),
             SubagentContext::Binding => {
                 let block = stashed.or_else(|| self.binding_for(brief)).unwrap_or_default();
@@ -2692,13 +3093,27 @@ impl Hooks {
             if let Err(e) = crate::orchestrate::clear_finish(&self.store, &id) {
                 eprintln!("atlas agent cap: release record of {id}: {e}");
             }
+            // The point dropped it (and its session, when it was the last
+            // agent) at the stop's refresh: it is listed again (#306 H4).
+            self.restart_due = true;
+            if !transcript.is_empty() && !self.session.is_empty() {
+                self.restart_sessions.insert(self.session.clone(), transcript.to_string());
+            }
         }
         if id.is_empty() || is_interim(prompt) {
             // A goal check-in has no task id; an interim stop gets nothing.
             let checkin = id.is_empty() && prompt.contains("Goal check-in:");
             return Ok(if checkin { self.ideas_line() } else { String::new() });
         }
-        self.orch.finished(&id, std::time::SystemTime::now());
+        // The real finish, in the store too, as SubagentStop files it: a stop
+        // that listed background work filed none, and another process (the
+        // next session's restart offer, `atlas queue next`) must see it
+        // (#306 H1). The point follows. A background shell or monitor task
+        // sends one too: only an agent's files a finish (#306 N1).
+        if self.is_agent(&id, transcript) {
+            self.file_finish(&id);
+            self.restart_due = true;
+        }
         let fresh = self.fresh_line(&id);
         let rest = self.journal_check(&id, transcript)?;
         // A slot may have freed: the launches waiting for one.
@@ -2707,7 +3122,8 @@ impl Hooks {
             Ok((heads, items)) if !items.is_empty() => {
                 let running = self.holders(transcript, &[]);
                 let p = crate::queue::propose(&self.settings.orchestrate, &items, &running);
-                crate::queue::proposal_line(&items, &heads, &p, 3)
+                let direct = self.settings.trackers.as_ref().is_some_and(|t| t.env_present(&|n| std::env::var(n).ok()));
+                crate::queue::proposal_line(&items, &heads, &p, 3) + &crate::trackers::snapshot::hint_lines(&heads, direct)
             }
             Ok(_) => String::new(),
             Err(e) => {
@@ -2716,6 +3132,28 @@ impl Hooks {
             }
         };
         Ok(fresh + &rest + &queued + &self.ideas_line())
+    }
+
+    /// Whether the task `id` of a notification is a subagent: this state saw
+    /// it run, or the session's subagents folder (of `transcript`) has its
+    /// meta file.
+    fn is_agent(&self, id: &str, transcript: &str) -> bool {
+        let bare = id.strip_prefix("agent-").unwrap_or(id);
+        self.agent_lane.contains_key(bare)
+            || self.agent_lane.contains_key(&format!("agent-{bare}"))
+            || (!transcript.is_empty() && crate::orchestrate::subagents_dir(transcript).join(format!("agent-{bare}.meta.json")).is_file())
+    }
+
+    /// Files agent `id`'s real finish, now: in memory for this process and in
+    /// the store for every other one (best effort: on a full disk only this
+    /// process knows).
+    fn file_finish(&mut self, id: &str) {
+        let id = id.strip_prefix("agent-").unwrap_or(id);
+        let now = std::time::SystemTime::now();
+        self.orch.finished(id, now);
+        if let Err(e) = crate::orchestrate::record_finish(&self.store, id, now) {
+            eprintln!("atlas agent cap: release record of {id}: {e}");
+        }
     }
 
     /// The PR event notices for a main session's event that reaches its own
@@ -3143,9 +3581,10 @@ bytes: {}", report.len()),
     }
 
     /// Writes a session's checkpoint from its segment `t` (read from `from`)
-    /// and the store, as PreCompact does: the key, and whether the chain card
-    /// was added. `model` is the model's own checkpoint entry, named in the
-    /// body (or said missing) while `compact.checkpoint_prompt` is on.
+    /// and the store, as PreCompact does: the key, whether the chain card
+    /// was added, and the live agents' text for the summary's instructions.
+    /// `model` is the model's own checkpoint entry, named in the body (or
+    /// said missing) while `compact.checkpoint_prompt` is on.
     #[allow(clippy::too_many_arguments)]
     fn write_checkpoint(
         &mut self,
@@ -3156,7 +3595,7 @@ bytes: {}", report.len()),
         from: &crate::checkpoint::TailFrom,
         model: Option<&crate::memory::Head>,
         t_pre: std::time::Instant,
-    ) -> Result<(String, bool)> {
+    ) -> Result<(String, bool, String)> {
         use crate::checkpoint::TailFrom;
         let ctx = match from {
             TailFrom::Own => if t.last_ctx > 0 { t.last_ctx } else { last_usage(Path::new(transcript)).ok().flatten().map_or(0, |(_, c)| c) },
@@ -3167,7 +3606,19 @@ bytes: {}", report.len()),
         let scope = crate::checkpoint::Lanes::for_project(self.settings.graph.as_deref());
         // Bounded by the transcript's own newest record: never a record the
         // session could not have seen.
-        let state = crate::checkpoint::state(&self.store, session, &t.start, &t.end, scope)?;
+        // The lanes of the agents running now lead the card's `lanes:`,
+        // whether or not they wrote in the segment (#309 item 4): the same
+        // running set the restart point reads.
+        let agents = self.card_agents(session, transcript);
+        let live: Vec<String> = agents.iter().map(|a| a.lane.clone()).filter(|l| !l.is_empty()).collect();
+        let mut state = crate::checkpoint::state_live(&self.store, session, &t.start, &t.end, scope, &live)?;
+        // Each live agent with its PR, or parked (#327).
+        // gh's fixed bound, cut at the hook's own deadline (#329).
+        let deadline = crate::card_agents::gh_deadline(std::time::Instant::now(), self.budget.deadline());
+        match crate::card_agents::items(&self.store, &agents, &self.pr_list, deadline) {
+            Ok((items, note)) => (state.agents, state.agents_note) = (items, note),
+            Err(e) => eprintln!("atlas checkpoint: live agents' PRs: {e}"),
+        }
         let mut body = crate::checkpoint::body(&state, t, self.settings.bytes_for(self.settings.compact.card_tokens));
         if self.settings.compact.checkpoint_prompt {
             body.push_str(&crate::checkpoint::model_line(model));
@@ -3210,7 +3661,65 @@ bytes: {}", report.len()),
         let key = w.next_key(&format!("journal:{lane}:"), 4)?;
         w.create(&key, "journal", "checkpoint", &lane, &d, None)?;
         w.commit()?;
-        Ok((key, chain.is_some()))
+        let tail = if state.agents.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nLive agents now (copy each PR number exactly into the state): {}\n", state.agents.join(", "))
+        };
+        Ok((key, chain.is_some(), tail))
+    }
+
+    /// The agents the card names: the session's running agents (#316), then
+    /// each agent launched in it that the host no longer lists, for
+    /// [`crate::card_agents::items`] to keep only while parked (#327).
+    /// Worktrees by their `Uses: worktree:NAME` in the ledger.
+    fn card_agents(&mut self, session: &str, transcript: &str) -> Vec<crate::card_agents::Agent> {
+        let now = std::time::SystemTime::now();
+        let rows = crate::worktree_ledger::open_rows(self.store.conn()).unwrap_or_else(|e| {
+            eprintln!("atlas checkpoint: worktree ledger: {e}");
+            Vec::new()
+        });
+        let running = self.session_agents(transcript, &rows, &mut None, now).unwrap_or_else(|e| {
+            eprintln!("atlas checkpoint: running agents: {e}");
+            Vec::new()
+        });
+        let launches: Vec<crate::memory::Head> = self
+            .store
+            .active_entries_since_no_body(LAUNCH_ENTRY, &crate::restart::crash_floor(now))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| !session.is_empty() && crate::memory::import::front_value(&h.meta, "session") == Some(session))
+            .collect();
+        let start = |h: &crate::memory::Head| crate::memory::import::front_value(&h.meta, "start").unwrap_or(h.time.as_str()).to_string();
+        let base = |p: &str| p.replace('\\', "/").trim_end_matches('/').rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+        let place = |name: &str, lane: &str, own: &str| -> String {
+            if name.is_empty() {
+                return own.to_string();
+            }
+            let n = name.to_ascii_lowercase();
+            let all: Vec<_> = rows.iter().filter(|w| base(&w.path) == n).collect();
+            all.iter().find(|w| w.lane == lane).or_else(|| all.first()).map_or_else(String::new, |w| w.path.clone())
+        };
+        let mut out = Vec::new();
+        for a in &running {
+            let own = launches.iter().filter(|h| crate::memory::import::front_value(&h.meta, "agent") == Some(a.id.as_str())).max_by(|x, y| x.time.cmp(&y.time));
+            let launched = own.map(start).or_else(|| self.agent_lane.get(&a.id).map(|r| r.start.clone())).unwrap_or_default();
+            let worktree = a.uses.iter().find_map(|u| u.strip_prefix("worktree:").map(str::to_string)).unwrap_or_default();
+            let path = place(&worktree, &a.lane, &a.worktree);
+            out.push(crate::card_agents::Agent { id: a.id.clone(), lane: a.lane.clone(), launched, worktree, path, running: true });
+        }
+        // One entry per agent, its newest launch; the running ones are named.
+        let mut seen: HashSet<String> = running.iter().map(|a| a.id.clone()).collect();
+        for h in launches.iter().rev() {
+            let Some(id) = crate::memory::import::front_value(&h.meta, "agent") else { continue };
+            if !seen.insert(id.to_string()) || h.scope.is_empty() {
+                continue;
+            }
+            let worktree = self.launch_uses(&h.key).into_iter().find_map(|u| u.strip_prefix("worktree:").map(str::to_string)).unwrap_or_default();
+            let path = place(&worktree, &h.scope, "");
+            out.push(crate::card_agents::Agent { id: id.to_string(), lane: h.scope.clone(), launched: start(h), worktree, path, running: false });
+        }
+        out
     }
 
     /// At a /clear (SessionEnd, `reason: clear`): the ending session's
@@ -3226,7 +3735,7 @@ bytes: {}", report.len()),
         if t.last_ctx == 0 {
             return Ok(());
         }
-        let model = crate::checkpoint::model_entry(&self.store, &ev.session_id, &t.start)?;
+        let model = crate::checkpoint::model_entry(&self.store, &ev.session_id, &t.start, path)?;
         self.write_checkpoint(&ev.session_id, &ev.transcript_path, "clear", &t, &crate::checkpoint::TailFrom::Own, model.as_ref(), t_pre)?;
         Ok(())
     }
@@ -3500,12 +4009,16 @@ fn start_log(s: &Settings) -> Option<(mpsc::Sender<LogRow>, std::thread::JoinHan
             // does not contend with this thread for the database.
             let Ok(first) = rx.recv() else { return };
             let Ok(conn) = crate::store::open_raw(&db) else { return };
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
-            if conn.execute_batch(crate::tokens::TOKEN_TABLE).is_err() {
-                return;
-            }
+            // A table refused (the lock held past the wait) is reported and
+            // made again before the next row: the thread lives on, and only
+            // the rows written while it is missing are lost.
+            let mut made = false;
+            let mut refused = false;
             let Ok(mem) = MemoryStore::open(&store) else { return };
             for r in std::iter::once(first).chain(rx) {
+                if !made {
+                    made = make_token_table(&conn, &mut refused);
+                }
                 if let Some(m) = &r.miss {
                     let _ = crate::compact::log_miss(&conn, m);
                 }
@@ -3529,6 +4042,29 @@ fn start_log(s: &Settings) -> Option<(mpsc::Sender<LogRow>, std::thread::JoinHan
         })
         .ok()?;
     Some((tx, handle))
+}
+
+/// Makes the token table on the log thread's connection, reporting a
+/// refusal. After one refusal a retry waits at most 1 s, so while the lock
+/// stays contended each row costs the thread (and the `Hooks::drop` that
+/// joins it) 1 s, not the full wait; the other writes keep the full wait
+/// (review N1 of #343).
+fn make_token_table(conn: &crate::db::Connection, refused: &mut bool) -> bool {
+    if *refused {
+        let _ = crate::hook_budget::bound_within::<1>(conn);
+    }
+    let made = match conn.execute_batch(crate::tokens::TOKEN_TABLE) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("atlas token log: {e}");
+            false
+        }
+    };
+    if *refused {
+        let _ = crate::hook_budget::bound(conn);
+    }
+    *refused = !made;
+    made
 }
 
 impl Drop for Hooks {
@@ -3562,13 +4098,13 @@ mod tests {
         assert_eq!((text.as_str(), panicked), ("", true));
         let (text, panicked) = guard(&settings, &ev, || "kept".to_string());
         assert_eq!((text.as_str(), panicked), ("kept", false));
-        let c = rusqlite::Connection::open(&db).unwrap();
+        let c = crate::db::Connection::open(&db).unwrap();
         let rows: Vec<(String, String, String, String)> = c
             .prepare("SELECT tool, query, reason, client FROM misses")
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .unwrap()
-            .collect::<rusqlite::Result<_>>()
+            .collect::<crate::db::Result<_>>()
             .unwrap();
         let want = [("route".to_string(), "hook panic PreToolUse Read".to_string(), "boom".to_string(), "atlas-hook".to_string())];
         assert_eq!(rows, want);
@@ -3621,6 +4157,47 @@ mod tests {
         assert_eq!(o.to_json("PostToolUse"), r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":{"stdout":"s"}}}"#);
         let i = HookAnswer { updated_input: Some(crate::json!({"command": "c"})), ..HookAnswer::default() };
         assert_eq!(i.to_json("PreToolUse"), r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"command":"c"}}}"#);
+    }
+
+    /// Every text a hook sends (a context from any path: records, the
+    /// compact card, a task notification; the user's line; a reason) loses its invisible characters and shows its
+    /// controls. `updatedToolOutput` is the tool's own output and stays raw,
+    /// so an exact `Edit` match on a file view still works.
+    #[test]
+    fn every_hook_text_is_scrubbed_but_the_tool_output() {
+        let dirty = "ig\u{200B}nore \u{202E}x\u{1b}[2J <T>";
+        let clean = "ignore x\\u{1b}[2J <T>";
+        let a = HookAnswer {
+            context: dirty.into(),
+            system_message: dirty.into(),
+            updated_output: Some(crate::json!({"stdout": dirty})),
+            ..HookAnswer::default()
+        };
+        let v = crate::json::parse(&a.to_json("PostToolUse")).unwrap();
+        assert_eq!(v["systemMessage"].as_str(), Some(clean));
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"].as_str(), Some(clean));
+        assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"]["stdout"].as_str(), Some(dirty));
+        let d = HookAnswer { deny: Some(dirty.into()), ..HookAnswer::default() };
+        let v = crate::json::parse(&d.to_json("PreToolUse")).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecisionReason"].as_str(), Some(clean));
+        let b = HookAnswer { block: Some(dirty.into()), ..HookAnswer::default() };
+        assert_eq!(crate::json::parse(&b.to_json("Stop")).unwrap()["reason"].as_str(), Some(clean));
+    }
+
+    /// The store-refusal notice names the store's path, which can hold any
+    /// character: it is scrubbed as a hook's context is (#299 review S4).
+    #[test]
+    fn the_store_refusal_notice_is_scrubbed() {
+        let e = crate::Error::StoreTooNew {
+            store: "memory store".into(),
+            path: "C:/st\u{202E}ore\u{1b}[2J.sqlite".into(),
+            found: "9".into(),
+            supported: "8".into(),
+        };
+        let v = crate::json::parse(&refusal_json(&e, "SessionStart")).unwrap();
+        for t in [v["systemMessage"].as_str().unwrap(), v["hookSpecificOutput"]["additionalContext"].as_str().unwrap()] {
+            assert!(t.contains("C:/store\\u{1b}[2J.sqlite"), "{t}");
+        }
     }
 
     #[test]
@@ -3690,4 +4267,40 @@ mod tests {
         assert!(named("ATLAS-BO0/notes", "ATLAS-BO0"));
         assert!(named("lane=ATLAS-BO0 and `ATLAS-BO0`", "ATLAS-BO0"));
     }
+
+    /// Review N1 of #343: once the token table is refused, a retry under a
+    /// held lock gives up in about 1 s, not the full wait; the next free
+    /// moment makes it.
+    #[test]
+    fn a_refused_token_table_is_retried_briefly() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!("atlas-token-retry-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let db = d.join("index.db");
+        let conn = crate::store::open_raw(&db).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder_db = db.clone();
+        let holder = std::thread::spawn(move || {
+            let c = crate::db::Connection::open(&holder_db).unwrap();
+            c.execute_batch("BEGIN IMMEDIATE").unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            c.execute_batch("COMMIT").unwrap();
+        });
+        rx.recv().unwrap();
+        let mut refused = true;
+        let t = std::time::Instant::now();
+        let made = make_token_table(&conn, &mut refused);
+        let waited = t.elapsed();
+        holder.join().unwrap();
+        assert!(!made && refused, "the 3 s hold outlasts the retry: {waited:?}");
+        assert!(waited >= std::time::Duration::from_millis(900) && waited < std::time::Duration::from_millis(2_500), "{waited:?}");
+        assert!(make_token_table(&conn, &mut refused) && !refused);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
+
+#[cfg(test)]
+#[path = "hooks_gc_phase_tests.rs"]
+mod gc_phase_tests;

@@ -1,0 +1,13 @@
+# The deliberate hidden characters `cargo xtask hidden` lets through: one
+# `path:LINES:U+XXXX reason` per line, LINES a comma list of line numbers
+# and A-B ranges. Every listed line must hold the character (a stale line
+# is an error), and a new one on another line is a finding. An invisible
+# character in code is never listed: write an escape (`\u{202e}` in Rust,
+# `\x1b` in a string). List a file only when its bytes must be raw.
+fixtures/js-test/jest-fail-verbose.txt:18-24,33-39:U+001B terminal colour codes: a captured jest log the test-output digest parses as it arrives
+fixtures/js-test/jest-fail.txt:9-15,24-30:U+001B terminal colour codes: a captured jest log the test-output digest parses as it arrives
+fixtures/js-test/vitest-fail.txt:2,4-9,11,13-14,16-17,19-20,22-28,30,32-41,43,45-48:U+001B terminal colour codes: a captured vitest log the test-output digest parses as it arrives
+fixtures/js-test/vitest-pass.txt:2,4,6-9:U+001B terminal colour codes: a captured vitest log the test-output digest parses as it arrives
+xtask/src/release_ci.rs:1947,1961:U+001E record separator in a test's fake git log line (the field and record separators `git log --format` is asked for)
+xtask/src/release_ci.rs:1945-1946:U+001F unit separator in a test's fake git log line (the field and record separators `git log --format` is asked for)
+scripts/prdigest/heads.set1.SHA256SUMS:138-140,168-171:U+FFFD invalid UTF-8: a checksum manifest naming upstream snapshot files whose names were cut mid-character at the source; its bytes must match the names

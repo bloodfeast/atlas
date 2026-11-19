@@ -626,7 +626,7 @@ impl Server {
                 if entry == crate::reviews::ENTRY && amend.is_none() && (crate::reviews::Review::parse(review_meta).is_none() || !crate::reviews::verdicts_known(review_meta)) {
                     let why = crate::reviews::Review::problem(review_meta).unwrap_or("`verdict:` names an unknown verdict");
                     return Err(Error::InvalidArgument(format!(
-                        "review entry refused: {why}. A review entry needs meta lines `role:` (or several, comma-separated), `pr:` (N, #N, repo#N or owner/repo#N; a `repo:` line names the repo of a bare N), `head:` (the sha it read, 7 or more hex digits) and `verdict:` (pass, merge, merge with follow-ups or request changes, each with an optional `(role)`); `report:` is kept"
+                        "review entry refused: {why}. A review entry needs meta lines `role:` (or several, comma-separated), `pr:` (N, #N, repo#N or owner/repo#N; a `repo:` line names the repo of a bare N), `head:` (the sha it read, 7 or more hex digits) and `verdict:` (pass, merge, merge with follow-ups or request changes, each with an optional `(role)`; GitHub's approve or approved is filed as pass, request_changes, changes_requested or changes as request changes); `report:` is kept"
                     )));
                 }
                 // A bare `pr: N` with no repo is filed, but counts for PR N in
@@ -655,6 +655,8 @@ impl Server {
                     let key = w.next_key(&format!("journal:{lane}:"), 4)?;
                     let meta = match &planned_meta {
                         Some(m) => with_newline(m.clone()),
+                        // A review's verdict is filed in canonical words (#325).
+                        None if entry == crate::reviews::ENTRY => with_newline(crate::reviews::canonical_meta(review_meta)),
                         None => opt_str(a, "meta")?.map(|s| with_newline(s.to_string())).unwrap_or_default(),
                     };
                     let (title, body) = title_and_body(head, rest);
@@ -702,7 +704,7 @@ impl Server {
                 }
                 let first_old = match old.first() {
                     Some(o) => {
-                        let h: Option<crate::memory::Head> = rusqlite::OptionalExtension::optional(w_head(&w, o))?;
+                        let h: Option<crate::memory::Head> = crate::db::OptionalExtension::optional(w_head(&w, o))?;
                         Some(h.ok_or_else(|| Error::NotFound(format!("record {o:?}")))?)
                     }
                     None => None,
@@ -716,7 +718,7 @@ impl Server {
                 // scope given) the record it revises or replaces is in it.
                 let named_key = opt_str(a, "key")?.map(str::to_string);
                 let in_user = |w: &crate::memory::Writer<'_>, k: &str| -> Result<bool> {
-                    let h: Option<crate::memory::Head> = rusqlite::OptionalExtension::optional(w_head(w, k))?;
+                    let h: Option<crate::memory::Head> = crate::db::OptionalExtension::optional(w_head(w, k))?;
                     Ok(h.is_some_and(|h| h.scope == USER) || store_exports_of(w, k)?.iter().any(|e| e == USER))
                 };
                 let scope = match opt_str(a, "scope")? {
@@ -811,7 +813,7 @@ impl Server {
                         (key, draft(title, String::new(), with_newline(body)))
                     }
                 };
-                let exists = rusqlite::OptionalExtension::optional(w_head(&w, &key))?.is_some();
+                let exists = crate::db::OptionalExtension::optional(w_head(&w, &key))?.is_some();
                 if user_layer && !exists {
                     // Never over a file the user layer holds that this
                     // project has not read (a hand-written memory).
@@ -958,7 +960,7 @@ fn write_user_layer(store: &MemoryStore, dir: &std::path::Path, index: &str, key
     Ok(format!("user layer: {}\n", dir.join(format!("{key}.md")).display()))
 }
 
-fn w_head(w: &crate::memory::Writer<'_>, key: &str) -> rusqlite::Result<crate::memory::Head> {
+fn w_head(w: &crate::memory::Writer<'_>, key: &str) -> crate::db::Result<crate::memory::Head> {
     w.head(key)
 }
 

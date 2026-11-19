@@ -81,6 +81,64 @@ fn recall_is_gated_budgeted_and_not_repeated() {
     assert!(!a.context.contains("== widget-cache"), "{}", a.context);
 }
 
+/// The prompt record budget is measured on the scrubbed line: a record full
+/// of escape characters (each shown as the six characters `\u{1b}`) that
+/// fits as stored but not as sent is left out, never sent over budget
+/// (#299 review S7).
+#[test]
+fn a_prompt_record_budget_is_measured_after_the_scrub() {
+    let t = Temp::new("hook-prompt-scrub-cap");
+    let mut s = settings(t.path());
+    seed(&s);
+    {
+        let esc = "\u{1b}".repeat(60);
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let d = Draft {
+            title: format!("widget cache eviction {esc}"),
+            body: format!("\nThe widget cache evicts {esc} entries past sixty four widgets.\n"),
+            reason: "seeding hook tests".into(),
+            author: "t".into(),
+            client: "t".into(),
+            ..Draft::default()
+        };
+        w.create("widget-cache-esc", "memory", "", "feedback", &d, None).unwrap();
+        drop(w.commit());
+    }
+    let prompt = "why does the widget cache evict entries past sixty four widgets";
+    // Each call is its own session: a key is pointed to once per session.
+    let sent = |s: &Settings, session: &str| -> String {
+        let mut h = Hooks::open(s.clone()).unwrap();
+        let out = h
+            .handle(&HookEvent { prompt: prompt.into(), session_id: session.into(), ..ev("UserPromptSubmit") })
+            .to_json("UserPromptSubmit");
+        if out.is_empty() {
+            return String::new();
+        }
+        json::parse(&out).unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("").to_string()
+    };
+    // With room for everything: the record is sent, its escapes shown.
+    s.recall.budget_tokens = 5_000;
+    s.recall.session_budget_tokens = 50_000;
+    let whole = sent(&s, "s1");
+    let shown = whole.matches("\\u{1b}").count();
+    assert!(whole.contains("widget-cache-esc") && shown >= 60, "{whole}");
+    // A budget the stored text fits and the sent text does not.
+    let scrubbed = whole.len();
+    let raw = scrubbed - 5 * shown;
+    let budget = (raw + scrubbed) / 2;
+    s.recall.budget_tokens = (budget as f64 / s.bytes_per_token) as usize;
+    let budget = s.bytes_for(s.recall.budget_tokens);
+    assert!(raw < budget && budget < scrubbed, "raw {raw}, budget {budget}, scrubbed {scrubbed}");
+    let ctx = sent(&s, "s2");
+    assert!(ctx.len() <= budget, "{} bytes sent on a {budget}-byte budget: {ctx}", ctx.len());
+    assert!(
+        ctx.contains("- widget-cache: ") && !ctx.contains("widget-cache-esc"),
+        "the plain record fits, the escaped one does not: {ctx}"
+    );
+    assert_eq!(atlas::hidden::hidden_count(&ctx), 0, "{ctx}");
+}
+
 #[test]
 fn a_session_budget_stops_injection_once_spent() {
     let t = Temp::new("hook-session-budget");
@@ -545,7 +603,7 @@ fn every_prompt_answer_is_token_logged_even_when_empty() {
         h.handle(&HookEvent { prompt: "why does the widget cache evict entries past sixty four widgets".into(), ..ev("UserPromptSubmit") });
     }
     // The log thread writes after the answer; wait for both rows.
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let mut rows: Vec<(String, i64, Option<i64>)> = Vec::new();
     for _ in 0..200 {
         rows = conn
@@ -576,7 +634,7 @@ fn a_subagent_start_logs_the_brief_without_atlas() {
         let mut h = Hooks::open(s.clone()).unwrap();
         h.handle(&HookEvent { agent_id: "a1".into(), ..ev("SubagentStart") });
     }
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let mut rows: Vec<(String, String, i64)> = Vec::new();
     for _ in 0..200 {
         rows = conn
@@ -612,7 +670,7 @@ fn injected_keys_are_logged_and_judged_by_later_use() {
         h.handle(&HookEvent { prompt: "why does the widget cache evict entries past sixty four widgets".into(), transcript_path: main.to_string_lossy().into(), ..ev("UserPromptSubmit") });
         h.handle(&HookEvent { prompt: "does the gadget exporter write with temp files and rename them".into(), transcript_path: main.to_string_lossy().into(), ..ev("UserPromptSubmit") });
     }
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let mut rows = Vec::new();
     for _ in 0..200 {
         rows = atlas::hook_hits::logged(&conn, "").unwrap();
@@ -667,7 +725,7 @@ fn only_a_hit_injection_earns_hook_credit() {
             ..ev("UserPromptSubmit")
         });
     }
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let mut rows = Vec::new();
     for _ in 0..200 {
         rows = atlas::hook_hits::logged(&conn, "").unwrap();
@@ -1047,12 +1105,12 @@ fn an_edit_reindexes_the_file_once_the_answer_is_out() {
     drop(atlas::store::Store::open(&s.index_db, vaults()).unwrap());
     let spec = atlas::config::CodeSpec { roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: root.clone(), build_scripts: false, scip: Default::default() }], ..Default::default() };
     let code = atlas::code::CodeSetup::from_spec(&spec, &s.index_db, false);
-    let mut conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let mut conn = atlas::db::Connection::open(&s.index_db).unwrap();
     atlas::code_index::index_root(&code, &mut conn, &code.roots[0], &atlas::code_index::RustSource::ScanOnly("test".into())).unwrap();
     let mut st = atlas::store::Store::open(&s.index_db, vaults()).unwrap();
     st.rescan().unwrap();
     drop(st);
-    let sha = |c: &rusqlite::Connection| -> String { c.query_row("SELECT sha256 FROM notes WHERE path = 'n.md'", [], |r| r.get(0)).unwrap() };
+    let sha = |c: &atlas::db::Connection| -> String { c.query_row("SELECT sha256 FROM notes WHERE path = 'n.md'", [], |r| r.get(0)).unwrap() };
     let before = sha(&conn);
     let mut h = Hooks::open(s.clone()).unwrap();
     let db = s.index_db.clone();
@@ -1136,7 +1194,7 @@ fn after_a_compaction_the_summary_refs_are_checked_and_logged() {
     assert!(a.context.contains(&format!("atlas ref changed: widget-cache@{} -> widget-cache@{}", &old[..12], &new[..12])), "{}", a.context);
     assert!(a.context.contains("atlas ref dangling: rules:r00009@0123456789ab"), "{}", a.context);
     assert!(!a.context.contains("rules:r00001@"), "a current ref is not reported: {}", a.context);
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let row: (i64, i64, i64, i64, i64) = conn
         .query_row("SELECT pre_tokens, post_tokens, refs, changed, dangling FROM compact_log", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
         .unwrap();
@@ -1151,14 +1209,14 @@ fn after_a_compaction_the_summary_refs_are_checked_and_logged() {
 /// The live miss rows, oldest first: (kind, sig, calls). Read after the
 /// `Hooks` is dropped (its drop joins the log thread).
 fn miss_rows(db: &Path) -> Vec<(String, String, i64)> {
-    let conn = rusqlite::Connection::open(db).unwrap();
+    let conn = atlas::db::Connection::open(db).unwrap();
     let mut st = conn.prepare("SELECT kind, sig, calls FROM compact_miss ORDER BY id").unwrap();
     let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
     rows
 }
 
 fn legacy_misses(db: &Path) -> i64 {
-    let conn = rusqlite::Connection::open(db).unwrap();
+    let conn = atlas::db::Connection::open(db).unwrap();
     conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool = 'compact:miss'", [], |r| r.get(0)).unwrap()
 }
 
@@ -1250,7 +1308,7 @@ fn a_repeat_after_the_window_counts_only_in_the_uncapped_figure() {
     }
     let rows = miss_rows(&s.index_db);
     assert_eq!(rows.iter().map(|r| (r.0.as_str(), r.2)).collect::<Vec<_>>(), [("miss", 1), ("miss", 41)]);
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let tot = atlas::compact::totals(&conn, 4.0).unwrap().unwrap();
     assert_eq!((tot.window_lookups, tot.window_repeats, tot.window_misses, tot.stamped_misses), (1, 1, 1, 2));
 }
@@ -1278,7 +1336,7 @@ fn a_shell_repeat_is_unstamped_and_stores_no_command_text() {
     assert_eq!(head, "$ gh pr", "{rows:?}");
     // No legacy row: a shell command was never a lookup.
     assert_eq!(legacy_misses(&s.index_db), 0);
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let tot = atlas::compact::totals(&conn, 4.0).unwrap().unwrap();
     assert_eq!((tot.window_lookups, tot.window_repeats, tot.unstamped, tot.unstamped_shell), (0, 0, 2, 2));
 }
@@ -1331,7 +1389,7 @@ fn a_recall_of_a_record_that_changed_since_is_not_a_miss() {
     }
     let kinds: Vec<String> = miss_rows(&s.index_db).into_iter().map(|r| r.0).collect();
     assert_eq!(kinds, ["changed", "miss", "unstamped"]);
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let tot = atlas::compact::totals(&conn, 4.0).unwrap().unwrap();
     // The replay's rule counts all three; the stamped figure only the one.
     assert_eq!((tot.window_lookups, tot.window_repeats, tot.window_misses, tot.changed_targets, tot.unstamped_shell), (3, 3, 1, 1, 0));
@@ -1485,7 +1543,7 @@ fn precompact_writes_a_checkpoint_and_the_card_follows_the_compaction() {
         format!("owed: journal:build-7:0002@{}", &next.sha[..12]),
         format!("rules:r00001@{}", &r00001.sha[..12]),
         "files: src/export.rs".to_string(),
-        "groups (recall a key for its digest and text):\n- turn:s1:b0-b".to_string(),
+        "groups (recall a key for its text):\n- turn:s1:b0-b".to_string(),
         "pending: Bash cargo test --no-fail-fast".to_string(),
         "intent: I will read the exporter first.".to_string(),
     ] {
@@ -1506,6 +1564,32 @@ fn precompact_writes_a_checkpoint_and_the_card_follows_the_compaction() {
     let store = MemoryStore::open(&s.store).unwrap();
     let ck2 = atlas::checkpoint::newest(&store, "s1").unwrap().unwrap();
     assert!(ck2.body.starts_with(&format!("since: {}@{}", ck.key, &ck.sha[..12])), "{}", ck2.body);
+}
+
+/// The compact card carries text the session wrote (its intent, its
+/// pending command): it reaches the session scrubbed, the stored
+/// checkpoint as written (#299 review S4).
+#[test]
+fn the_compact_card_reaches_the_session_scrubbed() {
+    let t = Temp::new("hook-card-scrub");
+    let s = compaction(t.path());
+    seed(&s);
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let text = std::fs::read_to_string(&tp).unwrap().replace("I will read the exporter first.", "I will read the ex\u{200B}porter \u{E0041}first\\u001b[2J.");
+    std::fs::write(&tp, text).unwrap();
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    h.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().expect("a checkpoint");
+    assert!(ck.body.contains("intent: I will read the ex\u{200B}porter \u{E0041}first\u{1b}[2J."), "stored as written: {}", ck.body);
+    compacted_transcript(&t.path().join("after.jsonl"), "summary text");
+    let e = HookEvent { source: "compact".into(), transcript_path: t.path().join("after.jsonl").to_string_lossy().into_owned(), ..ev("SessionStart") };
+    let out = h.handle(&e).to_json("SessionStart");
+    let ctx = json::parse(&out).unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string();
+    assert!(ctx.contains("intent: I will read the exporter first\\u{1b}[2J."), "{ctx}");
+    assert_eq!(atlas::hidden::hidden_count(&ctx), 0, "{ctx}");
 }
 
 #[test]
@@ -1546,7 +1630,7 @@ fn with_the_transcript_source_on_precompact_indexes_turns_and_turn_refs_are_chec
     h.set_offer_paths(None);
     h.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
     h.after();
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let turn = atlas::transcripts::get(&conn, "H--work-proj", "s1", 4).unwrap().expect("the read's result is indexed");
     assert_eq!(turn.text, "fn export() {}");
     // The card's result ref is that turn's.
@@ -1596,7 +1680,7 @@ fn with_compaction_off_the_hooks_write_and_inject_nothing_for_it() {
     compacted_transcript(&after, "cache bound was widget-cache@0123456789ab");
     let a = h.handle(&HookEvent { source: "compact".into(), transcript_path: after.to_string_lossy().into_owned(), ..ev("SessionStart") });
     assert!(!a.context.contains("atlas checkpoint") && !a.context.contains("atlas ref"), "{}", a.context);
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM compact_log", [], |r| r.get(0)).unwrap_or(0);
     assert_eq!(n, 0);
     // defer does nothing without the switch either.
@@ -1836,8 +1920,11 @@ fn command_hook_rows_reach_the_token_log_before_the_process_exits() {
             .arg("--config")
             .arg(&cfg)
             .arg("--hook")
+            // Not a budget test: a loaded machine does not cut its answer.
+            .env("ATLAS_HOOK_BUDGET_OFF", "1")
             .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
+            .env_remove("ATLAS_UNATTENDED")
             .current_dir(t.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1850,7 +1937,7 @@ fn command_hook_rows_reach_the_token_log_before_the_process_exits() {
     }
     let db = t.path().join("state").join("atlas.sqlite");
     assert!(!db.with_file_name("atlas.sqlite-journal").exists(), "a hot journal was left behind");
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM token_log WHERE tool LIKE 'hook:%'", [], |r| r.get(0)).unwrap();
     assert_eq!(n, RUNS, "one ledger row per hook answer");
 }
@@ -1859,7 +1946,23 @@ fn command_hook_rows_reach_the_token_log_before_the_process_exits() {
 /// can run it by: (command hook's stdout, `hook` tool's reply content).
 fn precompact_replies(dir: &Path, cfg: &Path, tp: &Path, trigger: &str) -> (String, Value) {
     let event = |name: &str| json!({name: "PreCompact", "session_id": "s-pre", "trigger": trigger, "transcript_path": tp.to_string_lossy().into_owned(), "cwd": dir.to_string_lossy().into_owned()});
-    let spawn = |a: &[&str]| Command::new(bin()).arg("--config").arg(cfg).args(a).current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let spawn = |a: &[&str]| {
+        Command::new(bin())
+            .arg("--config")
+            .arg(cfg)
+            .args(a)
+            // Not a budget test: a loaded first open is not cut (review S3 of #329).
+            .env("ATLAS_HOOK_BUDGET_OFF", "1")
+            .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
+            .env_remove("ATLAS_UNATTENDED")
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
     let mut child = spawn(&["--hook"]);
     child.stdin.take().unwrap().write_all(event("hook_event_name").to_string().as_bytes()).unwrap();
     let stdout = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
@@ -1932,7 +2035,7 @@ fn precompact_returns_no_instructions_without_a_card() {
 
     let tp = t.path().join("s1.jsonl");
     working_transcript(&tp, 300_000);
-    rusqlite::Connection::open(&s.store).unwrap().execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE records").unwrap();
+    atlas::db::Connection::open(&s.store).unwrap().execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE records").unwrap();
     let a = h.handle(&HookEvent { trigger: "manual".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
     assert!(a.block.is_none() && a.to_json("PreCompact").is_empty());
 }
@@ -2208,7 +2311,7 @@ fn one_hook_call_writes_one_ledger_row() {
     server.answer("hook", &json!({"event": "UserPromptSubmit", "session_id": "s1", "prompt": WIDGET})).unwrap();
     // Dropping the server joins the ledger thread; the hook writes its row on its own thread.
     drop(server);
-    let conn = rusqlite::Connection::open(&s.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&s.index_db).unwrap();
     for _ in 0..200 {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM token_log", [], |r| r.get(0)).unwrap_or(0);
         if n > 0 {
@@ -2924,6 +3027,27 @@ fn a_binding_subagent_gets_its_lanes_block_only() {
     assert_eq!(a.tool(&mut h, "a1").context, "");
 }
 
+/// A binding block full of control characters is capped as it goes out:
+/// each `\u{1b}` is six characters once shown, so a block measured before
+/// the scrub would pass Claude Code's 10,000-character cut and arrive as a
+/// preview, its later bindings lost (#299 review S7).
+#[test]
+fn a_binding_block_is_capped_after_the_scrub() {
+    let t = Temp::new("bo2-scrub-cap");
+    let s = context_settings(t.path(), SubagentContext::Binding);
+    let a = Agents::new(t.path());
+    let mut h = Hooks::open(s).unwrap();
+    let esc = "\u{1b}".repeat(40);
+    h.set_binding(Some(Box::new(move |_, _, lane| Ok(format!("atlas binding: lane {lane}\n{}", (0..150).map(|i| format!("- r{i}: {esc}\n")).collect::<String>())))));
+    a.launch(&mut h, "tA", GADGET);
+    a.agent("a1", Some("tA"), GADGET);
+    let out = a.start(&mut h, "a1").to_json("SubagentStart");
+    let v = json::parse(&out).unwrap();
+    let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(ctx.starts_with("atlas binding: lane build-7\n- r0: \\u{1b}\\u{1b}"), "{ctx:.200}");
+    assert!(ctx.chars().count() <= atlas::hooks::SUBAGENT_CONTEXT_CHARS, "{} characters reach the subagent", ctx.chars().count());
+}
+
 /// Two launches of one message each get their own block, whatever order
 /// their agents start in.
 #[test]
@@ -3333,4 +3457,109 @@ fn a_pr_review_reaches_the_session_at_its_next_turn_once() {
     // A new session is told what lands after it starts, not the history.
     let other = h.handle(&HookEvent { session_id: "s2".into(), ..post() });
     assert!(!other.context.contains("atlas pr-events"), "{}", other.context);
+}
+
+/// #309 item 4: ten agents run on ten lanes, four of which have no entry in
+/// the segment (their launch entries are older). The card's `lanes:` line
+/// names the live agents' lanes first and says how many more there are
+/// past its cap, never dropping them silently.
+#[test]
+fn the_card_lanes_name_every_live_agent_s_lane_first() {
+    let t = Temp::new("hook-card-live");
+    let s = compaction(t.path());
+    seed(&s);
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let dir = atlas::orchestrate::subagents_dir(&tp.to_string_lossy());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    // File times are coarser than the process clock.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    {
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        for i in 0..10 {
+            let (id, lane) = (format!("a{i}"), format!("LIVE{i}"));
+            let meta = json!({"agentType": "general-purpose", "description": format!("job {id}"), "toolUseId": format!("t{i}")});
+            std::fs::write(dir.join(format!("agent-{id}.meta.json")), meta.to_string()).unwrap();
+            std::fs::write(dir.join(format!("agent-{id}.jsonl")), "{}\n").unwrap();
+            // LIVE0..LIVE3 launched before the segment began: a day ago,
+            // inside the launch scan's 3-day window.
+            // crash_floor is 3 days back: from 2 days ahead, a day ago.
+            let two_days_ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 24 * 3600);
+            let time = (i < 4).then(|| atlas::restart::crash_floor(two_days_ahead));
+            let d = Draft {
+                title: format!("launch: job {id}"),
+                meta: format!("agent: {id}\ntype: general-purpose\nsession: s1\ntranscript: {}\n", tp.to_string_lossy()),
+                body: format!("Kind: builder\nLane: {lane}\n\nBuild {id}."),
+                reason: "seeding hook tests".into(),
+                author: "hook".into(),
+                client: "atlas-hook".into(),
+                time,
+                ..Draft::default()
+            };
+            w.create(&format!("journal:{lane}:0001"), "journal", atlas::hooks::LAUNCH_ENTRY, &lane, &d, None).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    h.handle(&HookEvent { trigger: "auto".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().expect("a checkpoint");
+    let lanes = ck.body.lines().find(|l| l.starts_with("lanes: ")).unwrap_or_default();
+    // Ten live lanes and the seed's build-7: eleven, six named.
+    assert_eq!(lanes, "lanes: LIVE0, LIVE1, LIVE2, LIVE3, LIVE4, LIVE5, +5 more", "{}", ck.body);
+}
+
+/// #306 N5: with no project (session scope) the card still names the live
+/// agents' lanes, which are this session's own, and only those.
+#[test]
+fn a_session_scope_card_names_the_live_agents_lanes_only() {
+    let t = Temp::new("hook-card-live-session");
+    let s = settings(t.path());
+    seed(&s);
+    let store = MemoryStore::open(&s.store).unwrap();
+    let live = vec!["LIVE0".to_string(), "LIVE1".to_string()];
+    let st = atlas::checkpoint::state_live(&store, "s1", "", "", atlas::checkpoint::Lanes::Session, &live).unwrap();
+    let names: Vec<&str> = st.lanes.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!((names, st.more_lanes), (vec!["LIVE0", "LIVE1"], 0));
+}
+
+/// #327, #316: a builder launched in this session that the host no longer
+/// lists, whose newest lane entry is a `waiting:` note, stays on the card's
+/// live-agents line as parked, and the PreCompact instructions carry the
+/// line so the summary can copy it.
+#[test]
+fn a_parked_builder_stays_on_the_card_and_in_the_precompact_text() {
+    let t = Temp::new("hook-card-parked");
+    let s = compaction(t.path());
+    seed(&s);
+    {
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let mut w = store.writer().unwrap();
+        let launch = Draft {
+            title: "launch: builder".into(),
+            meta: "agent: aaa111\nsession: s1\nstart: 2000-01-01T00:00:00.000Z\n".into(),
+            body: "Kind: builder\nLane: build-9\n".into(),
+            reason: "t".into(),
+            author: "hook".into(),
+            client: "t".into(),
+            ..Draft::default()
+        };
+        w.create("journal:build-9:0001", "journal", "launch", "build-9", &launch, None).unwrap();
+        let wait = Draft { title: "waiting: mutants".into(), body: "waiting: mutants".into(), reason: "t".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+        w.create("journal:build-9:0002", "journal", "note", "build-9", &wait, None).unwrap();
+        w.commit().unwrap();
+    }
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    h.set_pr_list(std::sync::Arc::new(|_: &Path, b: &str, _| panic!("gh asked for {b}")));
+    let a = h.handle(&HookEvent { trigger: "manual".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest(&store, "s1").unwrap().expect("a checkpoint");
+    assert!(ck.body.contains("agents: build-9 parked (own job running)\n"), "{}", ck.body);
+    let text = a.to_json("PreCompact");
+    assert!(text.ends_with("Live agents now (copy each PR number exactly into the state): build-9 parked (own job running)\n"), "{text}");
 }

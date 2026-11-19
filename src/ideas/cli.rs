@@ -46,7 +46,7 @@ type Row = (String, String, String, String, String);
 
 /// The captures, newest first.
 fn rows(store: &MemoryStore) -> Result<Vec<Row>, String> {
-    let s = |e: rusqlite::Error| e.to_string();
+    let s = |e: crate::db::Error| e.to_string();
     let mut st = store
         .conn()
         .prepare_cached("SELECT r.key, r.status, v.time, v.title, v.meta FROM records r JOIN versions v ON v.vid = r.head WHERE r.kind = 'journal' AND r.sub = 'idea' ORDER BY r.rid DESC")
@@ -54,7 +54,7 @@ fn rows(store: &MemoryStore) -> Result<Vec<Row>, String> {
     let out = st
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
         .map_err(s)?
-        .collect::<rusqlite::Result<Vec<_>>>()
+        .collect::<crate::db::Result<Vec<_>>>()
         .map_err(s)?;
     Ok(out)
 }

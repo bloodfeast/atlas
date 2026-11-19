@@ -38,7 +38,12 @@ recall key=h:                 # the newest handles
 
 In a terminal, `atlas slice h:ID --item NAME` (and `--failures`, `--lines A-B`, `--grep RE`, `--list`) gives
 the same slices, and `atlas run` and `atlas slice` write their hints in that form when their output is a
-terminal (the `recall` form when it goes to a model). A line over the 8 KB slice cap is cut to it, with a
+terminal (the `recall` form when it goes to a model). `atlas slice` takes both forms, so a hint copied from
+either works in a shell: `atlas slice h:ID lines=A-B` and `atlas slice h:ID grep="a b"` are `--lines A-B` and
+`--grep "a b"`. `digest-grep=RE` (`--digest-grep RE`) answers the digest's rows that match instead of the
+output's lines; for a tracker search that is every issue or hit, not only the rows the digest had room for. A
+`recall` with an `h:` key takes its selector in the key (`h:ID grep=RE`) or as the `lines`, `grep`, `item`
+... arguments, never `query` or `budget_tokens`. A line over the 8 KB slice cap is cut to it, with a
 note naming its size; `grep=RE` shows the part of a long line around its match.
 
 A Read is the exception. Agents read a file to read it: after an outline, most fetched the file again within

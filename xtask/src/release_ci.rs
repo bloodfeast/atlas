@@ -1633,6 +1633,54 @@ pub(crate) mod tests {
     /// multi-platform index digest.
     const BULLSEYE: &str = "debian:bullseye@sha256:6f519a81440354a85eb592c5f32109ab80605f6b892455983a6f618bf87fabe9";
 
+    /// The one third-party action a workflow may use, `Swatinem/rust-cache`
+    /// v2.9.3, and only in dev-pr.yml at this commit: a bump edits both.
+    const RUST_CACHE_SHA: &str = "d1527c8f67ef9af357290475d4af4b0fab8f12e0";
+
+    /// Every `uses:` line of `text` names one of GitHub's own actions,
+    /// pinned by a full commit SHA with its version named; with `cache_ok`
+    /// the one exception is `Swatinem/rust-cache` at [`RUST_CACHE_SHA`].
+    fn action_policy(file: &str, text: &str, cache_ok: bool) -> Result<(), String> {
+        for l in text.lines().filter(|l| l.trim_start().starts_with("uses:") || l.trim_start().starts_with("- uses:")) {
+            let spec = l.split("uses:").nth(1).unwrap_or_default().trim();
+            let (action, rest) = spec.split_once('@').ok_or_else(|| format!("{file}: not pinned: {l}"))?;
+            let sha = rest.split_whitespace().next().unwrap_or_default();
+            let cache = cache_ok && action == "Swatinem/rust-cache" && sha == RUST_CACHE_SHA;
+            if !(action.starts_with("actions/") || cache) {
+                return Err(format!("{file}: only GitHub's own actions: {l}"));
+            }
+            if !(sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())) {
+                return Err(format!("{file}: not pinned by SHA: {l}"));
+            }
+            if !rest.contains("# v") {
+                return Err(format!("{file}: the pinned version is named: {l}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The public CI (ci.yml, exported) uses GitHub's own actions only: no
+    /// cache, no third-party action, each pinned by SHA.
+    #[test]
+    fn the_public_ci_uses_only_github_actions() {
+        let root = repo_root();
+        let ci = read_text(&root.join(".github/workflows/ci.yml")).unwrap();
+        action_policy("ci.yml", &ci, false).unwrap();
+        assert!(!ci.contains("rust-cache") && !ci.contains("actions/cache") && !ci.contains("sccache"), "ci.yml builds uncached");
+        let checkout = "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
+        let pin = format!("      - uses: Swatinem/rust-cache@{RUST_CACHE_SHA} # v2.9.3\n");
+        assert!(action_policy("ci.yml", checkout, false).is_ok());
+        assert!(action_policy("ci.yml", "      - uses: Swatinem/rust-cache@v2\n", false).is_err(), "a tag");
+        assert!(action_policy("ci.yml", &pin, false).is_err(), "the cache, even pinned");
+        let other = "      - uses: someone/thing@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v1\n";
+        assert!(action_policy("ci.yml", other, false).is_err(), "any third-party action");
+        // dev-pr.yml: the cache at the one SHA only, never another action.
+        assert!(action_policy("dev-pr.yml", &pin, true).is_ok());
+        assert!(action_policy("dev-pr.yml", "      - uses: Swatinem/rust-cache@v2\n", true).is_err());
+        assert!(action_policy("dev-pr.yml", &pin.replace("d1527c8f", "00000000"), true).is_err(), "another commit");
+        assert!(action_policy("dev-pr.yml", other, true).is_err());
+    }
+
     /// The release workflows read as the rules say: every action pinned by
     /// a full commit SHA, no `pull_request_target`, no token permission by
     /// default and each job's own, every job gated to its repository (or
@@ -1652,13 +1700,10 @@ pub(crate) mod tests {
             assert!(!text.contains('\t'), "{file}: a tab");
             assert!(!text.contains("pull_request_target"), "{file}: pull_request_target");
             assert!(text.lines().any(|l| l == "permissions: {}"), "{file}: the token's default must be no permission");
-            for l in text.lines().filter(|l| l.trim_start().starts_with("uses:") || l.trim_start().starts_with("- uses:")) {
-                let spec = l.split("uses:").nth(1).unwrap().trim();
-                let (action, rest) = spec.split_once('@').unwrap_or_else(|| panic!("{file}: {l}"));
-                let sha = rest.split_whitespace().next().unwrap();
-                assert!(action.starts_with("actions/"), "{file}: only GitHub's own actions: {l}");
-                assert!(sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "{file}: not pinned by SHA: {l}");
-                assert!(rest.contains("# v"), "{file}: the pinned version is named: {l}");
+            // One exception: the dependency cache in the pull request check,
+            // which holds no secret and only reads the contents.
+            if let Err(e) = action_policy(file, &text, file == dev_only[1]) {
+                panic!("{e}");
             }
             // Every container is pinned by digest, the same image everywhere.
             for l in text.lines().filter(|l| l.trim_start().starts_with("container:")) {
@@ -1873,6 +1918,15 @@ pub(crate) mod tests {
         assert_eq!(clippy.len(), 2, "ci.yml's clippy runs");
         for c in clippy {
             assert!(check.lines().any(|l| l.trim() == c), "dev-pr.yml lacks ci.yml's {c}");
+        }
+        // Dependencies are cached in this check only: never in the public
+        // CI (the_public_ci_uses_only_github_actions) or a real release.
+        let cache = format!("uses: Swatinem/rust-cache@{RUST_CACHE_SHA} # v2.9.3");
+        assert!(check.contains(&cache) && check.contains(" git zstd >/dev/null"), "dev-pr.yml: the cache, and zstd for it in the container");
+        assert!(!check.contains("save-if:") && !check.contains("cache-workspace-crates:"), "dev-pr.yml: the action's defaults");
+        let release = read_text(&root.join(".github/workflows/release.yml")).unwrap();
+        for c in ["rust-cache", "actions/cache", "sccache", "RUSTC_WRAPPER"] {
+            assert!(!release.contains(c), "release.yml builds cold: {c}");
         }
     }
 

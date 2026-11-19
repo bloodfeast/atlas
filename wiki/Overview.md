@@ -32,6 +32,24 @@ vaults (see [[Cross-vault links]]); links within a vault are standard `[[wikilin
   `https` URLs: the embedding model at setup, checked against its SHA-256, and the update check at session
   start, whose manifest is checked against an ed25519 key built into atlas (see [[Security model]])
 
+## What else it does
+
+- **Orchestrated mode**, asked at setup and never on by default: an `orchestrate` skill teaches the main
+  session to delegate through lanes and lean briefs, and the hooks cap how many agents of each kind run at
+  once and hand an agent off at its context limit to a fresh one (see [[Orchestration]]).
+- **`atlas backlog`** lists ruled work that fell out of the queue, aging items first, each with the rulings
+  behind it. It only proposes; the queue's written order never changes (see [[Configuration reference]]).
+- **Pull request reviews.** In a `gh pr diff` file read, context far from a change is one marker line that
+  `recall h:ID lines=A-B` opens (see [[Handles and digests]]), and `atlas pr-events serve` wakes the session
+  that waits on a review (see [[Configuration reference]] and [[Security model]]).
+- **Long sections are searched whole.** Semantic search embeds a long section as overlapping windows, so a
+  question answered deep inside it finds it (see [[Semantic search]]).
+- **`atlas worktrees`** keeps an append-only ledger of which lane owns which worktree (see
+  [[Configuration reference]]).
+- **A fresh install teaches Claude atlas.** The server's instructions and a bundled `atlas` skill carry the
+  habits (recall before asking, journal decisions, hand off before stopping), and atlas tells you at session
+  start when an update arrives (see [[Install and setup]]).
+
 ## Where to go next
 
 - [[Install and setup]] to install the plugin and point it at your notes.

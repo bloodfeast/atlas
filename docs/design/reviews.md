@@ -29,7 +29,7 @@ meta: role: cost
       pr: 99
       head: 6e828cc
       verdict: merge with follow-ups
-      report: Z:/scratch/reviews/cost_pr99.md
+      report: reviews/cost_pr99.md
 ```
 
 The `journal` tool refuses a `review` entry without `role:`, `pr:`, `head:` (7 or more hex digits) and

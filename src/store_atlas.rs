@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::regex::Regex;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use crate::db::{params, Connection, OptionalExtension, Transaction};
 use crate::json::Value;
 
 use super::{begin, RescanStats, Store, MAX_INDEX};
@@ -1954,7 +1954,7 @@ impl Store {
         // Bring the summary rows up to date first (a no-op read when clean).
         let dirty: bool = self.conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM ident_dirty)")?.query_row([], |r| r.get(0))?;
         if dirty {
-            let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            let tx = Transaction::new_unchecked(&self.conn, crate::db::TransactionBehavior::Immediate)?;
             super::guard(&tx)?;
             tx.execute_batch(RECOUNT)?;
             tx.commit()?;
@@ -2002,7 +2002,7 @@ impl Store {
              WHERE sections_fts MATCH ?1 AND (?2 IS NULL OR d.source = ?2) AND (?3 IS NULL OR d.path LIKE ?3 ESCAPE '\\')
              ORDER BY bm25(sections_fts, 4.0, 1.0) LIMIT ?4",
         )?;
-        let fts_err = |e: rusqlite::Error| Error::InvalidArgument(format!("fts query: {e}"));
+        let fts_err = |e: crate::db::Error| Error::InvalidArgument(format!("fts query: {e}"));
         let rows = st
             .query_map(params![query, source, like, limit as i64], |r| {
                 let body: String = r.get(8)?;
@@ -2258,7 +2258,7 @@ impl Store {
         self.miss_rows("(?1 IS NULL OR status = ?1)", params![status], limit)
     }
 
-    fn miss_rows(&self, filter: &str, args: &[&dyn rusqlite::ToSql], limit: usize) -> Result<(Vec<Miss>, usize)> {
+    fn miss_rows(&self, filter: &str, args: &[&dyn crate::db::ToSql], limit: usize) -> Result<(Vec<Miss>, usize)> {
         let total: i64 = self.conn.query_row(&format!("SELECT COUNT(*) FROM misses WHERE {filter}"), args, |r| r.get(0))?;
         let mut st = self.conn.prepare_cached(&format!(
             "SELECT id, time, tool, query, returned, found, reason, client, status, resolved_time, resolution FROM misses WHERE {filter} ORDER BY id DESC"

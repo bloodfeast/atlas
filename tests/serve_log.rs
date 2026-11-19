@@ -261,9 +261,11 @@ fn hook_mode_writes_nothing() {
         .arg("--config")
         .arg(&cfg)
         .arg("--hook")
+        .env("ATLAS_HOOK_BUDGET_OFF", "1")
         .env("ATLAS_HOME", t.path().join("home-atlas"))
         .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_UNATTENDED")
         .current_dir(t.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -356,20 +358,21 @@ fn a_lock_dated_far_in_the_future_is_stale() {
     assert_grammar_all(t.path());
 }
 
-/// Header temporaries (`atlas-server.log.PID.NANOS.new`) left by a process
-/// killed mid-create are swept once older than the stale bound; a fresh one
+/// Header temporaries (`atlas-server.log.PID.NANOS.SEQ.new`, or
+/// `PID.NANOS.new` from older builds) left by a process killed mid-create
+/// are swept once older than the stale bound; a fresh one
 /// (another appender's, in use) and files of any other name are kept.
 #[test]
 fn leftover_header_temporaries_are_swept() {
     let t = Temp::new("serve-log-temps");
     let p = t.path().join(serve_log::FILE);
     let f = serve_log::FILE;
-    let stale = [format!("{f}.4242.1731600000000000000.new"), format!("{f}.1.0.new")];
+    let stale = [format!("{f}.4242.1731600000000000000.new"), format!("{f}.1.0.new"), format!("{f}.1.2.3.new")];
     let kept = [
         format!("{f}.4243.1731600000000000001.new"),
         format!("{f}.x.1.new"),
         format!("{f}.1.new"),
-        format!("{f}.1.2.3.new"),
+        format!("{f}.1.2.3.4.new"),
         format!("{f}.1.2.tmp"),
         "other.log.4242.1731600000000000000.new".to_string(),
     ];

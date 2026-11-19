@@ -1,9 +1,16 @@
-//! `atlas --bench [RUNS] [--queries FILE] [--before EXE CONFIG]`: the
+//! `atlas --bench [RUNS] [--queries FILE] [--before EXE CONFIG] [--cold-runs
+//! N]`: the
 //! timings and token counts atlas is held to, measured in process on the
 //! configured sources.
 //!
 //! Every timing is a median and p99 over many calls on a warm database (the
-//! store already open and indexed), except where it says cold.
+//! store already open and indexed), except where it says cold. The cold index
+//! is one sample unless `--cold-runs N` asks for more (each on a clean file),
+//! and then it too is a median and p99.
+//!
+//! The memory store's rows (lexical recall, one journal write) and the work
+//! queue's run on scratch stores the bench fills itself, beside `--db`; no
+//! configured store is written.
 //!
 //! Tokens are bytes divided by the configured ratio (see [`atlas::tokens`]).
 //! For a fixed query set (a file of `lookup ID`, `search TEXT` and
@@ -35,6 +42,8 @@ pub struct Opts {
     pub before: Option<(PathBuf, PathBuf)>,
     /// Bytes per token.
     pub bytes_per_token: f64,
+    /// Cold index samples (0 and 1 are both one sample).
+    pub cold_runs: usize,
 }
 
 struct Stats {
@@ -52,8 +61,73 @@ fn stats(mut v: Vec<Duration>) -> Stats {
     Stats { n, median: v[n / 2], p99: v[((n * 99) / 100).min(n - 1)] }
 }
 
+fn line(label: &str, s: &Stats) -> String {
+    format!("{label:<52} n={:<6} median {:>10.1} us   p99 {:>10.1} us", s.n, s.median.as_secs_f64() * 1e6, s.p99.as_secs_f64() * 1e6)
+}
+
 fn show(label: &str, s: &Stats) {
-    println!("{label:<52} n={:<6} median {:>10.1} us   p99 {:>10.1} us", s.n, s.median.as_secs_f64() * 1e6, s.p99.as_secs_f64() * 1e6);
+    println!("{}", line(label, s));
+}
+
+/// The pure-CPU calibration rows: one fixed piece of work (a canned value
+/// written as JSON; no database, no file, no system call) timed at the start
+/// of the run and after each section. The work is the same in every build
+/// and on either SQLite binding, so a calibration row that reads slower than
+/// another says the machine was slower there (a busy sibling thread, a lost
+/// turbo bin), and the rows of the section before it are to be read with
+/// that in mind. A run that was slow from start to end shows only against
+/// another run's rows.
+struct Calibration {
+    value: Value,
+    rows: Vec<(&'static str, Duration)>,
+}
+
+impl Calibration {
+    /// Samples per row.
+    const SAMPLES: usize = 200;
+    /// A row this many times the run's fastest is called slow.
+    const SLOW: f64 = 1.15;
+
+    fn new() -> Calibration {
+        let items: Vec<Value> = (0..96u32)
+            .map(|i| atlas::json!({"id": i, "name": format!("calibration item {i}"), "path": format!("notes/section-{}/item-{i}.md", i % 7), "line": i * 13 + 1, "kept": i % 3 == 0}))
+            .collect();
+        Calibration { value: atlas::json!({"items": items, "total": 96}), rows: Vec::new() }
+    }
+
+    /// Times the work, keeps the median under `point`, and returns the row
+    /// as the bench prints it.
+    fn row(&mut self, point: &'static str) -> String {
+        let mut t = Vec::with_capacity(Self::SAMPLES);
+        for _ in 0..Self::SAMPLES {
+            t.push(time(|| std::hint::black_box(std::hint::black_box(&self.value).to_string()).len()).1);
+        }
+        let s = stats(t);
+        self.rows.push((point, s.median));
+        line(&format!("calibration (pure CPU), {point}"), &s)
+    }
+
+    /// The last line: the fastest and slowest rows, and every point whose
+    /// row is slow against the fastest.
+    fn summary(&self) -> String {
+        let us = |d: &Duration| d.as_secs_f64() * 1e6;
+        let Some(fast) = self.rows.iter().min_by_key(|r| r.1) else { return "calibration: no rows".into() };
+        let Some(slow) = self.rows.iter().max_by_key(|r| r.1) else { return "calibration: no rows".into() };
+        let floor = us(&fast.1).max(f64::MIN_POSITIVE);
+        let over: Vec<String> = self.rows.iter().filter(|r| us(&r.1) > floor * Self::SLOW).map(|r| format!("{} ({:.2}x)", r.0, us(&r.1) / floor)).collect();
+        format!(
+            "calibration: fastest {:.1} us ({}), slowest {:.1} us ({}); {}",
+            us(&fast.1),
+            fast.0,
+            us(&slow.1),
+            slow.0,
+            if over.is_empty() { format!("no row over {}x the fastest", Self::SLOW) } else { format!("SLOW (over {}x the fastest): {}", Self::SLOW, over.join(", ")) }
+        )
+    }
+}
+
+fn show_ms(label: &str, s: &Stats) {
+    println!("{label:<52} n={:<6} median {:>10.1} ms   p99 {:>10.1} ms", s.n, s.median.as_secs_f64() * 1e3, s.p99.as_secs_f64() * 1e3);
 }
 
 fn time<T>(f: impl FnOnce() -> T) -> (T, Duration) {
@@ -162,6 +236,8 @@ pub fn run(setup: &Setup, runs: usize, opts: &Opts) -> Result<(), String> {
     let e = |x: atlas::Error| x.to_string();
     let bpt = opts.bytes_per_token;
     println!("atlas bench, {runs} runs per loop, db {}, {bpt} bytes per token", setup.db.display());
+    let mut cal = Calibration::new();
+    println!("{}", cal.row("start"));
 
     // Cold: a fresh database beside the configured one.
     let cold_db = setup.db.with_file_name("atlas-bench-cold.sqlite");
@@ -170,8 +246,14 @@ pub fn run(setup: &Setup, runs: usize, opts: &Opts) -> Result<(), String> {
             let _ = std::fs::remove_file(cold_db.with_file_name(format!("atlas-bench-cold.sqlite{ext}")));
         }
     };
-    clean();
-    {
+    let cold_runs = opts.cold_runs.max(1);
+    let mut cold_open = Vec::with_capacity(cold_runs);
+    let mut cold_vaults = Vec::with_capacity(cold_runs);
+    let mut cold_sources = Vec::with_capacity(cold_runs);
+    let mut cold_total = Vec::with_capacity(cold_runs);
+    let mut cold_files = (0, 0);
+    for _ in 0..cold_runs {
+        clean();
         let mut cold_setup = setup.atlas.clone();
         cold_setup.watch = false;
         let cold = Setup { vaults: setup.vaults.clone(), db: cold_db.clone(), atlas: cold_setup, code: None, semantic_model: setup.semantic_model.clone(), embed_threads: setup.embed_threads, memory: setup.memory.clone() };
@@ -181,17 +263,31 @@ pub fn run(setup: &Setup, runs: usize, opts: &Opts) -> Result<(), String> {
         let v = v.map_err(e)?;
         let (s, ts) = time(|| store.rescan_sources(None));
         let s = s.map_err(e)?;
-        println!(
-            "cold index: open {:.1} ms, vaults {} files in {:.1} ms, sources {} files in {:.1} ms, total {:.1} ms",
-            open.as_secs_f64() * 1e3,
-            v.files,
-            tv.as_secs_f64() * 1e3,
-            s.files,
-            ts.as_secs_f64() * 1e3,
-            (open + tv + ts).as_secs_f64() * 1e3
-        );
+        cold_files = (v.files, s.files);
+        cold_open.push(open);
+        cold_vaults.push(tv);
+        cold_sources.push(ts);
+        cold_total.push(open + tv + ts);
     }
     clean();
+    if cold_runs == 1 {
+        println!(
+            "cold index: open {:.1} ms, vaults {} files in {:.1} ms, sources {} files in {:.1} ms, total {:.1} ms",
+            cold_open[0].as_secs_f64() * 1e3,
+            cold_files.0,
+            cold_vaults[0].as_secs_f64() * 1e3,
+            cold_files.1,
+            cold_sources[0].as_secs_f64() * 1e3,
+            cold_total[0].as_secs_f64() * 1e3
+        );
+    } else {
+        println!("-- cold index, {cold_runs} runs, each on a clean file (vaults {} files, sources {} files)", cold_files.0, cold_files.1);
+        show_ms("cold index, open", &stats(cold_open));
+        show_ms("cold index, vaults", &stats(cold_vaults));
+        show_ms("cold index, sources", &stats(cold_sources));
+        show_ms("cold index, total", &stats(cold_total));
+    }
+    println!("{}", cal.row("after cold index"));
 
     // Two warm stores on the same database: one walking (the old way and
     // the fallback), one watching.
@@ -242,6 +338,7 @@ pub fn run(setup: &Setup, runs: usize, opts: &Opts) -> Result<(), String> {
     }
     show("rescan sources, walk, reread paths", &stats(rsr));
     show("rescan sources, walk, kept paths", &stats(rs));
+    println!("{}", cal.row("after rescans"));
 
     // The fixed query set.
     let queries: Vec<String> = match &opts.queries {
@@ -349,6 +446,7 @@ pub fn run(setup: &Setup, runs: usize, opts: &Opts) -> Result<(), String> {
         println!("lookup JSON answer: written once equals built and encoded twice on {same} of {runs}");
         show("lookup JSON answer, before (Value, encoded twice)", &stats(twice));
         show("lookup JSON answer, after (written once)", &stats(once));
+        println!("{}", cal.row("after lookup"));
     }
     let prefixes: Vec<&str> = calls.iter().filter(|(t, _)| *t == "ids").filter_map(|(_, a)| a["prefix"].as_str()).collect();
     if !prefixes.is_empty() {
@@ -398,6 +496,7 @@ pub fn run(setup: &Setup, runs: usize, opts: &Opts) -> Result<(), String> {
     if !whole_json.is_empty() {
         show("whole answer (watch, json), all queries", &stats(whole_json));
     }
+    println!("{}", cal.row("after ids, search and answers"));
     let before = match &opts.before {
         Some((exe, cfg)) => Some(ask_before(exe, cfg, &calls)?),
         None => None,
@@ -434,7 +533,81 @@ pub fn run(setup: &Setup, runs: usize, opts: &Opts) -> Result<(), String> {
         Some((_, b)) => println!("tools/list: before {b} bytes ({:.0} tokens), after {list} bytes ({:.0} tokens)", *b as f64 / bpt, list as f64 / bpt),
         None => println!("tools/list: {list} bytes ({:.0} tokens)", list as f64 / bpt),
     }
-    queue_rows(setup, runs)
+    memory_rows(setup, runs, &searches)?;
+    println!("{}", cal.row("after memory store"));
+    queue_rows(setup, runs)?;
+    println!("{}", cal.row("after queue and classify"));
+    println!("{}", cal.summary());
+    Ok(())
+}
+
+/// The memory store's rows: lexical recall (the store call under `recall
+/// query`, over the query set's search texts) on a scratch store of 500
+/// journal records whose text carries those search texts, and one journal
+/// write (a write batch: BEGIN IMMEDIATE, one record created, the `.jsonl`
+/// line appended, COMMIT) per sample on the same store. The scratch store is
+/// a file beside the database, removed afterwards.
+fn memory_rows(setup: &Setup, runs: usize, searches: &[String]) -> Result<(), String> {
+    const WORDS: [&str; 12] = ["reader", "ledger", "window", "anchor", "budget", "vector", "branch", "kernel", "packet", "summit", "thread", "module"];
+    const SEEDED: usize = 500;
+    let e = |x: atlas::Error| x.to_string();
+    let path = setup.db.with_file_name("atlas-bench-memory.sqlite");
+    let clean = || {
+        for ext in ["", "-wal", "-shm", ".jsonl"] {
+            let _ = std::fs::remove_file(path.with_file_name(format!("atlas-bench-memory.sqlite{ext}")));
+        }
+    };
+    clean();
+    let fallback = ["reader ledger".to_string()];
+    let texts: &[String] = if searches.is_empty() { &fallback } else { searches };
+    let draft = |i: usize| {
+        let text = &texts[i % texts.len()];
+        let filler: Vec<&str> = (0..40).map(|k| WORDS[(i * 7 + k * 5 + k / 3) % WORDS.len()]).collect();
+        atlas::memory::Draft {
+            title: format!("bench record {i}: {text}"),
+            meta: format!("what: bench\nn: {i}"),
+            body: format!("{text}. {}. Entry {i} of the bench store, about {text}.", filler.join(" ")),
+            reason: "atlas --bench".into(),
+            author: "atlas".into(),
+            client: "atlas-bench".into(),
+            provenance: None,
+            time: None,
+        }
+    };
+    let mut m = atlas::memory::MemoryStore::open(&path).map_err(e)?;
+    {
+        let mut w = m.writer().map_err(e)?;
+        for i in 0..SEEDED {
+            w.create(&format!("journal:BENCH-{}:{:04}", i / 100, i % 100), "journal", "note", &format!("BENCH-{}", i / 100), &draft(i), None).map_err(e)?;
+        }
+        w.commit().map_err(e)?;
+    }
+    let term_sets: Vec<Vec<String>> = texts.iter().map(|t| atlas::memory::recall::terms(t)).collect();
+    let mut hits = 0usize;
+    let mut t = Vec::new();
+    for k in 0..runs.min(400) {
+        let (r, d) = time(|| m.search(&term_sets[k % term_sets.len()], None, None, 24));
+        hits += r.map_err(e)?.len();
+        t.push(d);
+    }
+    println!("-- memory store (scratch, {SEEDED} journal records; {hits} hits over {} recalls)", t.len());
+    show("recall (lexical, store call)", &stats(t));
+    let mut t = Vec::new();
+    for k in 0..runs.min(200) {
+        let d = draft(SEEDED + k);
+        let (r, took) = time(|| -> atlas::error::Result<()> {
+            let mut w = m.writer()?;
+            let key = w.next_key("journal:BENCH-W:", 4)?;
+            w.create(&key, "journal", "note", "BENCH-W", &d, None)?;
+            w.commit()
+        });
+        r.map_err(e)?;
+        t.push(took);
+    }
+    show("journal write (BEGIN IMMEDIATE, one record)", &stats(t));
+    drop(m);
+    clean();
+    Ok(())
 }
 
 /// The work queue's rows: `atlas queue next`'s work (read the items, check
@@ -507,16 +680,16 @@ fn queue_rows(setup: &Setup, runs: usize) -> Result<(), String> {
 
 /// The lookup as the first atlas lane wrote it: three statements
 /// (definitions, mentions, mention count), kept here only to measure against.
-fn legacy_lookup(conn: &rusqlite::Connection, id: &str) -> usize {
+fn legacy_lookup(conn: &atlas::db::Connection, id: &str) -> usize {
     const SELECT: &str = "SELECT d.source, d.kind, d.path, i.line, i.ident, i.kind, i.def, i.date, ifnull(s.heading_path, ''),
          ifnull(s.line_start, 0), ifnull(s.line_end, 0), i.context, i.section_id
          FROM idents i JOIN docs d ON d.id = i.doc_id LEFT JOIN sections s ON s.id = i.section_id";
     let mut n = 0;
     let mut run = |sql: &str, limit: i64| {
         if let Ok(mut st) = conn.prepare_cached(sql) {
-            if let Ok(mut rows) = st.query(rusqlite::params![id, limit]) {
+            if let Ok(mut rows) = st.query(atlas::db::params![id, limit]) {
                 while let Ok(Some(r)) = rows.next() {
-                    let _: rusqlite::Result<String> = r.get(11);
+                    let _: atlas::db::Result<String> = r.get(11);
                     n += 1;
                 }
             }
@@ -529,7 +702,7 @@ fn legacy_lookup(conn: &rusqlite::Connection, id: &str) -> usize {
 }
 
 /// The ids listing as it was before: a GROUP BY over every occurrence.
-fn legacy_ids(conn: &rusqlite::Connection, prefix: &str) -> usize {
+fn legacy_ids(conn: &atlas::db::Connection, prefix: &str) -> usize {
     let like = format!("{}%", prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
     let Ok(mut st) = conn.prepare_cached(
         "SELECT MIN(i.ident), i.kind, SUM(i.rank > 0), COUNT(*), MAX(i.date) FROM idents i JOIN docs d ON d.id = i.doc_id
@@ -544,4 +717,36 @@ fn legacy_ids(conn: &rusqlite::Connection, prefix: &str) -> usize {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_calibration_row_reads_as_a_timing_row() {
+        let mut cal = Calibration::new();
+        let row = cal.row("start");
+        assert!(row.starts_with("calibration (pure CPU), start "), "{row}");
+        let cells: Vec<&str> = row.split_whitespace().collect();
+        let at = cells.iter().position(|c| *c == "n=200").unwrap();
+        assert_eq!((cells[at + 1], cells[at + 3], cells[at + 4], cells[at + 6]), ("median", "us", "p99", "us"), "{row}");
+        assert!(cells[at + 2].parse::<f64>().unwrap() > 0.0, "{row}");
+        assert_eq!(cal.rows.len(), 1);
+        assert_eq!(cal.rows[0].0, "start");
+    }
+
+    #[test]
+    fn the_summary_names_the_slow_points() {
+        let mut cal = Calibration::new();
+        assert_eq!(cal.summary(), "calibration: no rows");
+        cal.rows = vec![("start", Duration::from_micros(20)), ("after cold index", Duration::from_micros(22)),("after rescans", Duration::from_micros(21))];
+        assert_eq!(cal.summary(), "calibration: fastest 20.0 us (start), slowest 22.0 us (after cold index); no row over 1.15x the fastest");
+        cal.rows.push(("after lookup", Duration::from_micros(31)));
+        cal.rows.push(("after queue and classify", Duration::from_nanos(23_400)));
+        assert_eq!(
+            cal.summary(),
+            "calibration: fastest 20.0 us (start), slowest 31.0 us (after lookup); SLOW (over 1.15x the fastest): after lookup (1.55x), after queue and classify (1.17x)"
+        );
+    }
 }

@@ -59,7 +59,7 @@ fn strings(v: &[&str]) -> Vec<String> {
 
 /// The comb's weights, windows and cue lists: data, read from the
 /// configuration's `backlog` section. The defaults are the dry run's
-/// (Z:/scratch/v03release/BACKLOG_COMB_DESIGN.md, section 4).
+/// (the backlog comb design, section 4).
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// Rank per time asked.
@@ -490,21 +490,21 @@ fn load(store: &MemoryStore, bound: &str, t: i64) -> Result<Vec<Rec>> {
 fn placed_order(store: &MemoryStore) -> Result<HashMap<i64, (String, i64)>> {
     let mut st = store.conn().prepare("SELECT export, ord, rid FROM placement")?;
     let rows = st.query_map([], |r| Ok((r.get::<_, i64>(2)?, (r.get::<_, String>(0)?, r.get::<_, i64>(1)?))))?;
-    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    Ok(rows.collect::<crate::db::Result<HashMap<_, _>>>()?)
 }
 
 /// The IDs `ruling:` records define, by record id.
 fn defines(store: &MemoryStore) -> Result<Vec<(i64, String)>> {
     let mut st = store.conn().prepare("SELECT rid, target FROM refs WHERE kind = 'defines'")?;
     let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    Ok(rows.collect::<crate::db::Result<Vec<_>>>()?)
 }
 
 /// Vault notes whose frontmatter `status` starts with "queued": (id, status,
 /// modified seconds).
 fn vault_rows(db: Option<&Path>) -> Vec<(String, String, String, i64)> {
     let Some(db) = db.filter(|p| p.is_file()) else { return Vec::new() };
-    let Ok(conn) = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return Vec::new() };
+    let Ok(conn) = crate::db::Connection::open_with_flags(db, crate::db::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return Vec::new() };
     let Ok(mut st) = conn.prepare("SELECT vault, path, title, frontmatter, mtime_ns FROM notes WHERE frontmatter LIKE '%queued%'") else { return Vec::new() };
     let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?)));
     let Ok(rows) = rows else { return Vec::new() };

@@ -22,7 +22,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::compact::TurnAt;
 use crate::error::Result;
@@ -98,7 +98,7 @@ fn index_from(conn: &Connection, path: &Path, key: &str, f: &mut std::fs::File, 
     // Calls whose target names a secret, from earlier passes too.
     let mut secret_calls: HashSet<String> = {
         let mut st = conn.prepare_cached("SELECT id FROM turns_secret WHERE path = ?1")?;
-        let ids = st.query_map([key], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<HashSet<_>>>()?;
+        let ids = st.query_map([key], |r| r.get::<_, String>(0))?.collect::<crate::db::Result<HashSet<_>>>()?;
         ids
     };
     let mut added = 0;
@@ -193,7 +193,7 @@ pub fn search(conn: &Connection, project: &str, query: &str, limit: usize) -> Re
         .query_map(params![q.join(" "), project, limit as i64], |r| {
             Ok(Turn { id: format!("turn:{}:{}", r.get::<_, String>(0)?, r.get::<_, i64>(1)?), role: r.get(2)?, hash: r.get(3)?, text: r.get(4)? })
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<crate::db::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -270,7 +270,7 @@ pub fn line_at(path: &Path, offset: u64) -> Option<usize> {
 pub fn path_of(conn: &Connection, project: &str, s8: &str) -> Result<Option<std::path::PathBuf>> {
     conn.execute_batch(TABLES)?;
     let mut st = conn.prepare_cached("SELECT path FROM turns_seen")?;
-    let paths = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let paths = st.query_map([], |r| r.get::<_, String>(0))?.collect::<crate::db::Result<Vec<_>>>()?;
     Ok(paths.into_iter().map(std::path::PathBuf::from).find(|p| project_of_transcript(p) == project && session8(p) == s8))
 }
 

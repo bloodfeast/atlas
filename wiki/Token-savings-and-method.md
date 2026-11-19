@@ -57,8 +57,26 @@ target the 36% shell-read bucket. A 1-hour subagent cache targets the 25% re-wri
   what it costs. Nothing is written without a yes, every change is backed up and reversible, and `atlas settings
   offer --no` declines them.
 
-First measurements, on scratch copies of this repository with Opus sessions doing review, test and edit
-tasks. One early run: its sessions are not published, so these figures cannot be checked or rerun.
+## Headline figures
+
+The figures the README quotes, each with the setting that turns it on, the command that reproduces it and
+the sample it was taken on. A figure stamped with a version was measured again at that version (see
+[[Releasing]], the README gate).
+
+| What | Measured | Turned on by | Command | Sample |
+|---|---|---|---|---|
+| Lookups | 6.2x fewer tokens than grep and file reads, ratio of sums; 10.6x median (not additive), at v0.8.0 | on by default | `atlas --config <atlas.json> --token-report` (its measured ratio line; the Headline block with `--verbose`) | 7,971 atlas answers on one store (a copy taken 2026-11-18), against 96 pre-atlas lookup episodes in 44 of 66 transcripts before atlas's first call (2026-10-08) |
+| Memory questions | 100 of 100 answered (99 of 100 reading only the first result), median 506 tokens each, facts 176 of 176, at v0.8.0 | on by default | `cargo xtask memory-eval --config <atlas.json> --questions questions.txt --fresh-from <frozen store>` (row (b)) | the 100-question set on a frozen copy of one store (snap 2026-11-02) |
+| The tool list | 14 tools in 6,042 bytes (about 1,510 tokens), down from 47 tools and 5,930 tokens at v0.1 | always | `cargo test --test surface tools_list_fits_its_budget -- --nocapture` | the server's own `tools/list` answer; the test fails above 1,511 tokens |
+| Recall on each prompt | 1 of 30 off-topic prompts gets a record (2 records, 323 tokens over the 30); 49.6 tokens injected per prompt (of a 600-token budget) over the 303-prompt replay; with what was injected plus one follow-up read, 199 of the 303 questions are answered when the agent opens the pointer that holds the answer, 178 when it only ever opens the first pointer; all at the shipped defaults, at v0.8.0 | `recall.budget_tokens` 600, `recall.cos_floor` 0.53 and `recall.inject_floor` 0.60, the defaults | `cargo xtask memory-eval --config <atlas.json> --questions questions-1000-tune.txt --fresh-from <frozen store> --floor 0.6 --offtopic prompts.tsv` | the 30 `neg` prompts of the off-topic set ([[Configuration reference]]) at its revision of commit ddcd884 (the current file has its lane names replaced, so it needs a store with matching lanes) and the 303 recall questions replayed through the prompt hook, on a frozen copy of one store (snap 2026-11-02) |
+| Weak injections | 3,480 low-cosine pointers dropped, about 37k tokens a week, memory eval and its hook replay unchanged (61 of 70 questions answered when the agent opens the right pointer, 52 of 70 when it opens only the first), at v0.7.0 | `recall.inject_floor` 0.60, the default | `atlas --hook-report --tune-floor 1` | 14 days of hook data on one store |
+| Subagent start | about 200 tokens a start against 1,679 for `recall`, informing as many needs (builder 3 vs 2, reviewer 11 vs 11, research 4 vs 4), at v0.7.0 | `"recall": {"subagent_context": "binding"}`, off by default | `cargo xtask memory-eval ... --starts DIR` (row (s)) | 30 real agent launches |
+
+## An early run (superseded)
+
+The first measurements, on scratch copies of this repository with Opus sessions doing review, test and edit
+tasks, are superseded by the headline figures above. Its sessions are not published, so these figures cannot
+be checked or rerun; do not quote them.
 
 - Seven results were routed. Raw output over the threshold that was not routed: none.
 - 236 KB of output entered context as 8.2 KB of digests. One 87 KB source file became a 3.7 KB outline,

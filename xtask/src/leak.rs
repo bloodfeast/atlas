@@ -2,7 +2,8 @@
 //! paths, after normalising both. Used by `cargo xtask release` on every
 //! exported file (binaries included) and by `tests/leak_check.rs` on every
 //! tracked file; the test includes this file and `ucd.rs` by path, so it
-//! names its sibling as `super::ucd` and holds no other `crate::` path.
+//! names its sibling as `super::ucd` and holds no other `crate::` path
+//! (the format-character table is `atlas::hidden`, which both crates see).
 //!
 //! # Matching
 //!
@@ -20,7 +21,8 @@
 //!    decomposition (NFD) with nonspacing marks (`Mn`) dropped, so
 //!    precomposed and combining spellings, and accented look-alikes, match.
 //! 4. Format characters (`Cf`: zero-width space and joiners, soft hyphen,
-//!    BOM, bidi controls) are dropped.
+//!    BOM, bidi controls; the table is `atlas::hidden::is_format_char`) are
+//!    dropped.
 //! 5. Every run of white space and line breaks is one space, so a
 //!    multi-word term matches across a line break or a double space (a
 //!    term written as one word still does not match two words).
@@ -257,17 +259,18 @@ impl<'a> Matcher<'a> {
             push(n, c, at);
             return;
         }
-        let u = self.db.get(c as u32);
-        if &u.cat == b"Cf" {
+        // The one Cf table (src/hidden.rs), tested against this same UCD.
+        if atlas::hidden::is_format_char(c) {
             return;
         }
+        let u = self.db.get(c as u32);
         if u.cat[0] == b'Z' || c == '\u{85}' {
             space(n, at);
             return;
         }
         for x in self.db.nfd(&self.db.lower(c as u32)) {
             let d = self.db.get(x);
-            if &d.cat == b"Mn" || &d.cat == b"Cf" {
+            if &d.cat == b"Mn" || char::from_u32(x).is_some_and(atlas::hidden::is_format_char) {
                 continue;
             }
             push(n, char::from_u32(x).map(confusable).unwrap_or('\u{fffd}'), at);

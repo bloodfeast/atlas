@@ -39,7 +39,8 @@ references and callers) are deferred like the write tools: load them by a tool s
    quoted ruling exact; a key stands in for its text.
 
 atlas injects no rules of its own. The user's rules stay in their CLAUDE.md and memory files, which atlas
-indexes and recalls like any other source.
+indexes and recalls like any other source. For atlas as Claude's memory, setup and checks, see the wiki page
+Reference configuration.
 
 ## Lanes and sub-lanes
 
@@ -104,6 +105,10 @@ stays readable. Durable facts that are not lane work (a user's preference, a sta
   at 285k and a hard limit at 450k, scaled to the model's window. Past the handoff point the agent is told to
   wrap up; past the hard limit (enforced mode) every tool but `handoff` is denied. Under an enforced limit a
   subagent past its handoff point is not compacted: atlas blocks its compaction, and it hands off.
+- **Work lean to reach the handoff point later.** Find with `symbol`, `lookup`, `grep` or `section` before a
+  Read, then read the lines around the hit; pass `budget_tokens` to `recall` (except on a stored output's
+  h:ID key, which refuses it) and `read_note` unless you need the whole text; journal `pr:N head:SHA` when a PR opens and on each head move, so the orchestrator's card
+  shows it even if its own context compacts. The `orchestrate` skill's brief step "Work lean" lists the rest.
 - The main session is told when it passes its compact point to ask the user for `/compact`, and to
   recommend `/clear` instead when the last compaction left the session at `compact.clear_floor` or more.
   `atlas settings auto-compact` makes Claude Code's own automatic compaction fire at atlas's hard limit.

@@ -17,7 +17,7 @@ use common::*;
 /// table with one row, in rollback-journal mode (so a WAL switch would show).
 fn newer_memory(path: &Path) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let c = rusqlite::Connection::open(path).unwrap();
+    let c = atlas::db::Connection::open(path).unwrap();
     c.execute_batch(&format!(
         "PRAGMA journal_mode=DELETE; CREATE TABLE future(x TEXT); INSERT INTO future VALUES('kept'); PRAGMA user_version = {};",
         atlas::memory::SCHEMA_VERSION + 1
@@ -32,7 +32,7 @@ const NEWER_FOUND: &str = "1/parse-99";
 
 fn newer_index(path: &Path) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let c = rusqlite::Connection::open(path).unwrap();
+    let c = atlas::db::Connection::open(path).unwrap();
     c.execute_batch(&format!(
         "PRAGMA journal_mode=DELETE; CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
          INSERT INTO meta VALUES('schema', '{NEWER_INDEX}'); INSERT INTO meta VALUES('open_stamp', 'theirs');
@@ -177,6 +177,7 @@ fn cli(home: &Path, args: &[&str], stdin: &str) -> (bool, String, String) {
         .env_remove("ATLAS_CONFIG")
         .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_UNATTENDED")
         .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -236,12 +237,12 @@ fn the_command_hook_the_cli_and_the_doctor_each_say_so() {
 
 /// The stored `meta` value of `key` in the index database at `db`.
 fn meta(db: &Path, key: &str) -> Option<String> {
-    use rusqlite::OptionalExtension;
-    rusqlite::Connection::open(db).unwrap().query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional().unwrap()
+    use atlas::db::OptionalExtension;
+    atlas::db::Connection::open(db).unwrap().query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional().unwrap()
 }
 
 fn notes(db: &Path) -> i64 {
-    rusqlite::Connection::open(db).unwrap().query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0)).unwrap()
+    atlas::db::Connection::open(db).unwrap().query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0)).unwrap()
 }
 
 /// Opens the store at `fx` and indexes the vaults.
@@ -268,7 +269,7 @@ fn two_crate_versions_with_one_index_schema_interoperate() {
     // binary never rebuilds after this one.
     let newer = format!("{prefix}/999.0.0-dev");
     {
-        let c = rusqlite::Connection::open(&fx.db).unwrap();
+        let c = atlas::db::Connection::open(&fx.db).unwrap();
         c.execute("UPDATE meta SET value = ?1 WHERE key = 'schema'", [&newer]).unwrap();
         c.execute("UPDATE meta SET value = 'theirs' WHERE key = 'open_stamp'", []).unwrap();
     }
@@ -281,14 +282,14 @@ fn two_crate_versions_with_one_index_schema_interoperate() {
     assert!(atlas::store::index_skew(&fx.db).is_empty(), "the doctor says nothing");
     // Its stamp, when it matches this binary's rules, opens on the fast path.
     {
-        let c = rusqlite::Connection::open(&fx.db).unwrap();
+        let c = atlas::db::Connection::open(&fx.db).unwrap();
         c.execute("UPDATE meta SET value = ?1 WHERE key = 'schema'", [&ours]).unwrap();
     }
     open_and_scan(&fx);
     let stamp = meta(&fx.db, "open_stamp").unwrap();
     let theirs_stamp = stamp.replacen(&ours, &newer, 1);
     {
-        let c = rusqlite::Connection::open(&fx.db).unwrap();
+        let c = atlas::db::Connection::open(&fx.db).unwrap();
         c.execute("UPDATE meta SET value = ?1 WHERE key = 'schema'", [&newer]).unwrap();
         c.execute("UPDATE meta SET value = ?1 WHERE key = 'open_stamp'", [&theirs_stamp]).unwrap();
     }
@@ -300,7 +301,7 @@ fn two_crate_versions_with_one_index_schema_interoperate() {
     // schema and stamp written, then opened on the fast path with no
     // second rebuild.
     let older = format!("{prefix}/0.0.1");
-    rusqlite::Connection::open(&fx.db).unwrap().execute("UPDATE meta SET value = ?1 WHERE key = 'schema'", [&older]).unwrap();
+    atlas::db::Connection::open(&fx.db).unwrap().execute("UPDATE meta SET value = ?1 WHERE key = 'schema'", [&older]).unwrap();
     drop(atlas::store::Store::open(&fx.db, atlas::paths::Vaults::new(&fx.specs).unwrap()).unwrap());
     assert_eq!(meta(&fx.db, "schema").as_deref(), Some(ours.as_str()), "rebuilt to this binary's schema");
     assert_eq!(notes(&fx.db), 0, "the older derived tables were dropped");
@@ -313,7 +314,7 @@ fn two_crate_versions_with_one_index_schema_interoperate() {
 
     // Higher parse rules or a higher table shape are refused, nothing written.
     for (schema, found) in [(format!("1/parse-{}/0.0.1", 99), "1/parse-99"), ("9/parse-0/0.0.1".to_string(), "9/parse-0")] {
-        rusqlite::Connection::open(&fx.db).unwrap().execute("UPDATE meta SET value = ?1 WHERE key = 'schema'", [&schema]).unwrap();
+        atlas::db::Connection::open(&fx.db).unwrap().execute("UPDATE meta SET value = ?1 WHERE key = 'schema'", [&schema]).unwrap();
         let before = std::fs::read(&fx.db).unwrap();
         let e = atlas::store::Store::open(&fx.db, atlas::paths::Vaults::new(&fx.specs).unwrap()).err().expect("refused");
         assert!(matches!(&e, atlas::Error::StoreTooNew { found: f, .. } if f == found), "{e}");
@@ -332,9 +333,9 @@ fn the_index_store_refuses_a_newer_schema_and_rebuilds_an_older_one() {
     no_sidecars(&fx.db);
     assert_eq!(atlas::store::index_skew(&fx.db), vec![e]);
     // An older crate version's tables are rebuilt as before.
-    rusqlite::Connection::open(&fx.db).unwrap().execute("UPDATE meta SET value = '1/parse-1/0.0.1' WHERE key = 'schema'", []).unwrap();
+    atlas::db::Connection::open(&fx.db).unwrap().execute("UPDATE meta SET value = '1/parse-1/0.0.1' WHERE key = 'schema'", []).unwrap();
     drop(atlas::store::Store::open(&fx.db, atlas::paths::Vaults::new(&fx.specs).unwrap()).expect("an older index opens"));
     assert!(atlas::store::index_skew(&fx.db).is_empty());
-    let notes: i64 = rusqlite::Connection::open(&fx.db).unwrap().query_row("SELECT COUNT(*) FROM notes WHERE path = 'kept.md'", [], |r| r.get(0)).unwrap();
+    let notes: i64 = atlas::db::Connection::open(&fx.db).unwrap().query_row("SELECT COUNT(*) FROM notes WHERE path = 'kept.md'", [], |r| r.get(0)).unwrap();
     assert_eq!(notes, 0, "the older derived tables were dropped and rebuilt");
 }

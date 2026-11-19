@@ -90,7 +90,7 @@ fn setup(f: &Fixture, name: &str) -> CodeSetup {
 fn indexed(f: &Fixture, name: &str) -> (IndexReport, Server) {
     let code = setup(f, name);
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     let rep = code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::File(f.scip.clone())).unwrap();
     let store = atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap();
     let mut s = Server::new(store);
@@ -189,7 +189,7 @@ fn go_typed_ranges_give_definitions_callers_and_impl_edges() {
     let t = s.answer("symbol", &json!({"name": "Total"})).unwrap().into_text();
     assert!(t.contains("shapes:shapes.go:20-26\tfn\tshapes\tfunc Total(shapes []Shape) float64 {"), "{t}");
     // Read and Grep annotations: the method is the item, not its impl edge.
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     let items = code::file_items(&conn, &f.root.join("shapes.go").to_string_lossy()).unwrap().unwrap();
     let labels: Vec<String> = items.iter().map(|i| i.label()).collect();
     assert_eq!(labels, ["interface shapes::Shape 5-7", "fn Shape::Area 6-6", "struct shapes::Square 10-12", "field Square::Side 11-11", "fn Square::Area 15-17", "fn shapes::Total 20-26", "const shapes::Unit 29-29"]);
@@ -212,7 +212,7 @@ fn typescript_packed_ranges_constructors_and_files() {
     let (defs, refs, _) = answer(&mut s, "UNIT");
     assert_eq!(defs, ["src/main.ts:3 const main"]);
     assert_eq!(refs, ["src/main.ts:6 main::report"]);
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     let lang: String = conn.query_row("SELECT lang FROM code_files WHERE path = 'src/main.ts'", [], |r| r.get(0)).unwrap();
     assert_eq!(lang, "typescript");
 }
@@ -249,7 +249,7 @@ fn a_root_with_rust_beside_another_language_has_two_units() {
     assert_eq!(rep.rust, "rust: scan only: the SCIP file is from scip-go; go: prebuilt scip-go 0.2.9");
     let (defs, _, _) = answer(&mut s, "helper");
     assert_eq!(defs, ["tool/src/lib.rs:1 fn (scan) "]);
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     let units: i64 = conn.query_row("SELECT COUNT(*) FROM code_units WHERE root = 'mixed'", [], |r| r.get(0)).unwrap();
     assert_eq!(units, 2);
 }
@@ -272,7 +272,7 @@ fn python_without_kinds_uses_the_line_and_the_indentation_blocks() {
     let (defs, _, _) = answer(&mut s, "squared");
     assert_eq!(defs, ["shapes/geometry.py:45 method Square"]);
     // End lines from the indentation blocks; the method is the caller.
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     let items = code::file_items(&conn, &f.root.join("shapes/geometry.py").to_string_lossy()).unwrap().unwrap();
     let labels: Vec<String> = items.iter().map(|i| i.label()).collect();
     assert!(labels.contains(&"class geometry::Shape 15-34".to_string()) && labels.contains(&"fn Circle::area 59-64".to_string()), "{labels:?}");
@@ -306,7 +306,7 @@ fn java_kinds_ranges_impl_edges_and_anonymous_members_from_the_scanner() {
     assert_eq!(defs, ["src/main/java/shapes/Square.java:17 field Square"]);
     // End lines from the brace matcher, past a `throws` line and an
     // `implements` line; the method is the caller.
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     let items = code::file_items(&conn, &f.root.join("src/main/java/shapes/Square.java").to_string_lossy()).unwrap().unwrap();
     let labels: Vec<String> = items.iter().map(|i| i.label()).collect();
     for want in ["class shapes::Square 6-46", "field Square::BY_SIDE 8-14", "enum Square::Kind 33-40", "fn Square::unit 42-45"] {

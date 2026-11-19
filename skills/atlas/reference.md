@@ -30,7 +30,8 @@ Everything atlas takes, generated from the code the server answers from. The hab
 - `atlas queue next [--transcript PATH]`
 - `atlas queue release AGENT [--force] [--transcript PATH]`
 - `atlas queue add --description TEXT [--kind KIND] FILE|-`
-- `atlas queue plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT]`
+- `atlas queue plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT] [--ticket KEY]`
+- `atlas queue plan --from-jql QUERY [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--scope TEXT] [--order-from N] [--lane-from key|fixed:LANE] [--limit N]`
 
 ## Settings
 
@@ -72,6 +73,8 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `compact.window`
 - `db`
 - `default_project`
+- `hooks`
+- `hooks.budget_ms`
 - `ids`
 - `ids[].case_insensitive`
 - `ids[].exclude`
@@ -210,6 +213,8 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `pr_events`
 - `pr_events.lane`
 - `pr_events.port`
+- `project_tracking`
+- `project_tracking.atlassian`
 - `projects`
 - `projects[].code`
 - `projects[].db`
@@ -288,6 +293,13 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `vaults[].path`
 - `watch`
 - `wikilinks`
+- `worktrees`
+- `worktrees.auto_gc`
+- `worktrees.dirty`
+- `worktrees.disposable`
+- `worktrees.notify_gb`
+- `worktrees.quiet_minutes`
+- `worktrees.target_dirs`
 
 ## atlas tools
 
@@ -764,6 +776,7 @@ Memory records by key (history: true for versions), by query (best whole, the re
 - `tail` integer: h:ID only: the last N lines.
 - `page` integer: h:ID only: from line K (a PR file's next page).
 - `digest` boolean: h:ID only: the digest again.
+- `digest-grep` string: h:ID only: digest rows matching this regex (every issue or hit of a tracker search).
 
 #### supersede
 

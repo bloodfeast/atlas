@@ -19,7 +19,7 @@
 #![deny(missing_docs)]
 // Unsafe code is denied everywhere except the modules that need it and allow
 // it locally (the change-notification FFI in platform, the vector scans in
-// scan).
+// scan, the SQLite calls in db::raw and the declarations in db::ffi).
 #![deny(unsafe_code)]
 
 pub mod autocompact;
@@ -28,6 +28,7 @@ pub mod baseline;
 pub mod binding;
 pub mod calibrate;
 pub mod chain;
+pub mod card_agents;
 pub mod checkpoint;
 pub mod chunk;
 pub mod compact;
@@ -36,6 +37,7 @@ pub mod code;
 pub mod code_index;
 pub mod config;
 pub mod crop;
+pub mod db;
 pub mod digest;
 pub mod dirs;
 pub mod discussion;
@@ -45,6 +47,8 @@ pub mod fsio;
 pub mod glob;
 pub mod grammar;
 pub mod handles;
+pub mod hidden;
+pub mod hook_budget;
 pub mod hook_hits;
 pub mod hook_rewrite;
 pub mod hooks;
@@ -100,7 +104,10 @@ pub mod update;
 pub mod watch;
 pub mod wgsl;
 pub mod tools;
+pub mod trackers;
 pub mod transcripts;
+pub mod worktree_gc;
+pub mod worktree_gc_docker;
 pub mod worktree_ledger;
 
 pub use error::{Error, Result};

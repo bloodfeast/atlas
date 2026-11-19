@@ -509,7 +509,10 @@ fn scored_card(saved: &str, chain_card: &str) -> String {
     let old: String = saved
         .split_inclusive('\n')
         .filter(|l| {
-            in_chain |= l.starts_with("groups (recall a key for its digest and text):") || l.starts_with("chain_depth: ");
+            // The header before #309 named a digest; old transcripts hold it.
+            in_chain |= l.starts_with("groups (recall a key for its text):")
+                || l.starts_with("groups (recall a key for its digest and text):")
+                || l.starts_with("chain_depth: ");
             !l.starts_with("tools: ") && (!in_chain || l.starts_with("unread: "))
         })
         .collect();
@@ -1008,11 +1011,13 @@ mod tests {
     /// no chain card) gains it, and loses the `tools:` line.
     #[test]
     fn the_scored_card_holds_the_chain_listing_once() {
-        let rebuilt = "groups (recall a key for its digest and text):\n- turn:s1:b0-b900@3ab4bcdad185 a.rs\nchain_depth: 2 chain_index: 2\nlinks (recall a key for that segment's card and digest):\n- compact:s1:b0@2e90f19bdd77 2026-10-03T17:32..01:11 a.rs\n";
+        let rebuilt = "groups (recall a key for its text):\n- turn:s1:b0-b900@3ab4bcdad185 a.rs\nchain_depth: 2 chain_index: 2\nlinks (recall a key for that segment's card and digest):\n- compact:s1:b0@2e90f19bdd77 2026-10-03T17:32..01:11 a.rs\n";
         let stored = rebuilt.replace("b0-b900@3ab4bcdad185", "b0-b996@512e900cd645");
         let new = format!("atlas checkpoint journal:session:s:0001@b95831fcec1b (the state)\nintent: Next.\n{stored}");
+        // A card saved before #309, under the header that named a digest.
+        let old_head = new.replace("groups (recall a key for its text):", "groups (recall a key for its digest and text):");
         let old = "atlas checkpoint journal:session:s:0001@b95831fcec1b (the state)\ntools: Bash x3\nintent: Next.\n";
-        for saved in [new.as_str(), old] {
+        for saved in [new.as_str(), old_head.as_str(), old] {
             let c = scored_card(saved, rebuilt);
             assert_eq!(c.matches("chain_depth: ").count(), 1, "{c}");
             assert_eq!(c.matches("groups (recall").count(), 1, "{c}");

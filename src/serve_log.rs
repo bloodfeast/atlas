@@ -67,6 +67,7 @@ error text, names or paths.";
 pub const THREADS: &[&str] = &[
     "main",
     "atlas-hooks",
+    "atlas-hook-watch",
     "atlas-reader",
     "atlas-hook-log",
     "atlas-code-index",
@@ -357,7 +358,7 @@ fn is_stale(mtime: SystemTime, now: SystemTime) -> bool {
     apart > STALE_LOCK
 }
 
-/// Removes header temporaries (`atlas-server.log.PID.NANOS.new`, from
+/// Removes header temporaries (`atlas-server.log.PID.NANOS.SEQ.new`, from
 /// [`create_with_header`]) that a process killed mid-create, or a refused
 /// remove, left in the log's folder. Only stale ones go, so another
 /// appender's temporary in use is kept. Every failure is ignored.
@@ -374,7 +375,9 @@ fn sweep_temps(path: &Path) {
             continue;
         };
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        let temp = mid.split_once('.').is_some_and(|(pid, nanos)| digits(pid) && digits(nanos));
+        // PID.NANOS.SEQ, or PID.NANOS from a build before the sequence.
+        let parts = mid.split('.').count();
+        let temp = (2..=3).contains(&parts) && mid.split('.').all(digits);
         if temp && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| is_stale(t, now)) {
             let _ = fs::remove_file(e.path());
         }
@@ -386,14 +389,41 @@ fn sweep_temps(path: &Path) {
 /// linked into place, which fails when another appender created it first.
 /// So a log never holds a line before its header, nor two headers.
 fn create_with_header(path: &Path) -> io::Result<()> {
+    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    create_with_header_via(path, &temp_for(path, nanos), || ())
+}
+
+/// The header temporary's path for a clock reading of `nanos`: pid, clock
+/// and a per-process sequence number, so two threads reading the same
+/// clock value do not share it (issue #345).
+fn temp_for(path: &Path, nanos: u128) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    sibling(path, &format!(".{}.{nanos}.{}.new", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// [`create_with_header`] through the temporary `tmp`, calling `linked`
+/// once it is linked as the log and before it is removed: the test seam
+/// for an appender paused there.
+fn create_with_header_via(path: &Path, tmp: &Path, linked: impl FnOnce()) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir)?;
     }
-    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let tmp = sibling(path, &format!(".{}.{nanos}.new", std::process::id()));
     let head = format!("{HEADER}\n");
-    let linked = fs::write(&tmp, &head).and_then(|()| fs::hard_link(&tmp, path));
-    let _ = fs::remove_file(&tmp);
+    // `create_new`, never a truncating write: a temporary of the same name
+    // (another process's pid in another pid namespace at the same clock
+    // reading) may already be linked as the log, and truncating it would
+    // drop that log's lines. Then this appender takes the fallback below.
+    let linked = match OpenOptions::new().write(true).create_new(true).open(tmp) {
+        Ok(mut f) => {
+            let written = f.write_all(head.as_bytes());
+            drop(f);
+            let linked = written.and_then(|()| fs::hard_link(tmp, path)).inspect(|()| linked());
+            let _ = fs::remove_file(tmp);
+            linked
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::other("header temporary in use")),
+        Err(e) => Err(e),
+    };
     match linked {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
@@ -510,5 +540,36 @@ mod tests {
         }
         assert!(!text.contains(&secret), "a formatted payload reached the log:\n{text}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #345: appender A has hard linked its header temporary as the
+    /// log and not yet removed it; appender C appends a line; appender B,
+    /// whose temporary has the same name (same pid and clock reading),
+    /// creates the log. B must not truncate the file A linked: C's line
+    /// stays, under one header.
+    #[test]
+    fn a_header_temporary_of_the_same_name_does_not_truncate_a_linked_log() {
+        let dir = std::env::temp_dir().join(format!("atlas-serve-log-tmpname-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join(FILE);
+        let tmp = sibling(&path, ".1.2.new");
+        create_with_header_via(&path, &tmp, || {
+            append(&path, "exit reason=eof uptime=0.0s responses=0");
+            create_with_header_via(&path, &tmp, || ()).unwrap();
+        })
+        .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let ls: Vec<_> = text.lines().collect();
+        assert_eq!(ls.len(), 2, "{text}");
+        assert_eq!(ls[0], HEADER);
+        assert!(ls[1].ends_with(" exit reason=eof uptime=0.0s responses=0"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two temporaries asked for at one clock reading are named apart.
+    #[test]
+    fn header_temporaries_are_named_apart_within_a_process() {
+        let p = Path::new("state").join(FILE);
+        assert_ne!(temp_for(&p, 7), temp_for(&p, 7));
     }
 }

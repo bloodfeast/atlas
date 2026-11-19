@@ -73,6 +73,8 @@ fn config(root: &Path) -> PathBuf {
 fn command(root: &Path, cfg: &Path) -> Command {
     let mut c = Command::new(exe());
     c.arg("--config").arg(cfg).current_dir(root).env("ATLAS_HOME", root.join("home")).env("CLAUDE_CONFIG_DIR", root.join("claude")).env("HOME", root).env("USERPROFILE", root).env_remove("ATLAS_CONFIG");
+    // The runner's session kind is never inherited by the hook.
+    c.env_remove("CLAUDE_CODE_SESSION_ATTENDED").env_remove("CLAUDE_CODE_ENTRYPOINT").env_remove("ATLAS_UNATTENDED");
     c
 }
 
@@ -115,7 +117,7 @@ fn recalls(root: &Path, cfg: &Path) -> Vec<(String, String)> {
 fn hooks(root: &Path, cfg: &Path) -> Vec<(String, String)> {
     let mut all = Vec::new();
     for (i, q) in ASKS.iter().enumerate() {
-        let mut child = command(root, cfg).arg("--hook").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut child = command(root, cfg).arg("--hook").env("ATLAS_HOOK_BUDGET_OFF", "1").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let event = atlas::json!({"hook_event_name": "UserPromptSubmit", "session_id": format!("s{i}"), "prompt": *q, "cwd": root.to_string_lossy().to_string()});
         write!(child.stdin.take().unwrap(), "{event}").unwrap();
         let out = child.wait_with_output().unwrap();

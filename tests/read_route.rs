@@ -203,7 +203,7 @@ fn a_routed_read_logs_where_it_was_read_for_the_judged_credit() {
     sub.agent_id = "a7".into();
     sub.tool_use_id = "toolu_sub".into();
     assert!(routed(&mut r, &sub));
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     type Row = (String, String, String, String, Option<i64>, Option<i64>);
     let rows: Vec<Row> = conn
         .prepare("SELECT session, transcript, path, tool_use, grep, read FROM token_log WHERE tool = 'route:Read' ORDER BY id")
@@ -234,7 +234,7 @@ fn a_routed_read_is_logged_without_a_counterfactual() {
         ..HookEvent::default()
     };
     assert!(r.post_tool_use(&bash).unwrap().is_some());
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = conn
         .prepare("SELECT tool, returned, grep, read FROM token_log ORDER BY id")
         .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect())
@@ -252,6 +252,36 @@ fn a_routed_read_is_logged_without_a_counterfactual() {
     // shows of a Bash output: its first 30,000 characters (#215).
     assert_eq!(rows[1].0, "route:Bash");
     assert_eq!(rows[1].3, Some(30_000));
+}
+
+/// #297, R1: a digest ends with its hint line's newline, which Claude Code
+/// trims from the tool result the model reads; the route trims it, so the
+/// ledger logs the bytes the session receives.
+#[test]
+fn a_routed_digest_is_trimmed_and_logged_at_the_length_returned() {
+    let t = Temp::new("rr-trim");
+    let db = t.path().join("index.sqlite");
+    let mut r = Router::with_db(&db, mode(json!("all")));
+    let bash = HookEvent {
+        event: "PostToolUse".into(),
+        tool_name: "Bash".into(),
+        session_id: "s1".into(),
+        tool_input: json!({"command": "cargo build"}),
+        tool_response: json!({"stdout": text(40_000), "stderr": "", "interrupted": false, "isImage": false, "noOutputExpected": false}),
+        ..HookEvent::default()
+    };
+    let out = r.post_tool_use(&bash).unwrap().unwrap();
+    let stdout = out["stdout"].as_str().unwrap();
+    assert!(!stdout.ends_with('\n') && stdout.contains("recall h:"), "{stdout:?}");
+    let read = r.post_tool_use(&whole(SRC, 40_000)).unwrap().unwrap();
+    let content = read["file"]["content"].as_str().unwrap();
+    assert!(!content.ends_with('\n'), "{content:?}");
+    let conn = atlas::db::Connection::open(&db).unwrap();
+    let rows: Vec<(String, i64)> = conn
+        .prepare("SELECT tool, returned FROM token_log ORDER BY id")
+        .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        .unwrap();
+    assert_eq!(rows, [("route:Bash".to_string(), stdout.len() as i64), ("route:Read".to_string(), content.len() as i64)]);
 }
 
 /// #215: a shell output over the cap credits exactly the bytes of its first
@@ -275,7 +305,7 @@ fn a_routed_shell_output_is_credited_up_to_what_claude_code_shows() {
     let under = text(20_000);
     let n = under.len() as i64;
     assert!(r.post_tool_use(&bash(under)).unwrap().is_some());
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let reads: Vec<Option<i64>> = conn
         .prepare("SELECT read FROM token_log WHERE tool = 'route:Bash' ORDER BY id")
         .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())

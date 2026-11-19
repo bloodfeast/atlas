@@ -65,7 +65,12 @@ Every answer is logged to the `token_log` table with the bytes returned and the 
 without atlas: what `grep -rniF` would print for the question's literal over the same files, plus the files a
 reader then opens (whole when at most 80 lines, else an 80-line window around each match, windows merged). The
 rule is in `src/tokens.rs`; the measurement runs on a background thread after the answer is written.
-`atlas --token-report` prints totals by tool and by day: tokens returned, the counterfactual, and the ratio.
+`atlas --token-report` prints a summary in about 15 lines: the measured ratio (mean and median), credit, cost
+and net, the "Where the savings live" rows by source (when two or more sources are each under 1% of both the
+credit and the cost, they fold into one "small sources" row), and the answers and ledger ratio of the 7 days to
+the newest logged day. Every line fits 80 columns. `atlas --token-report --verbose` prints the
+full report: totals by tool and by day (tokens returned, the counterfactual, and the ratio) and every block
+below; `--tsv` prints the full report as tab-separated lines. The blocks named below are the full report's.
 
 The other read tools with a grep equivalent use the same two parts: `section` greps its id or heading like
 `lookup`, `grep` is its own pattern, `read_note` reads the whole note, `recall {query}` greps the query over the
@@ -127,7 +132,7 @@ are refused. `atlas --compact-report --transcripts DIR [--sweep T,T,...]` adds t
 checkpoint card's size and coverage, the hooks' latency, and with `--sweep` the token side of where to compact
 (a plain and an atlas-assisted arm at each threshold on the same sessions, each atlas row judged against plain at the
 same threshold: compactions, raw and cache-weighted tokens, re-reads; plain at Claude Code's default point is a
-labelled reference row only). `--token-report` ends with the compaction line: the ratio of context
+labelled reference row only). `--token-report --verbose` ends with the compaction line: the ratio of context
 before a compaction to its summary, refs and their dangling rate, and the lookups made again after one:
 within 40 tool calls of the boundary, repeats over lookups (comparable with the offline replay) and misses of
 targets unchanged since (a file's mtime and size, a folder by the edits under it and any shell command, a record's sha), then the uncapped misses, the repeats of
@@ -146,7 +151,13 @@ messages: the key in a tool input (a `recall key=`, a lookup, a grep), its sourc
 per hook. `--transcripts DIR --since TIME` adds injections reconstructed from past transcripts (rescored by the
 hook's own gate), `--rows` lists every key, and `--tune-floor SCALE` prints the relevance-floor curve from the active floor up and the
 floor that maximises the bytes the kept hits save net of the bytes injected (SCALE is the share of a hit's
-counterfactual credited: 1 for the full ledger credit).
+counterfactual credited: 1 for the full ledger credit). `--token-report` credits each hit by the same rules;
+once an injection's transcript has been still for six hours (and ends before the ledger's last row), its
+verdict is stored in `hit_verdict`, so a repeat report reads only the transcripts still changing. A stored
+verdict (a hit's, or a routed Read's in `read_verdict`) keeps the judge's version and the transcript's last
+change and size, and is judged again when either differs, as when a settled session is resumed; once the
+transcript is deleted, its stored verdicts stand. They hold memory as it was when they were judged: a later
+edit to a record does not change them.
 
 The counterfactual is rule-based, not a bound: some rows overcount and others score 0. atlas measures the other side itself, from your own Claude Code
 transcripts: the bytes of the Grep, Read and shell-read results agents read when they looked something up in the
@@ -157,7 +168,7 @@ and the first atlas call in the project's transcripts, kept from the first run; 
 session ran in one of the project's folders (every one without projects), less temporary, scratch, eval and
 replay folders (`calibrate.skip`); a call another transcript already holds (a replay, a resumed session) counts
 once. What the rules read of each pre-cutoff call (never a result's text) is kept in the store, so a later
-recalibration does not lose history Claude Code has since deleted. `--token-report` then heads its output with
+recalibration does not lose history Claude Code has since deleted. `--token-report --verbose` then heads its output with
 the measured ratio (mean pre-atlas episode over mean atlas answer, a ratio of sums; the medians' ratio beside it,
 marked not additive), when it was measured, from how many episodes and transcripts and with which rules version,
 and the ledger ratio with its per-answer median, labelled rule-based, not a bound. With fewer than 30 episodes

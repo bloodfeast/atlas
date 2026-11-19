@@ -73,6 +73,8 @@ pub fn run(root: &Path, args: Vec<String>) -> R {
             }
             let version = cargo_version(&read_text(&root.join("Cargo.toml"))?).ok_or("no version in Cargo.toml")?;
             refuse_stale_readme(root, &version)?;
+            // The hidden-character gate CI runs on every pull request.
+            say(&crate::hidden::tracked_gate(root)?);
             let denylist = denylist_from_env()?;
             let accepted = accepted_file(env("ATLAS_LEAK_ACCEPTED"), &denylist)?;
             check_here(root, &format!("v{version}"), &denylist, accepted.as_deref(), force).map(|_| ())

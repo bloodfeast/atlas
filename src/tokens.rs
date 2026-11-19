@@ -71,7 +71,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::error::Result;
 
@@ -138,6 +138,49 @@ pub fn credit_sql(cap: Option<i64>) -> String {
         "(CASE WHEN grep IS NULL THEN 0 WHEN tool IN ({capped}) THEN min(grep + ifnull(read, 0), {cap}) WHEN tool = 'route:Read' THEN 0 WHEN tool LIKE 'hook:%' THEN 0 \
          WHEN tool LIKE 'route:%' THEN min(grep + ifnull(read, 0), {SHOWN_CHARS}) ELSE grep + ifnull(read, 0) END)"
     )
+}
+
+/// The `meta` key holding the first `token_log` id a build that trims the
+/// digest's trailing newline logged (#303, #297 R1): rows below it may hold
+/// the newline, rows from it on do not.
+pub const TRIMMED_FROM: &str = "token_log_trimmed_from";
+
+/// The store's [`TRIMMED_FROM`] marker, `None` when it has none (no `meta`
+/// table, or no row): then every row may be an older build's.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`] if `meta` exists but cannot be read.
+pub fn trimmed_from(conn: &Connection) -> Result<Option<i64>> {
+    let has: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')", [], |r| r.get(0))?;
+    if !has {
+        return Ok(None);
+    }
+    let v: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [TRIMMED_FROM], |r| r.get(0)).optional()?;
+    // Deliberate: a value that does not parse reads as no marker, so every
+    // row is treated as old (the behaviour before #303) rather than failing
+    // the report or guessing a boundary.
+    Ok(v.and_then(|v| v.parse().ok()))
+}
+
+/// Records [`TRIMMED_FROM`] as the next `token_log` id, once: a later call
+/// keeps the first mark. Reads first, so a store already marked takes no
+/// write lock; only an unmarked one enters [`crate::store::guarded`], where
+/// `INSERT OR IGNORE` settles a racing second start. `meta` is the store's
+/// durable table, made here if the ledger starts first.
+fn mark_trimmed_from(conn: &Connection) -> Result<()> {
+    if trimmed_from(conn)?.is_some() {
+        return Ok(());
+    }
+    crate::store::guarded(conn, || {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) SELECT ?1, CAST(ifnull(MAX(id), 0) + 1 AS TEXT) FROM token_log",
+            [TRIMMED_FROM],
+        )?;
+        Ok(())
+    })
 }
 
 /// The table the ledger writes. Durable: never dropped with the derived
@@ -389,8 +432,13 @@ impl Ledger {
     /// [`crate::Error::Db`] if the table cannot be made.
     pub fn start(db: &Path, roots: Vec<(String, PathBuf)>) -> Result<Ledger> {
         let conn = crate::store::open_raw(db)?;
-        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(TOKEN_TABLE)?;
+        // This build trims the digest (#297, R1): mark where its rows begin
+        // (#303). A failed write costs only the marker, never the ledger:
+        // without it every row reads as old, the behaviour before #303.
+        if let Err(e) = mark_trimmed_from(&conn) {
+            eprintln!("atlas: token ledger: trimmed-digest marker not written: {e}");
+        }
         let (tx, rx) = mpsc::channel::<Record>();
         let roots: HashMap<String, PathBuf> = roots.into_iter().collect();
         let code = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -422,7 +470,10 @@ impl Ledger {
                                 measure_lines_upto(label, t, &hit, max)
                             })
                         }),
-                        Probe::File { source, path } => roots.get(source).and_then(|root| std::fs::metadata(root.join(path)).ok()).map(|m| Counterfactual { grep: 0, read: m.len() as usize }),
+                        Probe::File { source, path } => roots
+                            .get(source)
+                            .and_then(|root| std::fs::metadata(root.join(path)).ok())
+                            .map(|m| Counterfactual { grep: 0, read: m.len() as usize }),
                         Probe::Exports(text) => match paths().and_then(|p| p.export_dir) {
                             Some(dir) => Some(measure_exports(&dir, text)),
                             None => Some(measure_all(&conn, &roots, None, None, &|label, t, max| {
@@ -646,7 +697,13 @@ pub fn log_brief(conn: &Connection, session: &str, agent: &str, bytes: u64) -> R
     let time = crate::store::utc(SystemTime::now());
     let day = time.get(..10).unwrap_or("").to_string();
     crate::store::guarded(conn, || {
-        conn.prepare_cached("INSERT INTO brief_log(time, day, session, agent, bytes) VALUES(?1, ?2, ?3, ?4, ?5)")?.execute(params![time, day, session, agent, bytes as i64])?;
+        conn.prepare_cached("INSERT INTO brief_log(time, day, session, agent, bytes) VALUES(?1, ?2, ?3, ?4, ?5)")?.execute(params![
+            time,
+            day,
+            session,
+            agent,
+            bytes as i64
+        ])?;
         Ok(())
     })
 }
@@ -793,7 +850,7 @@ pub fn brief_measured(conn: &Connection, reference: &Path, bytes_per_token: f64)
     let mut st = conn.prepare(
         "SELECT f.file FROM calibrate_files f WHERE EXISTS(SELECT 1 FROM calibrate_calls c WHERE c.file = f.file AND c.time < ?1)",
     )?;
-    let files: Vec<String> = st.query_map([&cutoff], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let files: Vec<String> = st.query_map([&cutoff], |r| r.get(0))?.collect::<crate::db::Result<_>>()?;
     let files: std::collections::BTreeSet<String> = files.into_iter().filter(|f| subagent(f)).collect();
     if files.is_empty() {
         return Ok(None);
@@ -917,14 +974,8 @@ fn log(conn: &Connection, r: &Record, cf: Option<Counterfactual>) -> Result<()> 
     let time = crate::store::utc(SystemTime::now());
     let day = time.get(..10).unwrap_or("").to_string();
     crate::store::guarded(conn, || {
-        conn.prepare_cached("INSERT INTO token_log(time, day, tool, returned, grep, read) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![
-            time,
-            day,
-            r.tool,
-            r.returned as i64,
-            cf.map(|c| c.grep as i64),
-            cf.map(|c| c.read as i64)
-        ])?;
+        conn.prepare_cached("INSERT INTO token_log(time, day, tool, returned, grep, read) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?
+            .execute(params![time, day, r.tool, r.returned as i64, cf.map(|c| c.grep as i64), cf.map(|c| c.read as i64)])?;
         Ok(())
     })
 }
@@ -1081,6 +1132,9 @@ pub struct ReadCredit {
     pub credit: i64,
     /// Credit bytes by (`route:Read`, day), for [`add_hook_credit`].
     pub by: std::collections::BTreeMap<(String, String), i64>,
+    /// Credit bytes by `token_log` id, for the credit side's re-read
+    /// ([`crate::token_cost::Credits::reads`], #294).
+    pub rows: std::collections::HashMap<i64, i64>,
 }
 
 /// How long a transcript must stay untouched before its rows' verdicts are
@@ -1089,15 +1143,74 @@ pub struct ReadCredit {
 /// old ones).
 pub const SETTLED: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
+/// A transcript as a stored verdict saw it: its last change (UTC) and its
+/// size. A later run judges the verdict again when the transcript now
+/// differs, as when a settled session is resumed and appended to (#357).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    /// The last change, `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+    pub mtime: String,
+    /// The size in bytes.
+    pub size: i64,
+}
+
+fn stat(transcript: &Path) -> Option<(SystemTime, Stamp)> {
+    let m = std::fs::metadata(transcript).ok()?;
+    let t = m.modified().ok()?;
+    Some((t, Stamp { mtime: crate::store::utc(t), size: m.len() as i64 }))
+}
+
+/// A transcript's [`Stamp`] now; `None` when it cannot be read (Claude Code
+/// deleted it: a stored verdict then stands, as nothing can judge it again).
+pub fn stamp(transcript: &Path) -> Option<Stamp> {
+    stat(transcript).map(|(_, s)| s)
+}
+
+/// A transcript's [`Stamp`] when it has been still for `settled` as of
+/// `now` (its verdicts may be stored, see [`SETTLED`]); `None` when it
+/// changed since, or cannot be read.
+pub fn settled_since(transcript: &Path, now: SystemTime, settled: std::time::Duration) -> Option<Stamp> {
+    let (t, s) = stat(transcript)?;
+    (now.duration_since(t).ok()? >= settled).then_some(s)
+}
+
+/// Whether a stored verdict may be used: judged by the current judge from
+/// the transcript as it is now, or its transcript is gone (#357).
+pub fn verdict_current(judge: Option<i64>, current: i64, stored: (Option<&str>, Option<i64>), now: Option<&Stamp>) -> bool {
+    now.is_none_or(|s| judge == Some(current) && stored.0 == Some(s.mtime.as_str()) && stored.1 == Some(s.size))
+}
+
+/// The `route:Read` judge's version (#357). Bump it whenever a change could
+/// change a stored re-read verdict (how [`transcript_reads`] parses a
+/// transcript, how a path is keyed, or how `judge` matches a later Read):
+/// a stored verdict of another version is judged again while its transcript
+/// exists. A bump does not reach the verdicts of deleted transcripts, which
+/// keep their old credit; to retract those, delete the rows (or rename the
+/// table).
+pub const READ_JUDGE: i64 = 1;
+
 /// The stored verdicts: each settled `route:Read` row's re-read bytes, by
-/// its `token_log` id.
-const VERDICT_TABLE: &str = "CREATE TABLE IF NOT EXISTS read_verdict(id INTEGER PRIMARY KEY, reread INTEGER NOT NULL)";
+/// its `token_log` id, with the judge's version and the transcript's
+/// [`Stamp`] (the [`VERDICT_COLUMNS`], added to an older table on its next
+/// store; its rows have none and are judged again once).
+const VERDICT_TABLE: &str = "CREATE TABLE IF NOT EXISTS read_verdict(id INTEGER PRIMARY KEY, reread INTEGER NOT NULL, judge INTEGER, mtime TEXT, size INTEGER)";
+
+/// The columns #357 added to `read_verdict`.
+const VERDICT_COLUMNS: [(&str, &str); 3] = [("judge", "INTEGER"), ("mtime", "TEXT"), ("size", "INTEGER")];
+
+/// Whether `read_verdict` has the [`VERDICT_COLUMNS`] (a read).
+fn verdict_stamped(conn: &Connection) -> Result<bool> {
+    let have: Vec<String> =
+        conn.prepare("SELECT name FROM pragma_table_info('read_verdict')")?.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    Ok(VERDICT_COLUMNS.iter().all(|(c, _)| have.iter().any(|h| h == c)))
+}
 
 /// The judged credit of the `route:Read` rows: each row with a session,
 /// transcript and path is credited the output it replaced less the bytes of
 /// the later Reads of the same file in the same transcript (E3's method);
 /// every other row 0. A row whose transcript has been still for
-/// [`SETTLED`] has its verdict stored and is never judged again.
+/// [`SETTLED`] has its verdict stored; it is judged again only when
+/// [`READ_JUDGE`] or the transcript's [`Stamp`] changes (#357).
 ///
 /// # Errors
 ///
@@ -1134,15 +1247,25 @@ pub fn read_credit_at(conn: &Connection, now: SystemTime, settled: std::time::Du
         return Ok(c);
     }
     conn.execute_batch(VERDICT_TABLE)?;
-    type Row = (i64, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>);
+    // A table from before #357 lacks the stamp: its rows read as unstamped.
+    let stamped = verdict_stamped(conn)?;
+    let cols = if stamped { "v.judge, v.mtime, v.size" } else { "NULL, NULL, NULL" };
+    type Stored = (i64, Option<i64>, Option<String>, Option<i64>);
+    type Row = (i64, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<Stored>);
     let rows: Vec<Row> = conn
-        .prepare(
-            "SELECT t.id, t.time, t.day, ifnull(t.read, 0), t.session, t.transcript, t.path, t.tool_use, v.reread \
-             FROM token_log t LEFT JOIN read_verdict v ON v.id = t.id WHERE t.tool = 'route:Read' ORDER BY t.id",
-        )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?
+        .prepare(&format!(
+            "SELECT t.id, t.time, t.day, ifnull(t.read, 0), t.session, t.transcript, t.path, t.tool_use, v.reread, {cols} \
+             FROM token_log t LEFT JOIN read_verdict v ON v.id = t.id WHERE t.tool = 'route:Read' ORDER BY t.id"
+        ))?
+        .query_map([], |r| {
+            let stored = r.get::<_, Option<i64>>(8)?.map(|reread| Ok::<_, crate::db::Error>((reread, r.get(9)?, r.get(10)?, r.get(11)?))).transpose()?;
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, stored))
+        })?
         .collect::<std::result::Result<_, _>>()?;
-    let credit = |c: &mut ReadCredit, day: String, replaced: i64, reread: i64| {
+    // Each transcript with stored rows as it is now, stat'ed once.
+    let mut stamps: HashMap<String, Option<Stamp>> = HashMap::new();
+    let credit = |c: &mut ReadCredit, id: i64, day: String, replaced: i64, reread: i64| {
+        c.rows.insert(id, replaced - reread);
         c.replaced += replaced;
         c.reread += reread;
         c.credit += replaced - reread;
@@ -1160,10 +1283,13 @@ pub fn read_credit_at(conn: &Connection, now: SystemTime, settled: std::time::Du
             continue;
         }
         c.judged += 1;
-        if let Some(reread) = stored {
-            c.stored += 1;
-            credit(&mut c, day, replaced, reread);
-            continue;
+        if let Some((reread, judge, mtime, size)) = stored {
+            let now = stamps.entry(transcript.clone()).or_insert_with(|| stamp(Path::new(&transcript)));
+            if verdict_current(judge, READ_JUDGE, (mtime.as_deref(), size), now.as_ref()) {
+                c.stored += 1;
+                credit(&mut c, id, day, replaced, reread);
+                continue;
+            }
         }
         open.entry(transcript).or_default().push(Pending {
             id,
@@ -1174,31 +1300,34 @@ pub fn read_credit_at(conn: &Connection, now: SystemTime, settled: std::time::Du
             tool_use: tool_use.unwrap_or_default(),
         });
     }
-    let mut verdicts: Vec<(i64, i64)> = Vec::new();
+    let mut verdicts: Vec<(i64, i64, Stamp)> = Vec::new();
     for (transcript, rows) in open {
         let p = Path::new(&transcript);
-        let still = std::fs::metadata(p)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|d| d >= settled);
+        let still = settled_since(p, now, settled);
         let Some(uses) = transcript_reads(p) else {
             c.missing += rows.len() as i64;
             continue;
         };
         c.parsed += 1;
         for (row, reread) in rows.iter().zip(judge(&rows, &uses)) {
-            credit(&mut c, row.day.clone(), row.replaced, reread);
-            if still {
-                verdicts.push((row.id, reread));
+            credit(&mut c, row.id, row.day.clone(), row.replaced, reread);
+            if let Some(s) = &still {
+                verdicts.push((row.id, reread, s.clone()));
             }
         }
     }
     if !verdicts.is_empty() {
         crate::store::guarded(conn, || {
-            let mut st = conn.prepare_cached("INSERT OR IGNORE INTO read_verdict(id, reread) VALUES(?1, ?2)")?;
-            for (id, reread) in &verdicts {
-                st.execute(params![id, reread])?;
+            // Asked again under the lock: another report may have added them.
+            if !verdict_stamped(conn)? {
+                for (col, ty) in VERDICT_COLUMNS {
+                    conn.execute_batch(&format!("ALTER TABLE read_verdict ADD COLUMN {col} {ty}"))?;
+                }
+            }
+            // REPLACE: a row judged again (stale or unstamped) is restamped.
+            let mut st = conn.prepare_cached("INSERT OR REPLACE INTO read_verdict(id, reread, judge, mtime, size) VALUES(?1, ?2, ?3, ?4, ?5)")?;
+            for (id, reread, s) in &verdicts {
+                st.execute(params![id, reread, READ_JUDGE, s.mtime, s.size])?;
             }
             Ok(())
         })?;
@@ -1363,7 +1492,7 @@ pub fn report_days_without(conn: &Connection, bytes_per_token: f64, without: &[&
         "SELECT day, COUNT(*), SUM(returned), SUM({credit}), SUM(CASE WHEN grep IS NULL THEN 0 ELSE returned END)
          FROM token_log {filter} GROUP BY day ORDER BY day"
     ))?;
-    let rows = st.query_map(rusqlite::params_from_iter(without), |r| {
+    let rows = st.query_map(crate::db::params_from_iter(without), |r| {
         Ok(ReportRow {
             key: r.get(0)?,
             answers: r.get(1)?,
@@ -1477,7 +1606,8 @@ pub fn inject_report(conn: &Connection, bytes_per_token: f64) -> Result<Option<I
 pub fn log_select(conn: &Connection, hook: &str, key: &str, how: &str, bytes: usize, full: usize) -> Result<()> {
     let time = crate::store::utc(SystemTime::now());
     crate::store::guarded(conn, || {
-        conn.prepare_cached("INSERT INTO inject_select(time, hook, key, how, bytes, full) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?.execute(params![time, hook, key, how, bytes as i64, full as i64])?;
+        conn.prepare_cached("INSERT INTO inject_select(time, hook, key, how, bytes, full) VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?
+            .execute(params![time, hook, key, how, bytes as i64, full as i64])?;
         Ok(())
     })
 }
@@ -1505,7 +1635,12 @@ pub fn select_report(conn: &Connection, bytes_per_token: f64) -> Result<Vec<Sele
     conn.execute_batch(TOKEN_TABLE)?;
     let mut st = conn.prepare("SELECT how, COUNT(*), SUM(bytes), SUM(full) FROM inject_select GROUP BY how ORDER BY how")?;
     let rows = st.query_map([], |r| {
-        Ok(SelectRow { how: r.get(0)?, n: r.get(1)?, sent: r.get::<_, i64>(2)? as f64 / bytes_per_token, full: r.get::<_, i64>(3)? as f64 / bytes_per_token })
+        Ok(SelectRow {
+            how: r.get(0)?,
+            n: r.get(1)?,
+            sent: r.get::<_, i64>(2)? as f64 / bytes_per_token,
+            full: r.get::<_, i64>(3)? as f64 / bytes_per_token,
+        })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
@@ -1541,16 +1676,23 @@ pub struct MissRow {
 /// [`crate::Error::Db`].
 pub fn weekly_misses(conn: &Connection, since: &str, bytes_per_token: f64) -> Result<(Vec<MissRow>, Vec<MissRow>)> {
     conn.execute_batch(TOKEN_TABLE)?;
-    let has_misses: bool = conn.query_row("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'misses'", [], |r| r.get(0))?;
-    let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<MissRow> {
-        Ok(MissRow { what: r.get(0)?, query: r.get(1)?, count: r.get(2)?, tokens: r.get::<_, i64>(3)? as f64 / bytes_per_token, last: r.get(4)? })
+    let has_misses: bool =
+        conn.query_row("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'misses'", [], |r| r.get(0))?;
+    let row = |r: &crate::db::Row<'_>| -> crate::db::Result<MissRow> {
+        Ok(MissRow {
+            what: r.get(0)?,
+            query: r.get(1)?,
+            count: r.get(2)?,
+            tokens: r.get::<_, i64>(3)? as f64 / bytes_per_token,
+            last: r.get(4)?,
+        })
     };
     let misses = if has_misses {
         let mut st = conn.prepare(
             "SELECT tool, query, COUNT(*), SUM(LENGTH(found)), MAX(time) FROM misses WHERE status = 'open' AND time >= ?1
              GROUP BY tool, query ORDER BY COUNT(*) DESC, MAX(time) DESC LIMIT 10",
         )?;
-        let rows = st.query_map([since], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([since], row)?.collect::<crate::db::Result<Vec<_>>>()?;
         rows
     } else {
         Vec::new()
@@ -1559,7 +1701,7 @@ pub fn weekly_misses(conn: &Connection, since: &str, bytes_per_token: f64) -> Re
         "SELECT hook, key, COUNT(*), SUM(bytes), MAX(time) FROM hook_inject WHERE time >= ?1
          GROUP BY hook, key ORDER BY SUM(bytes) DESC, key LIMIT 10",
     )?;
-    let keys = st.query_map([since], row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let keys = st.query_map([since], row)?.collect::<crate::db::Result<Vec<_>>>()?;
     Ok((misses, keys))
 }
 
@@ -2093,6 +2235,53 @@ let Over = overflow;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #357: a stored verdict is judged again when its transcript changes
+    /// (appended to after it settled, or only touched), when the judge's
+    /// version differs, and once when an older table stored it unstamped.
+    #[test]
+    fn a_stored_verdict_is_judged_again_when_its_transcript_or_judge_changes() {
+        let dir = scratch("restamp");
+        let a = "C:/u/p/a.txt";
+        let t = dir.join("t.jsonl");
+        std::fs::write(&t, [read_use("r1", "2026-11-16T10:00:00Z", a, false), read_result("r1", "2026-11-16T10:00:01Z", 500)].concat()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TOKEN_TABLE).unwrap();
+        // A read_verdict from before #357, holding a wrong unstamped verdict.
+        conn.execute_batch("CREATE TABLE read_verdict(id INTEGER PRIMARY KEY, reread INTEGER NOT NULL)").unwrap();
+        log_read(&conn, 500, 30_000, &ReadAt { session: "s", transcript: &t.to_string_lossy(), path: a, tool_use: "r1" }).unwrap();
+        conn.execute("INSERT INTO read_verdict(id, reread) VALUES((SELECT MAX(id) FROM token_log), 7)", []).unwrap();
+        let run = || read_credit_at(&conn, SystemTime::now() + std::time::Duration::from_secs(1), std::time::Duration::ZERO).unwrap();
+        let first = run();
+        assert_eq!((first.parsed, first.stored, first.credit), (1, 0, 30_000), "the unstamped row is judged again: {first:?}");
+        let second = run();
+        assert_eq!((second.parsed, second.stored, second.credit), (0, 1, 30_000), "{second:?}");
+
+        // Appended to after it settled: a re-read now subtracts. The mtime
+        // is put back, so only the size tells.
+        let m = std::fs::metadata(&t).unwrap().modified().unwrap();
+        let more = [read_use("x1", "2026-11-17T09:00:00Z", a, false), read_result("x1", "2026-11-17T09:00:01Z", 10_000)].concat();
+        std::io::Write::write_all(&mut std::fs::OpenOptions::new().append(true).open(&t).unwrap(), more.as_bytes()).unwrap();
+        std::fs::File::options().write(true).open(&t).unwrap().set_modified(m).unwrap();
+        let appended = run();
+        assert_eq!((appended.parsed, appended.stored, appended.credit), (1, 0, 20_000), "{appended:?}");
+        assert_eq!(run().stored, 1);
+
+        // Only touched: same size, a new mtime.
+        std::fs::File::options().write(true).open(&t).unwrap().set_modified(m - std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!((run().parsed, run().stored), (1, 1), "judged again once, then stored");
+
+        // Another judge version's verdict is not used while the transcript can be read.
+        conn.execute("UPDATE read_verdict SET judge = judge - 1", []).unwrap();
+        let older = run();
+        assert_eq!((older.parsed, older.stored, older.credit), (1, 0, 20_000), "{older:?}");
+        // Gone: the old version's verdict stands, nothing can judge it again.
+        conn.execute("UPDATE read_verdict SET judge = judge - 1", []).unwrap();
+        std::fs::remove_file(&t).unwrap();
+        let gone = run();
+        assert_eq!((gone.parsed, gone.stored, gone.credit), (0, 1, 20_000), "{gone:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn crlf_lines_print_without_the_cr() {
         let c = measure_file("f", b"a TK\r\nb\r\n", b"tk");
@@ -2255,5 +2444,102 @@ let Over = overflow;
         log_row(&conn, "recall", 100, None).unwrap();
         log_row(&conn, "read_note", 100, Some(Counterfactual { grep: 0, read: 8000 })).unwrap();
         assert_eq!(recall_records_credit(&conn, 4.0).unwrap(), (4000.0 + 10_000.0) / 4.0);
+    }
+
+    /// #303: a ledger started on a store with no marker records the next
+    /// `token_log` id as where trimmed digests begin (1 on a fresh store);
+    /// a later start never moves it.
+    #[test]
+    fn the_ledger_marks_where_trimmed_digests_begin_once() {
+        let dir = std::env::temp_dir().join(format!("atlas-trimmed-from-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = |db: &Path, n: i64| {
+            let c = Connection::open(db).unwrap();
+            for _ in 0..n {
+                c.execute(
+                    "INSERT INTO token_log(time, day, tool, returned) VALUES('2026-11-17T00:00:00Z', '2026-11-17', 'route:Bash', 300)",
+                    [],
+                )
+                .unwrap();
+            }
+        };
+        let marker = |db: &Path| trimmed_from(&Connection::open(db).unwrap()).unwrap();
+        // A fresh store.
+        let fresh = dir.join("fresh.sqlite");
+        drop(Ledger::start(&fresh, Vec::new()).unwrap());
+        assert_eq!(marker(&fresh), Some(1));
+        rows(&fresh, 3);
+        drop(Ledger::start(&fresh, Vec::new()).unwrap());
+        assert_eq!(marker(&fresh), Some(1), "a later start never moves it");
+        // A store an older build logged to: its rows stay below the marker.
+        let old = dir.join("old.sqlite");
+        Connection::open(&old).unwrap().execute_batch(TOKEN_TABLE).unwrap();
+        rows(&old, 4);
+        assert_eq!(marker(&old), None);
+        drop(Ledger::start(&old, Vec::new()).unwrap());
+        assert_eq!(marker(&old), Some(5));
+        rows(&old, 2);
+        drop(Ledger::start(&old, Vec::new()).unwrap());
+        assert_eq!(marker(&old), Some(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #310 S1: a start on a marked store takes no write lock, so another
+    /// connection holding `BEGIN IMMEDIATE` neither delays nor fails it.
+    #[test]
+    fn a_marked_store_starts_the_ledger_without_a_write_lock() {
+        let dir = std::env::temp_dir().join(format!("atlas-trimmed-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("marked.sqlite");
+        drop(Ledger::start(&db, Vec::new()).unwrap());
+        assert_eq!(trimmed_from(&Connection::open(&db).unwrap()).unwrap(), Some(1));
+        let holder = Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let t = std::time::Instant::now();
+        let l = Ledger::start(&db, Vec::new());
+        let took = t.elapsed();
+        assert!(l.is_ok(), "the ledger starts while another connection writes");
+        assert!(took < std::time::Duration::from_secs(5), "no wait on the write lock: {took:?}");
+        drop(l);
+        holder.execute_batch("ROLLBACK;").unwrap();
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #310 S1: a marker write that fails is logged and the ledger still
+    /// starts; the store then has no marker (every row reads as old).
+    #[test]
+    fn a_failed_marker_write_still_starts_the_ledger() {
+        let dir = std::env::temp_dir().join(format!("atlas-trimmed-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("refusing.sqlite");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TRIGGER meta_refuses BEFORE INSERT ON meta BEGIN SELECT RAISE(ABORT, 'meta refuses'); END;",
+            )
+            .unwrap();
+        let l = Ledger::start(&db, Vec::new());
+        assert!(l.is_ok(), "a failed marker write does not turn the ledger off: {:?}", l.as_ref().err());
+        drop(l);
+        assert_eq!(trimmed_from(&Connection::open(&db).unwrap()).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #310 N2: `meta` with no marker row (the store made it, the ledger has
+    /// not started yet) reads as no marker.
+    #[test]
+    fn meta_without_the_marker_row_reads_as_no_marker() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('durable', '3');",
+        )
+        .unwrap();
+        assert_eq!(trimmed_from(&conn).unwrap(), None);
     }
 }

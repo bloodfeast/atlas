@@ -109,7 +109,7 @@ fn recorded(dir: &Path) -> Vec<Vec<String>> {
 /// Indexes the root and opens a server over it.
 fn indexed(code: &CodeSetup, db: &Path) -> (IndexReport, Server) {
     drop(atlas::store::Store::open(db, vaults(db)).unwrap());
-    let mut conn = rusqlite::Connection::open(db).unwrap();
+    let mut conn = atlas::db::Connection::open(db).unwrap();
     let rep = code_index::index_root(code, &mut conn, &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
     let store = atlas::store::Store::open(db, vaults(db)).unwrap();
     let mut s = Server::new(store);
@@ -131,7 +131,7 @@ fn answer(s: &mut Server, name: &str) -> (Vec<String>, Vec<String>) {
 }
 
 fn labels(db: &Path, file: &Path) -> Vec<String> {
-    let conn = rusqlite::Connection::open(db).unwrap();
+    let conn = atlas::db::Connection::open(db).unwrap();
     code::file_items(&conn, &file.to_string_lossy()).unwrap().expect("covered").iter().map(|i| i.label()).collect()
 }
 
@@ -189,7 +189,7 @@ fn the_scanner_alone_gives_definitions_and_ranges() {
     for want in ["class geometry::Shape 15-34", "fn Shape::Shape 21-24", "field Shape::tagged 24-24", "fn Circle::area 59-64", "fn geometry::area_of 70-75"] {
         assert!(l.contains(&want.to_string()), "{want}: {l:?}");
     }
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let r = atlas::recall::code_check(&conn, &code.roots).unwrap();
     assert_eq!(
         r.langs,
@@ -215,7 +215,7 @@ fn a_prebuilt_index_is_read_and_a_newer_file_falls_back_to_the_scanner() {
     // Ends from the indentation blocks; callers from them.
     let l = labels(&db, &root.join("shapes/geometry.py"));
     assert!(l.contains(&"fn geometry::area_of 70-75".to_string()), "{l:?}");
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let r = atlas::recall::code_check(&conn, &code.roots).unwrap();
     assert_eq!((r.langs[0].truth, r.langs[0].indexed, r.langs[0].missing), (16, 16, 0), "SCIP rows hold every definition grep finds");
     drop(conn);
@@ -315,7 +315,7 @@ fn an_edited_python_file_is_rescanned_at_once() {
     let p = root.join("shapes/geometry.py");
     let text = format!("# A header line.\n{}", fs::read_to_string(&p).unwrap());
     fs::write(&p, text).unwrap();
-    let mut conn = rusqlite::Connection::open(&db).unwrap();
+    let mut conn = atlas::db::Connection::open(&db).unwrap();
     assert!(matches!(code::reindex_file(&mut conn, &p.to_string_lossy()).unwrap(), Reindexed::Rows(_)));
     let (defs, _) = answer(&mut s, "largest");
     assert_eq!(defs, ["shapes/geometry.py:79 fn (scan) geometry"]);

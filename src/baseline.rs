@@ -15,7 +15,7 @@
 
 use std::time::SystemTime;
 
-use rusqlite::{params, Connection};
+use crate::db::{params, Connection};
 
 use crate::error::Result;
 

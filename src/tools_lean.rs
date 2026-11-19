@@ -90,7 +90,9 @@ impl Server {
             };
         };
         if let Some(k) = ["query", "lane", "history", "kind", "scope", "budget_tokens"].iter().find(|k| a.contains_key(k)) {
-            return Err(Error::InvalidArgument(format!("{k} does not apply to key h:ID (a stored output)")));
+            return Err(Error::InvalidArgument(format!(
+                "{k} does not apply to key h:ID (a stored output); a selector goes in key, as \"h:ID grep=RE\", or as the lines, grep, item ... arguments"
+            )));
         }
         let (id, mut pairs) = handles::split_key(key).map_err(Error::InvalidArgument)?;
         for k in SLICE_ARGS {
@@ -187,7 +189,7 @@ impl Server {
                 let sid: Option<i64> = conn
                     .query_row(
                         "SELECT s.id FROM sections s JOIN docs dd ON dd.id = s.doc_id WHERE dd.source = ?1 AND dd.path = ?2 AND s.line_start <= ?3 AND s.line_end >= ?3 ORDER BY s.line_start DESC LIMIT 1",
-                        rusqlite::params![d.source, d.path, d.line],
+                        crate::db::params![d.source, d.path, d.line],
                         |r| r.get(0),
                     )
                     .ok();
@@ -203,7 +205,7 @@ impl Server {
                    AND (?2 IS NULL OR d.source = ?2) AND (?3 IS NULL OR d.path = ?3)
                  ORDER BY d.source, d.path, s.line_start LIMIT 50",
             )?;
-            let rows = st.query_map(rusqlite::params![h, source, path, h.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")], |r| r.get::<_, i64>(0))?;
+            let rows = st.query_map(crate::db::params![h, source, path, h.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")], |r| r.get::<_, i64>(0))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
         let mut ids = ids;

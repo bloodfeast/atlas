@@ -75,8 +75,21 @@ Keep it lean. A brief is a work order, not a copy of the rulebook.
 4. **Scope:** the files or modules it owns, what it must not touch, and what it is safe to do without asking.
 5. **Verification:** the exact command that proves the work, and the numbers it must match.
 6. **Journal and limits:** "Journal to lane `<id>`. From your handoff point, wrap up at the next clean stopping
-   point and write your handoff; you must hand off by your hard limit."
-7. **The report:** hand back the digest form. Lead with the outcome (PR, branch, merge, verdict) in the
+   point and write your handoff; you must hand off by your hard limit. Journal `pr:N head:SHA` when you open
+   a PR and again on each push that moves its head. Before ending a turn to wait on a background job of
+   your own, journal a `note` whose first line is `waiting: <job> (<your worktree or branch>)`."
+7. **Work lean:** the habits that keep an agent's context for the work. Every turn re-reads the whole
+   context, so what an agent reads once it pays for again on each later turn:
+   - find before you read: atlas `symbol`, `lookup`, `grep` and `section` first, then read about 150 lines
+     around the hit; a whole file only when it is small; never re-read what you just edited or already read;
+   - small edits: the smallest unique anchor; new tests in their own small file or appended at the end;
+     large files written in parts;
+   - logs go to a file: read its tail and a grep for failures; cite the path, never paste the log;
+   - downscale or crop an image before reading it;
+   - read a brief or a review once in full, then only the item in hand;
+   - prefix every file in a shared scratch folder with the lane or PR;
+   - stop new work before the handoff point and finish the item in hand.
+8. **The report:** hand back the digest form. Lead with the outcome (PR, branch, merge, verdict) in the
    first lines, then the numbers, every open question under a `## Questions` heading, and every risk (a denied
    action, an unverified claim, a failure left open). File anything longer (the full notes, tables, logs) as a
    journal entry and cite its key. The report stays in the orchestrator's context for every later turn, so a
@@ -97,6 +110,12 @@ When such an agent finishes, atlas tells you to start a fresh agent from its han
 `fresh` setting, it tells you to start it or to ask the user first. The fresh agent's brief names the lane and
 says to start from `recall lane=<id>`.
 
+**A parked agent is left alone.** A completion that lacks the brief's report items, or whose note says it
+waits on its own background work (its own newest entry is `waiting: <job> (<worktree or branch>)`), is
+parked, not finished: do not read its transcript or message it; wait for the next notification on the same
+task id. An entry is the agent's own when it names the agent's worktree or branch; on a lane no other agent
+shares, any entry since its launch is.
+
 The main session follows the same rule. Near your own limit, journal and hand off, and offer the user a
 compaction point.
 
@@ -107,8 +126,11 @@ compaction point.
 - **Review independently when it matters.** Give the reviewer the code and the claim, not your conclusion.
   Name reviewers by job (simplicity, cost), never by person.
 - **File each review** as a `journal` entry `review` with meta `role:`, `pr:`, `head:` (the sha it read),
-  `verdict:` and `report:`. With `orchestrate.reviews` set, `gh pr merge` waits for every role's review of the
-  PR's current head.
+  `verdict:` and `report:`. The verdict is one of `pass`, `merge`, `merge with follow-ups` or
+  `request changes` (any case, `-` or `_` for spaces); GitHub's `approve`/`approved` is filed as `pass`, and
+  `request_changes`/`changes_requested`/`changes` as `request changes`. `pr:` and `head:` take comma lists:
+  the review then counts for each listed PR at each listed head. With `orchestrate.reviews` set,
+  `gh pr merge` waits for every role's review of the PR's current head.
 - **Merge only what passed.** Then record the merge commit in the lane journal.
 
 ## Finish cleanly

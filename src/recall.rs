@@ -520,7 +520,7 @@ fn wgsl_attrs_then<R>(s: &str, x: usize, k: impl Fn(usize) -> Option<R>) -> Opti
 ///
 /// [`crate::error::Error::Io`] when a root cannot be walked,
 /// [`crate::error::Error::Db`] from SQLite.
-pub fn code_check(conn: &rusqlite::Connection, roots: &[crate::code::CodeRoot]) -> Result<CodeRecall> {
+pub fn code_check(conn: &crate::db::Connection, roots: &[crate::code::CodeRoot]) -> Result<CodeRecall> {
     use std::collections::HashMap;
     let mut rep = CodeRecall::default();
     let built = crate::code::root_records(conn)?;
@@ -642,7 +642,7 @@ pub fn code_check(conn: &rusqlite::Connection, roots: &[crate::code::CodeRoot]) 
 /// # Errors
 ///
 /// [`crate::error::Error::Db`] from SQLite.
-pub fn ctor_rows(conn: &rusqlite::Connection, root: &str) -> Result<std::collections::HashMap<(String, u32), bool>> {
+pub fn ctor_rows(conn: &crate::db::Connection, root: &str) -> Result<std::collections::HashMap<(String, u32), bool>> {
     let mut out: std::collections::HashMap<(String, u32), bool> = std::collections::HashMap::new();
     let mut st = conn.prepare(
         "SELECT f.path, o.line, o.kind FROM code_occ o JOIN code_files f ON f.id = o.file WHERE f.root = ?1 AND o.sect = 0 AND o.kind LIKE 'ctor%'",

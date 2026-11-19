@@ -1,0 +1,12 @@
+{
+  "name": "<project>",
+  "repos": [
+    {
+      "name": "<repo>",
+      "path": "<repo folder, relative to the workspace>",
+      "remote": "https://github.com/<owner>/<repo>.git",
+      "role": "<one line: what this repo is>",
+      "talks_to": []
+    }
+  ]
+}

@@ -412,7 +412,7 @@ pub fn write(store: &MemoryStore, spec: &ExportSpec, dir: &Path, adopt: bool) ->
     // The files and their rows are written under the store's write lock.
     // Inside a caller's transaction (tools_memory's `after_write`) the check
     // runs in that one, which holds the lock already.
-    let own = if store.conn().is_autocommit() { Some(rusqlite::Transaction::new_unchecked(store.conn(), rusqlite::TransactionBehavior::Immediate)?) } else { None };
+    let own = if store.conn().is_autocommit() { Some(crate::db::Transaction::new_unchecked(store.conn(), crate::db::TransactionBehavior::Immediate)?) } else { None };
     super::check_locked(store.conn(), store.path())?;
     let r = write_files(store, spec, dir, adopt);
     // The rows of the files already written are kept on an error, as each
@@ -430,7 +430,7 @@ fn write_files(store: &MemoryStore, spec: &ExportSpec, dir: &Path, adopt: bool) 
     for (rel, text) in render(store, spec)? {
         let full = dir.join(&rel);
         let rel_s = rel.to_string_lossy().replace('\\', "/");
-        let last: Option<String> = rusqlite::OptionalExtension::optional(
+        let last: Option<String> = crate::db::OptionalExtension::optional(
             store.conn().prepare_cached("SELECT sha FROM export_files WHERE export = ?1 AND path = ?2")?.query_row([&spec.name, &rel_s], |r| r.get(0)),
         )?;
         let disk = std::fs::read(&full).ok();

@@ -229,7 +229,7 @@ pub struct OrchestrateSpec {
     /// none: every linked worktree of the project's repositories).
     pub worktree_roots: Vec<std::path::PathBuf>,
     /// runq's state root, for the restart point's holders (`orchestrate.runq_root`;
-    /// `RUNQ_ROOT` comes first, runq's Windows default last: see
+    /// optional; `RUNQ_ROOT` comes first, and with neither none is read: see
     /// [`crate::restart::runq_root`]).
     pub runq_root: Option<std::path::PathBuf>,
 }
@@ -673,11 +673,57 @@ pub fn record_finish(store: &crate::memory::MemoryStore, id: &str, at: SystemTim
         conn.execute_batch(RELEASE_TABLE)?;
         conn.execute(
             "INSERT INTO agent_releases(agent, time) VALUES(?1, ?2) ON CONFLICT(agent) DO UPDATE SET time = max(time, excluded.time)",
-            rusqlite::params![id, nanos],
+            crate::db::params![id, nanos],
         )?;
         conn.execute("DELETE FROM agent_releases WHERE time < ?1", [keep])?;
         Ok(())
     })
+}
+
+/// The store table of each session's last start (SessionStart startup,
+/// resume or clear): when the Claude Code process that runs it began.
+pub const SESSION_START_TABLE: &str = "CREATE TABLE IF NOT EXISTS session_starts(session TEXT PRIMARY KEY, time INTEGER NOT NULL);";
+
+/// Writes session `session`'s start in `store`, timed `at` ([`SESSION_START_TABLE`];
+/// the later start wins). A server that restarts mid-session reads it
+/// ([`session_start`]) to count the agents its Claude Code process still
+/// runs, which wrote before the server started (#306). Rows older than
+/// [`RELEASE_KEEP`] before `at` are pruned.
+///
+/// # Errors
+///
+/// [`crate::Error::StoreTooNew`] (nothing written) or [`crate::Error::Db`].
+pub fn record_session_start(store: &crate::memory::MemoryStore, session: &str, at: SystemTime) -> crate::Result<()> {
+    let conn = store.conn();
+    let nanos = release_nanos(at);
+    let keep = release_nanos(at.checked_sub(RELEASE_KEEP).unwrap_or(UNIX_EPOCH));
+    crate::memory::guarded(conn, store.path(), || {
+        conn.execute_batch(SESSION_START_TABLE)?;
+        conn.execute(
+            "INSERT INTO session_starts(session, time) VALUES(?1, ?2) ON CONFLICT(session) DO UPDATE SET time = max(time, excluded.time)",
+            crate::db::params![session, nanos],
+        )?;
+        conn.execute("DELETE FROM session_starts WHERE time < ?1", [keep])?;
+        Ok(())
+    })
+}
+
+/// Session `session`'s last start in `store` ([`record_session_start`]),
+/// if one was recorded.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn session_start(store: &crate::memory::MemoryStore, session: &str) -> crate::Result<Option<SystemTime>> {
+    let conn = store.conn();
+    let exists: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_starts')", [], |r| r.get(0))?;
+    if !exists {
+        return Ok(None);
+    }
+    let mut st = conn.prepare_cached("SELECT time FROM session_starts WHERE session = ?1")?;
+    let n: Option<i64> = st.query_map([session], |r| r.get(0))?.next().transpose()?;
+    Ok(n.map(|n| UNIX_EPOCH + Duration::from_nanos(u64::try_from(n).unwrap_or(0))))
 }
 
 /// Removes agent `id`'s release record from `store`, if any: the agent
@@ -700,7 +746,7 @@ pub fn clear_finish(store: &crate::memory::MemoryStore, id: &str) -> crate::Resu
 }
 
 /// Whether the store has [`RELEASE_TABLE`]: a read, never DDL.
-fn has_release_table(conn: &rusqlite::Connection) -> crate::Result<bool> {
+fn has_release_table(conn: &crate::db::Connection) -> crate::Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_releases')", [], |r| r.get(0))?)
 }
 
@@ -715,7 +761,7 @@ pub fn released(store: &crate::memory::MemoryStore) -> crate::Result<HashMap<Str
         return Ok(HashMap::new());
     }
     let mut st = conn.prepare_cached("SELECT agent, time FROM agent_releases")?;
-    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<crate::db::Result<Vec<_>>>()?;
     Ok(rows.into_iter().map(|(a, n)| (a, UNIX_EPOCH + Duration::from_nanos(u64::try_from(n).unwrap_or(0)))).collect())
 }
 
@@ -875,6 +921,11 @@ pub struct Agents {
     /// When this process started, for a resident server; `None` for a
     /// command hook (a process per event).
     started: Option<SystemTime>,
+    /// When the Claude Code process of each agents folder's session started,
+    /// where known ([`session_start`]): an agent there counts from then, not
+    /// from [`Agents::started`], so a server restarted mid-session still
+    /// counts the agents that wrote before it (#306).
+    opened: HashMap<PathBuf, SystemTime>,
     /// Launches admitted whose agent has not started yet, oldest first.
     pending: Vec<Pending>,
     /// The next pending record's number.
@@ -957,6 +1008,7 @@ impl Agents {
     pub fn new(started: Option<SystemTime>) -> Agents {
         Agents {
             started,
+            opened: HashMap::new(),
             pending: Vec::new(),
             seq: 0,
             last: None,
@@ -1120,6 +1172,17 @@ impl Agents {
         self.started = started;
     }
 
+    /// Sets when the session whose agents folder is `dir` started
+    /// ([`session_start`]): its agents count from then.
+    pub fn set_opened(&mut self, dir: &Path, at: SystemTime) {
+        self.opened.insert(dir.to_path_buf(), at);
+    }
+
+    /// The session start set for the agents folder `dir` ([`Agents::set_opened`]).
+    pub fn opened(&self, dir: &Path) -> Option<SystemTime> {
+        self.opened.get(dir).copied()
+    }
+
     /// Records a real finish of an agent, seen now.
     pub fn finished(&mut self, id: &str, at: SystemTime) {
         self.finished.insert(id.to_string(), at);
@@ -1220,6 +1283,8 @@ impl Agents {
         };
         // Records whose agent wrote after them: the agent counts again.
         let mut written_since: Vec<String> = Vec::new();
+        // An agent last written before this floor ran in an earlier process.
+        let floor = self.opened.get(dir).copied().or(self.started);
         for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_prefix("agent-").and_then(|n| n.strip_suffix(".meta.json")) else { continue };
@@ -1244,7 +1309,7 @@ impl Agents {
             if released.get(id).is_some_and(|r| *r < last) {
                 written_since.push(id.to_string());
             }
-            if self.started.is_some_and(|st| last < st) {
+            if floor.is_some_and(|st| last < st) {
                 continue;
             }
             let idle = now.duration_since(last).unwrap_or_default();

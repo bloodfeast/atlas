@@ -4,3 +4,6 @@
 .github/workflows/dev-pr.yml export-ignore
 # SCIP indexes are binary protobuf.
 *.scip binary
+# The vendored SQLite amalgamation is stored and checked out byte for byte
+# (tests/sqlite_pin.rs pins its SHA-256).
+vendor/sqlite/** -text

@@ -137,7 +137,7 @@ fn items(v: &str) -> impl Iterator<Item = String> + '_ {
 /// [`VERDICTS`] when it is filed.
 fn passes(verdict: &str) -> bool {
     let v = verdict.to_ascii_lowercase();
-    !(v.contains("request") && v.contains("change"))
+    !(v.contains("request") && v.contains("change")) && verdict_words(&v) != "changes"
 }
 
 /// The verdicts a `review` entry may give, as [`verdict_words`] reads them.
@@ -157,7 +157,51 @@ fn verdict_words(part: &str) -> String {
 /// the filing check for `review` entries, so an unknown word such as
 /// `reject` or `do not merge` is refused rather than read as a pass.
 pub fn verdicts_known(meta: &str) -> bool {
-    meta_value(meta, "verdict").is_some_and(|v| items(v).all(|part| VERDICTS.contains(&verdict_words(&part).as_str())))
+    meta_value(meta, "verdict").is_some_and(|v| items(v).all(|part| canonical_part(&part).is_some()))
+}
+
+/// GitHub's review words (`gh pr review --approve`, a review's
+/// `APPROVED` and `CHANGES_REQUESTED` states), as [`verdict_words`] reads
+/// them, and the verdict each is filed as (#325).
+const ALIASES: &[(&str, &str)] = &[("approve", "pass"), ("approved", "pass"), ("changes requested", "request changes"), ("changes", "request changes")];
+
+/// A verdict part's canonical word (one of [`VERDICTS`]) with its `(role)`
+/// kept; `None` for an unknown word.
+fn canonical_part(part: &str) -> Option<String> {
+    let words = verdict_words(part);
+    let canon = ALIASES.iter().find(|(a, _)| *a == words).map_or(words.as_str(), |(_, c)| c);
+    let canon = SHOWN[VERDICTS.iter().position(|v| *v == canon)?];
+    let p = part.trim_end();
+    Some(match (p.rfind('('), p.ends_with(')')) {
+        (Some(i), true) => format!("{canon} {}", p[i..].to_ascii_lowercase()),
+        _ => canon.to_string(),
+    })
+}
+
+/// [`VERDICTS`] as a review is filed with them.
+const SHOWN: [&str; 4] = ["pass", "merge", "merge with follow-ups", "request changes"];
+
+/// `meta` with each known part of its `verdict:` line in its canonical
+/// spelling ([`SHOWN`]; `approved` filed as `pass`, `changes_requested` as
+/// `request changes`); unknown words and every other line are kept.
+pub fn canonical_meta(meta: &str) -> String {
+    let mut done = false;
+    let lines: Vec<String> = meta
+        .lines()
+        .map(|l| match l.strip_prefix("verdict").and_then(|r| r.strip_prefix(':')) {
+            Some(v) if !done => {
+                done = true;
+                let parts: Vec<String> = v.split(',').map(str::trim).filter(|x| !x.is_empty()).map(|x| canonical_part(x).unwrap_or_else(|| x.to_string())).collect();
+                format!("verdict: {}", parts.join(", "))
+            }
+            _ => l.to_string(),
+        })
+        .collect();
+    let mut out = lines.join("\n");
+    if meta.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 impl Review {
@@ -373,6 +417,32 @@ pub type HeadResult = std::result::Result<(Pr, String), String>;
 /// How long the gate waits for `gh pr view`.
 const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Waits for `call` (a gh run, on its own thread) at most [`GH_TIMEOUT`],
+/// cut to the hook budget left on this thread
+/// ([`crate::hook_budget::cut`]), so a slow gh still gives the gate's own
+/// answer inside the budget (review B1 of #329). Past the wait, `cancel`
+/// runs (it ends the process) and the answer is an error naming `what`.
+///
+/// # Errors
+///
+/// `call`'s, or that `what` did not answer in time.
+pub fn gh_wait<T: Send + 'static>(what: &str, call: impl FnOnce() -> std::result::Result<T, String> + Send + 'static, cancel: impl FnOnce()) -> std::result::Result<T, String> {
+    let wait = crate::hook_budget::cut(GH_TIMEOUT);
+    // The waiter owns the call; the deadline is a channel receive, so a
+    // hung gh costs the wait rather than the harness's hook timeout.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(call());
+    });
+    match rx.recv_timeout(wait) {
+        Ok(r) => r,
+        Err(_) => {
+            cancel();
+            Err(format!("{what}: no answer in {} ms", wait.as_millis()))
+        }
+    }
+}
+
 /// The PR's number, repo and head sha from `gh pr view --json
 /// number,headRefOid,url`, run in `cwd`.
 ///
@@ -396,19 +466,7 @@ pub fn gh_head(m: &Merge, cwd: &str) -> HeadResult {
     crate::code_index::no_window(&mut c);
     let child = c.spawn().map_err(|e| format!("gh: {e}"))?;
     let pid = child.id();
-    // The waiter owns the child; the deadline is a channel receive, so a
-    // hung gh costs GH_TIMEOUT rather than the harness's hook timeout.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let out = match rx.recv_timeout(GH_TIMEOUT) {
-        Ok(r) => r.map_err(|e| format!("gh: {e}"))?,
-        Err(_) => {
-            crate::platform::process::terminate(pid);
-            return Err(format!("gh pr view: no answer in {} s", GH_TIMEOUT.as_secs()));
-        }
-    };
+    let out = gh_wait("gh pr view", move || child.wait_with_output().map_err(|e| format!("gh: {e}")), move || crate::platform::process::terminate(pid))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("gh pr view: {}", err.lines().next().unwrap_or("failed").trim()));
@@ -631,5 +689,34 @@ mod tests {
         // Changes requested on this head block even beside a pass of it.
         let no = r("role: simplicity\npr: 99\nhead: 6e828cc\nverdict: REQUEST CHANGES");
         assert_eq!(missing(&roles, &[simp, no, cost], &pr(99), head), ["simplicity review requested changes at head 6e828cc (a review of a newer head must pass)"]);
+    }
+
+    /// #325: GitHub's review words are taken, any case, and filed as the
+    /// canonical verdict; an unknown word is still refused.
+    #[test]
+    fn github_review_words_file_as_the_canonical_verdict() {
+        let m = |v: &str| format!("role: cost\npr: 9\nhead: b4baa64\nverdict: {v}\nreport: r.md");
+        for (word, canon) in [
+            ("approve", "pass"),
+            ("APPROVED", "pass"),
+            ("Approve (cost)", "pass (cost)"),
+            ("request_changes", "request changes"),
+            ("REQUEST_CHANGES", "request changes"),
+            ("changes_requested", "request changes"),
+            ("Changes Requested", "request changes"),
+            ("changes", "request changes"),
+            ("CHANGES (cost)", "request changes (cost)"),
+        ] {
+            assert!(verdicts_known(&m(word)), "{word}");
+            assert_eq!(canonical_meta(&m(word)), m(canon), "{word}");
+            let r = Review::parse(&m(word)).unwrap();
+            assert_eq!(r.verdict("cost"), Some(canon == "pass" || canon == "pass (cost)"), "{word}");
+        }
+        // The other canonical words take their filed spelling; other lines are untouched.
+        assert_eq!(canonical_meta(&m("Merge_With_Follow_Ups")), m("merge with follow-ups"));
+        assert_eq!(canonical_meta(&m("PASS (cost), reject")), m("pass (cost), reject"));
+        for bad in ["reject", "approves", "change", "lgtm"] {
+            assert!(!verdicts_known(&m(bad)), "{bad}");
+        }
     }
 }

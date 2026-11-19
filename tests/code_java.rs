@@ -87,7 +87,7 @@ fn recorded(dir: &Path) -> Vec<Vec<String>> {
 /// Indexes the root and opens a server over it.
 fn indexed(code: &CodeSetup, db: &Path) -> (IndexReport, Server) {
     drop(atlas::store::Store::open(db, vaults(db)).unwrap());
-    let mut conn = rusqlite::Connection::open(db).unwrap();
+    let mut conn = atlas::db::Connection::open(db).unwrap();
     let rep = code_index::index_root(code, &mut conn, &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
     let store = atlas::store::Store::open(db, vaults(db)).unwrap();
     let mut s = Server::new(store);
@@ -176,7 +176,7 @@ fn the_scanner_alone_holds_the_recall_truth() {
     assert_eq!(rep.units, [Unit { dir: String::new(), lang: "java".into(), source: "scan only: test".into() }]);
     assert_eq!(defs(&mut s, "Square"), ["src/main/java/shapes/Square.java:6 class (scan) shapes", "src/main/java/shapes/Square.java:19 ctor (scan) Square"]);
     assert_eq!(defs(&mut s, "double"), ["src/main/kotlin/shapes/Extra.kt:5 fn (scan) shapes"]);
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let r = atlas::recall::code_check(&conn, &code.roots).unwrap();
     let got: Vec<(String, usize, usize, usize)> = r.langs.iter().map(|l| (l.lang.clone(), l.truth, l.scan_only, l.missing)).collect();
     assert_eq!(got, [("java".to_string(), 14, 14, 0), ("kotlin".to_string(), 2, 2, 0)]);

@@ -62,8 +62,9 @@ only bumps it. The table is a ledger: triggers refuse a delete and any change bu
 stamps, each set once from NULL and never cleared. `removed_at` means the folder is gone (NULL while it
 exists); `ended_at` means another lane took the worktree over while it still exists. A row is open while
 both stamps are NULL, and that one predicate is used by the partial unique index (one open row per path),
-the handover, `atlas worktrees list` and the removal code that will read the ledger. Nothing in atlas
-removes a worktree from it. Opening a store at version 2 copies it to `memory.sqlite.v2.bak` with
+the handover, `atlas worktrees list` and worktree gc (`src/worktree_gc.rs`), which removes only open-row
+worktrees that are stale and hold no work, with `git worktree remove` and never `--force`, and stamps their rows
+removed; rows themselves are never deleted. Opening a store at version 2 copies it to `memory.sqlite.v2.bak` with
 `VACUUM INTO` under the write lock, then adds the table in the same transaction as the version bump, so a
 crash leaves the v2 store; an atlas built for version 2 refuses a store at 3.
 

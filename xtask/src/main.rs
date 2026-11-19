@@ -15,7 +15,7 @@
 //! cargo xtask skill [--check]
 //! cargo xtask verify-macos
 //! cargo xtask test-gate [-- NEXTEST_ARGS...]
-//! cargo xtask linux-test [--debug] [--no-clippy] [--image IMAGE] [-- TEST_ARGS...]
+//! cargo xtask linux-test [--debug] [--no-clippy] [--no-cache] [--cpus N] [--image IMAGE] [--no-default-features] [--features LIST] [-- TEST_ARGS...]
 //! cargo xtask linux-test --clean [--all]
 //! cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
 //! cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--starts DIR] [--rows] [--show QID ...]
@@ -94,6 +94,7 @@ mod digest_eval;
 mod hook_bench;
 mod langs_bench;
 mod leak;
+mod hidden;
 mod linux_test;
 mod memory_eval;
 mod rules_eval;
@@ -137,7 +138,8 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
        cargo xtask skill [--check]
        cargo xtask verify-macos
        cargo xtask test-gate [-- NEXTEST_ARGS...]
-       cargo xtask linux-test [--debug] [--no-clippy] [--image IMAGE] [-- TEST_ARGS...]
+       cargo xtask hidden
+       cargo xtask linux-test [--debug] [--no-clippy] [--no-cache] [--cpus N] [--image IMAGE] [--no-default-features] [--features LIST] [-- TEST_ARGS...]
        cargo xtask linux-test --clean [--all]
        cargo xtask coverage [--debug] [--html] [--no-run] [-- TEST_ARGS...]
        cargo xtask memory-eval --config CONFIG --questions FILE [--project NAME] [--cwd DIR] [--fresh-from DIR] [--floor F ...] [--offtopic FILE] [--starts DIR] [--rows] [--show QID ...]
@@ -206,6 +208,7 @@ fn main() -> ExitCode {
         "hook-bench" => hook_bench::run(args),
         "test-gate" => test_gate::run(args),
         "linux-test" => linux_test::run(args),
+        "hidden" => hidden::run(args),
         "verify-macos" => match verify_macos::run() {
             Ok(0) => Ok(()),
             Ok(code) => return ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -387,7 +390,7 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
     let t = calibrate::Targets::new(&vaults, &sources, &handoff)?;
     let bpt = c.bytes_per_token.unwrap_or(atlas::tokens::DEFAULT_BYTES_PER_TOKEN);
     if token_use {
-        let conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+        let conn = atlas::db::Connection::open(&db).map_err(|e| e.to_string())?;
         let base = atlas::baseline::latest(&conn).map_err(|e| e.to_string())?.map(|(_, b)| b.median);
         match replay {
             Some(rc) => {
@@ -412,7 +415,7 @@ fn calibrate_baseline(args: Vec<String>, token_use: bool) -> Result<(), String> 
         }
         None => calibrate::measure_audited(&dir, &before, &t, &skip, dedup, None),
     };
-    let conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+    let conn = atlas::db::Connection::open(&db).map_err(|e| e.to_string())?;
     atlas::baseline::save(&conn, &b).map_err(|e| e.to_string())?;
     let side = atlas::baseline::AtlasSide::read(&conn).map_err(|e| e.to_string())?;
     println!("pre-atlas lookups (calls before {before}): {} episodes in {} of {} transcripts", b.episodes, b.used, b.transcripts);
@@ -446,7 +449,7 @@ fn clipped(args: Vec<String>) -> Result<(), String> {
         [flag, path] if flag == "--store" => PathBuf::from(path),
         _ => return Err(USAGE.into()),
     };
-    let db = rusqlite::Connection::open_with_flags(&store, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| format!("{}: {e}", store.display()))?;
+    let db = atlas::db::Connection::open_with_flags(&store, atlas::db::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| format!("{}: {e}", store.display()))?;
     let mut q = db
         .prepare(
             "SELECT r.key, r.status, v.time FROM records r JOIN versions v ON v.vid = r.head \

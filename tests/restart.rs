@@ -222,8 +222,13 @@ fn the_server_keeps_the_restart_point_current_from_its_hooks() {
     let (tx, server, mut answers) = serve_answers(t.path(), set.clone(), Duration::from_secs(3600));
     launch_and_start(&tx, &mut answers, &tp, &dir, "b1", "t1");
     assert!(
-        atlas::restart::wait_prepared(Duration::from_secs(20), |b| names(b, "b1")),
-        "SubagentStart prepared no point naming b1: {:?}",
+        // The launch's own refresh may already list b1 (its session is
+        // listed from its first event, #306); its start settles the launch.
+        atlas::restart::wait_prepared(Duration::from_secs(20), |b| {
+            b.and_then(|b| Point::parse(&String::from_utf8_lossy(b)))
+                .is_some_and(|p| p.agents.iter().any(|a| a.id == "b1" && a.launch.starts_with("journal:WALRUS:")))
+        }),
+        "the hooks prepared no point naming b1 with its launch: {:?}",
         prepared()
     );
     let p = prepared().unwrap();

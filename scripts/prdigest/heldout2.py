@@ -11,7 +11,8 @@ The rule, fixed before any lever of lane D lands:
 * Candidates: each repo's cached set 1 list (`TAG.list.json`, the 100 most
   recently created merged PRs), newest merge first, after excluding every PR
   number that appears anywhere under the set 1 folder (picks, dropped/,
-  under/, unpicked/) and in prdigest/raw and prdigest/measure.
+  under/, unpicked/) and in the earlier fixture folders named by
+  ATLAS_PRDIGEST_OTHER_DIRS (set 2 used prdigest/raw and prdigest/measure).
 * If a repo's list runs dry (fewer than 4 picks, or fewer than 2 with 2+
   rounds, once every candidate is tried), one more list call fetches the 200
   most recently created merged PRs, and its older 100 are tried next, under
@@ -38,10 +39,12 @@ import heads  # noqa: E402
 from heldout import (CUTOFF, MAX_DIFFS_PER_REPO, MIN_BYTES, MIN_CHANGED, MULTI_PER_REPO, PER_REPO, REPOS, VIEW_FIELDS,  # noqa: E402
                      Budget, cached, diff_files, rounds_of)
 
-# The earlier PR digest fixture folders whose PR numbers are excluded. These
-# are the maintainer's local scratch paths, as set 2 was picked; elsewhere,
-# name them with ATLAS_PRDIGEST_OTHER_DIRS (`;` between folders).
-OTHER_DIRS = [d for d in os.environ.get("ATLAS_PRDIGEST_OTHER_DIRS", "Z:/scratch/v03release/prdigest/raw;Z:/scratch/v03release/prdigest/measure").split(";") if d]
+# The earlier PR digest fixture folders whose PR numbers are excluded, named
+# with ATLAS_PRDIGEST_OTHER_DIRS (`;` between folders). Required: without
+# them a held-out set could repeat a PR the earlier sets already used.
+OTHER_DIRS = [d for d in os.environ.get("ATLAS_PRDIGEST_OTHER_DIRS", "").split(";") if d]
+if not OTHER_DIRS:
+    sys.exit("heldout2: set ATLAS_PRDIGEST_OTHER_DIRS to the earlier fixture folders (`;` between folders)")
 
 
 def seen_numbers(dirs):

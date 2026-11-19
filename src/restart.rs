@@ -53,9 +53,6 @@ const LIVE_WINDOW: Duration = Duration::from_secs(5 * 60);
 pub const REFRESH_EVERY: Duration = Duration::from_secs(180);
 /// The runq state file version this reads; any other is skipped.
 const RUNQ_STATE: &str = "runq-state 1";
-/// runq's own default root on Windows, used when neither `RUNQ_ROOT` nor
-/// `orchestrate.runq_root` names one.
-pub const RUNQ_DEFAULT_ROOT: &str = "Z:/scratch/gpulock/state";
 /// The lock file beside the store that one session start holds while it
 /// reads and files the crash case, so two starts at once offer it once.
 pub const OFFER_LOCK: &str = "restart-offer.lock";
@@ -288,8 +285,8 @@ pub fn wait_prepared(timeout: Duration, pred: impl FnMut(Option<&[u8]>) -> bool)
 /// The runq root a test set ([`set_runq_root`]).
 static RUNQ_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Points the runq read at `root` instead of `RUNQ_ROOT` or runq's default
-/// (tests).
+/// Points the runq read at `root` instead of `RUNQ_ROOT` or the
+/// configured root (tests).
 #[doc(hidden)]
 pub fn set_runq_root(root: PathBuf) {
     *RUNQ_ROOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root);
@@ -344,13 +341,18 @@ pub fn runq_holders_at(root: &Path) -> Vec<String> {
 
 /// The runq root the holders are read from: the root a test set, else the
 /// `RUNQ_ROOT` environment variable (as runq itself reads it), else
-/// `configured` (`orchestrate.runq_root`), else runq's default
-/// [`RUNQ_DEFAULT_ROOT`] on Windows; elsewhere none (no holders are read).
+/// `configured` (`orchestrate.runq_root`); with neither set, none (no
+/// holders are read).
 pub fn runq_root(configured: Option<&Path>) -> Option<PathBuf> {
     let set = RUNQ_ROOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    set.or_else(|| std::env::var_os("RUNQ_ROOT").filter(|r| !r.is_empty()).map(PathBuf::from))
-        .or_else(|| configured.map(Path::to_path_buf))
-        .or_else(|| cfg!(windows).then(|| PathBuf::from(RUNQ_DEFAULT_ROOT)))
+    let env = std::env::var_os("RUNQ_ROOT").filter(|r| !r.is_empty()).map(PathBuf::from);
+    runq_root_from(set, env, configured)
+}
+
+/// [`runq_root`]'s order over its inputs: the test root, the environment's
+/// `RUNQ_ROOT`, then `configured`. No root is built in.
+fn runq_root_from(set: Option<PathBuf>, env: Option<PathBuf>, configured: Option<&Path>) -> Option<PathBuf> {
+    set.or(env).or_else(|| configured.map(Path::to_path_buf))
 }
 
 /// The runq holders now, from [`runq_root`]. Read in the [`Refresher`]
@@ -425,6 +427,12 @@ impl Refresher {
 /// `YYYY-MM-DDTHH:MM:SSZ` for `t`.
 fn utc(t: SystemTime) -> String {
     crate::discussion::civil(t.duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)))
+}
+
+/// The oldest launch entry time the crash case and the restart point read
+/// ([`CRASH_WINDOW`] before `now`), in the store's time form.
+pub fn crash_floor(now: SystemTime) -> String {
+    utc_ms(now.checked_sub(CRASH_WINDOW).unwrap_or(UNIX_EPOCH))
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.000Z` for `t`: the form of the store's times, so
@@ -639,6 +647,23 @@ fn claim_points(store: &Path, now: SystemTime, boot: Option<SystemTime>) -> Vec<
     out
 }
 
+/// The agents named by the point files beside `store` whose server still
+/// runs (the ones [`claim_points`] leaves): a live server lists them, so
+/// they run on even when the server that filed their launch is gone (#306
+/// M1: an MCP server restart under a waiting agent).
+fn live_point_agents(store: &Path) -> HashSet<String> {
+    let Some(dir) = store.parent() else { return HashSet::new() };
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(POINT_PREFIX) && n.ends_with(".json")))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok().as_deref().and_then(Point::parse))
+        .filter(|p| !p.server.is_empty() && server_live(&p.server) == Some(true))
+        .flat_map(|p| p.agents.into_iter().map(|a| a.id))
+        .collect()
+}
+
 /// Whether the machine booted (at `boot`, when known) after `written`: a
 /// point written then is from a machine that went down since.
 pub fn booted_since(written: SystemTime, boot: Option<SystemTime>) -> bool {
@@ -721,6 +746,13 @@ pub fn offer_at(store: &mut MemoryStore, session: &str, now: SystemTime, boot: O
         }
     }
     let from_points = open.len();
+    // An agent a live server's point lists runs on: never a crash, even
+    // when the server that filed its launch is gone (#306 M1). The limit:
+    // a server lists an agent only after it has handled an event of that
+    // agent's session, so a server restarted under an idle parent that has
+    // sent it no event yet lists none, and a resume in a second terminal
+    // can still offer a quiet waiter as dead.
+    covered.extend(live_point_agents(store.path()));
     // The crash case, read before this start files its own record.
     let crashed = match crash_agents(store, session, now, &released, &mut covered) {
         Ok(a) => a,
@@ -776,8 +808,10 @@ pub fn offer_at(store: &mut MemoryStore, session: &str, now: SystemTime, boot: O
 }
 
 /// The crash case's agents: the active `launch` entries of the last
-/// [`CRASH_WINDOW`], of every session other than `session`, whose agent is
-/// not in `covered` (which they join), did not finish and is not running:
+/// [`CRASH_WINDOW`], of every session other than `session` (and of
+/// `session` itself when the server that filed them is gone: a resume),
+/// whose agent is not in `covered` (which they join), did not finish and is
+/// not running:
 /// - the server that filed the entry (its `server:` line, pid and start
 ///   time) still runs, so its session does too: not offered;
 /// - a restart record already offered the agent (`offered:`, `agents:`):
@@ -804,16 +838,19 @@ fn crash_agents(
             *e = (*e).max(at);
         }
     }
-    let floor = utc_ms(now.checked_sub(CRASH_WINDOW).unwrap_or(UNIX_EPOCH));
     let live_after = now.checked_sub(LIVE_WINDOW).unwrap_or(UNIX_EPOCH);
     let mut out = Vec::new();
-    for h in store.active_entries_no_body(crate::hooks::LAUNCH_ENTRY)?.into_iter().filter(|h| h.time > floor) {
+    for h in store.active_entries_since_no_body(crate::hooks::LAUNCH_ENTRY, &crash_floor(now))? {
         let s = front_value(&h.meta, "session").unwrap_or("");
         let id = front_value(&h.meta, "agent").unwrap_or("").to_string();
-        if s.is_empty() || s == session || id.is_empty() || !covered.insert(id.clone()) {
+        // The asking session's own entries count only once the server that
+        // filed them is gone: a resume of the same session in a new process,
+        // whose agents died with the old one (#306 H2).
+        let live = front_value(&h.meta, "server").and_then(server_live);
+        if s.is_empty() || (s == session && live != Some(false)) || id.is_empty() || !covered.insert(id.clone()) {
             continue;
         }
-        if front_value(&h.meta, "server").and_then(server_live) == Some(true) {
+        if live == Some(true) {
             continue;
         }
         let description = front_value(&h.meta, "description").unwrap_or("").to_string();
@@ -1334,5 +1371,16 @@ mod tests {
         assert_eq!(st.signal(), Some(15), "{st:?}");
         assert_eq!(points_in(&dir).len(), 1, "{logged}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With neither `RUNQ_ROOT` nor `orchestrate.runq_root` set there is no
+    /// runq root, so no holder file is read: no machine's path is built in.
+    #[test]
+    fn no_runq_root_without_env_or_config() {
+        assert_eq!(runq_root_from(None, None, None), None);
+        let c = PathBuf::from("/cfg/runq");
+        assert_eq!(runq_root_from(None, None, Some(&c)), Some(c.clone()));
+        let e = PathBuf::from("/env/runq");
+        assert_eq!(runq_root_from(None, Some(e.clone()), Some(&c)), Some(e));
     }
 }

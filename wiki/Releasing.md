@@ -81,6 +81,19 @@ unrelated release; `rust-toolchain.toml` pins the same version, so the shipped b
 it, change `channel` in `rust-toolchain.toml`, `CLIPPY_TOOLCHAIN` in `xtask/src/release.rs` and every `1.99.0` in
 `.github/workflows/ci.yml` and `.github/workflows/dev-pr.yml`, and clear what the new lints find.
 
+## CI caches
+
+Only `dev-pr`'s `release-check` caches compiled dependencies, with `Swatinem/rust-cache`, pinned by commit like
+every action and the one third-party action allowed in any workflow, in `dev-pr.yml` only (a test holds its commit,
+so a bump is a deliberate edit in two places). It saves the registry crates only (the action removes the
+workspace's own crates before it saves), keyed on the runner, rustc's version, `Cargo.lock`, the `Cargo.toml` files
+and `rust-toolchain.toml`, so a toolchain or lockfile change starts cold; `zstd` is installed in the Debian 11
+container for the archive. The save setting is the action's default: the workflow runs only on pull requests, and
+GitHub scopes a cache a pull request saves to that pull request, so main and other pull requests never read it. The
+cache therefore helps only a pull request's later pushes and re-runs: every pull request's first run is cold (3m47s
+measured, plus a 36 MB save), a re-run warm (2m39s). The public `ci.yml` stays uncached by decision, on GitHub's own
+actions only, and the release workflow (`release.yml`) caches nothing: a published binary is always built cold.
+
 ## Before a pull request
 
 Every pull request passes, on the machine that made it and on its committed head: `cargo fmt` on the files it

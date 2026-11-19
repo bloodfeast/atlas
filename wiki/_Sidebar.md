@@ -4,6 +4,7 @@
 - [[Overview]]
 - [[Install and setup]]
 - [[Configuration reference]]
+- [[Reference configuration]]
 - [[Projects and multi-repo]]
 
 **What it saves**
@@ -20,6 +21,7 @@
 - [[Memory and rule files]]
 - [[Orchestration]]
 - [[Discussions]]
+- [[Project tracking]]
 - [[Generated indices]]
 - [[Cross-vault links]]
 

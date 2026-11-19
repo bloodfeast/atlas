@@ -1484,37 +1484,78 @@ fn a_start_before_its_meta_pairs_by_id_later() {
     assert!(agents.admit(&o, &at("tC"), SystemTime::now(), t0 + Duration::from_secs(130)).is_none(), "B's record outlived its start");
 }
 
-/// The cost of an Agent PreToolUse admit in a long session: 300 meta files
+/// The cost of an Agent PreToolUse admit in a long session: 600 meta files
 /// (half finished), with a pending launch, so the pairing pass runs too.
-/// Prints the median and p99; the bar is 250 ms.
+/// Prints the median and p98 beside the median at 60 metas; the bar is
+/// their ratio.
 #[test]
-fn admit_at_300_metas_is_cheap() {
+fn admit_at_600_metas_is_cheap() {
     use atlas::orchestrate::{Agents, Launch};
     use std::time::{Duration, Instant, SystemTime};
-    let t = Temp::new("orch-admit-cost");
-    let s = Session::new(t.path());
     let o = atlas::orchestrate::resolve(Some(&OrchestrateSpec { enabled: Some(true), kinds: vec![(Kind::Builder, KindSpec { max: Some(400), ..Default::default() })], ..Default::default() }), None, None, |k| (k == atlas::orchestrate::LIMIT_ENV).then(|| "1000".to_string()));
-    let mut agents = Agents::new(Some(SystemTime::now() - Duration::from_secs(5)));
-    for i in 0..300 {
-        s.agent(&format!("a{i:03}"), "general-purpose", &format!("t{i:03}"), "Kind: builder\nBuild it.", 1000, i % 2 == 0);
-    }
-    let tp = s.tp();
     let input = json!({"description": "d", "subagent_type": "general-purpose"});
-    let at =
-        |id: &'static str| Launch { transcript: &tp, tool_use_id: id, input: &input, brief: "Kind: builder\nBuild more.", store: None };
-    // One launch stays pending throughout (its agent never starts).
-    assert!(agents.admit(&o, &at("t-pending"), SystemTime::now(), Instant::now()).is_none());
-    let mut times = Vec::new();
-    for _ in 0..101 {
-        let t0 = Instant::now();
-        assert!(agents.admit(&o, &at("t-probe"), SystemTime::now(), Instant::now()).is_none());
-        times.push(t0.elapsed());
-        agents.release_last();
+    // Two sessions, 600 and 60 metas, probed in turn so a load on the
+    // machine weighs on both alike: the growth is checked as the ratio of
+    // their fastest probes, which load does not move, not as milliseconds.
+    let sessions: Vec<(Temp, String)> = [600, 60]
+        .into_iter()
+        .map(|n| {
+            let t = Temp::new(&format!("orch-admit-cost-{n}"));
+            let s = Session::new(t.path());
+            for i in 0..n {
+                s.agent(&format!("a{i:03}"), "general-purpose", &format!("t{i:03}"), "Kind: builder\nBuild it.", 1000, i % 2 == 0);
+            }
+            let tp = s.tp();
+            (t, tp)
+        })
+        .collect();
+    let mut agents: Vec<Agents> = sessions.iter().map(|_| Agents::new(Some(SystemTime::now() - Duration::from_secs(5)))).collect();
+    let mut times: [Vec<Duration>; 2] = [Vec::new(), Vec::new()];
+    for (k, (_, tp)) in sessions.iter().enumerate() {
+        // One launch stays pending throughout (its agent never starts).
+        let l = Launch { transcript: tp, tool_use_id: "t-pending", input: &input, brief: "Kind: builder\nBuild more.", store: None };
+        assert!(agents[k].admit(&o, &l, SystemTime::now(), Instant::now()).is_none());
     }
-    times.sort();
-    let (p50, p99) = (times[50], times[99]);
-    println!("admit at 300 metas: median {:.2} ms, p99 {:.2} ms", p50.as_secs_f64() * 1e3, p99.as_secs_f64() * 1e3);
-    assert!(p99 < Duration::from_millis(250), "p99 {p99:?}");
+    for _ in 0..51 {
+        for (k, (_, tp)) in sessions.iter().enumerate() {
+            let l = Launch { transcript: tp, tool_use_id: "t-probe", input: &input, brief: "Kind: builder\nBuild more.", store: None };
+            let t0 = Instant::now();
+            assert!(agents[k].admit(&o, &l, SystemTime::now(), Instant::now()).is_none());
+            times[k].push(t0.elapsed());
+            agents[k].release_last();
+        }
+    }
+    for t in &mut times {
+        t.sort();
+    }
+    let ((p50, p98), small) = ((times[0][25], times[0][49]), times[1][25]);
+    let (fast, fast_small) = (times[0][0], times[1][0]);
+    let ratio = fast.as_secs_f64() / fast_small.as_secs_f64().max(1e-6);
+    println!(
+        "admit at 600 metas: fastest {:.2} ms, median {:.2} ms, p98 {:.2} ms; at 60 metas: fastest {:.2} ms, median {:.2} ms; ratio of fastest {ratio:.1}, of medians {:.1}",
+        fast.as_secs_f64() * 1e3,
+        p50.as_secs_f64() * 1e3,
+        p98.as_secs_f64() * 1e3,
+        fast_small.as_secs_f64() * 1e3,
+        small.as_secs_f64() * 1e3,
+        p50.as_secs_f64() / small.as_secs_f64().max(1e-6)
+    );
+    // Linear in the metas is 10x at most (a fixed cost makes it less: 9.9x
+    // unloaded); quadratic is 100x. The spread is 600 to 60 so that a
+    // quadratic term on top of the linear reads stands clear: a listing of
+    // the folder per meta measured 33.7x. The fastest of 51 probes is the
+    // cost with the least load on it: under a loaded gate the medians
+    // reached 21.1x, the 600-meta probes, being longer, taking more of it.
+    assert!(ratio < 20.0, "600 metas cost {ratio:.1}x 60 metas: admit grows faster than the metas");
+    // Backstops for a cost that is linear but slow (the ratio passes it).
+    // The fastest probe carries the least load: 75 ms unloaded, so 300 ms
+    // is 4x; loaded medians reached 174 ms, which the fastest sits under.
+    // An admit 7x slower but linear has its fastest near 500 ms and fails
+    // here; in a loaded full gate the fastest stayed at 77 ms. The p98 is
+    // what load moves (1.07 s in that same gate, 84-90 ms unloaded), so it
+    // keeps a 2 s bar, a backstop for a stall only.
+    assert!(fast < Duration::from_millis(300), "fastest admit at 600 metas took {fast:?}: slow even with the least load");
+    assert!(p98 < Duration::from_secs(2), "p98 {p98:?}");
 }
 
 /// Allow and remind: with orchestrate on, an
@@ -3122,4 +3163,541 @@ fn an_orphaned_claimed_point_is_claimed_again() {
     assert!(!a.context.contains("agent q2"), "a live start's claimed point was taken: {a:?}");
     assert!(!dead.exists(), "the orphan was left");
     assert!(held.exists(), "a live start's claimed point was removed");
+}
+
+// ---- #306: the restart point names exactly the live agents
+
+/// The interim `<task-notification>` Claude Code sends when agent `id`
+/// stops while its own background work runs.
+fn interim(h: &mut Hooks, s: &Session, id: &str) -> HookAnswer {
+    let note = format!("<task-notification>\n<task-id>{id}</task-id>\n<status>completed</status>\n<summary>Agent \"x\" is waiting on its own background work</summary>\n<note>This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.</note>\n<result>r</result>\n</task-notification>");
+    h.handle(&HookEvent { prompt: note, transcript_path: s.tp(), ..ev("UserPromptSubmit") })
+}
+
+/// A main-session prompt: the one event a restarted server may see.
+fn prompt(h: &mut Hooks, s: &Session) -> HookAnswer {
+    h.handle(&HookEvent { prompt: "carry on".into(), transcript_path: s.tp(), ..ev("UserPromptSubmit") })
+}
+
+/// SessionStart of `source` for session `s1`, with its transcript.
+fn opened(h: &mut Hooks, s: &Session, source: &str) -> HookAnswer {
+    h.handle(&HookEvent { source: source.into(), transcript_path: s.tp(), ..ev("SessionStart") })
+}
+
+/// Agent `id` launched and started in lane `lane`: its launch entry's key.
+fn waiter(h: &mut Hooks, s: &Session, id: &str, lane: &str) -> String {
+    let brief = format!("Kind: builder\nLane: {lane}\n\nBuild {id}.");
+    assert!(launch_with(h, s, &format!("t-{id}"), &brief).deny.is_none());
+    s.agent(id, "general-purpose", &format!("t-{id}"), &brief, 1000, false);
+    let _ = start(h, s, id);
+    entries(h, lane, "launch")[0].key.clone()
+}
+
+/// Whether point `p` lists agent `id` with lane `lane` and launch `key`.
+fn lists(p: &atlas::restart::Point, id: &str, lane: &str, key: &str) -> bool {
+    p.agents.iter().any(|a| a.id == id && a.lane == lane && a.launch == key)
+}
+
+/// #306 H3: a builder stops with its CI monitor running (`background_tasks`
+/// not empty): it stays in the point, and still after the atlas server
+/// restarts mid-session with no new write of its transcript, with its lane
+/// and launch key.
+#[test]
+fn a_waiter_with_background_work_stays_in_the_point_across_a_server_restart() {
+    let t = Temp::new("orch-306-bg");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(4), &[])).unwrap();
+    let _ = opened(&mut h, &s, "startup");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let key = waiter(&mut h, &s, "b1", "WAITER");
+    let stop = h.handle(&HookEvent {
+        agent_id: "b1".into(),
+        agent_type: "general-purpose".into(),
+        last_message: "waiting on CI".into(),
+        transcript_path: s.tp(),
+        background_tasks: json!([{"id": "bg1", "type": "monitor"}]),
+        ..ev("SubagentStop")
+    });
+    assert!(stop.block.is_none(), "{stop:?}");
+    let p = h.restart_point();
+    assert!(lists(&p, "b1", "WAITER", &key), "{p:?}");
+    drop(h);
+    // The atlas server restarts; Claude Code and b1 run on.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut next = Hooks::open(settings(t.path(), &builders(4), &[])).unwrap();
+    let _ = prompt(&mut next, &s);
+    let p = next.restart_point();
+    assert!(lists(&p, "b1", "WAITER", &key), "the restarted server lost the waiter: {p:?}");
+}
+
+/// #306 H4: a SubagentStop with no `background_tasks` field records the
+/// finish, and the interim notification after it undoes it: the point is
+/// due again and lists the agent with its lane and launch key, though the
+/// refresh between dropped its session.
+#[test]
+fn an_interim_notification_puts_the_waiter_back_in_the_point() {
+    let t = Temp::new("orch-306-interim");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(4), &[])).unwrap();
+    let _ = opened(&mut h, &s, "startup");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let key = waiter(&mut h, &s, "b1", "WAITER");
+    assert!(stop_agent(&mut h, &s, "b1").block.is_none());
+    h.after();
+    assert!(h.restart_point().agents.is_empty());
+    assert!(!h.restart_due());
+    let _ = interim(&mut h, &s, "b1");
+    assert!(h.restart_due(), "the interim notification left the point stale");
+    let p = h.restart_point();
+    assert!(lists(&p, "b1", "WAITER", &key), "{p:?}");
+    drop(h);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut next = Hooks::open(settings(t.path(), &builders(4), &[])).unwrap();
+    let _ = prompt(&mut next, &s);
+    let p = next.restart_point();
+    assert!(lists(&p, "b1", "WAITER", &key), "the restarted server lost the waiter: {p:?}");
+}
+
+/// #306 H1: a waiter's real finish arrives only as its notification (its
+/// SubagentStop listed background work). The finish is in the store, so
+/// another process's offer does not list it.
+#[test]
+fn a_finish_seen_only_in_its_notification_is_not_offered() {
+    let t = Temp::new("orch-306-finish");
+    let s = Session::new(t.path());
+    let set = settings(t.path(), &builders(4), &[]);
+    let path = set.store.clone();
+    let mut h = Hooks::open(set).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let _ = waiter(&mut h, &s, "b1", "WAITER");
+    let stop = h.handle(&HookEvent {
+        agent_id: "b1".into(),
+        agent_type: "general-purpose".into(),
+        last_message: "waiting on CI".into(),
+        transcript_path: s.tp(),
+        background_tasks: json!([{"id": "bg1", "type": "monitor"}]),
+        ..ev("SubagentStop")
+    });
+    assert!(stop.block.is_none(), "{stop:?}");
+    let _ = finished(&mut h, &s, "b1");
+    assert!(h.restart_point().agents.is_empty());
+    drop(h);
+    age_agent(&s, "b1", std::time::Duration::from_secs(10 * 60));
+    let mut store = atlas::memory::MemoryStore::open(&path).unwrap();
+    let a = atlas::restart::offer(&mut store, "s2", std::time::SystemTime::now()).unwrap().unwrap_or_default();
+    assert!(!a.contains("agent b1"), "a finished agent was offered: {a}");
+}
+
+/// Files a `launch` entry for agent `id` of session `s1` in lane `lane`,
+/// filed by the server `server`.
+fn launch_entry(store: &mut atlas::memory::MemoryStore, s: &Session, id: &str, lane: &str, server: &str) {
+    let d = atlas::memory::Draft {
+        title: format!("launch: job {id}"),
+        meta: format!("agent: {id}\ntype: general-purpose\nmodel: opus\ndescription: job {id}\nstart: 2026-11-18T00:00:00.000Z\nsession: s1\ntranscript: {}\nserver: {server}\n", s.tp()),
+        body: format!("Kind: builder\nLane: {lane}\n\nBuild {id}."),
+        reason: "test".into(),
+        author: "hook".into(),
+        client: "atlas-hook".into(),
+        ..atlas::memory::Draft::default()
+    };
+    let mut w = store.writer().unwrap();
+    let key = format!("journal:{lane}:0001");
+    w.create(&key, "journal", atlas::hooks::LAUNCH_ENTRY, lane, &d, None).unwrap();
+    w.commit().unwrap();
+}
+
+/// #306 H2: Claude Code restarts and resumes the same session; its agents
+/// died with the old process and no point names them. The resumed
+/// session's offer lists them from their launch entries when the server
+/// that filed them is gone, and not when it still runs.
+#[test]
+fn a_resumed_session_is_offered_its_own_dead_agents() {
+    let t = Temp::new("orch-306-resume");
+    let s = Session::new(t.path());
+    let set = settings(t.path(), &builders(4), &[]);
+    let mut store = atlas::memory::MemoryStore::open(&set.store).unwrap();
+    s.agent("dead1", "general-purpose", "t1", "Kind: builder\nLane: GONE\n\nBuild.", 1000, false);
+    s.agent("live1", "general-purpose", "t2", "Kind: builder\nLane: HERE\n\nBuild.", 1000, false);
+    launch_entry(&mut store, &s, "dead1", "GONE", "4294967290 1");
+    launch_entry(&mut store, &s, "live1", "HERE", &atlas::restart::server_tag());
+    age_agent(&s, "dead1", std::time::Duration::from_secs(10 * 60));
+    age_agent(&s, "live1", std::time::Duration::from_secs(10 * 60));
+    let a = atlas::restart::offer(&mut store, "s1", std::time::SystemTime::now()).unwrap().unwrap_or_default();
+    assert!(a.contains("agent dead1") && a.contains("journal:GONE:0001"), "the resumed session's dead agent was not offered: {a:?}");
+    assert!(!a.contains("agent live1"), "an agent whose server runs was offered: {a:?}");
+}
+
+/// #306 M1: the server that filed a waiter's launch restarted (an update or
+/// an /mcp reconnect) and the session resumes while the waiter, quiet for
+/// 10 minutes on a CI monitor, runs on. The live server's point lists it,
+/// so it is not offered: a dead filing server is not a dead agent.
+#[test]
+fn a_resumed_session_is_not_offered_an_agent_a_live_point_lists() {
+    let t = Temp::new("orch-306-m1");
+    let s = Session::new(t.path());
+    let set = settings(t.path(), &builders(4), &[]);
+    let mut store = atlas::memory::MemoryStore::open(&set.store).unwrap();
+    s.agent("w1", "general-purpose", "t1", "Kind: builder\nLane: WAIT\n\nBuild.", 1000, false);
+    launch_entry(&mut store, &s, "w1", "WAIT", "4294967290 1");
+    age_agent(&s, "w1", std::time::Duration::from_secs(10 * 60));
+    let point = atlas::restart::Point {
+        agents: vec![point_agent(&s, "w1", "journal:WAIT:0001")],
+        server: atlas::restart::server_tag(),
+        ..atlas::restart::Point::default()
+    };
+    std::fs::write(atlas::restart::point_path(&set.store), point.to_json()).unwrap();
+    let a = atlas::restart::offer(&mut store, "s1", std::time::SystemTime::now()).unwrap();
+    assert!(!a.as_deref().unwrap_or("").contains("agent w1"), "a live point's agent was offered as dead: {a:?}");
+    assert!(atlas::restart::point_path(&set.store).exists(), "a live server's point was claimed");
+}
+
+/// Files a `launch` entry `key` for agent `id` of session `s1` with `body`,
+/// filed by no known server.
+fn launch_body(store: &mut atlas::memory::MemoryStore, s: &Session, key: &str, id: &str, lane: &str, body: &str) {
+    let d = atlas::memory::Draft {
+        title: format!("launch: job {id}"),
+        meta: format!("agent: {id}\ntype: general-purpose\nmodel: opus\ndescription: job {id}\nstart: 2026-11-18T00:00:00.000Z\nsession: s1\ntranscript: {}\n", s.tp()),
+        body: body.into(),
+        reason: "test".into(),
+        author: "hook".into(),
+        client: "atlas-hook".into(),
+        ..atlas::memory::Draft::default()
+    };
+    let mut w = store.writer().unwrap();
+    w.create(key, "journal", atlas::hooks::LAUNCH_ENTRY, lane, &d, None).unwrap();
+    w.commit().unwrap();
+}
+
+/// #306 S1 and S2: a restarted server resolves an agent it saw no start of
+/// from its launch entry once (a second refresh scans nothing), and a
+/// relaunch filed as "The same brief as {k}" takes its resources from `k`.
+#[test]
+fn a_restarted_server_reads_each_agent_s_launch_once_and_follows_a_same_brief() {
+    let t = Temp::new("orch-306-s1s2");
+    let s = Session::new(t.path());
+    let set = settings(t.path(), &builders(4), &[]);
+    let brief = "Kind: builder\nLane: SAME\nUses: compile\n\nBuild.";
+    {
+        let mut store = atlas::memory::MemoryStore::open(&set.store).unwrap();
+        launch_body(&mut store, &s, "journal:SAME:0001", "b0", "SAME", brief);
+        launch_body(
+            &mut store,
+            &s,
+            "journal:SAME:0002",
+            "b2",
+            "SAME",
+            "The same brief as journal:SAME:0001; recall journal:SAME:0001 for its text.\n",
+        );
+    }
+    let mut h = Hooks::open(set).unwrap();
+    let _ = opened(&mut h, &s, "resume");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("b2", "general-purpose", "t-b2", brief, 1000, false);
+    let _ = prompt(&mut h, &s);
+    let p = h.restart_point();
+    let b2 = p.agents.iter().find(|a| a.id == "b2").unwrap_or_else(|| panic!("b2 not listed: {p:?}"));
+    assert_eq!((b2.launch.as_str(), b2.uses.clone()), ("journal:SAME:0002", vec!["compile".to_string()]), "{p:?}");
+    assert_eq!(h.launch_scans(), 1);
+    let again = h.restart_point();
+    assert_eq!(again.agents, p.agents);
+    assert_eq!(h.launch_scans(), 1, "the second refresh scanned the launch entries again");
+}
+
+/// #306 N1: a background shell or monitor task's notification files no
+/// finish and leaves the point as it was; an agent this server saw no
+/// start of (its meta file is in the session) still does.
+#[test]
+fn only_an_agent_s_notification_files_a_finish() {
+    let t = Temp::new("orch-306-n1");
+    let s = Session::new(t.path());
+    let mut h = Hooks::open(settings(t.path(), &builders(4), &[])).unwrap();
+    let _ = prompt(&mut h, &s);
+    h.after();
+    let _ = finished(&mut h, &s, "bash7");
+    assert!(!h.restart_due(), "a shell task's notification left the point due");
+    s.agent("q1", "general-purpose", "t-q1", "Kind: builder\nLane: Q\n\nBuild.", 1000, false);
+    let _ = finished(&mut h, &s, "q1");
+    assert!(h.restart_due());
+    let r = atlas::orchestrate::released(h.store()).unwrap();
+    assert!(r.contains_key("q1") && !r.contains_key("bash7"), "{r:?}");
+}
+
+/// #306 r2 N1: a running agent whose launch entry is older than the launch
+/// scan's 3-day bound still gets its launch key, lane and `Uses:` in the
+/// point, from one unbounded read on the miss.
+#[test]
+fn a_restarted_server_finds_a_launch_older_than_the_scan_bound() {
+    let t = Temp::new("orch-306-n1-old");
+    let s = Session::new(t.path());
+    let set = settings(t.path(), &builders(4), &[]);
+    {
+        let mut store = atlas::memory::MemoryStore::open(&set.store).unwrap();
+        // crash_floor is 3 days back: from 2 days ago, 5 days ago.
+        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
+        let d = atlas::memory::Draft {
+            title: "launch: job old5".into(),
+            meta: format!("agent: old5\ntype: general-purpose\nmodel: opus\ndescription: job old5\nsession: s1\ntranscript: {}\n", s.tp()),
+            body: "Kind: builder\nLane: OLD\nUses: compile\n\nBuild.".into(),
+            reason: "test".into(),
+            author: "hook".into(),
+            client: "atlas-hook".into(),
+            time: Some(atlas::restart::crash_floor(two_days_ago)),
+            ..atlas::memory::Draft::default()
+        };
+        let mut w = store.writer().unwrap();
+        w.create("journal:OLD:0001", "journal", atlas::hooks::LAUNCH_ENTRY, "OLD", &d, None).unwrap();
+        w.commit().unwrap();
+    }
+    let mut h = Hooks::open(set).unwrap();
+    let _ = opened(&mut h, &s, "resume");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.agent("old5", "general-purpose", "t-old5", "Build.", 1000, false);
+    let _ = prompt(&mut h, &s);
+    let p = h.restart_point();
+    let a = p.agents.iter().find(|a| a.id == "old5").unwrap_or_else(|| panic!("old5 not listed: {p:?}"));
+    assert_eq!((a.launch.as_str(), a.lane.as_str(), a.uses.clone()), ("journal:OLD:0001", "OLD", vec!["compile".to_string()]), "{p:?}");
+}
+
+/// #305 gap 4: an `atlas queue` CLI with a builder cap of 8, its home, its
+/// store and a session folder under Claude Code's projects folder.
+struct QueueCli {
+    _t: Temp,
+    home: PathBuf,
+    claude: PathBuf,
+}
+
+impl QueueCli {
+    fn new(name: &str) -> QueueCli {
+        let t = Temp::new(name);
+        let home = t.path().join("home");
+        let claude = home.join("claude");
+        let q = QueueCli { home, claude, _t: t };
+        // The first run writes the template configuration; the cap goes in it.
+        let (ok, out) = q.run(&[]);
+        assert!(ok, "{out}");
+        let cfg = q.home.join("atlas.json");
+        let mut v = json::parse(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        if let Value::Object(m) = &mut v {
+            m.insert("orchestrate".into(), json::parse(r#"{"enabled": true, "kinds": {"builder": {"max": 8}}}"#).unwrap());
+        }
+        std::fs::write(&cfg, v.to_string()).unwrap();
+        q
+    }
+
+    fn run(&self, args: &[&str]) -> (bool, String) {
+        let o = std::process::Command::new(bin())
+            .arg("queue")
+            .args(args)
+            .env("ATLAS_HOME", &self.home)
+            .env_remove("ATLAS_CONFIG")
+            .env_remove(atlas::orchestrate::LIMIT_ENV)
+            .env("CLAUDE_CONFIG_DIR", &self.claude)
+            .output()
+            .unwrap();
+        (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+    }
+
+    fn store(&self) -> atlas::memory::MemoryStore {
+        atlas::memory::MemoryStore::open(&self.home.join("state").join("memory.sqlite")).unwrap()
+    }
+
+    /// Files a waiting builder launch on `lane`.
+    fn wait(&self, lane: &str) {
+        let prompt = format!("Kind: builder\nLane: {lane}\n\nBuild {lane}.");
+        let description = format!("build {lane}");
+        let l = atlas::queue::Launch {
+            kind: Kind::Builder,
+            lane: Some(lane),
+            description: &description,
+            subagent_type: "general-purpose",
+            prompt: &prompt,
+            session: "s0",
+            class_meta: "",
+        };
+        atlas::queue::add(&mut self.store(), &l).unwrap();
+    }
+
+    /// Files the `launch` journal entry the SubagentStart hook files for
+    /// `agent` of the session at `transcript`, on `lane`.
+    fn launched(&self, lane: &str, agent: &str, transcript: &str) {
+        self.launched_at(lane, agent, transcript, None);
+    }
+
+    /// [`QueueCli::launched`], filed at `time` (`None` is now).
+    fn launched_at(&self, lane: &str, agent: &str, transcript: &str, time: Option<&str>) {
+        let mut m = self.store();
+        let d = atlas::memory::Draft {
+            title: format!("launch of agent {agent}"),
+            meta: format!(
+                "agent: {agent}\ntype: general-purpose\nmodel: opus\ndescription: d\nstart: 0\nsession: s1\ntranscript: {transcript}\n"
+            ),
+            body: "Build.".into(),
+            reason: "test".into(),
+            author: "test".into(),
+            client: "test".into(),
+            provenance: None,
+            time: time.map(str::to_string),
+        };
+        let mut w = m.writer().unwrap();
+        let key = w.next_key(&format!("journal:{lane}:"), 4).unwrap();
+        w.create(&key, "journal", atlas::hooks::LAUNCH_ENTRY, lane, &d, None).unwrap();
+        w.commit().unwrap();
+    }
+}
+
+/// How many launches a `queue next` output starts.
+fn starts(out: &str) -> usize {
+    let Some(at) = out.find("start together: ") else { return 0 };
+    let rest = &out[at..];
+    rest[..rest.find(". Waiting:").unwrap_or(rest.len())].matches("journal:").count()
+}
+
+/// #305 gap 4: with no `--transcript`, `queue next` counts the agents of
+/// the sessions its launch records name: 7 builders run under a cap of 8,
+/// so one of 8 waiting builders starts, not 8.
+#[test]
+fn queue_next_counts_the_running_agents_of_the_launch_records() {
+    let q = QueueCli::new("orch-305-count");
+    let s = Session::new(&q.claude.join("projects"));
+    for i in 0..7 {
+        s.agent(&format!("r{i}"), "general-purpose", &format!("t-r{i}"), &format!("Kind: builder\nLane: RUN{i}\n\nBuild."), 1000, false);
+    }
+    for i in 0..8 {
+        q.wait(&format!("WAIT{i}"));
+    }
+    let (ok, out) = q.run(&["next"]);
+    assert!(ok && starts(&out) == 8, "{out}");
+    // Two launches of one session read its folder once.
+    q.launched("RUN0", "r0", &s.tp());
+    q.launched("RUN1", "r1", &s.tp());
+    let (ok, out) = q.run(&["next"]);
+    assert!(ok, "{out}");
+    assert_eq!(starts(&out), 1, "{out}");
+    assert!(out.contains("(running agents from the launch records of 1 session;"), "{out}");
+}
+
+/// #305 gap 4: a running agent found through a launch record holds the
+/// record's lane, even when its brief names none.
+#[test]
+fn queue_next_keeps_a_lane_held_by_a_launch_records_agent() {
+    let q = QueueCli::new("orch-305-lane");
+    let s = Session::new(&q.claude.join("projects"));
+    s.agent("h1", "general-purpose", "t-h1", "Kind: builder\n\nBuild.", 1000, false);
+    // An `agent:<id>` placeholder scope leaves the brief's own lane.
+    s.agent("h2", "general-purpose", "t-h2", "Kind: builder\nLane: BRIEF\n\nBuild.", 1000, false);
+    q.wait("BRIEF");
+    q.launched("agent:h2", "h2", &s.tp());
+    q.wait("HELD");
+    q.wait("FREE");
+    q.launched("HELD", "h1", &s.tp());
+    let (ok, out) = q.run(&["next"]);
+    assert!(ok && out.contains("start together: journal:FREE:0001"), "{out}");
+    assert_eq!(starts(&out), 1, "{out}");
+    assert!(out.contains("journal:HELD:0001 (lane HELD") && out.contains("journal:BRIEF:0001 (lane BRIEF"), "{out}");
+}
+
+/// #305 gap 4: `--transcript` reads only the session it names, and with no
+/// launch record in the window the note says none were found.
+#[test]
+fn queue_next_transcript_wins_and_an_empty_ledger_says_so() {
+    let q = QueueCli::new("orch-305-flag");
+    let busy = Session::new(&q.claude.join("projects").join("busy"));
+    let idle = Session::new(&q.claude.join("projects").join("idle"));
+    for i in 0..7 {
+        busy.agent(
+            &format!("b{i}"),
+            "general-purpose",
+            &format!("t-b{i}"),
+            &format!("Kind: builder\nLane: BUSY{i}\n\nBuild."),
+            1000,
+            false,
+        );
+    }
+    q.wait("ONE");
+    q.wait("TWO");
+    let (ok, out) = q.run(&["next"]);
+    assert!(ok && out.contains("(no running agents were found from launch records;") && !out.contains("not counted"), "{out}");
+    q.launched("BUSY0", "b0", &busy.tp());
+    let (ok, out) = q.run(&["next", "--transcript", &idle.tp()]);
+    assert!(ok && starts(&out) == 2 && !out.contains("launch records"), "{out}");
+    let (ok, out) = q.run(&["next"]);
+    assert!(ok && starts(&out) == 1, "{out}");
+}
+
+/// #315 S1: a launch record whose session folder fails to list with an
+/// error other than NotFound (here its `subagents` is a regular file) is
+/// logged and skipped; `queue next` still answers from the other session.
+#[test]
+fn queue_next_skips_a_launch_record_whose_folder_cannot_be_listed() {
+    let q = QueueCli::new("orch-315-bad");
+    let s = Session::new(&q.claude.join("projects").join("good"));
+    for i in 0..7 {
+        s.agent(&format!("g{i}"), "general-purpose", &format!("t-g{i}"), &format!("Kind: builder\nLane: RUN{i}\n\nBuild."), 1000, false);
+    }
+    let bad = q.claude.join("projects").join("bad").join("s9");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("subagents"), "not a folder").unwrap();
+    q.launched("BAD", "x9", &format!("{}.jsonl", bad.display()));
+    q.launched("RUN0", "g0", &s.tp());
+    for i in 0..8 {
+        q.wait(&format!("WAIT{i}"));
+    }
+    let (ok, out) = q.run(&["next"]);
+    assert!(ok, "{out}");
+    assert_eq!(starts(&out), 1, "{out}");
+    assert!(out.contains("(running agents from the launch records of 1 session;") && out.contains("atlas queue next: "), "{out}");
+}
+
+/// #315 N3: a launch record filed before the `stale_minutes` window (360
+/// by default) names no session; one just inside it does.
+#[test]
+fn queue_next_ignores_a_launch_record_older_than_the_window() {
+    let q = QueueCli::new("orch-315-old");
+    let s = Session::new(&q.claude.join("projects"));
+    for i in 0..7 {
+        s.agent(&format!("o{i}"), "general-purpose", &format!("t-o{i}"), &format!("Kind: builder\nLane: RUN{i}\n\nBuild."), 1000, false);
+    }
+    for i in 0..8 {
+        q.wait(&format!("WAIT{i}"));
+    }
+    let ago = |m: u64| atlas::store::utc(std::time::SystemTime::now() - std::time::Duration::from_secs(m * 60));
+    q.launched_at("RUN0", "o0", &s.tp(), Some(&ago(361)));
+    let (ok, out) = q.run(&["next"]);
+    assert!(ok && starts(&out) == 8 && out.contains("(no running agents were found from launch records;"), "{out}");
+    q.launched_at("RUN1", "o1", &s.tp(), Some(&ago(359)));
+    let (ok, out) = q.run(&["next"]);
+    assert!(ok && starts(&out) == 1, "{out}");
+}
+
+/// #315 review S2: `atlas queue next` reads each launch entry's session and
+/// floors its agents at that session's last start, so an agent last
+/// written before a restart (it died with the old process) stops counting
+/// at once; another agent of the session that wrote since still counts.
+#[test]
+fn queue_next_does_not_count_an_agent_of_a_session_that_restarted() {
+    let t = Temp::new("orch-315-s2");
+    let s = Session::new(t.path());
+    let set = settings(t.path(), &builders(4), &[]);
+    let mut store = atlas::memory::MemoryStore::open(&set.store).unwrap();
+    let o = atlas::orchestrate::resolve(Some(&builders(4)), None, None, |_| None);
+    s.agent("dead1", "general-purpose", "t1", "Kind: builder\nLane: GONE\n\nBuild.", 1000, false);
+    s.agent("live1", "general-purpose", "t2", "Kind: builder\nLane: HERE\n\nBuild.", 1000, false);
+    launch_entry(&mut store, &s, "dead1", "GONE", "4294967290 1");
+    launch_entry(&mut store, &s, "live1", "HERE", "4294967290 1");
+    age_agent(&s, "dead1", std::time::Duration::from_secs(30 * 60));
+    age_agent(&s, "live1", std::time::Duration::from_secs(60));
+    let now = std::time::SystemTime::now();
+    let ids = |store: &atlas::memory::MemoryStore| {
+        let (hs, read) = atlas::queue::launch_holders(&o, store, now).unwrap();
+        assert_eq!(read, 1);
+        let mut n: Vec<String> = hs.into_iter().map(|h| h.name).collect();
+        n.sort();
+        n
+    };
+    // No recorded start: both count, as before.
+    let before = ids(&store);
+    assert!(before.len() == 2 && before.iter().any(|n| n.contains("dead1")), "{before:?}");
+    atlas::orchestrate::record_session_start(&store, "s1", now - std::time::Duration::from_secs(10 * 60)).unwrap();
+    let after = ids(&store);
+    assert!(after.len() == 1 && after[0].contains("live1"), "an agent of a restarted session still counted: {after:?}");
 }

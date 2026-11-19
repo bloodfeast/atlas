@@ -139,7 +139,10 @@ fn alternatives(inner: &str) -> Vec<String> {
 
 /// The subcommand words of [`queue_commands`].
 pub fn queue_words() -> Vec<String> {
-    queue_commands().iter().map(|c| c.split_whitespace().next().unwrap_or("").to_string()).collect()
+    // `plan` has two alternatives (by hand, and --from-jql): one word.
+    let mut w: Vec<String> = queue_commands().iter().map(|c| c.split_whitespace().next().unwrap_or("").to_string()).collect();
+    w.dedup();
+    w
 }
 
 /// Every configuration key the code accepts.

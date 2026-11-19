@@ -255,36 +255,6 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
     Ok(Manifest { version, files, highlights, plugin_changed_in })
 }
 
-/// True for a Unicode format character (general category Cf): bidi
-/// overrides and isolates, zero-width spaces and joiners, the byte order
-/// mark, soft hyphen, tag characters and the like. They draw nothing, and
-/// some reorder or hide the text around them.
-fn is_format_char(c: char) -> bool {
-    matches!(
-        c as u32,
-        0xAD | 0x600..=0x605
-            | 0x61C
-            | 0x6DD
-            | 0x70F
-            | 0x890..=0x891
-            | 0x8E2
-            | 0x180E
-            | 0x200B..=0x200F
-            | 0x202A..=0x202E
-            | 0x2060..=0x2064
-            | 0x2066..=0x206F
-            | 0xFEFF
-            | 0xFFF9..=0xFFFB
-            | 0x110BD
-            | 0x110CD
-            | 0x13430..=0x1343F
-            | 0x1BCA0..=0x1BCA3
-            | 0x1D173..=0x1D17A
-            | 0xE0001
-            | 0xE0020..=0xE007F
-    )
-}
-
 /// One Highlights line as a notice shows it: control characters (a
 /// terminal escape, a newline) made spaces, format characters (a bidi
 /// override, a zero-width space) removed, runs of space made one, and at
@@ -292,7 +262,7 @@ fn is_format_char(c: char) -> bool {
 /// `...`). `None` when nothing is left. The release step bounds the lines
 /// it writes with this, and the reader bounds them again.
 pub fn highlight_line(s: &str) -> Option<String> {
-    let spaced: String = s.chars().filter(|c| !is_format_char(*c)).map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let spaced: String = s.chars().filter(|c| !crate::hidden::is_format_char(*c)).map(|c| if c.is_control() { ' ' } else { c }).collect();
     let t = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
     if t.is_empty() {
         return None;

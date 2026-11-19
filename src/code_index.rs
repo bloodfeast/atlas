@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::code::{self, CodeRoot, CodeSetup, Rows, RowStats, WriteStats};
 use crate::error::{Error, Result};
@@ -1065,7 +1065,6 @@ fn set(shared: &Shared, name: &str, s: RootState) {
 
 fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, watcher: &Watcher) -> Result<()> {
     let mut conn = crate::store::open_raw(db)?;
-    conn.busy_timeout(Duration::from_secs(30))?;
     code::ensure_schema(&conn)?;
     let rust = rust.unwrap_or_else(|| match find_rust_analyzer(setup.rust_analyzer.as_deref()) {
         Ok(p) => RustSource::Analyzer(p),

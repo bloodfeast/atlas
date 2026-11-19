@@ -47,7 +47,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
 use crate::scip::{self, Index};
@@ -416,7 +416,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
     // One write transaction, taken at its start (a deferred one that reads
     // first cannot wait for another writer).
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::db::Transaction::new_unchecked(conn, crate::db::TransactionBehavior::Immediate)?;
     make_schema(&tx)?;
     tx.commit()?;
     Ok(())
@@ -430,7 +430,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 /// # Errors
 ///
 /// [`Error::StoreTooNew`], else [`Error::Db`] from SQLite.
-fn make_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+fn make_schema(tx: &crate::db::Transaction<'_>) -> Result<()> {
     let have = stored_code_schema(tx);
     if have.as_deref() == Some(CODE_SCHEMA) {
         return Ok(());
@@ -2564,7 +2564,7 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
 }
 
 /// Recomputes `code_counts` for these names in one root.
-fn recount(tx: &rusqlite::Transaction<'_>, root: &str, names: &HashSet<String>) -> Result<()> {
+fn recount(tx: &crate::db::Transaction<'_>, root: &str, names: &HashSet<String>) -> Result<()> {
     let mut del = tx.prepare("DELETE FROM code_counts WHERE name = ?1 AND root = ?2")?;
     let mut ins = tx.prepare(
         "INSERT INTO code_counts(name, root, defs, refs, impls)
@@ -2883,7 +2883,7 @@ mod tests {
         let newer = format!("code-{}", code_schema_number(CODE_SCHEMA).unwrap() + 1);
         conn.execute("UPDATE meta SET value = ?1 WHERE key = 'code_schema'", [&newer]).unwrap();
         conn.execute_batch("DROP TABLE code_packages;").unwrap();
-        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = crate::db::Transaction::new_unchecked(&conn, crate::db::TransactionBehavior::Immediate).unwrap();
         let e = make_schema(&tx).unwrap_err();
         assert!(e.is_store_too_new(), "{e}");
         drop(tx);
@@ -2892,7 +2892,7 @@ mod tests {
         assert_eq!(made, 0, "no schema is run");
         // An older one is migrated by the same step.
         conn.execute("UPDATE meta SET value = 'code-6' WHERE key = 'code_schema'", []).unwrap();
-        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = crate::db::Transaction::new_unchecked(&conn, crate::db::TransactionBehavior::Immediate).unwrap();
         make_schema(&tx).unwrap();
         tx.commit().unwrap();
         let schema: String = conn.query_row("SELECT value FROM meta WHERE key = 'code_schema'", [], |r| r.get(0)).unwrap();

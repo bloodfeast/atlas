@@ -413,7 +413,7 @@ pub struct QMeta {
 }
 
 /// Splits on commas outside parentheses.
-fn split_top(s: &str) -> Vec<String> {
+pub(crate) fn split_top(s: &str) -> Vec<String> {
     let (mut out, mut cur, mut depth) = (Vec::new(), String::new(), 0i32);
     for c in s.chars() {
         match c {
@@ -509,6 +509,99 @@ pub struct Marks {
     pub done: std::collections::HashSet<String>,
     /// (item key, condition) marked met.
     pub met: Vec<(String, String)>,
+    /// Each ticket a queue item tracks (key upper-cased), with its latest
+    /// snapshot, if one was taken: what `after: ticket KEY STATUS` reads.
+    pub tickets: std::collections::HashMap<String, Option<TicketSnap>>,
+}
+
+/// A ticket's latest snapshot, as the queue reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketSnap {
+    /// Its status name (`Dev In Progress`).
+    pub status: String,
+    /// Its status category (`To Do`, `In Progress`, `Done`), if recorded.
+    pub category: String,
+    /// When it was fetched.
+    pub fetched: String,
+}
+
+impl TicketSnap {
+    /// Whether `want` names its status or its status category (case ignored).
+    pub fn matches(&self, want: &str) -> bool {
+        let want = want.trim();
+        !want.is_empty() && (self.status.eq_ignore_ascii_case(want) || self.category.eq_ignore_ascii_case(want))
+    }
+}
+
+/// Every queue item that tracks a ticket (a `ticket:` meta line), in any
+/// status, oldest first: meta and titles only.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn ticket_items(store: &MemoryStore) -> Result<Vec<Head>> {
+    store.entries_with_line_no_body(ENTRY, "ticket:")
+}
+
+/// The ticket items still open: waiting, or started and not yet marked
+/// done (`done`, the done marks). A dropped or superseded item is closed.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn open_ticket_items(store: &MemoryStore, done: &std::collections::HashSet<String>) -> Result<Vec<Head>> {
+    let mut out = Vec::new();
+    for h in ticket_items(store)? {
+        let open = match h.status.as_str() {
+            "active" => true,
+            "retired" => !done.contains(&h.key) && store.retired_reason(h.rid)?.is_some_and(|r| r.starts_with("started")),
+            _ => false,
+        };
+        if open {
+            out.push(h);
+        }
+    }
+    Ok(out)
+}
+
+/// The latest snapshot of each tracked ticket, from `items`
+/// ([`ticket_items`]): the newest `ticket_fetched` wins.
+fn ticket_snaps(items: &[Head]) -> std::collections::HashMap<String, Option<TicketSnap>> {
+    let mut m: std::collections::HashMap<String, Option<TicketSnap>> = std::collections::HashMap::new();
+    for h in items {
+        let Some(t) = crate::trackers::snapshot::ticket_of(&h.meta) else { continue };
+        let v = |k: &str| meta_value(&h.meta, k).unwrap_or("").to_string();
+        let snap = meta_value(&h.meta, "ticket_fetched").map(|f| TicketSnap {
+            status: v("ticket_status"),
+            category: v("ticket_category"),
+            fetched: f.to_string(),
+        });
+        let slot = m.entry(t.to_ascii_uppercase()).or_default();
+        if let Some(s) = snap {
+            let newer = match slot.as_ref() {
+                Some(old) => epoch_secs(&s.fetched).unwrap_or(i64::MIN) >= epoch_secs(&old.fetched).unwrap_or(i64::MIN),
+                None => true,
+            };
+            if newer {
+                *slot = Some(s);
+            }
+        }
+    }
+    m
+}
+
+/// Reads a typed ticket condition, `ticket KEY STATUS` (STATUS a status
+/// name or category, any case): the key and the status.
+pub fn ticket_condition(text: &str) -> Option<(String, String)> {
+    let mut w = text.trim().splitn(2, char::is_whitespace);
+    if !w.next()?.eq_ignore_ascii_case("ticket") {
+        return None;
+    }
+    let rest = w.next()?.trim_start();
+    let (key, status) = rest.split_once(char::is_whitespace)?;
+    let ok = !key.is_empty() && key.len() <= 64 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let status = status.trim();
+    (ok && !status.is_empty()).then(|| (key.to_ascii_uppercase(), status.to_string()))
 }
 
 impl Marks {
@@ -529,6 +622,7 @@ impl Marks {
                 m.met.push((k.to_string(), meta_value(&meta, "condition").unwrap_or("*").to_string()));
             }
         }
+        m.tickets = ticket_snaps(&ticket_items(store)?);
         Ok(m)
     }
 
@@ -556,6 +650,9 @@ pub enum DepState {
     Superseded(String),
     /// Its key waits, directly or not, on this item.
     Cycle,
+    /// A `ticket KEY STATUS` condition whose ticket no queue item tracks,
+    /// so no snapshot of it can be taken.
+    Untracked,
 }
 
 /// Each `after` condition of an item with its state. `waiting` is the
@@ -567,6 +664,13 @@ pub fn dep_states(store: &MemoryStore, key: &str, after: &[String], marks: &Mark
         .map(|t| {
             let st = if marks.is_met(key, t) {
                 DepState::Met
+            } else if let Some((k, want)) = ticket_condition(t) {
+                // Met from the ticket's latest snapshot, no mark needed.
+                match marks.tickets.get(&k) {
+                    None => DepState::Untracked,
+                    Some(Some(s)) if s.matches(&want) => DepState::Met,
+                    Some(_) => DepState::Waiting,
+                }
             } else {
                 match dep(t) {
                     Dep::Key(k) if marks.done.contains(&k) => DepState::Met,
@@ -744,6 +848,7 @@ fn open(states: &[(String, DepState)]) -> Vec<String> {
             DepState::Dropped => Some(format!("{t} (dropped from the queue)")),
             DepState::Superseded(by) => Some(format!("{t} (superseded by {by})")),
             DepState::Cycle => Some(format!("{t} (a cycle)")),
+            DepState::Untracked => Some(format!("{t} (no queue item tracks this ticket)")),
         })
         .collect()
 }
@@ -996,6 +1101,98 @@ pub fn holders(
         .collect()
 }
 
+/// The running agents of every session that filed a `launch` entry in the
+/// last `orch.stale` window, as holders, and how many of those sessions
+/// were read (#305 gap 4: `atlas queue next` without `--transcript`). That
+/// spans every session in the store, not only the caller's as the
+/// admission hook counts, so it can propose fewer starts than the hook
+/// would admit (conservative). A session whose agents folder cannot be
+/// listed is logged to stderr and skipped. An agent a
+/// launch entry names takes the entry's lane (the hook's sub-lane or the
+/// brief's `Lane:`), not an `agent:<id>` placeholder.
+///
+/// # Errors
+///
+/// Store errors reading the launch entries.
+pub fn launch_holders(
+    orch: &crate::orchestrate::OrchSettings,
+    store: &MemoryStore,
+    now: std::time::SystemTime,
+) -> std::result::Result<(Vec<crate::lanes::Holder>, usize), String> {
+    launch_holders_counted(orch, store, now).map(|(h, read, _)| (h, read))
+}
+
+/// [`launch_holders`], and how many sessions the launch entries named: a
+/// caller that must not act on a partial view (worktree gc) compares the
+/// sessions read with the sessions found.
+///
+/// # Errors
+///
+/// Store errors reading the launch entries.
+pub fn launch_holders_counted(
+    orch: &crate::orchestrate::OrchSettings,
+    store: &MemoryStore,
+    now: std::time::SystemTime,
+) -> std::result::Result<(Vec<crate::lanes::Holder>, usize, usize), String> {
+    use crate::memory::import::front_value;
+    let floor = crate::store::utc(now.checked_sub(orch.stale).unwrap_or(std::time::UNIX_EPOCH));
+    let mut transcripts: Vec<String> = Vec::new();
+    let mut lane_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut session_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for h in store.active_entries_no_body(crate::hooks::LAUNCH_ENTRY).map_err(|e| e.to_string())? {
+        if h.time <= floor {
+            continue;
+        }
+        let Some(t) = front_value(&h.meta, "transcript").map(str::trim).filter(|t| !t.is_empty()) else { continue };
+        if !transcripts.iter().any(|x| x == t) {
+            transcripts.push(t.to_string());
+        }
+        // The session that launched it (read as `restart` reads it): its
+        // agents count from its last recorded start (#315 review S2).
+        if let Some(s) = front_value(&h.meta, "session").map(str::trim).filter(|s| !s.is_empty()) {
+            session_of.entry(t.to_string()).or_insert_with(|| s.to_string());
+        }
+        let id = front_value(&h.meta, "agent").map(str::trim).unwrap_or("");
+        if !id.is_empty() && !h.scope.is_empty() && !h.scope.starts_with("agent:") {
+            lane_of.insert(id.to_string(), h.scope.clone());
+        }
+    }
+    let mut out = Vec::new();
+    let mut read = 0;
+    for t in &transcripts {
+        let dir = crate::orchestrate::subagents_dir(t);
+        // One unreadable session folder (a malformed `transcript:`, a denied
+        // or dropped drive) is logged and skipped, as `Hooks::restart_point`
+        // does, so the other sessions still give a proposal.
+        let mut agents = crate::orchestrate::Agents::new(None);
+        // An agent last written before its session's start died with the
+        // process before it (a crash or a closed terminal); with no
+        // recorded start it counts for the whole `stale` window.
+        match session_of.get(t).map(|s| crate::orchestrate::session_start(store, s)).transpose() {
+            Ok(Some(Some(at))) => agents.set_opened(&dir, at),
+            Ok(_) => {}
+            Err(e) => eprintln!("atlas queue next: session start: {e}"),
+        }
+        let r = match agents.running(orch, &dir, Some(store), now) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("atlas queue next: {}: {e}", dir.display());
+                continue;
+            }
+        };
+        read += 1;
+        let mut hs = holders(&r, &dir, &[], &orch.lanes, &|_| None);
+        for (a, h) in r.iter().zip(hs.iter_mut()) {
+            if let Some(l) = lane_of.get(&a.id) {
+                h.class.lane = Some(l.clone());
+                h.class.lane_src = crate::lanes::Source::Declared;
+            }
+        }
+        out.extend(hs);
+    }
+    Ok((out, read, transcripts.len()))
+}
+
 /// The proposal for what runs now: free slots per kind and in total from
 /// the caps.
 pub fn propose(s: &crate::orchestrate::OrchSettings, items: &[crate::lanes::Item], running: &[crate::lanes::Holder]) -> crate::lanes::Proposal {
@@ -1062,7 +1259,7 @@ pub(crate) fn age(time: &str, now: &str) -> String {
 }
 
 /// The usage of `atlas queue`.
-pub const USAGE: &str = "usage: atlas queue [list [--lane LANE] | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next [--transcript PATH] | release AGENT [--force] [--transcript PATH] | add --description TEXT [--kind KIND] FILE|- | plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT]]";
+pub const USAGE: &str = "usage: atlas queue [list [--lane LANE] | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next [--transcript PATH] | release AGENT [--force] [--transcript PATH] | add --description TEXT [--kind KIND] FILE|- | plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT] [--ticket KEY] | plan --from-jql QUERY [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--scope TEXT] [--order-from N] [--lane-from key|fixed:LANE] [--limit N]]";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -1179,6 +1376,7 @@ pub fn cli(
                             DepState::Dropped => "dropped from the queue",
                             DepState::Superseded(_) => "superseded",
                             DepState::Cycle => "a cycle",
+                            DepState::Untracked => "no queue item tracks this ticket",
                         };
                         format!("  after: {}", states[i].iter().map(|(a, st)| format!("{a} [{}]", word(st))).collect::<Vec<_>>().join(", "))
                     };
@@ -1204,7 +1402,9 @@ pub fn cli(
                     u.join(", ")
                 );
             }
-            println!("`atlas queue show KEY` prints one; `atlas queue next` proposes what starts now; a launch whose brief has `Queue: KEY` takes that item off the queue; `atlas queue drop KEY` removes one, `atlas queue done KEY` marks one done, `atlas queue met KEY [CONDITION]` marks a condition met; `atlas queue release AGENT` frees the lane and slots of an agent that died without its finish recorded. KEY is an item's full key, or its lane when one item is open there (waiting, or started and not yet done; `show` and `drop` take waiting items only).");
+            println!(
+                "`atlas queue show KEY` prints one; `atlas queue next` proposes what starts now, counting the running agents of the session `--transcript PATH` names or, without it, of every session in the store that filed a launch record in the `stale_minutes` window (conservative: the admission hook counts its own session only); a launch whose brief has `Queue: KEY` takes that item off the queue; `atlas queue drop KEY` removes one, `atlas queue done KEY` marks one done, `atlas queue met KEY [CONDITION]` marks a condition met; `atlas queue release AGENT` frees the lane and slots of an agent that died without its finish recorded. KEY is an item's full key, or its lane when one item is open there (waiting, or started and not yet done; `show` and `drop` take waiting items only)."
+            );
             Ok(ExitCode::SUCCESS)
         }
         "show" => {
@@ -1227,7 +1427,7 @@ pub fn cli(
                 println!("no launches are waiting");
                 return Ok(ExitCode::SUCCESS);
             }
-            let mut running = Vec::new();
+            let running;
             if let Some(t) = flag(args, "--transcript") {
                 let dir = crate::orchestrate::subagents_dir(&t);
                 let r = crate::orchestrate::Agents::new(None)
@@ -1235,7 +1435,16 @@ pub fn cli(
                     .map_err(|e| format!("{}: {e}", dir.display()))?;
                 running = holders(&r, &dir, &[], &orch.lanes, &|_| None);
             } else {
-                println!("(no --transcript: running agents are not counted)");
+                let (r, sessions) = launch_holders(orch, store, std::time::SystemTime::now())?;
+                running = r;
+                if sessions == 0 {
+                    println!("(no running agents were found from launch records; --transcript names one session)");
+                } else {
+                    println!(
+                        "(running agents from the launch records of {sessions} session{}; --transcript names one session)",
+                        if sessions == 1 { "" } else { "s" }
+                    );
+                }
             }
             let p = propose(orch, &items, &running);
             print!("{}", proposal_line(&items, &heads, &p, usize::MAX));
@@ -1275,6 +1484,14 @@ pub fn cli(
             let list = |n: &str| flag(args, n).map(|v| split_top(&v)).unwrap_or_default();
             let order = flag(args, "--order").map(|o| o.parse::<crate::lanes::Order>().map_err(|()| format!("--order needs a number such as 9 or 9.5, not {o:?}"))).transpose()?;
             let mut p = Planned { lane, kind, priority, uses: list("--uses"), after: list("--after"), order, title: need("--title")?, scope: flag(args, "--scope").unwrap_or_default(), extra: Vec::new() };
+            if let Some(t) = flag(args, "--ticket") {
+                // The ticket this item tracks (atlas track snapshot).
+                let t = t.trim();
+                if t.is_empty() || t.len() > 64 || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                    return Err(format!("--ticket {t:?}: a ticket key such as PROJ-123"));
+                }
+                p.extra.push(format!("ticket: {t}"));
+            }
             check_planned(store, &mut p, served)?;
             let key = add_planned(store, &p).map_err(s)?;
             println!("planned {key} ({}, {}{})", p.kind, p.priority.map_or("normal", crate::lanes::Priority::name), p.order.as_ref().map(|o| format!(", order {o}")).unwrap_or_default());

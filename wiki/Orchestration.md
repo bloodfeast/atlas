@@ -89,6 +89,24 @@ told to wrap up and write its handoff; past its hard limit (enforced mode) every
 denied, and so is a SendMessage to it. When it finishes, the orchestrator is told to start a fresh agent from
 the handoff, or to ask the user first (`orchestrate.fresh`).
 
+## Working lean
+
+Every turn re-reads an agent's whole context, so the `orchestrate` skill's brief has a **Work lean** step
+(step 7) that the orchestrator puts in every brief: find with atlas's `symbol`, `lookup`, `grep` and
+`section` before reading, then read only the lines around the hit; small edits with the smallest unique
+anchor; logs to a file, with the tail and a failure grep read and the path cited; images downscaled or
+cropped before reading; a brief or review read once in full; shared scratch files prefixed with the lane or
+PR; new work stopped before the handoff point. The `atlas` skill keeps the atlas-specific part beside its
+context limits.
+
+The brief's **Journal and limits** step (step 6) asks for `pr:N head:SHA` when a PR opens and on each head
+move, and, before an agent ends a turn to wait on its own background job, a `note` whose first line is
+`waiting: <job> (<worktree or branch>)`. A completion whose own newest entry is that note, or one without
+the brief's report items, is parked: the orchestrator leaves it alone and waits for the next notification on
+the same task id. An entry is the agent's own when it names the agent's worktree or branch; on a lane no
+other agent shares, any entry since its launch is. The compaction card keeps such an agent on its
+`agents:` line as `parked (own job running)` by the same rule.
+
 ## Reports and SubagentStop digests
 
 A subagent's report stays in the orchestrator's context for every later turn, so the skill asks for the
@@ -96,6 +114,73 @@ digest form: the outcome first, then the numbers, the open questions and the ris
 filed as a journal entry and cited by key. In orchestrated mode the SubagentStop hook sends a report over
 28,000 bytes back once: atlas files it whole in the agent's lane and asks for the digest. A report within the bound, or a second stop, goes through. When an agent finishes without
 having written a journal entry, the task notification says so.
+
+## Worktree gc
+
+The worktree ownership ledger (`atlas worktrees`) knows which lane owns which worktree; `atlas worktrees gc` uses it
+to clean up after finished work, never losing any. It looks only at open ledger rows, never at a main checkout.
+
+A worktree is **stale** when its HEAD is a commit of its own (committed after its ledger row was made) that is in
+the remote default branch (`origin/HEAD`, else `origin/main` or `origin/master`) and is not that branch's tip, or a
+merged or closed PR event note names its head and that head is its own commit (made after the worktree); and it is
+not in use. A worktree with no commits of its own is new,
+not done, however far the default branch has moved past it. A worktree is **in use** when a running agent holds
+its lane or declares `worktree:<name>`, a waiting queue item does, or anything in it, its linked build folders, its
+git folder or its ledger row changed within the quiet period (`worktrees.quiet_minutes`, 2 hours by default),
+which also covers a main session working in it and a row whose lane is unknown. When the running agents cannot
+all be read (the launch records cannot be, or any session they name cannot be), nothing is stale. The cheap tests
+go first (held, the ledger row's times, merged or new, git status) and files are walked last, only for a worktree
+gc would touch; build output is looked at two folders deep, and the walk stops at the first newer file. The
+in-use check runs again, with the running agents and the waiting queue read again, just before each worktree is
+touched.
+
+A worktree **holds work**, and is never removed, when any of these is true: a tracked file is modified or deleted;
+anything is staged (intent-to-add included); a file is untracked and not ignored; a file is ignored outside the
+build folders (the worktree's `target_dirs`) and not listed in `worktrees.disposable` (default `target/` at the
+top of the tree only), since `git worktree remove` would delete it unasked; git reports a status entry of any other kind; a commit is in no remote-tracking ref (not pushed, no
+upstream, no remote); a merge, rebase, cherry-pick, revert or bisect is under way; the worktree is locked
+(`git worktree lock`); a stash entry was made on its branch; any of these checks fails or times out (unknown
+counts as work); or the path is not a linked worktree of the repository the ledger names. The checks run again
+just before each removal, which is `git worktree remove` without `--force`: when git refuses, the refusal is
+reported and nothing is forced.
+
+Every delete gc makes (a worktree, its in-tree `target/`, a linked build folder) goes through one guard, which
+walks what it is about to delete immediately before, entering no link or junction, and refuses on a checkout
+(`.git`, `.hg`, `.jj` or `.svn`, or a folder shaped as a bare repository, at any depth), a secret (a denied name,
+`.envrc`, or a name that is not UTF-8) or a folder it cannot read. A worktree's walk covers the whole tree, its
+ignored and build folders included, and passes over its own `.git` file and the files git tracks. The plan makes
+the same walk, only for a worktree it would delete from, and lists a refusal as work; the hourly notify-only run
+makes no quiet-period or guard walk; it only sums sizes, up to `worktrees.notify_gb`, an upper bound (a tree the
+removal would refuse is still counted). `worktrees.dirty` says what a stale worktree that holds work gets
+([[Configuration reference]]): reported (the default), its build output deleted, or its work committed, pushed
+and verified on the remote before removal. Commit-and-push refuses, and leaves the work reported, when an
+untracked file is over 10 MB, has a denied name (`.env`, key files), or holds a line atlas's redaction rules or the
+leak denylist flag, or when a line the tracked files gain is flagged so, or those changes are over 10 MB. One
+`--apply` or `--auto` run goes at a time: a second finds the run lock beside the store held (the operating
+system's file lock, which goes with a run that dies) and does nothing.
+
+With a worktree, its linked build folder (`worktrees.target_dirs`) goes, unless the guard refuses it, or it lies
+inside any git checkout (unless it carries a `CACHEDIR.TAG` with the generic signature cargo writes and that repository tracks nothing in it, as with a
+build folder in an untracked folder of a workspace that is itself a repository), or is, holds or lies in a checkout (a
+ledger worktree, a main checkout or a listed worktree): then it is refused and
+reported. Then the Docker objects
+`cargo xtask linux-test` made for it: the `atlas-linux-target-<hash>` volume and the stopped
+`atlas-linux-test-<hash>` container, `<hash>` from the checkout's path. atlas removes only those, only for a
+checkout that is gone, and never while a container runs on them. Every other container and volume is listed,
+never touched, with what Docker can verify: a container's state and when it stopped ("exited 5 weeks ago"), a
+volume with the containers that use it, and a volume no container uses as "unreferenced, last activity
+unknown". Without Docker, or with it stopped, that part is skipped quietly. Docker Desktop's disk image does not
+shrink when volumes go: compacting it is your step.
+
+```text
+atlas worktrees gc           the plan, with sizes; changes nothing
+atlas worktrees gc --apply   the plan, carried out
+```
+
+Each line of the report starts with `remove`, `work` (holds work, left alone), `target` (build output only),
+`commit` (saved, then removed) or `keep` (not stale), then the path, lane, branch and reason; then the Docker
+lines and the reclaimable total. With `worktrees.auto_gc` on, the hook runs it by itself; off, session start says
+one line when the stale space passes `worktrees.notify_gb`.
 
 ## An example
 

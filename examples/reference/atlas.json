@@ -1,0 +1,257 @@
+{
+  "wikilinks": true,
+  "vault_id_keys": [
+    "id"
+  ],
+  "refresh_limit": 64,
+  "recall": {
+    "budget_tokens": 600,
+    "subagent_context": "binding",
+    "lane_budget_tokens": 2000,
+    "fts_floor": 9.72,
+    "min_terms": 3,
+    "hybrid_fts_floor": 8.89,
+    "cos_floor": 0.43,
+    "cos_alone": 0.72,
+    "query_tokens": 32,
+    "inject_floor": 0
+  },
+  "cap": {
+    "warn_tokens": 450000,
+    "block_tokens": 500000,
+    "warn_every": 25000,
+    "main_session": false
+  },
+  "projects": [
+    {
+      "name": "<project>",
+      "roots": [
+        "<WORKSPACE>"
+      ],
+      "db": "<ATLAS_HOME>/state/atlas.sqlite",
+      "vaults": [
+        {
+          "name": "notes",
+          "path": "<WORKSPACE>/<Obsidian vault folder>"
+        }
+      ],
+      "sources": [
+        {
+          "name": "intent",
+          "root": "<WORKSPACE>/<repo>/.claude",
+          "include": [
+            "INTENT.md"
+          ],
+          "chunk": {
+            "top_level_items": true
+          }
+        },
+        {
+          "name": "docs",
+          "root": "<WORKSPACE>/<repo>/docs",
+          "include": [
+            "*.md"
+          ]
+        },
+        {
+          "name": "memory",
+          "root": "<CLAUDE_MEMORY_DIR>",
+          "include": [
+            "*.md"
+          ],
+          "id_keys": [
+            "name"
+          ],
+          "names_kind": "memory",
+          "exclude": [
+            "index/*"
+          ]
+        }
+      ],
+      "ids": [
+        {
+          "name": "decision",
+          "regex": "\\bD-[0-9]{3,4}\\b"
+        },
+        {
+          "name": "lane",
+          "regex": "\\bLANE-[0-9]+[a-z]?\\b"
+        },
+        {
+          "name": "pr",
+          "regex": "(?:^|[^A-Za-z0-9_&/])(?P<id>#[0-9]{1,5})\\b"
+        },
+        {
+          "name": "work",
+          "regex": "\\b[A-Z][A-Z0-9]+(?:-[A-Z][A-Z0-9]+)+\\b"
+        }
+      ],
+      "code": {
+        "roots": [
+          {
+            "name": "main",
+            "root": "<WORKSPACE>/<repo>"
+          }
+        ]
+      },
+      "memory": {
+        "store": "<ATLAS_HOME>/state/memory.sqlite",
+        "export_dir": "<ATLAS_HOME>/exports",
+        "snapshot_dir": "<ATLAS_HOME>/state/snapshots",
+        "snapshot_hours": 24,
+        "snapshot_cap_mb": 1024,
+        "exports": [
+          {
+            "name": "memory",
+            "shape": "memory",
+            "path": "memory",
+            "index": "MEMORY.md"
+          },
+          {
+            "name": "intent",
+            "shape": "items",
+            "path": "INTENT.md"
+          },
+          {
+            "name": "handoffs",
+            "shape": "headings",
+            "path": "HANDOFFS.md",
+            "handoffs": true
+          }
+        ],
+        "tree": {
+          "hub_max": 24,
+          "hub_target": 20,
+          "hub_min": 8,
+          "line_max": 150,
+          "pin_body_chars": 400,
+          "keyword_weight": 0.5,
+          "name_stop": [
+            "<your first name>",
+            "<project>",
+            "claude"
+          ],
+          "branches": [
+            {
+              "name": "project",
+              "title": "<Project>: design and code",
+              "hook": "<one line: what memories on this branch are about>",
+              "words": [
+                "<keyword>",
+                "<prefix*>"
+              ],
+              "repo": "<repo>"
+            },
+            {
+              "name": "atlas",
+              "title": "atlas",
+              "hook": "the project-memory MCP server: setup, vaults, recall and tooling",
+              "words": [
+                "atlas",
+                "obsidian",
+                "vault*",
+                "tooling"
+              ]
+            },
+            {
+              "name": "workflow",
+              "title": "Workflow: agents, reviews, git and builds",
+              "hook": "orchestrating agents, briefs and reviews, worktrees and git, builds and tests",
+              "words": [
+                "agent*",
+                "subagent*",
+                "orchestrat*",
+                "brief*",
+                "review*",
+                "worktree*",
+                "git",
+                "commit*",
+                "merge*",
+                "branch*",
+                "ci",
+                "test*",
+                "shell",
+                "script*",
+                "build",
+                "builds",
+                "compaction",
+                "handoff",
+                "lane*",
+                "skill*",
+                "queue*"
+              ]
+            },
+            {
+              "name": "machine",
+              "title": "Machine, accounts and credentials",
+              "hook": "the machine, disks, Docker, API keys, GitHub and git identity",
+              "words": [
+                "credential*",
+                "api key",
+                "env",
+                "machine",
+                "disk",
+                "docker",
+                "github",
+                "email",
+                "identity"
+              ]
+            },
+            {
+              "name": "me",
+              "title": "About me",
+              "hook": "who I am, what I value, how I like to decide",
+              "words": [
+                "prefer*"
+              ],
+              "types": [
+                "user"
+              ]
+            }
+          ],
+          "line_format": "slug",
+          "pins": []
+        },
+        "brief_reference": "<WORKSPACE>/<repo>/.claude/INTENT.md",
+        "transcripts": true
+      },
+      "file": "<WORKSPACE>/atlas.project.json"
+    }
+  ],
+  "default_project": "<project>",
+  "orchestrate": {
+    "resources": {
+      "gpu": 1,
+      "compile": 1
+    },
+    "enabled": true,
+    "mode": "enforced",
+    "fresh": "auto",
+    "kinds": {
+      "builder": {
+        "max": 6,
+        "limit": 500000,
+        "handoff": 285000
+      },
+      "reviewer": {
+        "max": 4,
+        "limit": 500000,
+        "handoff": 285000
+      },
+      "research": {
+        "max": 2,
+        "limit": 500000,
+        "handoff": 285000
+      }
+    }
+  },
+  "compact": {
+    "enabled": true
+  },
+  "memory": {
+    "rules": true
+  },
+  "backlog": {
+    "asker": "<your first name>"
+  }
+}

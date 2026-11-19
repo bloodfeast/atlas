@@ -91,6 +91,9 @@ pub enum Shape {
     Summary,
     /// Anything else.
     Generic,
+    /// A Jira or Confluence response read by `atlas track`
+    /// ([`crate::trackers::digest`]).
+    Tracker,
 }
 
 /// A pattern of a [`RUNNERS`] row. The digest's own fixed patterns are the
@@ -815,6 +818,7 @@ pub fn shape(kind: &str, cmd: &str, text: &str) -> Shape {
         "read" => return Shape::Source(lang_of(cmd)),
         "grep" => return Shape::Grep,
         "glob" | "files" => return Shape::Listing,
+        "tracker" => return Shape::Tracker,
         _ => {}
     }
     let step = last_step(cmd);
@@ -880,6 +884,7 @@ pub fn digest(id: &str, label: &str, shape: Shape, text: &str, exit: Option<i32>
         Shape::Source(lang) => source(id, lang, text, max_bytes * OUTLINE_MAX_BYTES / DEFAULT_MAX_BYTES.max(1)),
         Shape::Summary => summary(text) + &hint(id, "failures=true | grep=RE"),
         Shape::Generic => generic(id, text, exit, max_bytes),
+        Shape::Tracker => crate::trackers::digest::body(id, text, max_bytes * OUTLINE_MAX_BYTES / DEFAULT_MAX_BYTES.max(1)),
     };
     out.push_str(&body);
     out
@@ -897,6 +902,7 @@ pub fn items(shape: Shape, text: &str) -> Vec<Item> {
         Shape::CargoBuild => build_items(text),
         Shape::Grep => grep_items(text),
         Shape::Source(lang) => outline_as(lang, text),
+        Shape::Tracker => crate::trackers::digest::items(text),
         Shape::Listing | Shape::Generic => Vec::new(),
     }
 }
@@ -2607,32 +2613,215 @@ pub fn cli(args: Vec<String>) -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-fn generic(id: &str, text: &str, exit: Option<i32>, max: usize) -> String {
-    let hits: Vec<(usize, &str)> = text.lines().enumerate().filter(|(_, l)| bad_word(l)).collect();
-    let mut out = String::new();
-    if exit.is_none() {
-        out.push_str(&format!("{} lines match error|fail|panic; exit status unknown\n", hits.len()));
+/// A generic output of at most this many lines keeps every line (#326).
+const SHORT_LINES: usize = 24;
+/// The characters a short output keeps of each line.
+const SHORT_LINE_CHARS: usize = 120;
+/// The characters a short output keeps of each JSONL record.
+const SHORT_RECORD_CHARS: usize = 80;
+/// The first lines a longer output shows beside its tail.
+const HEAD_LINES: usize = 2;
+/// The characters the shortest digest keeps of line 1.
+const FIRST_LINE_CHARS: usize = 80;
+
+/// A line as the generic digest sees it (#326).
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// Not a JSON object: matched for error|fail|panic.
+    Plain,
+    /// A JSONL record: one class, never matched inside its strings.
+    Record,
+    /// A JSONL record at error level: counted and shown as a match.
+    RecordError,
+}
+
+/// The level words of an error record: log crates, syslog and GCP severities.
+const ERROR_LEVELS: [&str; 9] = ["error", "err", "fatal", "panic", "critical", "crit", "alert", "emerg", "emergency"];
+/// The pino/bunyan numeric levels that are errors: 50 error, 60 fatal and
+/// any custom level between them. Only `level` is read as a number: GCP's
+/// numeric `severity` puts INFO at 200, syslog's runs 0-7 lower-is-worse.
+const ERROR_LEVEL_NUMBERS: std::ops::RangeInclusive<i64> = 50..=60;
+
+/// Whether a line is a JSON object (a JSONL record) and, if so, whether its
+/// top-level `level`, `severity` or `lvl` is an error word (any case), its
+/// `level` an integer in 50..=60, or its `is_error` true (or "true").
+fn line_kind(l: &str) -> Kind {
+    let t = l.trim();
+    if !(t.starts_with('{') && t.ends_with('}')) {
+        return Kind::Plain;
+    }
+    let Ok(v) = crate::json::parse(t) else { return Kind::Plain };
+    let Some(o) = v.as_object() else { return Kind::Plain };
+    let word = ["level", "severity", "lvl"]
+        .iter()
+        .filter_map(|k| o.get(k)?.as_str())
+        .any(|s| ERROR_LEVELS.iter().any(|w| s.eq_ignore_ascii_case(w)));
+    let number = o.get("level").and_then(|v| v.as_i64()).is_some_and(|n| ERROR_LEVEL_NUMBERS.contains(&n));
+    let level = word || number;
+    let is_error = o.get("is_error").is_some_and(|v| v.as_bool() == Some(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true")));
+    if level || is_error {
+        Kind::RecordError
     } else {
-        out.push_str(&format!("{} lines match error|fail|panic\n", hits.len()));
+        Kind::Record
     }
-    let budget = max / 2;
-    let mut used = 0;
-    for (i, l) in hits.iter().take(MAX_FAILURES) {
-        let q = format!("{}: {}\n", i + 1, clip(l, QUOTE));
-        if used + q.len() > budget {
-            break;
+}
+
+/// A line cut to `n` characters, saying how many it dropped.
+fn clip_counted(s: &str, n: usize) -> String {
+    let s = s.trim_end();
+    let len = s.chars().count();
+    if len <= n {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(n).collect();
+    t.push_str(&format!("...(+{} chars)", len - n));
+    t
+}
+
+/// A quote line cut to `budget` bytes on a char boundary and marked `...`;
+/// none when not even its line number and one character fit.
+fn clip_quote(s: &str, budget: usize) -> Option<String> {
+    let s = s.trim_end_matches('\n');
+    let mut end = budget.checked_sub("...\n".len())?.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let body = s.find(": ")? + 2;
+    (end > body).then(|| format!("{}...\n", &s[..end]))
+}
+
+fn generic(id: &str, text: &str, exit: Option<i32>, max: usize) -> String {
+    let kinds: Vec<Kind> = text.lines().map(line_kind).collect();
+    let hits: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter(|&(i, l)| match kinds[i] {
+            Kind::Plain => bad_word(l),
+            Kind::Record => false,
+            Kind::RecordError => true,
+        })
+        .collect();
+    let jsonl = kinds.iter().filter(|&&k| k != Kind::Plain).count();
+    // The header, saying how many matches are shown when not all of them are.
+    let pre = |shown: usize| {
+        let mut p = format!("{} lines match error|fail|panic", hits.len());
+        if shown < hits.len() {
+            p.push_str(&format!(", {shown} shown"));
         }
-        used += q.len();
-        out.push_str(&q);
+        p.push_str(if exit.is_none() { "; exit status unknown\n" } else { "\n" });
+        if jsonl > 0 {
+            p.push_str(&format!("{jsonl} JSONL records (matched by level, not text)\n"));
+        }
+        p
+    };
+    let hint = hint(id, "lines=A-B | grep=RE");
+    // Each form below is taken only at half the raw size or less, so a low
+    // threshold never gets a digest larger than the output it stands for.
+    let half = text.len() / 2;
+    let n = kinds.len();
+    // A short output is not cut to its matches and tail: a few long lines
+    // put it over the threshold, and the line that mattered was the first.
+    if n <= SHORT_LINES {
+        let mut out = pre(hits.len());
+        for (i, l) in text.lines().enumerate() {
+            let keep = if kinds[i] == Kind::Plain { SHORT_LINE_CHARS } else { SHORT_RECORD_CHARS };
+            out.push_str(&format!("{}: {}\n", i + 1, clip_counted(l, keep)));
+        }
+        out.push_str(&hint);
+        if out.len() <= half || n == 0 {
+            return out;
+        }
     }
-    out.push_str(&tail(text, max.saturating_sub(out.len()).max(200)));
-    out.push_str(&hint(id, "lines=A-B | grep=RE"));
-    out
+    // The quoted matches past a head of `h` lines (a match in the head is
+    // shown there, not twice), each line one string. A quote that does not
+    // fit is skipped, so one long line hides no match after it (#332 r3);
+    // when none fits, the first is cut to the budget's bytes.
+    let quotes = |h: usize| -> Vec<String> {
+        let budget = max / 2;
+        let mut used = 0;
+        let mut q = Vec::new();
+        let mut over = None;
+        for (i, l) in hits.iter().filter(|&&(i, _)| i >= h) {
+            if q.len() == MAX_FAILURES {
+                break;
+            }
+            let s = format!("{}: {}\n", i + 1, clip(l, QUOTE));
+            if used + s.len() > budget {
+                over.get_or_insert(s);
+                continue;
+            }
+            used += s.len();
+            q.push(s);
+        }
+        if q.is_empty() {
+            q.extend(over.and_then(|s| clip_quote(&s, budget)));
+        }
+        q
+    };
+    let in_head = |h: usize| hits.iter().filter(|&&(i, _)| i < h).count();
+    let line_no = |s: &str| s.split_once(": ").and_then(|(n, _)| n.parse::<usize>().ok());
+    let quoted = quotes(HEAD_LINES);
+    let pre2 = pre(in_head(HEAD_LINES) + quoted.len());
+    let quoted_at: Vec<usize> = quoted.iter().filter_map(|s| line_no(s)).collect();
+    let quoted = quoted.concat();
+    let mut head = format!("first {} of {n} lines:\n", HEAD_LINES.min(n));
+    for (i, l) in text.lines().take(HEAD_LINES).enumerate() {
+        head.push_str(&format!("{}: {}\n", i + 1, clip_counted(l, QUOTE)));
+    }
+    // The tail is sized after the head: the head counts in the budget.
+    let last = tail(text, max.saturating_sub(pre2.len() + quoted.len() + head.len()).max(200));
+    // The matches the tail shows count as shown too, each once (#332 r3, N1).
+    let in_tail = last
+        .lines()
+        .skip(1)
+        .filter_map(line_no)
+        .filter(|&ln| ln > HEAD_LINES && !quoted_at.contains(&ln) && hits.binary_search_by_key(&(ln - 1), |&(i, _)| i).is_ok())
+        .count();
+    let pre3 = pre(in_head(HEAD_LINES) + quoted_at.len() + in_tail);
+    let out = [pre3.as_str(), &quoted, &head, &last, &hint].concat();
+    if out.len() <= half {
+        return out;
+    }
+    let out = [pre2.as_str(), &quoted, &head, &hint].concat();
+    if out.len() <= half {
+        return out;
+    }
+    // Last, the head shrinks to line 1 before any match is dropped; then the
+    // matches are dropped from the end until the digest fits (#332 r2, M1).
+    let first = text.lines().next().unwrap_or("");
+    let head1 = format!("first 1 of {n} lines:\n1: {}\n", clip_counted(first, FIRST_LINE_CHARS));
+    let quoted = quotes(1);
+    let mut k = quoted.len();
+    loop {
+        let out = [pre(in_head(1) + k), quoted[..k].concat(), head1.clone(), hint.clone()].concat();
+        // At k = 0 the digest is the header, line 1 at FIRST_LINE_CHARS
+        // (at most 4 B a char) and the hint: about 510 B at worst, so at
+        // the 1024 B threshold floor it still fits. A wider line 1 or a
+        // longer header must keep that sum under half of 1024.
+        if k == 0 || out.len() <= half {
+            return out;
+        }
+        k -= 1;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A quote cut to its budget keeps its line number and at least one
+    /// character, cuts on a char boundary and says it was cut (#332 r3).
+    #[test]
+    fn a_quote_is_cut_to_its_budget_on_a_char_boundary() {
+        let q = "101: error: x\n";
+        // 9 B leaves "101: " and the marker: no character, no quote.
+        assert_eq!(clip_quote(q, 9), None);
+        assert_eq!(clip_quote(q, 10).as_deref(), Some("101: e...\n"));
+        assert_eq!(clip_quote(q, 3), None);
+        // "7: " then 2-byte chars: 10 B leaves 6, which ends inside one.
+        assert_eq!(clip_quote("7: \u{436}\u{436}\u{436}\n", 10).as_deref(), Some("7: \u{436}...\n"));
+        assert_eq!(clip_quote("7: \u{436}\u{436}\u{436}\n", 8), None);
+    }
 
     #[test]
     fn a_check_log_keeps_only_tables_failures_panics_and_verdicts() {

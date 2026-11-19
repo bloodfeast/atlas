@@ -24,7 +24,8 @@ fn fresh(c: &mut Command, root: &Path) {
         .env("USERPROFILE", root)
         .env_remove("ATLAS_CONFIG")
         .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT");
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_UNATTENDED");
     for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
         c.env(k, "http://127.0.0.1:9");
     }
@@ -103,7 +104,7 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
     // event JSON on stdin. It is also the first run, so it writes the template.
     let mut c = Command::new(bin());
     fresh(&mut c, root);
-    let mut hook = c.arg("--hook").current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut hook = c.arg("--hook").env("ATLAS_HOOK_BUDGET_OFF", "1").current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let input = json!({"hook_event_name": "SessionStart", "session_id": "s1", "source": "startup", "transcript_path": transcript.to_string_lossy().to_string(), "cwd": root.to_string_lossy().to_string()});
     write!(hook.stdin.take().unwrap(), "{input}").unwrap();
     let ho = hook.wait_with_output().unwrap();

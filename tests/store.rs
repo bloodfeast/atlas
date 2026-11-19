@@ -5,7 +5,7 @@ mod common;
 use std::fs;
 
 use common::*;
-use rusqlite::Connection;
+use atlas::db::Connection;
 use atlas::json;
 
 fn dump(conn: &Connection) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {

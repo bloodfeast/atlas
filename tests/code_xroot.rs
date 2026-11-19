@@ -138,12 +138,12 @@ fn setup(t: &Temp) -> (CodeSetup, PathBuf) {
 }
 
 fn index_one(code: &CodeSetup, db: &Path, i: usize) -> IndexReport {
-    let mut conn = rusqlite::Connection::open(db).unwrap();
+    let mut conn = atlas::db::Connection::open(db).unwrap();
     code_index::index_root(code, &mut conn, &code.roots[i], &RustSource::ScanOnly("test".into())).unwrap()
 }
 
 fn fingerprint(db: &Path, root: &str) -> String {
-    let conn = rusqlite::Connection::open(db).unwrap();
+    let conn = atlas::db::Connection::open(db).unwrap();
     conn.query_row("SELECT fingerprint FROM code_roots WHERE root = ?1", [root], |r| r.get(0)).unwrap()
 }
 
@@ -275,7 +275,7 @@ fn a_rust_crate_using_a_sibling_roots_crate_gets_its_references() {
     code.defer_on_cargo = false;
     code.indexers = Indexers::Off("off in tests".into());
     drop(atlas::store::Store::open(&db, vaults(&db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&db).unwrap();
+    let mut conn = atlas::db::Connection::open(&db).unwrap();
     code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::File(geo_scip)).unwrap();
     let rep = code_index::index_root(&code, &mut conn, &code.roots[1], &RustSource::File(app_scip)).unwrap();
     assert_eq!((rep.rows.xroot_refs, rep.rows.external_refs), (2, 1), "{:?}", rep.rows);
