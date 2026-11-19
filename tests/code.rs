@@ -388,11 +388,65 @@ fn file_items_map_a_path_to_its_items_and_skip_stale_or_foreign_files() {
     let grep = "src/multi.rs:7:        let n = self.n;\nsrc/multi.rs-8-        n + 1\nsrc/nothere.rs:1:x".to_string();
     let out = atlas::hook_rewrite::annotate_grep(&grep, &f.root.to_string_lossy(), None, &mut |p| code::file_items(&conn, p)).unwrap();
     assert_eq!(out, "src/multi.rs:7:        let n = self.n; [fn Cache::get 6-9]\nsrc/multi.rs-8-        n + 1\nsrc/nothere.rs:1:x");
+    // A covered file whose rows hold no item is covered with no items, not
+    // unknown (`file_items` reads the file and its rows in one statement).
+    let shapes = f.root.join("src/shapes.rs");
+    let rows = "DELETE FROM code_occ WHERE file = (SELECT id FROM code_files WHERE root = 'app' AND path = 'src/shapes.rs')";
+    conn.execute(rows, []).unwrap();
+    assert_eq!(code::file_items(&conn, &shapes.to_string_lossy()).unwrap().map(|v| v.len()), Some(0));
     // A file outside every root, and a file written after the indexing.
     assert!(code::file_items(&conn, &f.db.to_string_lossy()).unwrap().is_none());
     let later = std::time::SystemTime::now() + Duration::from_secs(60);
     fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
     assert!(code::file_items(&conn, &path.to_string_lossy()).unwrap().is_none());
+}
+
+/// The rule: a file modified after a run's walk began is not served from that
+/// run's rows. A stand-in rust-analyzer edits a file while the run is under
+/// way. The run's stamp used to be taken at its write, after the edit, so the
+/// file passed as indexed (and when the edit lands after atlas read the file,
+/// its old lines would be served).
+#[cfg(unix)]
+#[test]
+fn a_file_modified_after_the_walk_began_is_not_served_from_that_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture("code-mid-run");
+    write(&f.root.join("src/mid.rs"), "pub fn before() {}\n");
+    // Its arguments: scip ROOT --output FILE --config-path JSON. It sleeps
+    // well past the stamps' millisecond, edits, and fails, so the run goes on
+    // from the line scan.
+    let ra = f.root.parent().unwrap().join("stand-in-ra.sh");
+    fs::write(&ra, "#!/bin/sh\nsleep 0.05\nprintf 'pub fn during() {}\\n' >> \"$2/src/mid.rs\"\nexit 1\n").unwrap();
+    fs::set_permissions(&ra, fs::Permissions::from_mode(0o755)).unwrap();
+    let code = setup(&f);
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let rep = code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::Analyzer(ra)).unwrap();
+    assert!(rep.rust.contains("exited with"), "the stand-in ran: {}", rep.rust);
+    assert!(fs::read_to_string(f.root.join("src/mid.rs")).unwrap().contains("during"), "the stand-in edited the file");
+    assert!(code::file_items(&conn, &f.root.join("src/mid.rs").to_string_lossy()).unwrap().is_none(), "edited after the walk began");
+    assert!(code::file_items(&conn, &f.root.join("src/lib.rs").to_string_lossy()).unwrap().is_some(), "an untouched file is served");
+}
+
+/// A root whose stored fingerprint no longer matches its files, while the
+/// files stay as they are, is indexed again by the running indexer. A file
+/// edited during a run leaves this state (the stored fingerprint is the
+/// walk's, the last one seen is the run's end), and so does another root's rpc
+/// change, which clears the stored fingerprint. A full walk used to see the
+/// files unchanged since its last look and schedule nothing.
+#[test]
+fn a_stale_but_stable_root_is_indexed_again() {
+    let f = fixture("code-stale-stable");
+    let mut code = setup(&f);
+    code.watch = false;
+    code.rescan_interval = Duration::from_millis(20);
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let ix = Indexer::start(code.clone(), f.db.clone(), Some(RustSource::File(f.scip.clone())));
+    assert!(ix.wait_reports(1, Duration::from_secs(60)), "{:?}", ix.status());
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute("UPDATE code_roots SET fingerprint = '' WHERE root = 'app'", []).unwrap();
+    ix.check();
+    assert!(ix.wait_reports(2, Duration::from_secs(20)), "the stale root was not indexed again: {:?}", ix.status());
 }
 
 /// The line of `text` (1-based) that is exactly `want` after trimming its

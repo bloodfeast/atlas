@@ -308,6 +308,9 @@ fn decode_mem(ix: &scip::Index<'_>, file: usize) -> usize {
 /// is written from the line scan and the report says why.
 pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rust: &RustSource) -> Result<IndexReport> {
     let t0 = Instant::now();
+    // The rows are as current as the walk: a file changed after it began is
+    // not served from them (`code::file_items` compares mtimes with this).
+    let started = crate::store::utc(SystemTime::now());
     let walk = root.walk()?;
     let fingerprint = walk.fingerprint_with(&root.scip.configured());
     let mut rep = IndexReport { root: root.name.clone(), ..IndexReport::default() };
@@ -464,7 +467,7 @@ pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rus
     }
     rep.rust = code::units_note(&rep.units);
     let elapsed = t0.elapsed().as_millis() as u64;
-    rep.write = code::write_root(conn, &root.name, &root.root, &rows, &text_of, &fingerprint, &rep.units, elapsed)?;
+    rep.write = code::write_root(conn, &root.name, &root.root, &rows, &text_of, &fingerprint, &rep.units, elapsed, &started)?;
     if own_rpcs != own_before {
         // The other roots' call sites of this root's rpcs are stale: their
         // fingerprints are cleared, so the next walk re-indexes them.
@@ -1114,6 +1117,12 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                     // Still changing (or first sight): restart the quiet time,
                     // except at startup, where a stale root goes at once.
                     changed[i] = Some(if walk_all && seen_fp[i].is_empty() { Instant::now() - setup.debounce } else { Instant::now() });
+                } else if changed[i].is_none() {
+                    // Stale but unchanged since the last look, with nothing
+                    // pending: a file edited during the last run (the stored
+                    // fingerprint is that run's walk), or a fingerprint another
+                    // root's run cleared. It has been quiet, so it goes at once.
+                    changed[i] = Some(Instant::now() - setup.debounce);
                 }
                 seen_fp[i] = fp;
             } else if change_wakes(&snap.paths, &r.exclude) {

@@ -131,7 +131,7 @@ Routing is deterministic: hooks decide, not the model. It is on by default; `lea
     move the folder, and Git Bash paths (`/c/...`) map to drive paths. Any other part (an assignment,
     `||`, a redirect, `$(`) leaves the whole command unread, so an annotation never guesses which output
     is which. `git grep -n` is read like `grep -rn`.
-  - A file outside every code root, or written after its root was indexed, is not annotated.
+  - A file outside every code root, or written after its root's indexing began, is not annotated.
     `lean.annotate: false` turns this off.
 - **Fail open.** Any routing error leaves the call untouched and records a miss (`tool = "route"`).
 - **Digests** (`src/digest.rs`) have a 600 B budget, or 3.2 KB for an outline. Each digest ends with one

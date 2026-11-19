@@ -35,6 +35,7 @@
 1 sleep tests/code_cs.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 sleep tests/code_go.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 sleep tests/code_ts.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+1 sleep tests/code_xroot.rs -- a sleep or poll used to order threads or processes: a wait that shows no run follows; the indexer gives no signal when a walk finds nothing; to become a count of walks
 4 elapsed tests/concurrency.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 6 sleep tests/concurrency.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 1 timeout tests/concurrency.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
