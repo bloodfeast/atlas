@@ -292,6 +292,11 @@ Edit, Write or MultiEdit is re-indexed as soon as the edit lands (a Rust file by
 the scanner, as is a TypeScript, JavaScript, C#, Python, Java or Kotlin file: definitions and ranges at once, its
 references at the root's next full run), so its next read is
 annotated again.
+A file in a git worktree of a code root's repository is annotated too: Claude Code's `.claude/worktrees/NAME`,
+or a worktree beside the root, including the worktrees of a bare repository. The index holds no rows for such
+a file, so its ranges come from a scan of its own text when it is read, and nothing is stored. A file added
+on the worktree's branch is covered the same way. `symbol` still answers from the root's own checkout, so a
+function added in a worktree is not found by `symbol`, and one moved there shows the checkout's line.
 `lean.annotate: false` turns the annotations off (see [[Handles and digests]]).
 
 ## Language coverage
