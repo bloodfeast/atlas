@@ -3,7 +3,8 @@
 //!
 //! `cargo test --test proptest`; `PROPTEST_CASES=N` runs more cases. A failing
 //! case prints its minimal input; proptest also saves it under
-//! `tests/proptest/proptest-regressions/` so the next run tries it first.
+//! `tests/proptest-regressions/<module>.txt`, which is checked in, so every run
+//! tries the saved cases first.
 
 mod checkout;
 mod denylist;
