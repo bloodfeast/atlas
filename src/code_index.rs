@@ -275,6 +275,9 @@ pub struct IndexReport {
     pub write_ms: f64,
     /// Everything, milliseconds.
     pub total_ms: f64,
+    /// The fingerprint the run stored: its walk's, taken before any file was
+    /// read.
+    pub fingerprint: String,
 }
 
 fn decode_mem(ix: &scip::Index<'_>, file: usize) -> usize {
@@ -313,7 +316,7 @@ pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rus
     let started = crate::store::utc(SystemTime::now());
     let walk = root.walk()?;
     let fingerprint = walk.fingerprint_with(&root.scip.configured());
-    let mut rep = IndexReport { root: root.name.clone(), ..IndexReport::default() };
+    let mut rep = IndexReport { root: root.name.clone(), fingerprint: fingerprint.clone(), ..IndexReport::default() };
     let mut scip_bytes: Option<Vec<u8>> = None;
     let has_manifest = root.root.join("Cargo.toml").is_file();
     // A root of another language's code alone (a Go service) has no Rust
@@ -1085,7 +1088,13 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
         Ok(p) => RustSource::Analyzer(p),
         Err(why) => RustSource::ScanOnly(why),
     });
-    let holder = format!("pid {}", std::process::id());
+    // One name per indexer, so two indexers in one process do not share the
+    // lease.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let holder = format!("pid {} indexer {}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    // A root due now: quiet for the whole quiet time already. An `Instant`
+    // cannot go back past the clock's start, so shortly after boot it is now.
+    let due_now = || Instant::now().checked_sub(setup.debounce).unwrap_or_else(Instant::now);
     let n = setup.roots.len();
     // Per root: when it last changed, and the fingerprint last walked.
     let mut changed: Vec<Option<Instant>> = vec![None; n];
@@ -1115,14 +1124,19 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                     changed[i] = None;
                 } else if fp != seen_fp[i] {
                     // Still changing (or first sight): restart the quiet time,
-                    // except at startup, where a stale root goes at once.
-                    changed[i] = Some(if walk_all && seen_fp[i].is_empty() { Instant::now() - setup.debounce } else { Instant::now() });
-                } else if changed[i].is_none() {
-                    // Stale but unchanged since the last look, with nothing
-                    // pending: a file edited during the last run (the stored
-                    // fingerprint is that run's walk), or a fingerprint another
-                    // root's run cleared. It has been quiet, so it goes at once.
-                    changed[i] = Some(Instant::now() - setup.debounce);
+                    // except at startup, where a stale root goes at once. A
+                    // file edited during this indexer's own last run lands
+                    // here too: `seen_fp` is the fingerprint that run stored.
+                    changed[i] = Some(if walk_all && seen_fp[i].is_empty() { due_now() } else { Instant::now() });
+                } else if indexed == Some("") && changed[i].is_none() {
+                    // A mark, unchanged since the last look: another root's
+                    // run (its rpcs or packages changed) or a migration
+                    // cleared the fingerprint. It has been quiet, so it goes
+                    // at once. Any other stale fingerprint, unchanged here,
+                    // is another server's write (another configuration or
+                    // version): this indexer settles on it, or two servers
+                    // would take turns re-indexing the root.
+                    changed[i] = Some(due_now());
                 }
                 seen_fp[i] = fp;
             } else if change_wakes(&snap.paths, &r.exclude) {
@@ -1164,6 +1178,17 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                 changed[i] = Some(Instant::now());
                 continue;
             }
+            // Another server may have indexed it since it was scheduled
+            // here: then there is nothing to do.
+            let fp = code::root_fingerprint(r).unwrap_or_default();
+            if code::root_records(&conn)?.get(&r.name).is_some_and(|x| x.fingerprint == fp) {
+                let _ = release_lease(&conn, &holder);
+                changed[i] = None;
+                seen_fp[i] = fp;
+                set(shared, &r.name, RootState::Idle);
+                settled[i] = true;
+                continue;
+            }
             set(shared, &r.name, if settled[i] { RootState::Running } else { RootState::Starting });
             log_line(&setup.dir, &format!("{} indexing", r.name));
             let res = index_root(setup, &mut conn, r, &rust);
@@ -1173,7 +1198,9 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                 Ok(rep) => {
                     log_line(&setup.dir, &format!("{} done: {} in {:.0} ms ({} defs, {} refs, {} impls)", r.name, rep.rust, rep.total_ms, rep.write.defs, rep.write.refs, rep.write.impls));
                     failed[i] = None;
-                    seen_fp[i] = code::root_fingerprint(r).unwrap_or_default();
+                    // The fingerprint the run stored, not today's: a file
+                    // edited during the run then reads as a change.
+                    seen_fp[i] = rep.fingerprint.clone();
                     shared.reports.lock().unwrap_or_else(|p| p.into_inner()).push(rep);
                     set(shared, &r.name, RootState::Idle);
                     settled[i] = true;

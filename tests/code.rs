@@ -428,6 +428,89 @@ fn a_file_modified_after_the_walk_began_is_not_served_from_that_run() {
     assert!(code::file_items(&conn, &f.root.join("src/lib.rs").to_string_lossy()).unwrap().is_some(), "an untouched file is served");
 }
 
+/// Waits until `count()` reaches `n` (at most 30 s), then fifty rescan
+/// intervals more, and gives the final count.
+fn settled_count(n: usize, count: impl Fn() -> usize) -> usize {
+    let t = std::time::Instant::now();
+    while count() < n && t.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    count()
+}
+
+/// Every server shares one index database, and two servers can compute
+/// different fingerprints for one root: one started before a configuration
+/// change (here a configured prebuilt SCIP file) and one after. Each settles on
+/// the other's write. A stale root goes at once only for a mark (a stored
+/// fingerprint of ''), so the two never take turns re-indexing it.
+#[test]
+fn two_indexers_that_disagree_on_a_fingerprint_settle() {
+    let f = fixture("code-two-fp");
+    let mut a = setup(&f);
+    a.watch = false;
+    a.rescan_interval = Duration::from_millis(20);
+    let mut b = a.clone();
+    b.roots[0].scip = code::Prebuilt::Files(vec![(String::new(), Some(f.scip.clone()))]);
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let ia = Indexer::start(a, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
+    assert!(ia.wait_reports(1, Duration::from_secs(30)), "{:?}", ia.status());
+    let ib = Indexer::start(b, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
+    let runs = settled_count(1, || ib.reports().len());
+    assert_eq!((ia.reports().len(), runs), (1, 1), "the two indexers took turns");
+}
+
+/// Two servers that see one change run it once: the second, given the lease
+/// after the first's run, finds the stored fingerprint current and stands
+/// down. Both watch the root, as servers do, and the safety-net walk is far
+/// off, so nothing but that recheck stops the second run. A stand-in
+/// rust-analyzer keeps the first run long enough for the second to be waiting.
+#[cfg(unix)]
+#[test]
+fn two_indexers_index_one_change_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture("code-two-once");
+    let ra = f.root.parent().unwrap().join("slow-ra.sh");
+    fs::write(&ra, "#!/bin/sh\nsleep 0.3\nexit 1\n").unwrap();
+    fs::set_permissions(&ra, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut code = setup(&f);
+    code.watch = true;
+    code.rescan_interval = Duration::from_secs(60);
+    index(&f, &code);
+    let ia = Indexer::start(code.clone(), f.db.clone(), Some(RustSource::Analyzer(ra.clone())));
+    let ib = Indexer::start(code.clone(), f.db.clone(), Some(RustSource::Analyzer(ra)));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(ia.reports().len() + ib.reports().len(), 0, "the stored index is current");
+    write(&f.root.join("src/later.rs"), "pub fn later() {}\n");
+    let runs = settled_count(1, || ia.reports().len() + ib.reports().len());
+    assert_eq!(runs, 1, "one change was indexed more than once");
+}
+
+/// A running indexer indexes a file edited during its run again, once. The
+/// run stores its walk's fingerprint, and the indexer remembers that one, so
+/// the edit reads as a change at the next walk. A stand-in rust-analyzer makes
+/// the edit during the first run only.
+#[cfg(unix)]
+#[test]
+fn a_running_indexer_indexes_a_mid_run_edit_again_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture("code-mid-run-ix");
+    write(&f.root.join("src/mid.rs"), "pub fn before() {}\n");
+    let ra = f.root.parent().unwrap().join("edit-once-ra.sh");
+    let script = "#!/bin/sh\nif [ ! -e \"$2/../edited\" ]; then\n  touch \"$2/../edited\"\n  sleep 0.05\n  printf 'pub fn during() {}\\n' >> \"$2/src/mid.rs\"\nfi\nexit 1\n";
+    fs::write(&ra, script).unwrap();
+    fs::set_permissions(&ra, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut code = setup(&f);
+    code.watch = false;
+    code.rescan_interval = Duration::from_millis(20);
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let ix = Indexer::start(code, f.db.clone(), Some(RustSource::Analyzer(ra)));
+    assert_eq!(settled_count(2, || ix.reports().len()), 2, "{:?}", ix.status());
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let items = code::file_items(&conn, &f.root.join("src/mid.rs").to_string_lossy()).unwrap().expect("current");
+    assert!(items.iter().any(|i| i.name == "during"), "{items:?}");
+}
+
 /// A root whose stored fingerprint no longer matches its files, while the
 /// files stay as they are, is indexed again by the running indexer. A file
 /// edited during a run leaves this state (the stored fingerprint is the

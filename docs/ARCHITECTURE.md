@@ -148,6 +148,15 @@ innermost fn inside an impl, else the impl. The scan finds impl blocks too, and 
 type as container. Reindexing runs on its own thread
 when a root changes, never on the query path.
 
+Every server on a machine shares one index database, and one lease lets one run at a time. A root is indexed
+again when its files change, including an edit during the server's own last run: the server remembers the
+fingerprint that run stored, its walk's. It is also indexed again, at once, when its stored fingerprint is a
+mark (`''`), which another root's run (its rpcs or packages changed) or a migration leaves. Any other stale
+fingerprint, with the files unchanged, is another server's write, from another configuration or version, and
+the server settles on it: re-indexing it would make two servers take turns forever. A server that gets the
+lease for a root first rechecks it: when another server has indexed it since, it stands down, so one change
+costs one run.
+
 An Edit, Write or MultiEdit re-indexes the file it changed at once (R7). The hook worker queues the path,
 sends the hook's answer, then does the work, so the edit never waits:
 

@@ -31,7 +31,8 @@
 2 sleep tests/gate_timing.rs -- an ignored measure's lock holder, holding another writer's lock in bursts (#416); asserts nothing
 1 elapsed tests/calibrate.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 2 sleep tests/calibrate.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
-1 elapsed tests/code.rs -- a give-up bound on a poll for an event (outcome fixed unless it hangs); to become a readiness signal
+2 elapsed tests/code.rs -- a give-up bound on a poll for an event (outcome fixed unless it hangs); to become a readiness signal
+3 sleep tests/code.rs -- a sleep or poll used to order threads or processes: a poll for runs, a wait that shows no run follows, a wait for two indexers' first walks; the indexer gives no signal when a walk finds nothing; to become a count of walks
 1 sleep tests/code_cs.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 sleep tests/code_go.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 sleep tests/code_ts.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
