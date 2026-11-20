@@ -1240,6 +1240,60 @@ fn set(shared: &Shared, name: &str, s: RootState) {
     }
 }
 
+/// What a full walk makes of one root: the indexer loop's decision, apart from
+/// its clocks and files, so a model can drive it (`tests/proptest`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walked {
+    /// The stored index is current, or this fingerprint already failed:
+    /// nothing is due.
+    Current,
+    /// The files changed since the last look, or this is the first: due after
+    /// the quiet time, or at once on a full walk's first sight.
+    Changing {
+        /// Due at once.
+        at_once: bool,
+    },
+    /// A mark (a stored fingerprint of `''`), unchanged since the last look,
+    /// with nothing pending: another root's run (its rpcs or packages changed)
+    /// or a migration cleared it, and it has been quiet, so it is due at once.
+    Mark,
+    /// Leave the root as it is. A pending change keeps its time, and any other
+    /// stale fingerprint, with the files unchanged here, is another server's
+    /// write (another configuration or version): the indexer settles on it, or
+    /// two servers would take turns re-indexing the root.
+    Keep,
+}
+
+/// Decides [`Walked`] for one root.
+///
+/// # Arguments
+///
+/// * `stored` - the fingerprint in the index, `None` when it was never indexed.
+/// * `current` - the files' fingerprint now.
+/// * `seen` - the fingerprint this indexer last walked, or the one its last run
+///   stored (its walk's), so a file edited during that run reads as a change.
+/// * `failed` - the fingerprint of a failed attempt, not retried until the
+///   files change.
+/// * `pending` - whether a change is waiting for its quiet time.
+/// * `walk_all` - whether this is a full walk of every root.
+pub fn after_walk(stored: Option<&str>, current: &str, seen: &str, failed: Option<&str>, pending: bool, walk_all: bool) -> Walked {
+    if stored == Some(current) || failed == Some(current) {
+        Walked::Current
+    } else if current != seen {
+        Walked::Changing { at_once: walk_all && seen.is_empty() }
+    } else if stored == Some("") && !pending {
+        Walked::Mark
+    } else {
+        Walked::Keep
+    }
+}
+
+/// Whether an indexer that got the lease for a root stands down: another
+/// server has stored the files' fingerprint since this one scheduled the run.
+pub fn stands_down(stored: Option<&str>, current: &str) -> bool {
+    stored == Some(current)
+}
+
 fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, watcher: &Watcher) -> Result<()> {
     let mut conn = crate::store::open_raw(db)?;
     code::ensure_schema(&conn)?;
@@ -1301,28 +1355,18 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                     }
                 };
                 let indexed = stored.get(&r.name).map(|x| x.fingerprint.as_str());
-                if indexed == Some(fp.as_str()) {
-                    // Current: a root that failed to walk and came back
-                    // unchanged gets no run, so its failure ends here.
-                    changed[i] = None;
-                    failed[i] = None;
-                } else if failed[i].as_ref().is_some_and(|f| f.0 == fp) {
-                    changed[i] = None;
-                } else if fp != seen_fp[i] {
-                    // Still changing (or first sight): restart the quiet time,
-                    // except at startup, where a stale root goes at once. A
-                    // file edited during this indexer's own last run lands
-                    // here too: `seen_fp` is the fingerprint that run stored.
-                    changed[i] = Some(if walk_all && seen_fp[i].is_empty() { due_now() } else { Instant::now() });
-                } else if indexed == Some("") && changed[i].is_none() {
-                    // A mark, unchanged since the last look: another root's
-                    // run (its rpcs or packages changed) or a migration
-                    // cleared the fingerprint. It has been quiet, so it goes
-                    // at once. Any other stale fingerprint, unchanged here,
-                    // is another server's write (another configuration or
-                    // version): this indexer settles on it, or two servers
-                    // would take turns re-indexing the root.
-                    changed[i] = Some(due_now());
+                match after_walk(indexed, &fp, &seen_fp[i], failed[i].as_ref().map(|f| f.0.as_str()), changed[i].is_some(), walk_all) {
+                    Walked::Current => {
+                        changed[i] = None;
+                        // Current: a failure from an earlier walk (the folder
+                        // briefly unreadable, now back unchanged) no longer holds.
+                        if indexed == Some(fp.as_str()) {
+                            failed[i] = None;
+                        }
+                    }
+                    Walked::Changing { at_once } => changed[i] = Some(if at_once { due_now() } else { Instant::now() }),
+                    Walked::Mark => changed[i] = Some(due_now()),
+                    Walked::Keep => {}
                 }
                 seen_fp[i] = fp;
             } else if change_wakes(&snap.paths, &r.exclude) {
@@ -1377,7 +1421,7 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                         return Err(e);
                     }
                 };
-                if stored.get(&r.name).is_some_and(|x| x.fingerprint == fp) {
+                if stands_down(stored.get(&r.name).map(|x| x.fingerprint.as_str()), &fp) {
                     let _ = release_lease(&conn, &holder);
                     changed[i] = None;
                     failed[i] = None;
