@@ -54,6 +54,7 @@
 35 sleep tests/orchestrate.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 elapsed tests/pr_digest.rs -- a time printed for the reader; asserts nothing
 4 elapsed tests/projects.rs -- a wall-time bound on work (perf claim); to become a count of work done
+1 sleep tests/reindex_stamp_fifo.rs -- sleeps to move a file time past a clock tick: the pipe's write past reindex_file's stamp, which is the real clock inside it, so no explicit file time can be placed after it; to become an injected clock
 2 sleep tests/restart.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 timeout tests/restart.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
 1 sleep tests/trackers.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
