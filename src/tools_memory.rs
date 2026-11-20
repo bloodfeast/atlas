@@ -545,7 +545,7 @@ impl Server {
         let held: Vec<Value> = self
             .held_slots()?
             .into_iter()
-            .map(|h| crate::json!({"kind": h.kind.name(), "lane": h.lane, "description": h.description, "since": h.since, "running": h.running}))
+            .map(|h| crate::json!({"kind": h.kind.name(), "lane": h.lane, "description": h.description, "since": h.since, "running": h.running && h.released.is_none(), "agent": h.agent, "slot": h.slot, "released": h.released.map(crate::orchestrate::DeadReason::text)}))
             .collect();
         Ok(crate::json!({"lanes": lanes, "idle": idle, "held_slots": held}))
     }

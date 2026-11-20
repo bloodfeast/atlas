@@ -43,10 +43,10 @@ what atlas cuts. Measured:
 
 | What | Measured | Turned on by | Method |
 |---|---|---|---|
-| Lookups | 6.2x fewer tokens than grep and file reads (ratio of sums over 7,971 answers on one store; 10.6x median), at v0.8.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
-| Memory questions | 100 of 100 answered, median 506 tokens each, on the 100-question memory eval, at v0.8.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Lookups | 6.1x fewer tokens than grep and file reads (ratio of sums over 8,639 answers on one store; 10.3x median), at v0.10.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Memory questions | 100 of 100 answered, median 506 tokens each, on the 100-question memory eval, at v0.10.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
 | The tool list, in every session | 14 tools in 6,042 bytes (about 1,510 tokens), down from 47 tools and 5,930 tokens; a test holds the budget | always | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
-| Recall on each prompt | 1 of 30 off-topic prompts gets a record; about 50 tokens injected per prompt over a 303-prompt replay, at v0.8.0 | `recall.budget_tokens` 600, `recall.cos_floor` 0.53 and `recall.inject_floor` 0.60, the defaults | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Recall on each prompt | 1 of 30 off-topic prompts gets a record; about 50 tokens injected per prompt over a 303-prompt replay, at v0.10.0 | `recall.budget_tokens` 600, `recall.cos_floor` 0.53 and `recall.inject_floor` 0.60, the defaults | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
 | Weak injections | 2,739 low-cosine pointers dropped, about 27k tokens a week over 14 days of one store, memory eval unchanged, at v0.9.0 | `recall.inject_floor` 0.60, the default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
 | Subagent start | about 210 tokens against 649 for the default, informing 18 needs against 1 on 30 real launches, at v0.9.0 | `"recall": {"subagent_context": "binding"}`, off by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
 

@@ -85,15 +85,19 @@ it, change `channel` in `rust-toolchain.toml`, `CLIPPY_TOOLCHAIN` in `xtask/src/
 
 The third-party actions a workflow may use are a short list a test holds, each at one commit, so a bump is a
 deliberate edit in the workflow and the test (`third_party_allowed` in `xtask/src/release_ci.rs`); a tag, another
-commit or any other action fails it. The rule is Brandon's (2026-11-19: "Allow cache, not leak job"): the public
-`ci.yml` may use `Swatinem/rust-cache`, `taiki-e/install-action` (the prebuilt cargo-nextest, its checksum
-checked, never built from source) and `samypr100/setup-dev-drive` (the Windows test job builds and runs on a ReFS
-Dev Drive); `dev-pr.yml` the cache only; `release-pr.yml`, whose leak job holds the denylist, and `release.yml`
-none.
+commit or any other action fails it. The rule is Brandon's (2026-11-19: "Allow cache, not leak job", then "Replace
+with GitHub/inline"): the public `ci.yml` uses GitHub's own actions only, because the public repository's Actions
+policy refuses any other. Its cache is `actions/cache` (restore, and save from main), cargo-nextest is a prebuilt
+release whose sha256 the workflow pins and checks (never built from source), and the Windows test job's ReFS Dev
+Drive is an inline PowerShell step. `dev-pr.yml` may use `Swatinem/rust-cache`; `release-pr.yml`, whose leak job
+holds the denylist, and `release.yml` none.
 
 In the public `ci.yml` a push to main saves the caches and every pull request, a fork's too, restores main's and
-saves nothing (`save-if`), so no pull request can plant what main or another pull request builds from. Each holds
-the registry crates only, as below.
+saves nothing (the save step runs on main only), so no pull request can plant what main or another pull request
+builds from. Each holds the cargo registry and the target folder. The target folder is never pruned: a
+`Cargo.lock` change restores the last cache and saves a new entry with the old dependencies' artifacts still in
+it, so the entries grow until GitHub's 10 GB repository limit evicts the oldest; that is accepted (the next save
+after an eviction starts small again).
 
 `dev-pr`'s `release-check` caches compiled dependencies with `Swatinem/rust-cache` too. It saves the registry crates only (the action removes the
 workspace's own crates before it saves), keyed on the runner, rustc's version, `Cargo.lock`, the `Cargo.toml` files
@@ -119,23 +123,71 @@ ok (2 passed, 0 failed) 4s; clippy all-targets dev ok 5s; clippy default ok 1s`.
 ## The release
 
 A release goes through three hands: the development repository opens a pull request, the public repository
-builds, and the owner approves, signs and publishes. Nothing of the development history is exported, and the
-release signing key never leaves the owner's machine. The owner drives it with one command, run twice at a
-terminal, with his approval on GitHub between the two runs:
+builds, and the owner's machine approves, signs and publishes. Nothing of the development history is exported,
+and the release signing key never leaves the owner's machine. The whole release is one unattended run, which an
+agent on the owner's machine makes from start to end:
 
 ```sh
-cargo xtask release ship vX.Y.Z   # run 1: opens the release pull request
-# review and approve the pull request on GitHub, on its head commit
-cargo xtask release ship vX.Y.Z   # run 2: merges, waits for the build, signs and publishes
+cargo xtask version                # folds changes/ into CHANGELOG.md and bumps the version
+# open that as a pull request on the development repository, merge it once its checks pass
+cargo xtask release ship vX.Y.Z    # preflight, release-pr, approval, merge, build, sign, publish
 ```
 
-Each run reads what GitHub holds for the version and takes the next step, so a run that stopped anywhere is
-simply run again. Run 1 asks nothing: it prints its plan and sends the export to the public repository as a pull
-request branch, and the owner's approval of that pull request on GitHub is the gate before anything merges. Run 2
-asks before each of its public acts, at a terminal, for a typed answer that names the act and the version:
-`merge vX.Y.Z` before the merge, and `publish vX.Y.Z` once before the signature, the upload, the pushes and the
-publish. An answer for one act never passes another. Without a terminal every one is refused and nothing changes,
-so no script or agent can merge or publish a release; no environment variable or flag skips a prompt.
+`release ship` reads what GitHub holds for the version and takes each next step until the release is out: it
+opens the release pull request (run 1), waits for the public repository's checks and for the owner's approval on GitHub, merges it, watches the build,
+signs and publishes (run 2). It asks nothing at the terminal. A run
+that stopped anywhere is simply run again, and goes on from where GitHub stands. It stops, with the line that
+failed, on anything a person must decide: a gate that fails, a failed check, a request for changes, a new leak
+hit (below), or more than a day of waiting.
+
+**The one human gate** is the owner's approval of the release pull request on GitHub (from any device, his
+phone included), plus a new leak hit, which always stops for him. Ship never approves the pull request itself: it
+looks at the pull request's reviews once a minute, with no prompt, and the moment his latest review approves its
+head commit and every check on that head has passed, it merges, signs with the stored passphrase and publishes,
+with no further step. An approval of an earlier head does not count.
+
+`cargo xtask release ship vX.Y.Z --attended` is the older two-run form for the owner at a terminal: run 1 opens the
+pull request, the owner approves it on GitHub, and run 2 asks for a typed `merge vX.Y.Z` before the merge and
+`publish vX.Y.Z` before the signature, each refused without a terminal.
+
+**What the owner sets up once.**
+
+1. The private configuration (below), naming the denylist, the accepted-hits file and the signing key.
+2. `cargo xtask release store-passphrase`, at a terminal: it asks for the signing key's passphrase twice, without
+   echo, checks that it opens the key, and keeps it encrypted with Windows DPAPI under his account on this machine
+   (`%LOCALAPPDATA%/atlas-release/sign-passphrase.dpapi`, or the file `ATLAS_SIGN_PASSPHRASE_STORE` names). It
+   decrypts on that machine under that account only, but there any process running as the account can decrypt
+   it, an agent's included: the store keeps the passphrase off disk in the clear and away from other accounts,
+   not away from programs the owner runs. Ship refuses to start without it, and checks that it opens the key
+   before anything else, so a run never stops at the signature after the merge. Ship hands it to openssl on
+   openssl's standard input (`-passin stdin`), never in an argument, the environment or any output. Run it again after changing the passphrase. Off Windows there is no store, and openssl asks for
+   the passphrase when signing.
+3. `gh` logged in as the owner, with the rights to merge the public pull request, set the
+   development repository's environment secrets, and dispatch its workflows.
+
+**Approval.** The public `main` ruleset wants the code owner's approval of the release pull request, and ship
+wants it too: the owner's latest review must approve the head commit. Ship never gives it; it waits for it.
+
+**The preflight.** Before run 1 dispatches anything, ship runs here every check the `release-pr` and `release`
+workflows make, so a failure stops with its own line instead of on GitHub: the hidden-text guard (`cargo xtask
+hidden`); `release --pr` as a dry run against a fresh clone of the public repository (the changelog section and
+its highlights, the versions, the links, the export, every exported file and wiki page against the denylist, the
+release notes, and the export guard); the xtask tests (`cargo test -p xtask --locked`, which also checks the
+lockfile the workflows build with `--locked`); the public CI's required checks on the exported tree, its
+clippy lines from the exported `ci.yml` run as written (the pinned toolchain, `--all-targets` with
+`--features atlas/dev`, and `-D warnings`) and its workspace tests (`cargo test --workspace --profile ci --locked
+--no-fail-fast`, which covers nextest's run and the doc tests in one), with the exported tree first made a git
+checkout of its own whose index tracks the export as the release commit does (the release commit also keeps main's previous
+`bin/`, which the export never carries and no workspace test depends on), since tests that ask git what is tracked
+would otherwise ask whatever repository holds the stage folder; then `release check`, the binary leak gate
+and secret scan on locally built release binaries. A pass is stamped in `<stage>/vX.Y.Z/preflight` for the commit, the denylist and
+the accepted-hits file.
+
+**The leak secrets.** Just before each dispatch, ship sets the `linux-leak` job's
+`ATLAS_LEAK_DENYLIST` and `ATLAS_LEAK_ACCEPTED` secrets of the development repository from the local files
+(the bytes piped to `gh`, never printed; a comment line when there are no accepted hits), so the
+`linux-leak` job always checks with exactly what the local gates used, and a change to either file never needs a
+hand copy to GitHub.
 
 **Run 1** (no pull request yet):
 
@@ -147,7 +199,8 @@ so no script or agent can merge or publish a release; no environment variable or
    `HEAD` does not hold, which the export would revert, stops it before anything is checked or dispatched.
    Then the binary leak check: unless a pass stamp stands for this commit, denylist and accepted-hits file, `release
    check` (below) runs first. The plan says so before it starts: three release builds, tens of minutes.
-3. The plan, then the dispatch, with no prompt. The command records the commit, a random nonce and the run in its stage folder
+3. The plan, the preflight (above), the binary leak check when no stamp stands, the leak secrets set from the
+   local files, then the dispatch, with no prompt. The command records the commit, a random nonce and the run in its stage folder
    (`<stage>/vX.Y.Z/ship/state.json`), and starts the `release-pr` workflow with the version, that commit and the
    nonce. It finds the run by the nonce in its name, watches it to the end, and prints the pull request. A failed
    run is reported by its page only, never its log.
@@ -177,8 +230,9 @@ whose body is the release notes. Each job's secrets are its own, in an Environme
 run and nothing else is built there: the public repository's CI tests the pull request.
 
 **Review** (public repository). The pull request comes from the release GitHub App, so the owner can give it
-the code-owner approval the `main` ruleset requires. Approve it on its head commit once the CI checks pass; do
-not merge it on GitHub: run 2 merges it.
+the code-owner approval the `main` ruleset requires. The owner approves it on its head commit once the CI
+checks pass; unattended ship is waiting for exactly that. Never merge it on GitHub: run 2 merges
+it.
 
 **Run 2** (the pull request open):
 
@@ -199,12 +253,14 @@ not merge it on GitHub: run 2 merges it.
    the pull request's `reviews` by time, comments aside, as GitHub counts it (gh's `latestReviews` leaves the
    commit out, so it cannot tell which head was approved), and every check must have passed, these five among
    them: `test (ubuntu-latest)`, `test (windows-latest)`, `test (macos-latest)`, `clippy (windows-latest)`,
-   `clippy (ubuntu-latest)`. Anything missing is listed, nothing changes, and the run ends; run it again later.
+   `clippy (ubuntu-latest)`. Anything missing is listed and nothing changes. Unattended, a check still running
+   or not yet started is waited on (a look a minute), and so is the owner's missing approval; anything
+   else ends the run. With `--attended` the run ends; run it again later.
    The command checks this itself because the owner, as an admin, could merge past the ruleset on GitHub.
 4. The full public-repository guard, then a fresh clone of the public repository: the checkout's `HEAD` must hold
    exactly what the pull request's head holds (export-ignored files and `bin/` aside), so the approval was of
    this code.
-5. `merge vX.Y.Z`, then a squash merge pinned to the approved head commit (GitHub refuses it if the branch moved),
+5. `merge vX.Y.Z` (typed with `--attended`, said unattended), then a squash merge pinned to the approved head commit (GitHub refuses it if the branch moved),
    with the release commit's own subject and message, so GitHub's default text never decides what enters the public
    history. GitHub picks the squash commit's author (it refused the public address given as `--author-email`), and
    ship checks every address after the merge. Never with the admin bypass. The branch is kept.
@@ -292,23 +348,70 @@ the Linux build CI makes, and `sign` checks the downloaded assets; the stamp nev
 the denylist's term count and SHA-256, both of the file and of its text with carriage returns removed and one
 final newline; the `linux-leak` job prints the second for the secret copy, so the two can be compared.
 
-**Accepted hits.** A linker packs unrelated string literals side by side, and the leak check's folding of white
-space and string concatenation can join two of them into a denylist term (v0.3.0's flag strings did). Such a
-place is accepted in the private accepted-hits file instead of cutting the term. Each line is a term number and
-the SHA-256 of that term and the normalised text around the place (48 characters each side); the term itself is
-never written. An entry passes that one place in a release binary (ELF, PE or Mach-O) and nothing else: every
-place of every term is checked on its own, a text file, a path, the exported tree and the wiki pages are never
-accepted, and a malformed line or an unknown term number is refused. The binary checks (`check`, the `linux-leak`
-job and `sign`'s assets) print how many places were accepted and how many entries went unused. To add the places
-of a hit after checking that it is a false positive, at a terminal:
+**A place in a binary is judged by the source, not its bytes.** A linker packs unrelated string literals side by
+side with nothing between them, in an order that changes per build and per target, so a term can show up across
+two literals that each hold only part of it (v0.3.0 to v0.9.0 had such places, and the earlier rules, which keyed
+an accepted place on the bytes around it, needed a new entry for most releases). So every place of a term in a
+release binary (ELF, PE or Mach-O) is explained against the source the binary was built from:
+
+- the tree: for `check`, the stage's `git archive`; for `gate` and `sign`, the checkout's HEAD (its files that are
+  not export-ignored, as HEAD holds them, whatever the working files say), or `--src TREE`;
+- the dependencies: every registry package `cargo metadata --locked` names outside the tree, by crate, version
+  and file; a path or git package outside the tree is the owner's code, judged as the tree is;
+- the string literals of the toolchain's library source, when `rust-src` is installed: always read, so what
+  explains one place never depends on whether another was explained.
+
+Two kinds of known strings come from those files. Literal values, what a compiler lays into a binary whole: the
+string literals of Rust and C files (escapes decoded, a format string also cut at its `{}`), the literals a
+`concat!` or C's adjacency joins, as one value, and every other text file whole (`include_str!`). And, only to
+report a place one of them holds, the identifiers and comment lines of Rust and C files and the lines of other
+text files (none from the toolchain). A string of fewer than 3 bytes is not one. A linker lays whole literal values
+end to end, so, by the bytes of the place:
+
+- **literals packed side by side**: two or more whole literal values, each starting where the one before ends, of
+  different files, make it, and reach past the term on both sides. It passes with no entry, and the binary checks
+  list each such place with its pieces' files and lines;
+- **one string of the tree** holds it: it stops. The export gate refuses the same term in the source, which is
+  where to fix it;
+- **one literal of a dependency or of the toolchain** holds it, with at least 4 bytes beyond the term: third-party
+  text, reported by crate, version, file and line. It stops until an entry accepts it;
+- **a join**: whole known strings end to end make it, but not as packing does: a piece is an identifier, a comment
+  or a text line, two pieces side by side come from one file (a macro may join them in the source), or the pieces
+  start or end exactly where the term does (as a word in a path would). It may be packing, it may not: it stops,
+  and the owner checks the place; only an entry keyed on its pieces passes it;
+- **anything else stops, and no entry accepts it**: no such chain makes the place, so the build put it there (a
+  path with a home folder in a panic location, a user or host name, an environment value, generated code); or a
+  dependency's string that is not a literal value, or holds the term with less than 4 bytes around it (an entry
+  for it would accept the term wherever a build puts it). Fix the build (the release builds remap the workspace,
+  cargo home and sysroot paths).
+
+A place in a text file, in a path, in the exported tree or in the wiki pages is never explained or accepted, nor a
+place found only in a UTF-16 reading. Every place is judged on its own, so an accepted one cannot hide another
+place of the same term.
+
+**Accepted hits.** Each line of the private accepted-hits file is a term number and the SHA-256 of the domain
+`atlas-accept-src-v1`, that term, the crate's name and the dependency's string that holds the place. Source content
+only: no offset, no neighbouring bytes, no version or file path, so an entry holds on every rebuild and every
+target, and voids when a new version of the crate changes that string. A join's entry is the SHA-256 of the domain
+`atlas-accept-join-v1`, that term, and each piece's crate and string in order. The term itself is never written.
+Entries of the earlier forms (digests of a binary's bytes around a place) match nothing: the checks say once how
+many entries matched no place, so delete the ones no release needs. A malformed line or an unknown term number is
+refused. The binary checks (`check`, the `linux-leak` job and `sign`'s assets) print each place of literals side
+by side and each accepted place, with the files and lines of their source, never a path that holds a term. To list
+every place of a binary with its verdict, and add the entries for its dependency and join places after checking
+them, at a terminal:
 
 ```sh
-cargo xtask release accept-hit PATH/TO/BINARY...           # type `accept N` to append
-cargo xtask release accept-hit PATH/TO/BINARY... --print   # the entries, nothing written
+cargo xtask release accept-hit PATH/TO/BINARY... [--src TREE]           # type `accept N` to append
+cargo xtask release accept-hit PATH/TO/BINARY... [--src TREE] --print   # the entries, nothing written
 ```
 
-Without a terminal it refuses. Then copy the file to the `ATLAS_LEAK_ACCEPTED` secret. An entry holds only while the same literals sit side by side again, on every target, so a new release may
-need new entries.
+Without a terminal it refuses: a new hit is always the owner's call, never accepted by an agent. A leak report
+names the file, line, column, byte offset, term number and verdict of each place, never the term, so an agent can
+locate the place and ask. Ship copies the file to the `ATLAS_LEAK_ACCEPTED` secret itself before its next dispatch.
+`check`, `gate` and `accept-hit` read the denylist and the accepted-hits file from the private configuration
+(above) when `ATLAS_LEAK_DENYLIST` is not set.
+
 
 ## The checkout guard
 
@@ -334,8 +437,9 @@ has no dry path: it talks to GitHub and refuses `ATLAS_GITHUB_STUB`. The doc com
 
 `manifest.json` holds the version and, per target, the file, its download URL, SHA-256 and size; one writer
 makes it, in the format atlas's updater reads. The signature, `manifest.json.sig`, is made with `openssl pkeyutl
--sign -rawin` from the release signing key (an ed25519 PEM kept offline; openssl asks for its passphrase; nothing
-ever creates or prints a private key). Signing refuses a key whose public half is not the one built into atlas
+-sign -rawin` from the release signing key (an ed25519 PEM kept on the owner's machine; nothing ever creates or
+prints a private key). Its passphrase comes from the DPAPI store on Windows (see the owner's one-time setup under
+[The release](#the-release)), given to openssl on its standard input; elsewhere openssl asks for it. Signing refuses a key whose public half is not the one built into atlas
 (`TRUSTED_KEY_HEX` in `src/update.rs`), and refuses to publish while that constant is still the test key.
 
 ## The local rehearsal

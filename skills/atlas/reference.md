@@ -28,7 +28,8 @@ Everything atlas takes, generated from the code the server answers from. The hab
 - `atlas queue done KEY`
 - `atlas queue met KEY [CONDITION]`
 - `atlas queue next [--transcript PATH]`
-- `atlas queue release AGENT [--force] [--transcript PATH]`
+- `atlas queue release SLOT|AGENT|LANE [--force]`
+- `atlas queue release AGENT --transcript PATH [--force]`
 - `atlas queue add --description TEXT [--kind KIND] FILE|-`
 - `atlas queue plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT] [--ticket KEY]`
 - `atlas queue plan --from-jql QUERY [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--scope TEXT] [--order-from N] [--lane-from key|fixed:LANE] [--limit N]`
@@ -212,6 +213,7 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `orchestrate.window`
 - `orchestrate.worktree_roots`
 - `pr_events`
+- `pr_events.ignore_logins`
 - `pr_events.lane`
 - `pr_events.port`
 - `project_tracking`

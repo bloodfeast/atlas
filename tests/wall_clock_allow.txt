@@ -1,0 +1,62 @@
+# Wall-clock uses in test code that remain, per file: COUNT KIND PATH -- REASON.
+# See tests/wall_clock_lint.rs. Counts only ever go down.
+1 elapsed src/calibrate/rules.rs -- a time printed for the reader; asserts nothing
+4 elapsed src/card_agents_tests.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+2 sleep src/card_agents_tests.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+1 sleep src/code_index.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+2 elapsed src/glob.rs -- a wall-time bound on work (perf claim); to become a count of work done
+4 elapsed src/hook_budget.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+3 sleep src/hook_budget.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+1 elapsed src/hooks.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+1 sleep src/hooks.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+2 elapsed src/ideas/mod.rs -- a wall-time bound on work (perf claim); to become a count of work done
+1 elapsed src/json.rs -- a wall-time bound on work (perf claim); to become a count of work done
+2 elapsed src/lex/props.rs -- a wall-time bound on work (perf claim); to become a count of work done
+1 elapsed src/paths.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 sleep src/paths.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 elapsed src/pr_listen.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+4 sleep src/pr_listen.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+10 sleep src/pr_supervise.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 timeout src/pr_supervise.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
+5 sleep src/protocol.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 sleep src/restart.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 elapsed src/tokens.rs -- a wall-time bound on work (perf claim); to become a count of work done
+3 elapsed tests/adversarial/embed.rs -- a wall-time bound on work (perf claim); to become a count of work done
+3 elapsed tests/adversarial/hooks.rs -- a wall-time bound on work (perf claim); to become a count of work done
+3 elapsed tests/adversarial/images.rs -- a wall-time bound on work (perf claim); to become a count of work done
+9 elapsed tests/adversarial/parsers.rs -- a wall-time bound on work (perf claim); to become a count of work done
+2 elapsed tests/adversarial/queries.rs -- a wall-time bound on work (perf claim); to become a count of work done
+4 sleep tests/atlas.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+1 elapsed tests/calibrate.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+2 sleep tests/calibrate.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 elapsed tests/code.rs -- a give-up bound on a poll for an event (outcome fixed unless it hangs); to become a readiness signal
+1 sleep tests/code_cs.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+1 sleep tests/code_go.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+1 sleep tests/code_ts.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+4 elapsed tests/concurrency.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+6 sleep tests/concurrency.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 timeout tests/concurrency.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
+2 sleep tests/db_busy_handler.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 sleep tests/handles.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+5 elapsed tests/hook_budget.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+1 sleep tests/hook_budget.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+1 timeout tests/hook_budget.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
+9 sleep tests/hooks.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+6 elapsed tests/ideas.rs -- a wall-time bound on work (perf claim); to become a count of work done
+2 sleep tests/ideas.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 elapsed tests/orchestrate.rs -- a time printed for the reader; asserts nothing (the admit cost is counted, #373)
+35 sleep tests/orchestrate.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+1 elapsed tests/pr_digest.rs -- a time printed for the reader; asserts nothing
+4 elapsed tests/projects.rs -- a wall-time bound on work (perf claim); to become a count of work done
+2 sleep tests/restart.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+1 timeout tests/restart.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
+1 sleep tests/trackers.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+4 elapsed tests/update.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+5 sleep tests/update.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+1 timeout tests/update.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
+1 elapsed tests/worktree_ledger.rs -- a time printed for the reader; asserts nothing
+3 sleep tests/worktree_ledger.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+3 elapsed tests/write_lock_wait.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+3 sleep tests/write_lock_wait.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+2 elapsed xtask/src/compact_live.rs -- a wall-time bound on work (perf claim); to become a count of work done
+1 sleep xtask/src/memory_eval.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock

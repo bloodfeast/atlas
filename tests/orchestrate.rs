@@ -2298,7 +2298,7 @@ fn queue_release_frees_a_dead_holder_and_refuses_a_live_one() {
     let (ok, out) = run(&["release"]);
     assert!(!ok && out.contains("usage: atlas queue"), "{out}");
     let (ok, out) = run(&["release", "--help"]);
-    assert!(ok && out.contains("release AGENT [--force] [--transcript PATH]"), "{out}");
+    assert!(ok && out.contains("release SLOT|AGENT|LANE [--force] | release AGENT --transcript PATH [--force]"), "{out}");
 }
 
 /// #207 review M1-M3: the lines Claude Code writes after a tool result, read
@@ -3668,8 +3668,12 @@ fn queue_next_does_not_count_an_agent_of_a_session_that_restarted() {
     age_agent(&s, "dead1", std::time::Duration::from_secs(30 * 60));
     age_agent(&s, "live1", std::time::Duration::from_secs(60));
     let now = std::time::SystemTime::now();
+    // No reboot or owner evidence (#389 review S1): the machine's boot
+    // time would release dead1 on a host up less than 30 minutes.
+    let unknown = |_: &str| None;
+    let probe = atlas::queue::DeadProbe { boot: None, owner_alive: &unknown };
     let ids = |store: &atlas::memory::MemoryStore| {
-        let (hs, read) = atlas::queue::launch_holders(&o, store, now).unwrap();
+        let (hs, read) = atlas::queue::launch_holders_at(&o, store, now, &probe).unwrap();
         assert_eq!(read, 1);
         let mut n: Vec<String> = hs.into_iter().map(|h| h.name).collect();
         n.sort();
@@ -3685,3 +3689,9 @@ fn queue_next_does_not_count_an_agent_of_a_session_that_restarted() {
 
 #[path = "orchestrate/cap_slots.rs"]
 mod cap_slots;
+
+#[path = "orchestrate/dead_slots.rs"]
+mod dead_slots;
+
+#[path = "orchestrate/slot_numbers.rs"]
+mod slot_numbers;

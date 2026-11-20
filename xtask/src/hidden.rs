@@ -30,11 +30,16 @@
 //! # The allowlist
 //!
 //! [`ALLOW`] (checked in) lets the deliberate cases through, one line per
-//! entry: `path:LINES:U+XXXX reason`, where LINES is a comma list of line
-//! numbers and `A-B` ranges. `#` comments and blank lines are ignored. A
-//! reason is required, every listed line must hold the character (a line
-//! that does not is stale, an error), and an invisible character in code is
-//! never allowlisted: write an escape.
+//! entry: `COUNT path:U+XXXX reason`, which lets COUNT of that character
+//! through anywhere in that one file. An entry is keyed by the file and the
+//! character, never by line numbers, so an edit above a deliberate case
+//! cannot make the entry stale. `#` comments and blank lines are ignored. A
+//! reason is required, and the file must hold exactly COUNT of the
+//! character: one more (a new hidden character slipped into an allowed
+//! file) or one fewer fails with the count to set, and an entry that
+//! matches nothing is stale, an error. An invisible character in code is never
+//! allowlisted: write an escape. The old `path:LINES:U+XXXX` form is
+//! refused with a message that says how to rewrite it.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -227,11 +232,16 @@ fn mixed_tokens(path: &str, text: &str, out: &mut Vec<Finding>) {
     flush(&mut scripts, &mut odd);
 }
 
-/// The parsed allowlist: one (path, line, code point) per listed line.
+/// The parsed allowlist: one (path, code point, count) per entry.
 #[derive(Debug, Default)]
 pub struct Allow {
-    pub entries: Vec<(String, usize, u32)>,
+    pub entries: Vec<(String, u32, usize)>,
 }
+
+/// An allowlist entry whose count is not what the file holds: (path, code
+/// point, the count listed, the count found). A count found of 0 is a stale
+/// entry.
+pub type Miscount = (String, u32, usize, usize);
 
 impl Allow {
     /// Parses the allowlist text; every entry needs a reason, and an
@@ -243,13 +253,28 @@ impl Allow {
             if l.is_empty() || l.starts_with('#') {
                 continue;
             }
-            let bad = || format!("{ALLOW}:{}: want `path:LINES:U+XXXX reason`, got {l:?}", n + 1);
-            let (entry, reason) = l.split_once([' ', '\t']).ok_or_else(bad)?;
+            let bad = || format!("{ALLOW}:{}: want `COUNT path:U+XXXX reason`, got {l:?}", n + 1);
+            let (count, rest) = l.split_once([' ', '\t']).ok_or_else(bad)?;
+            let Some(count) = count.parse::<usize>().ok().filter(|c| *c > 0) else {
+                return Err(format!(
+                    "{ALLOW}:{}: an entry starts with how many of the character the file holds: write `COUNT {l}` (`cargo xtask hidden` names the count)",
+                    n + 1
+                ));
+            };
+            let (entry, reason) = rest.trim_start().split_once([' ', '\t']).ok_or_else(bad)?;
             if reason.trim().is_empty() {
                 return Err(bad());
             }
-            let (rest, cp) = entry.rsplit_once(':').ok_or_else(bad)?;
-            let (path, lines) = rest.rsplit_once(':').ok_or_else(bad)?;
+            let (path, cp) = entry.rsplit_once(':').ok_or_else(bad)?;
+            if let Some((p, lines)) = path.rsplit_once(':').filter(|(_, l)| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit() || b == b',' || b == b'-')) {
+                return Err(format!(
+                    "{ALLOW}:{}: entries are keyed by file and character, not line numbers (which go stale when code above moves): write `{p}:{cp} reason` without `:{lines}`",
+                    n + 1
+                ));
+            }
+            if path.is_empty() {
+                return Err(bad());
+            }
             let cp = u32::from_str_radix(cp.strip_prefix("U+").ok_or_else(bad)?, 16).map_err(|_| bad())?;
             let c = char::from_u32(cp).ok_or_else(bad)?;
             if is_code(path) && !c.is_control() {
@@ -258,41 +283,48 @@ impl Allow {
                     n + 1
                 ));
             }
-            for part in lines.split(',') {
-                let (a, b) = part.split_once('-').unwrap_or((part, part));
-                let (a, b): (usize, usize) = (a.parse().map_err(|_| bad())?, b.parse().map_err(|_| bad())?);
-                if a == 0 || b < a {
-                    return Err(bad());
-                }
-                entries.extend((a..=b).map(|line| (path.to_string(), line, cp)));
-            }
+            entries.push((path.to_string(), cp, count));
         }
         Ok(Allow { entries })
     }
 }
 
 /// The findings in `files` the allowlist does not let through, and the
-/// allowlist entries that matched nothing.
-pub fn check(files: &[(String, Vec<u8>)], allow: &Allow) -> (Vec<Finding>, Vec<(String, usize, u32)>) {
+/// allowlist entries whose count is not what the file holds (a count of 0
+/// found: stale). A new hidden character in an allowed file is a count above
+/// the entry's, so it fails too.
+pub fn check(files: &[(String, Vec<u8>)], allow: &Allow) -> (Vec<Finding>, Vec<Miscount>) {
     let mut left = Vec::new();
-    let mut used = vec![false; allow.entries.len()];
+    let mut used = vec![0usize; allow.entries.len()];
     for (path, bytes) in files {
         if bytes.contains(&0) || BINARY.contains(&ext(path)) {
             continue;
         }
         for f in scan(path, bytes) {
-            match allow.entries.iter().position(|(p, l, c)| *p == f.path && *l == f.line && *c == f.cp) {
-                Some(i) => used[i] = true,
+            match allow.entries.iter().position(|(p, c, _)| *p == f.path && *c == f.cp) {
+                Some(i) => used[i] += 1,
                 None => left.push(f),
             }
         }
     }
-    let stale = allow.entries.iter().zip(used).filter(|(_, u)| !u).map(|(e, _)| e.clone()).collect();
-    (left, stale)
+    let off = allow.entries.iter().zip(used).filter(|((_, _, n), u)| n != u).map(|((p, c, n), u)| (p.clone(), *c, *n, u)).collect();
+    (left, off)
 }
 
 /// The tracked files under `root`, read.
+/// `root` must be the top of a git checkout: in a plain folder inside some
+/// other repository (an extracted export under a parent checkout), git
+/// would answer for that repository, and every entry would read as stale.
 fn tracked(root: &Path) -> R<Vec<(String, Vec<u8>)>> {
+    let top = Command::new("git").arg("-C").arg(root).args(["rev-parse", "--show-toplevel"]).output().map_err(|e| format!("git rev-parse: {e}"))?;
+    if !top.status.success() {
+        return Err(format!("{} is not in a git checkout: the gate reads the tracked files ({})", root.display(), String::from_utf8_lossy(&top.stderr).trim()));
+    }
+    let top = String::from_utf8_lossy(&top.stdout).trim().to_string();
+    let same = |p: &Path| std::fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()));
+    if same(Path::new(&top))? != same(root)? {
+        return Err(format!("{} is not the top of a git checkout (git answers for {top}): the gate reads the tracked files, so run it in a checkout of its own", root.display()));
+    }
     let out = Command::new("git").arg("-C").arg(root).args(["ls-files", "-z"]).output().map_err(|e| format!("git ls-files: {e}"))?;
     if !out.status.success() {
         return Err(format!("git ls-files failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
@@ -317,13 +349,14 @@ pub fn allowlist(root: &Path) -> R<Allow> {
 }
 
 /// The gate over `files`: Ok with a one-line summary, or Err listing every
-/// finding (and, when `strict`, every allowlist entry that matched nothing).
+/// finding and every allowlist entry the file holds more of than its count;
+/// when `strict`, also every entry the file holds fewer of, or none).
 pub fn gate(files: &[(String, Vec<u8>)], allow: &Allow, strict: bool, what: &str) -> R<String> {
-    let (left, stale) = check(files, allow);
-    let stale: Vec<_> = if strict { stale } else { Vec::new() };
+    let (left, off) = check(files, allow);
+    let stale: Vec<_> = off.into_iter().filter(|(_, _, n, u)| strict || u > n).collect();
     if left.is_empty() && stale.is_empty() {
         return Ok(format!(
-            "context poisoning guard: {} files in {what}, no hidden text ({} allowlisted lines)",
+            "context poisoning guard: {} files in {what}, no hidden text ({} allowlist entries)",
             files.len(),
             allow.entries.len()
         ));
@@ -332,11 +365,17 @@ pub fn gate(files: &[(String, Vec<u8>)], allow: &Allow, strict: bool, what: &str
     for f in &left {
         msg.push_str(&format!("{f}\n"));
     }
-    for (p, l, c) in &stale {
-        msg.push_str(&format!("{ALLOW}: {p}:{l}:U+{c:04X} matches nothing; remove it\n"));
+    for (p, c, n, u) in &stale {
+        if *u == 0 {
+            msg.push_str(&format!("{ALLOW}: {p}:U+{c:04X} matches nothing; remove it\n"));
+        } else if u > n {
+            msg.push_str(&format!("{ALLOW}: {p}:U+{c:04X} allows {n}, the file holds {u}: a new one was added; check it, and if deliberate set the count to {u}\n"));
+        } else {
+            msg.push_str(&format!("{ALLOW}: {p}:U+{c:04X} allows {n}, the file holds {u}: set the count to {u}\n"));
+        }
     }
     msg.push_str(&format!(
-        "context poisoning guard: {} hidden-text finding(s), {} stale allowlist line(s) in {what}; a deliberate case goes in {ALLOW} with its reason",
+        "context poisoning guard: {} hidden-text finding(s), {} miscounted allowlist entr(ies) in {what}; a deliberate case goes in {ALLOW} with its count and reason",
         left.len(),
         stale.len()
     ));
@@ -451,29 +490,72 @@ mod tests {
     }
 
     #[test]
-    fn the_allowlist_names_lines_and_flags_stale_ones() {
-        let allow =
-            Allow::parse("# fixtures\nfx/a.txt:1,3-4:U+001B terminal colour fixture\nfx/gone.txt:2:U+200B no longer there\n").unwrap();
+    fn the_allowlist_names_file_and_character_and_flags_stale_ones() {
+        let allow = Allow::parse(
+            "# fixtures\n4 fx/a.txt:U+001B terminal colour fixture\n1 fx/gone.txt:U+200B no longer there\n1 fx/c.txt:U+001B another char only\n",
+        )
+        .unwrap();
         let files = vec![
             ("fx/a.txt".to_string(), b"\x1b[31m\nplain\n\x1b[0m\nx\x1b\n\x1b new\n".to_vec()),
+            ("fx/c.txt".to_string(), b"\x1b\x07\n".to_vec()),
             ("src/b.md".to_string(), "x\u{200B}".as_bytes().to_vec()),
             ("bin".to_string(), vec![0, 0x1b]),
             ("logo.png".to_string(), vec![0x1b]),
         ];
         let (left, stale) = check(&files, &allow);
         let left: Vec<String> = left.iter().map(ToString::to_string).collect();
-        // Line 5 of fx/a.txt is not listed: a new escape there is a finding.
-        assert_eq!(left, ["fx/a.txt:5:1: U+001B control character", "src/b.md:1:2: U+200B zero-width character"]);
-        assert_eq!(stale, [("fx/gone.txt".to_string(), 2, 0x200B)]);
+        // Every escape of fx/a.txt passes, wherever it sits; another
+        // character in a listed file, or the same one in another file, is
+        // still a finding.
+        assert_eq!(left, ["fx/c.txt:1:2: U+0007 control character", "src/b.md:1:2: U+200B zero-width character"]);
+        assert_eq!(stale, [("fx/gone.txt".to_string(), 0x200B, 1, 0)]);
         let e = gate(&files, &allow, true, "t").unwrap_err();
-        assert!(e.contains("src/b.md:1:2: U+200B") && e.contains("fx/gone.txt:2:U+200B matches nothing"), "{e}");
-        assert!(Allow::parse("fx/a.txt:1:U+001B").is_err(), "a reason is required");
-        assert!(Allow::parse("fx/a.txt:U+001B reason").is_err(), "lines are required");
-        assert!(Allow::parse("fx/a.txt:1:1B reason").is_err());
-        assert!(Allow::parse("fx/a.txt:3-1:U+001B reason").is_err());
-        let e = Allow::parse("src/a.rs:4:U+202E a test").unwrap_err();
+        assert!(e.contains("src/b.md:1:2: U+200B") && e.contains("fx/gone.txt:U+200B matches nothing"), "{e}");
+        assert!(Allow::parse("1 fx/a.txt:U+001B").is_err(), "a reason is required");
+        assert!(Allow::parse("1 :U+001B reason").is_err(), "a path is required");
+        assert!(Allow::parse("1 fx/a.txt:1B reason").is_err());
+        let e = Allow::parse("1 fx/a.txt:1,3-4:U+001B reason").unwrap_err();
+        assert!(e.contains("not line numbers") && e.contains("`fx/a.txt:U+001B reason`"), "{e}");
+        let e = Allow::parse("1 src/a.rs:U+202E a test").unwrap_err();
         assert!(e.contains("never allowlisted"), "{e}");
-        assert!(Allow::parse("src/a.rs:4:U+001E a test separator").is_ok(), "a control character in code may be");
+        assert!(Allow::parse("1 src/a.rs:U+001E a test separator").is_ok(), "a control character in code may be");
+        // The count is required, and is a positive number.
+        for bad in ["fx/a.txt:U+001B reason", "0 fx/a.txt:U+001B reason", "x fx/a.txt:U+001B reason"] {
+            let e = Allow::parse(bad).unwrap_err();
+            assert!(e.contains("starts with how many"), "{bad}: {e}");
+        }
+    }
+
+    /// The count binds an entry to how many of the character the file
+    /// holds: a new hidden character in an allowed file fails, and so does a
+    /// count above the actual, each with the count to set.
+    #[test]
+    fn an_allowlist_count_above_or_below_the_file_fails_with_a_hint() {
+        let allow = Allow::parse("2 fx/log.txt:U+001B captured colour codes\n").unwrap();
+        let two = vec![("fx/log.txt".to_string(), b"\x1b[31mred\x1b[0m\n".to_vec())];
+        assert!(gate(&two, &allow, true, "t").is_ok());
+        assert!(gate(&two, &allow, false, "t").is_ok());
+        // One more: the strict and the export gate both fail.
+        let three = vec![("fx/log.txt".to_string(), b"\x1b[31mred\x1b[0m\n\x1b[2J\n".to_vec())];
+        for strict in [true, false] {
+            let e = gate(&three, &allow, strict, "t").unwrap_err();
+            assert!(e.contains("fx/log.txt:U+001B allows 2, the file holds 3") && e.contains("set the count to 3"), "{e}");
+        }
+        // One fewer: the strict gate fails with the count to set.
+        let one = vec![("fx/log.txt".to_string(), b"\x1b[31mred\n".to_vec())];
+        let e = gate(&one, &allow, true, "t").unwrap_err();
+        assert!(e.contains("allows 2, the file holds 1: set the count to 1"), "{e}");
+    }
+
+    /// Moving a deliberate case to another line (an edit above it) leaves
+    /// its entry valid: the regression a line-keyed list had.
+    #[test]
+    fn an_edit_above_a_listed_case_does_not_stale_its_entry() {
+        let allow = Allow::parse("1 fx/log.txt:U+001B captured colour codes\n").unwrap();
+        let before = vec![("fx/log.txt".to_string(), b"\x1b[31mred\n".to_vec())];
+        let after = vec![("fx/log.txt".to_string(), b"a new first line\nanother\n\x1b[31mred\n".to_vec())];
+        assert!(gate(&before, &allow, true, "t").is_ok());
+        assert!(gate(&after, &allow, true, "t").is_ok());
     }
 
     #[test]
@@ -489,5 +571,28 @@ mod tests {
         if let Err(e) = tracked_gate(&crate::skill::root()) {
             panic!("{e}");
         }
+    }
+
+    /// The release preflight's case: an extracted export (no `.git` of its
+    /// own) inside another checkout. The gate refuses it by name rather
+    /// than asking the outer repository and calling every entry stale; once
+    /// the folder is a checkout of its own, it passes.
+    #[test]
+    fn an_export_inside_another_checkout_is_refused_until_it_is_its_own() {
+        let d = std::env::temp_dir().join(format!("atlas-hidden-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let tree = d.join("stage").join("tree");
+        std::fs::create_dir_all(tree.join("xtask")).unwrap();
+        std::fs::create_dir_all(tree.join("fx")).unwrap();
+        std::fs::write(tree.join(ALLOW), "1 fx/log.txt:U+001B captured colour codes\n").unwrap();
+        std::fs::write(tree.join("fx/log.txt"), b"\x1b[31mred\n").unwrap();
+        let git = |dir: &Path, args: &[&str]| assert!(Command::new("git").arg("-C").arg(dir).args(args).output().unwrap().status.success(), "git {args:?}");
+        git(&d, &["init", "-q"]);
+        let e = tracked_gate(&tree).unwrap_err();
+        assert!(e.contains("is not the top of a git checkout") && !e.contains("matches nothing"), "{e}");
+        git(&tree, &["init", "-q"]);
+        git(&tree, &["add", "-A"]);
+        assert!(tracked_gate(&tree).is_ok(), "{:?}", tracked_gate(&tree));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -8,7 +8,8 @@
 //!     after another (on Windows: x86_64-pc-windows-msvc, then
 //!     x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu inside WSL),
 //!     in the release's build environment with at most 16 jobs, and runs the
-//!     binary leak gate (accepted hits honoured) and the secret scan on
+//!     binary leak gate (places explained against the exported source,
+//!     `explain.rs`; accepted hits honoured) and the secret scan on
 //!     them. Refuses first a README.md that is out of date for the version
 //!     ([`stale_readme`]; `release ship` runs the same before its export),
 //!     then a checkout with an uncommitted change to a tracked
@@ -17,18 +18,20 @@
 //!     accepted-hits file's SHA-256; a later run with the same key says so
 //!     and builds nothing (--force runs it anyway), and a change to any of
 //!     the three runs it again.
-//! cargo xtask release gate --dir DIR [--export]
+//! cargo xtask release gate --dir DIR [--src TREE] [--export]
 //!     The same gates on the binaries in DIR (the release-pr workflow's
-//!     Linux build). With --export, also HEAD exported as `release --pr`
-//!     exports it, every file and wiki page against the denylist: the
-//!     release-pr job's pr job holds no denylist and exports only the
-//!     commit this checked.
-//! cargo xtask release accept-hit FILE... [--print]
-//!     Lists every place of every term in the release binaries FILE... and
-//!     appends an entry for each place not yet accepted to the
-//!     accepted-hits file (`accept.rs`), after the owner types the
-//!     confirmation at a terminal. With --print it writes the entries to
-//!     standard output instead and changes nothing.
+//!     Linux build), explained against TREE (default: this checkout's
+//!     tracked, not export-ignored files). With --export, also HEAD
+//!     exported as `release --pr` exports it, every file and wiki page
+//!     against the denylist: the release-pr job's pr job holds no denylist
+//!     and exports only the commit this checked.
+//! cargo xtask release accept-hit FILE... [--src TREE] [--print]
+//!     Lists every place of every term in the release binaries FILE... with
+//!     its verdict against TREE (default: this checkout), and appends an
+//!     entry for each place a dependency's string holds that is not yet
+//!     accepted to the accepted-hits file (`accept.rs`), after the owner
+//!     types the confirmation at a terminal. With --print it writes the
+//!     entries to standard output instead and changes nothing.
 //! ```
 //!
 //! Every run prints the denylist's term count and SHA-256 (of the file as
@@ -36,8 +39,9 @@
 //! newline, the form the release-pr job writes from the secret), so the
 //! local file and the secret copy can be compared. Terms are never printed.
 //!
-//! Environment: ATLAS_LEAK_DENYLIST (required), ATLAS_LEAK_ACCEPTED (the
-//! accepted-hits file; default `leak-accepted.txt` beside the denylist),
+//! Environment: ATLAS_LEAK_DENYLIST (else the release config's `denylist`,
+//! as ship reads it), ATLAS_LEAK_ACCEPTED (the accepted-hits file; else the
+//! config's `accepted`; default `leak-accepted.txt` beside the denylist),
 //! CARGO_BUILD_JOBS (capped at 16; default 16), ATLAS_WSL_DISTRO and
 //! ATLAS_RELEASE_STAGE as for the release.
 
@@ -48,7 +52,7 @@ use std::process::Command;
 
 use crate::accept::{places, Accepted};
 use crate::release::{bin_name, cargo_version, env, mkdir, output, read_text, rm_rf, say, sha256_file, status, write, Ctx};
-use crate::release_ci::{accepted_file, binary_leak_gate, denylist_from_env, secret_gate, stage_root, USAGE};
+use crate::release_ci::{accepted_file, binary_leak_gate, denylist_from_env, git, secret_gate, stage_root, USAGE};
 
 type R<T = ()> = Result<T, String>;
 
@@ -75,23 +79,24 @@ pub fn run(root: &Path, args: Vec<String>) -> R {
             refuse_stale_readme(root, &version)?;
             // The hidden-character gate CI runs on every pull request.
             say(&crate::hidden::tracked_gate(root)?);
-            let denylist = denylist_from_env()?;
-            let accepted = accepted_file(env("ATLAS_LEAK_ACCEPTED"), &denylist)?;
+            let (denylist, accepted) = lists(root)?;
             check_here(root, &format!("v{version}"), &denylist, accepted.as_deref(), force).map(|_| ())
         }
         "gate" => {
-            let (mut dir, mut export) = (None, false);
+            let (mut dir, mut export, mut src) = (None, false, None);
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--dir" => dir = it.next().map(PathBuf::from),
+                    "--src" => src = Some(src_arg(it.next())?),
                     "--export" => export = true,
                     _ => return Err(format!("unknown argument {a}\n{USAGE}")),
                 }
             }
             let dir = dir.ok_or(USAGE)?;
-            let denylist = denylist_from_env()?;
-            let accepted = accepted_file(env("ATLAS_LEAK_ACCEPTED"), &denylist)?;
-            gate(&dir, &denylist, accepted.as_deref())?;
+            let (denylist, accepted) = lists(root)?;
+            // The source the binaries were built from: this checkout unless
+            // --src names an exported tree.
+            gate(&dir, &denylist, accepted.as_deref(), src.as_deref().unwrap_or(root))?;
             if export {
                 // The release-pr job's pr job holds no denylist: the export
                 // is checked here, and that job exports this commit again.
@@ -103,10 +108,11 @@ pub fn run(root: &Path, args: Vec<String>) -> R {
             Ok(())
         }
         "accept-hit" => {
-            let (mut files, mut print) = (Vec::new(), false);
-            for a in it {
+            let (mut files, mut print, mut src) = (Vec::new(), false, None);
+            while let Some(a) = it.next() {
                 match a.as_str() {
                     "--print" => print = true,
+                    "--src" => src = Some(src_arg(it.next())?),
                     _ if a.starts_with("--") => return Err(format!("unknown argument {a}\n{USAGE}")),
                     _ => files.push(PathBuf::from(a)),
                 }
@@ -114,12 +120,32 @@ pub fn run(root: &Path, args: Vec<String>) -> R {
             if files.is_empty() {
                 return Err(USAGE.into());
             }
-            let denylist = denylist_from_env()?;
-            let target = env("ATLAS_LEAK_ACCEPTED").map(PathBuf::from).unwrap_or_else(|| denylist.with_file_name(crate::accept::DEFAULT_NAME));
-            accept_hit(&files, &denylist, &target, print, &Tty).map(|_| ())
+            let (denylist, target) = if env("ATLAS_LEAK_DENYLIST").is_some() {
+                let d = denylist_from_env()?;
+                let t = env("ATLAS_LEAK_ACCEPTED").map(PathBuf::from).unwrap_or_else(|| d.with_file_name(crate::accept::DEFAULT_NAME));
+                (d, t)
+            } else {
+                let s = crate::release_ship::settings(root)?;
+                let t = s.accepted.unwrap_or_else(|| s.denylist.with_file_name(crate::accept::DEFAULT_NAME));
+                (s.denylist, t)
+            };
+            accept_hit(&files, &denylist, &target, src.as_deref().unwrap_or(root), print, &Tty).map(|_| ())
         }
         _ => Err(USAGE.into()),
     }
+}
+
+/// The denylist and accepted-hits file for `check` and `gate`:
+/// ATLAS_LEAK_DENYLIST (and ATLAS_LEAK_ACCEPTED) when set, else the release
+/// config as ship reads it (`release_ship::settings`).
+fn lists(root: &Path) -> R<(PathBuf, Option<PathBuf>)> {
+    if env("ATLAS_LEAK_DENYLIST").is_some() {
+        let d = denylist_from_env()?;
+        let a = accepted_file(env("ATLAS_LEAK_ACCEPTED"), &d)?;
+        return Ok((d, a));
+    }
+    let s = crate::release_ship::settings(root)?;
+    Ok((s.denylist, s.accepted))
 }
 
 /// `check` on this host's targets with the real build, at most 16 jobs; its
@@ -160,10 +186,10 @@ pub(crate) fn denylist_summary(denylist: &Path) -> R<String> {
 
 /// `gate`: the denylist's summary, then the binary leak gate and the secret
 /// scan of DIR.
-pub(crate) fn gate(dir: &Path, denylist: &Path, accepted: Option<&Path>) -> R {
+pub(crate) fn gate(dir: &Path, denylist: &Path, accepted: Option<&Path>, src: &Path) -> R {
     say(&denylist_summary(denylist)?);
     let what = format!("the binaries in {}", dir.display());
-    binary_leak_gate(dir, denylist, accepted, &what)?;
+    binary_leak_gate(dir, denylist, accepted, Some(src), &what)?;
     secret_gate(dir, &what)
 }
 
@@ -267,11 +293,165 @@ pub(crate) fn check(c: &Check) -> R<bool> {
             missing.join(", ")
         ));
     }
-    binary_leak_gate(&bin, &c.denylist, c.accepted.as_deref(), "the local release binaries")?;
+    binary_leak_gate(&bin, &c.denylist, c.accepted.as_deref(), Some(&c.stage.join("src")), "the local release binaries")?;
     secret_gate(&bin, "the local release binaries")?;
     write(&c.stage.join(STAMP), format!("{key}targets {}\n", c.want.join(" ")))?;
     say(&format!("check passed: {} (stamp {})", c.want.join(", "), c.stage.join(STAMP).display()));
     Ok(true)
+}
+
+// ---------------------------------------------------------------- preflight
+
+/// What the preflight stamp is keyed by beyond `current_key`: a change to
+/// what the preflight runs voids every older stamp.
+const PREFLIGHT_V: &str = "preflight v2: hidden, export dry run, xtask tests, CI clippy, CI tests\n";
+
+/// Ship's preflight, before run 1 dispatches anything: every check the
+/// release-pr workflow (and the release workflow after it) makes that can
+/// run here, so a failure stops at its own line instead of on GitHub.
+///
+/// 1. `cargo xtask hidden` over the tracked tree (the linux-leak job's
+///    context poisoning guard).
+/// 2. `release --pr` as a dry run against `public` (ship's fresh clone of
+///    the public repository): the changelog section and its highlights,
+///    the versions, the links, the export, every exported file and wiki
+///    page against the denylist (the linux-leak job's `gate --export`),
+///    the release notes, and the export guard on the public main. Nothing
+///    is pushed.
+/// 3. `cargo test -p xtask --locked`: the release's own code, and the
+///    lockfile the workflows build with `--locked`.
+/// 4. The public CI's clippy on the exported tree: each `cargo +TOOLCHAIN
+///    clippy` line of its ci.yml, run as written ([`ci_clippy_runs`]).
+/// 5. The public CI's workspace tests on the exported tree ([`CI_TESTS`]).
+///
+/// The public `main` ruleset requires the CI's test and clippy checks, so a
+/// failure in 4 or 5 would hold the merge after the dispatch.
+///
+/// The binary leak gate and the secret scan are `release check`, which ship
+/// runs after this. A pass is stamped in `stage` for the commit, the
+/// denylist and the accepted-hits file, like `check`'s.
+pub(crate) fn preflight(root: &Path, stage: &Path, public: &Path, repo: &str, denylist: &Path, accepted: Option<&Path>) -> R {
+    let key = format!("{}{PREFLIGHT_V}", current_key(root, denylist, accepted)?.1);
+    if passed(stage, &key) {
+        say(&format!("preflight: passed already for this commit, denylist and accepted-hits file ({})", stage.join(STAMP).display()));
+        return Ok(());
+    }
+    rm_rf(stage)?;
+    mkdir(stage)?;
+    say("preflight 1/5: hidden text (cargo xtask hidden)");
+    say(&crate::hidden::tracked_gate(root).map_err(|e| format!("hidden text:\n{e}"))?);
+    say("preflight 2/5: `release --pr --dry-run` against a clone of the public repository (export, denylist on every file and wiki page, changelog, notes)");
+    let api = crate::public_repo::api();
+    let p = crate::release_ci::Pr {
+        root: root.to_path_buf(),
+        remote: public.to_string_lossy().replace('\\', "/"),
+        expect: None,
+        dry_run: true,
+        require_clean: true,
+        guard_checkout: false,
+        leak: crate::release_ci::Leak::Denylist(denylist.to_path_buf()),
+        repo: repo.to_string(),
+        ident: crate::release_ci::Ident::from_env(),
+        stage: stage.join("pr"),
+        publish_ok: false,
+        in_ci: false,
+        confirm: &Tty,
+        api: api.as_ref(),
+        open_pr: false,
+    };
+    crate::release_ci::pr(&p).map_err(|e| format!("the release-pr export (dry run): {e}"))?;
+    say("preflight 3/5: cargo test -p xtask --locked");
+    let xtask = ["test", "-p", "xtask", "--locked"].map(String::from);
+    cargo_logged(root, &xtask, None, &stage.join("xtask-test.log"), "the xtask tests")?;
+    // The public CI's required checks, on the exported tree as the public
+    // CI sees it, in a target folder of their own so a rebuild reuses it.
+    let tree = stage.join("pr").join("tree");
+    as_checkout(&tree)?;
+    let target = root.join("target").join("release-preflight");
+    let ci = std::fs::read_to_string(tree.join(".github/workflows/ci.yml")).map_err(|e| format!("the exported ci.yml: {e}"))?;
+    for (i, args) in ci_clippy_runs(&ci)?.iter().enumerate() {
+        say(&format!("preflight 4/5: the public CI's clippy, as ci.yml runs it: cargo {}", args.join(" ")));
+        cargo_logged(&tree, args, Some(&target), &stage.join(format!("clippy-{}.log", i + 1)), "the public CI's clippy").map_err(|e| format!("{e}\n(ci.yml pins its clippy toolchain: `rustup toolchain install <version> -c clippy` if it is missing)"))?;
+    }
+    let tests = CI_TESTS.map(String::from);
+    say(&format!("preflight 5/5: the public CI's tests (nextest and doc tests there; here one run): cargo {}", tests.join(" ")));
+    cargo_logged(&tree, &tests, Some(&target), &stage.join("ci-test.log"), "the public CI's workspace tests")?;
+    write(&stage.join(STAMP), key)?;
+    say(&format!("preflight passed (stamp {})", stage.join(STAMP).display()));
+    Ok(())
+}
+
+/// Makes the extracted export `tree` a git checkout of its own, its index
+/// `git add -A` of the export, so the public CI's tests that ask git what
+/// is tracked (the hidden-text gate, the public-files check) see the
+/// export as the public CI's checkout does. The export never carries
+/// `bin/` (`export_commit` refuses one); the CI's checkout of the release
+/// commit also holds main's previous `bin/`, which no workspace test
+/// depends on (the hidden-text gate skips binaries, and the public-files
+/// check asks only for its named files). Without this git answers for
+/// whatever repository holds the stage folder, or for none. The index is
+/// enough for those tests, so no commit (no identity, no signing).
+pub(crate) fn as_checkout(tree: &Path) -> R {
+    rm_rf(&tree.join(".git"))?;
+    output(git(tree).args(["init", "-q"]))?;
+    output(git(tree).args(["add", "-A"]))?;
+    Ok(())
+}
+
+/// The public CI's tests as one `cargo test` run: ci.yml runs `cargo nextest
+/// run --workspace --cargo-profile ci --locked --no-fail-fast` and then the
+/// doc tests (`cargo test --workspace --profile ci --locked --doc`), which
+/// `cargo test` covers in one run without nextest installed.
+const CI_TESTS: [&str; 6] = ["test", "--workspace", "--profile", "ci", "--locked", "--no-fail-fast"];
+
+/// The clippy commands of ci.yml (`run: cargo +TOOLCHAIN clippy ...` lines),
+/// as cargo's arguments; an error when it holds none, so a reshaped ci.yml
+/// stops the preflight rather than skipping the check.
+pub(crate) fn ci_clippy_runs(ci: &str) -> R<Vec<Vec<String>>> {
+    let runs: Vec<Vec<String>> = ci
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("run: cargo "))
+        .filter(|l| l.starts_with('+') && l.split_whitespace().nth(1) == Some("clippy"))
+        .map(|l| l.split_whitespace().map(String::from).collect())
+        .collect();
+    if runs.is_empty() {
+        return Err("the exported ci.yml has no `run: cargo +TOOLCHAIN clippy` line: the preflight cannot run the public CI's clippy".into());
+    }
+    Ok(runs)
+}
+
+/// `cargo ARGS` in `dir` (with `CARGO_TARGET_DIR` when `target` is given),
+/// its output to `log`; on a failure, the failing lines (tests, panics,
+/// errors and the result line), quoted from the log.
+fn cargo_logged(dir: &Path, args: &[String], target: Option<&Path>, log: &Path, what: &str) -> R {
+    let file = std::fs::File::create(log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let err = file.try_clone().map_err(|e| e.to_string())?;
+    let mut c = Command::new("cargo");
+    c.args(args).current_dir(dir).stdout(file).stderr(err);
+    if let Some(t) = target {
+        c.env("CARGO_TARGET_DIR", t);
+    }
+    let ok = c.status().map_err(|e| format!("cargo {}: {e}", args.join(" ")))?.success();
+    if ok {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    Err(format!("{what} failed (log {}):\n{}", log.display(), failing_lines(&text)))
+}
+
+/// The lines of a `cargo test` log that say what failed: each failing test,
+/// each panic and compile error, and the result line.
+pub(crate) fn failing_lines(log: &str) -> String {
+    let keep = |l: &str| {
+        let t = l.trim_start();
+        (t.starts_with("test ") && t.ends_with("FAILED")) || t.contains("panicked at") || t.starts_with("error") || t.starts_with("test result:")
+    };
+    let lines: Vec<&str> = log.lines().filter(|l| keep(l)).take(40).collect();
+    if lines.is_empty() {
+        log.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+    } else {
+        lines.join("\n")
+    }
 }
 
 // ---------------------------------------------------------------- readme
@@ -390,8 +570,9 @@ pub(crate) fn refuse_stale_readme(root: &Path, version: &str) -> R {
 
 // ---------------------------------------------------------------- accept-hit
 
-/// A typed confirmation. The terminal one is the only one built outside
-/// tests: nothing skips it.
+/// A typed confirmation: the terminal one ([`Tty`]), or unattended ship's
+/// (`release_ship::Unattended`), which says the act and goes on. `accept-hit`
+/// always takes the terminal one: a new leak hit is the owner's call.
 pub trait Confirm {
     /// Ok when the person typed `expect` after `prompt`.
     fn confirm(&self, prompt: &str, expect: &str) -> R;
@@ -426,9 +607,19 @@ fn answer(tty: bool, prompt: &str, expect: &str, read: impl FnOnce() -> R<String
     }
 }
 
-/// `accept-hit`: the entries for every place in `files` not yet in the file
-/// at `target`, printed (`print`) or appended after the confirmation.
-pub(crate) fn accept_hit(files: &[PathBuf], denylist: &Path, target: &Path, print: bool, confirm: &dyn Confirm) -> R<Vec<(usize, String)>> {
+/// The value of `--src`: a folder that must be given.
+fn src_arg(v: Option<String>) -> R<PathBuf> {
+    match v {
+        Some(s) if !s.is_empty() && !s.starts_with("--") => Ok(PathBuf::from(s)),
+        _ => Err(format!("--src needs the folder the binaries were built from\n{USAGE}")),
+    }
+}
+
+/// `accept-hit`: every place in `files` with its verdict against the source
+/// `src` (on standard error), and the entries for the places a dependency's
+/// or the toolchain's string holds that are not yet in the file at `target`,
+/// printed (`print`) or appended after the confirmation.
+pub(crate) fn accept_hit(files: &[PathBuf], denylist: &Path, target: &Path, src: &Path, print: bool, confirm: &dyn Confirm) -> R<Vec<(usize, String)>> {
     let list = std::fs::read(denylist).map_err(|_| "the denylist is not readable".to_string())?;
     let list = String::from_utf8_lossy(&list).into_owned();
     let db = crate::ucd::Db::load(&crate::pack_embedder::default_ucd())?;
@@ -446,21 +637,43 @@ pub(crate) fn accept_hit(files: &[PathBuf], denylist: &Path, target: &Path, prin
         named.push((f.file_name().map_or_else(|| f.display().to_string(), |n| n.to_string_lossy().into_owned()), b));
     }
     let ps = places(&m, &named);
-    if let Some(p) = ps.iter().find(|p| p.digest.is_none()) {
+    if let Some(p) = ps.iter().find(|p| p.at.is_none()) {
         return Err(format!("{}: a path is never accepted; rename it", p.line()));
     }
+    let corpus = crate::release_ci::source_corpus(&ps, &named, Some(src), "the binaries")?;
     let existing = if target.is_file() { Accepted::parse(&read_text(target)?, &m)? } else { Accepted::default() };
-    let mut new = BTreeSet::new();
+    let (mut new, mut stop) = (BTreeSet::new(), 0);
     for p in &ps {
-        eprintln!("release: place: {}", p.line());
-        let k = (p.term, p.digest.clone().expect("path places refused above"));
-        if !existing.0.contains(&k) {
+        // Every place with its verdict, by term number: the audit trail.
+        let v = crate::accept::verdict(p, &named, &corpus);
+        let k = crate::accept::entry(&m, p, &v);
+        let note = match (&v, &k) {
+            (Some(crate::explain::Verdict::Split(_)), _) => "passes without an entry",
+            (_, Some(k)) if existing.0.contains(k) => "accepted already",
+            (Some(crate::explain::Verdict::Join(..)), Some(_)) => "a new entry, only if the owner finds the pieces packed side by side",
+            (_, Some(_)) => "a new entry",
+            _ => {
+                stop += 1;
+                "cannot be accepted: fix the source or the build"
+            }
+        };
+        eprintln!("release: place: {}{}: {note}", p.line(), crate::accept::reason(&m, &v));
+        if let Some(k) = k.filter(|k| !existing.0.contains(k)) {
             new.insert(k);
         }
     }
     let terms: BTreeSet<usize> = ps.iter().map(|p| p.term).collect();
     // Standard error, so --print leaves only the entries on standard output.
-    eprintln!("release: {} place(s) of {} term(s) in {} file(s): {} new entr(ies), {} entr(ies) in {}", ps.len(), terms.len(), named.len(), new.len(), existing.0.len(), target.display());
+    eprintln!(
+        "release: {} place(s) of {} term(s) in {} file(s): {} new entr(ies), {} that cannot be accepted, {} entr(ies) in {}",
+        ps.len(),
+        terms.len(),
+        named.len(),
+        new.len(),
+        stop,
+        existing.0.len(),
+        target.display()
+    );
     let new: Vec<(usize, String)> = new.into_iter().collect();
     if print {
         print!("{}", Accepted(new.iter().cloned().collect()).lines());
@@ -533,52 +746,121 @@ mod tests {
     }
 
     #[test]
+    fn src_needs_a_value() {
+        for v in [None, Some(String::new()), Some("--print".to_string())] {
+            assert!(src_arg(v.clone()).unwrap_err().contains("--src needs"), "{v:?}");
+        }
+        assert_eq!(src_arg(Some("t".to_string())).unwrap(), PathBuf::from("t"));
+    }
+
+    /// A cargo tree at `d/tree` whose registry dependency `quire` (vendored
+    /// outside the tree, in place of crates.io) holds `made by TERM` in a
+    /// literal.
+    fn cargo_tree(d: &Path) -> PathBuf {
+        let tree = d.join("tree");
+        let vendor = d.join("vendor");
+        let dep = vendor.join("quire");
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::create_dir_all(tree.join(".cargo")).unwrap();
+        std::fs::create_dir_all(dep.join("src")).unwrap();
+        std::fs::write(tree.join("Cargo.toml"), "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nquire = \"1.0.0\"\n\n[workspace]\n").unwrap();
+        let v = atlas::json::to_string(&vendor.display().to_string().replace('\\', "/"));
+        std::fs::write(tree.join(".cargo/config.toml"), format!("[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = {v}\n")).unwrap();
+        std::fs::write(tree.join("src/main.rs"), "fn main() {\n    println!(\"{}\", quire::BY);\n}\n").unwrap();
+        std::fs::write(dep.join("Cargo.toml"), "[package]\nname = \"quire\"\nversion = \"1.0.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(dep.join(".cargo-checksum.json"), "{\"files\":{},\"package\":null}").unwrap();
+        std::fs::write(dep.join("src/lib.rs"), format!("/// The author.\npub const BY: &str = \"made by {}\";\n", term())).unwrap();
+        assert!(Command::new("cargo").current_dir(&tree).args(["generate-lockfile", "--offline"]).status().unwrap().success());
+        tree
+    }
+
+    #[test]
     fn accept_hit_appends_only_after_the_confirmation() {
         let d = tmp("accept");
         let deny = d.join("deny.txt");
         std::fs::write(&deny, format!("# t\n{}\n", term())).unwrap();
+        let tree = cargo_tree(&d);
         let bin = d.join("atlas-x");
-        std::fs::write(&bin, elf(&format!("{}{}{}", "a".repeat(30), term(), "b".repeat(30)))).unwrap();
+        std::fs::write(&bin, elf(&format!("\0{}made by {}{}\0", "a".repeat(30), term(), "b".repeat(30)))).unwrap();
         let target = d.join(crate::accept::DEFAULT_NAME);
 
         // Refused: nothing written.
         let no = Said(false, Cell::new(0));
-        assert!(accept_hit(std::slice::from_ref(&bin), &deny, &target, false, &no).is_err());
+        assert!(accept_hit(std::slice::from_ref(&bin), &deny, &target, &tree, false, &no).is_err());
         assert_eq!((no.1.get(), target.exists()), (1, false));
         // --print: entries out, nothing written, nothing asked.
-        let printed = accept_hit(std::slice::from_ref(&bin), &deny, &target, true, &no).unwrap();
+        let printed = accept_hit(std::slice::from_ref(&bin), &deny, &target, &tree, true, &no).unwrap();
         assert_eq!((printed.len(), no.1.get(), target.exists()), (1, 1, false));
+        // Keyed on the dependency's string, not the bytes around it.
+        let db = crate::ucd::Db::load(&crate::pack_embedder::default_ucd()).unwrap();
+        let m = crate::leak::Matcher::new(&db, &std::fs::read_to_string(&deny).unwrap());
+        let term_text = &m.terms()[0].text;
+        assert_eq!(printed[0].1, crate::accept::digest(1, term_text, "quire", format!("made by {}", term()).as_bytes()));
         // Confirmed: written, and the gate then passes the binary.
         let yes = Said(true, Cell::new(0));
-        assert_eq!(accept_hit(std::slice::from_ref(&bin), &deny, &target, false, &yes).unwrap(), printed);
+        assert_eq!(accept_hit(std::slice::from_ref(&bin), &deny, &target, &tree, false, &yes).unwrap(), printed);
         let text = std::fs::read_to_string(&target).unwrap();
         assert_eq!(text, format!("1  {}\n", printed[0].1));
         assert!(!text.contains(&term()));
         let dir = d.join("bins");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::copy(&bin, dir.join("atlas-x")).unwrap();
-        assert!(binary_leak_gate(&dir, &deny, None, "t").is_err());
-        binary_leak_gate(&dir, &deny, Some(&target), "t").unwrap();
-        // The same bytes as a text file beside it, with an entry made for
-        // them: never accepted.
-        let text = std::fs::read(&bin).unwrap()[8..].to_vec();
-        std::fs::write(dir.join("notes.txt"), &text).unwrap();
-        let db = crate::ucd::Db::load(&crate::pack_embedder::default_ucd()).unwrap();
-        let m = crate::leak::Matcher::new(&db, &std::fs::read_to_string(&deny).unwrap());
-        let extra = crate::accept::places(&m, &[("notes.txt".to_string(), text)]).into_iter().map(|p| (p.term, p.digest.unwrap()));
-        let both = d.join("both.txt");
-        std::fs::write(&both, Accepted(extra.chain(printed.iter().cloned()).collect()).lines()).unwrap();
-        let e = binary_leak_gate(&dir, &deny, Some(&both), "t").unwrap_err();
+        assert!(binary_leak_gate(&dir, &deny, None, Some(&tree), "t").is_err());
+        assert!(binary_leak_gate(&dir, &deny, Some(&target), None, "t").is_err(), "nothing explained without the source");
+        binary_leak_gate(&dir, &deny, Some(&target), Some(&tree), "t").unwrap();
+        // The same bytes as a text file beside it: never accepted.
+        std::fs::write(dir.join("notes.txt"), &std::fs::read(&bin).unwrap()[8..]).unwrap();
+        let e = binary_leak_gate(&dir, &deny, Some(&target), Some(&tree), "t").unwrap_err();
         assert!(e.starts_with("1 leak(s)"), "{e}");
         std::fs::remove_file(dir.join("notes.txt")).unwrap();
         // Again: nothing new, nothing asked.
-        assert!(accept_hit(std::slice::from_ref(&bin), &deny, &target, false, &yes).unwrap().is_empty());
+        assert!(accept_hit(std::slice::from_ref(&bin), &deny, &target, &tree, false, &yes).unwrap().is_empty());
         assert_eq!(yes.1.get(), 1);
+        // A place the build put in: no entry offered, and the gate stops.
+        let built = d.join("atlas-y");
+        std::fs::write(&built, elf(&format!("\0/home/{}/src\0", term()))).unwrap();
+        assert!(accept_hit(std::slice::from_ref(&built), &deny, &target, &tree, true, &no).unwrap().is_empty());
+        std::fs::copy(&built, dir.join("atlas-y")).unwrap();
+        let e = binary_leak_gate(&dir, &deny, Some(&target), Some(&tree), "t").unwrap_err();
+        assert!(e.starts_with("1 leak(s)") && e.contains("atlas-y") && e.contains("not explained by the source") && !e.contains(&term()), "{e}");
         // A text file is refused outright.
         let txt = d.join("notes.md");
         std::fs::write(&txt, term()).unwrap();
-        let e = accept_hit(&[txt], &deny, &target, false, &yes).unwrap_err();
+        let e = accept_hit(&[txt], &deny, &target, &tree, false, &yes).unwrap_err();
         assert!(e.contains("not an executable"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The preflight's exported tree sits in a stage folder that may be
+    /// inside another checkout (or none): `as_checkout` makes it its own,
+    /// tracking the export as the release commit does (ignored files left
+    /// out), and the hidden-text gate then passes on it.
+    #[test]
+    fn as_checkout_tracks_the_export_as_the_release_commit_does() {
+        let d = tmp("checkout");
+        let g = |dir: &Path, args: &[&str]| assert!(Command::new("git").arg("-C").arg(dir).args(args).output().unwrap().status.success(), "git {args:?}");
+        g(&d, &["init", "-q"]);
+        let tree = d.join("pr").join("tree");
+        for (f, body) in [
+            (".gitignore", &b"scratch.txt\n"[..]),
+            ("a.txt", b"a\n"),
+            ("scratch.txt", b"not exported\n"),
+            ("fx/log.txt", b"\x1b[31mred\n"),
+            ("xtask/hidden-allow.txt", b"1 fx/log.txt:U+001B captured colour codes\n"),
+        ] {
+            let p = tree.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        assert!(crate::hidden::tracked_gate(&tree).unwrap_err().contains("is not the top of a git checkout"));
+        as_checkout(&tree).unwrap();
+        let ls = output(git(&tree).args(["ls-files"])).unwrap();
+        assert_eq!(ls.lines().collect::<Vec<_>>(), [".gitignore", "a.txt", "fx/log.txt", "xtask/hidden-allow.txt"]);
+        crate::hidden::tracked_gate(&tree).unwrap();
+        // Run again over the same stage (a rerun): a fresh index.
+        as_checkout(&tree).unwrap();
+        crate::hidden::tracked_gate(&tree).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A one-commit repository to check.
@@ -739,5 +1021,21 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let version = cargo_version(&read_text(&root.join("Cargo.toml")).unwrap()).unwrap();
         assert_eq!(refuse_stale_readme(root, &version), Ok(()));
+    }
+
+    /// The preflight runs the public CI's clippy lines as ci.yml writes
+    /// them, and stops when it finds none.
+    #[test]
+    fn the_preflight_takes_the_public_ci_clippy_lines_from_ci_yml() {
+        let ci = "      - name: a\n        run: cargo +1.2.3 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings\n        run: cargo build\n        run: cargo +1.2.3 build\n        run: cargo +1.2.3 clippy --workspace --locked -- -D warnings\n";
+        let runs = ci_clippy_runs(ci).unwrap();
+        assert_eq!(runs.iter().map(|r| r.join(" ")).collect::<Vec<_>>(), ["+1.2.3 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings", "+1.2.3 clippy --workspace --locked -- -D warnings"]);
+        assert!(ci_clippy_runs("run: cargo clippy\n").unwrap_err().contains("no `run: cargo +TOOLCHAIN clippy` line"));
+        // The real ci.yml: both of its clippy runs, with -D warnings.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let real = ci_clippy_runs(&read_text(&root.join(".github/workflows/ci.yml")).unwrap()).unwrap();
+        assert_eq!(real.len(), 2);
+        assert!(real.iter().all(|r| r.ends_with(&["-D".to_string(), "warnings".to_string()])) && real[0].iter().any(|a| a == "--all-targets"));
+        assert!(CI_TESTS.contains(&"--workspace") && CI_TESTS.contains(&"ci") && CI_TESTS.contains(&"--locked"));
     }
 }

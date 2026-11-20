@@ -14,6 +14,55 @@ Sections are not written here by hand. Each pull request adds a fragment, `chang
 and section, and `cargo xtask version` folds the pending fragments into one section for the next release, in
 the order above, and sets the version by replaying them in merge order (`changes/README.md`).
 
+## v0.10.0
+
+### Highlights
+
+- **Copilot and other bot reviews no longer end a PR wait, and your own agents' comments no longer wake you.**
+  `atlas pr-events serve` drops events from bots and comments by the gh user it runs as, while a person's
+  review, yours included, still meets the wait. The new `pr_events.ignore_logins` key silences other chosen
+  reviewers.
+- **An agent that died in a reboot, or with its Claude Code session, is no longer listed as holding a cap
+  slot** in `atlas queue list`, `atlas queue next` and `recall op=status` (worktree gc still waits for its
+  finish or `stale_minutes`), and `atlas queue release` now takes the slot number shown in the listing, an
+  agent id or a lane.
+
+### Features
+
+- **`pr_events.ignore_logins` silences chosen reviewers.** An optional list of GitHub logins, compared without
+  case, whose reviews, review comments and PR comments `atlas pr-events serve` drops: they meet no wait and
+  surface no notice. Empty by default.
+- **`atlas queue release` takes a slot number or a lane, as well as an agent id.** Each launch gets a slot
+  number when its agent starts, and keeps it: the held-slot listing shows it (`#2`) the same way with or
+  without `--lane`, and after other agents start or finish. `atlas queue release 2` (or `#2`), `atlas queue
+  release ID` or `atlas queue release LANE` frees that slot and prints the agent it released; a row listed
+  released can be named too. A number no held slot carries is refused, and so is a lane held by more than
+  one agent, which lists each of them. With `--transcript PATH` the selector is an agent id in that session.
+  An agent launched before this release has no slot number (it shows as `--`) and is released by its agent
+  id or lane.
+
+### Fixes
+
+- **Bot reviews and comments no longer end a PR wait or wake the orchestrator.** `atlas pr-events serve` now
+  drops a review, review comment or PR comment whose GitHub user or sender type is `Bot`, so a Copilot review
+  (login `Copilot`, no `[bot]` suffix) no longer meets a `review pr#N` wait, and bot review comments and PR
+  comments no longer surface notices. A login ending in `[bot]` is still dropped. A person's review still meets
+  the wait.
+- **Your own agents' replies no longer wake you.** The listener reads the gh user once at start (`gh api user`,
+  asked of each host served, so a GitHub Enterprise repository asks its own host) and drops review comments
+  and PR comments by that user, so builders replying as the same user stay quiet. A review by that user still
+  meets the wait, since the gh user is also the person reviewing. Enterprise Managed User logins (`jdoe_acme`)
+  are read too. When gh is not logged in it says so at start and only the other rules apply.
+- **A cap slot held by an agent that died in a reboot, or with its Claude Code session, is no longer listed
+  as held.** Its transcript never ended, so `atlas queue list`, `atlas queue next` and `recall op=status`
+  counted it until `stale_minutes`. They now count an unfinished agent as released when the machine booted
+  after its last write, or when the process that ran it is gone (the resident server names it as `owner:` on
+  each launch entry, only when the first process above it, past any shell or launcher, is `claude`, `node` or
+  `bun`). Without such evidence the agent still counts. Worktree gc does not use this evidence: it keeps a dead
+  agent's worktree until its finish is recorded or `stale_minutes` passes. The listing shows such an agent as
+  `released: boot after last write` (or `owning Claude Code process gone`), and the json `held_slots` rows
+  carry `agent`, `slot` and `released` (a released row is not `running`).
+
 ## v0.9.0
 
 ### Highlights

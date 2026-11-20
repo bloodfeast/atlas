@@ -1,13 +1,15 @@
 # The deliberate hidden characters `cargo xtask hidden` lets through: one
-# `path:LINES:U+XXXX reason` per line, LINES a comma list of line numbers
-# and A-B ranges. Every listed line must hold the character (a stale line
-# is an error), and a new one on another line is a finding. An invisible
-# character in code is never listed: write an escape (`\u{202e}` in Rust,
-# `\x1b` in a string). List a file only when its bytes must be raw.
-fixtures/js-test/jest-fail-verbose.txt:18-24,33-39:U+001B terminal colour codes: a captured jest log the test-output digest parses as it arrives
-fixtures/js-test/jest-fail.txt:9-15,24-30:U+001B terminal colour codes: a captured jest log the test-output digest parses as it arrives
-fixtures/js-test/vitest-fail.txt:2,4-9,11,13-14,16-17,19-20,22-28,30,32-41,43,45-48:U+001B terminal colour codes: a captured vitest log the test-output digest parses as it arrives
-fixtures/js-test/vitest-pass.txt:2,4,6-9:U+001B terminal colour codes: a captured vitest log the test-output digest parses as it arrives
-xtask/src/release_ci.rs:2017,2031:U+001E record separator in a test's fake git log line (the field and record separators `git log --format` is asked for)
-xtask/src/release_ci.rs:2015-2016:U+001F unit separator in a test's fake git log line (the field and record separators `git log --format` is asked for)
-scripts/prdigest/heads.set1.SHA256SUMS:138-140,168-171:U+FFFD invalid UTF-8: a checksum manifest naming upstream snapshot files whose names were cut mid-character at the source; its bytes must match the names
+# `COUNT path:U+XXXX reason` per line, which lets COUNT of that character
+# through anywhere in that one file. Entries are keyed by file and
+# character, never by line numbers, so an edit above a case cannot make its
+# entry stale. The file must hold exactly COUNT of the character: one more
+# (a new hidden character in an allowed file) or one fewer fails, and the
+# gate names the count to set; an entry that matches nothing is an error.
+# An invisible character in code is never listed: write an escape
+# (`\u{202e}` in Rust, `\x1b` or `\x1f` in a string). List a file only when
+# its bytes must be raw.
+114 fixtures/js-test/jest-fail-verbose.txt:U+001B terminal colour codes: a captured jest log the test-output digest parses as it arrives
+114 fixtures/js-test/jest-fail.txt:U+001B terminal colour codes: a captured jest log the test-output digest parses as it arrives
+264 fixtures/js-test/vitest-fail.txt:U+001B terminal colour codes: a captured vitest log the test-output digest parses as it arrives
+44 fixtures/js-test/vitest-pass.txt:U+001B terminal colour codes: a captured vitest log the test-output digest parses as it arrives
+17 scripts/prdigest/heads.set1.SHA256SUMS:U+FFFD invalid UTF-8: a checksum manifest naming upstream snapshot files whose names were cut mid-character at the source; its bytes must match the names

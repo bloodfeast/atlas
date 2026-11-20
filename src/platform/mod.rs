@@ -485,6 +485,12 @@ pub(crate) mod process {
         })
     }
 
+    /// Every process as (pid, parent pid, executable name); empty where the
+    /// table cannot be read.
+    pub(crate) fn table() -> Vec<(u32, u32, String)> {
+        processes()
+    }
+
     /// This process's parent pid, when it can be read.
     pub(crate) fn parent() -> Option<u32> {
         #[cfg(unix)]

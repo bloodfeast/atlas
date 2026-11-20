@@ -1,6 +1,17 @@
-//! `cargo xtask release ship vX.Y.Z`: the release as one resumable command,
-//! run twice by the owner at a terminal, with his approval on GitHub between
-//! the two runs (the release process, Q3 to Q6).
+//! `cargo xtask release ship vX.Y.Z`: the release as one resumable command
+//! (the release process, Q3 to Q6). Unattended by default (Brandon
+//! 2026-11-19: "We need this to be a process you can do autonomously"):
+//! [`drive`] takes run 1 and run 2 below back to back, waits while only the
+//! public checks are running or the owner's approval on GitHub is missing
+//! (that approval is the one human gate: ship never gives it, and waits for
+//! it with no prompt; Brandon 2026-11-20), says each act
+//! instead of asking ([`Unattended`]), and signs with the passphrase kept in
+//! the DPAPI store (`crate::passphrase`, `release store-passphrase`). Before
+//! anything is dispatched it runs the workflows' gates here
+//! (`release_check::preflight`) and sets the linux-leak job's secrets from
+//! the local files (`Hub::sync_secrets`). `--attended` is the older form:
+//! two runs at a terminal, the owner's approval on GitHub between them, and
+//! each public act behind its typed prompt.
 //!
 //! ```text
 //! cargo xtask release ship vX.Y.Z
@@ -46,10 +57,9 @@
 //! run again: a release-pr run in progress is watched, not dispatched
 //! again; a closed pull request whose branch is gone, or holds a later
 //! export, gives way to run 1; a merged pull request is never merged again;
-//! a half-signed release resumes on its binaries commit. Each public act is
-//! behind its own typed prompt (`release_check::Tty`, the only `Confirm`
-//! built outside tests); without a terminal every one is refused, so no agent can open,
-//! merge or publish a release. The signing key's path is checked
+//! a half-signed release resumes on its binaries commit. With `--attended`,
+//! each public act is behind its own typed prompt (`release_check::Tty`);
+//! without a terminal every one is refused. The signing key's path is checked
 //! (`is_file`, never opened) only after every other check of the publish;
 //! openssl alone opens it, when signing.
 //!
@@ -423,7 +433,20 @@ pub trait Hub {
     fn merge(&self, m: &Merge) -> R;
     /// The pause between two looks for a run or a merge.
     fn wait(&self);
+    /// Sets the release-leak environment's ATLAS_LEAK_DENYLIST and
+    /// ATLAS_LEAK_ACCEPTED secrets of the development repository from the
+    /// local files (piped, never printed), so the linux-leak job checks
+    /// with exactly what the local gates used.
+    fn sync_secrets(&self, denylist: &Path, accepted: Option<&Path>) -> R;
 }
+
+/// The development repository's environment whose secrets the linux-leak
+/// job reads (release-pr.yml).
+pub const LEAK_ENV: &str = "release-leak";
+
+/// What the accepted-hits secret holds without an accepted-hits file: a
+/// comment, since GitHub refuses an empty secret.
+pub const NO_ACCEPTED: &str = "# no accepted hits\n";
 
 /// `gh` as the owner is logged in as, every call with `--repo`.
 pub struct GhHub {
@@ -509,6 +532,33 @@ impl Hub for GhHub {
     fn wait(&self) {
         crate::release_ci::no_gh_in_tests();
         std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+    fn sync_secrets(&self, denylist: &Path, accepted: Option<&Path>) -> R {
+        crate::release_ci::no_gh_in_tests();
+        let set = |name: &str, body: Vec<u8>| -> R {
+            use std::io::Write as _;
+            let mut child = Command::new("gh")
+                .args(["secret", "set", name, "--env", LEAK_ENV, "--repo", DEV_REPO])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("gh secret set {name}: {e}"))?;
+            child.stdin.take().ok_or("gh: no stdin")?.write_all(&body).map_err(|e| format!("gh secret set {name}: {e}"))?;
+            let out = child.wait_with_output().map_err(|e| format!("gh secret set {name}: {e}"))?;
+            if !out.status.success() {
+                // gh's own message names the secret, never its value.
+                return Err(format!("gh secret set {name} --env {LEAK_ENV} failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            Ok(())
+        };
+        let read = |p: &Path, what: &str| std::fs::read(p).map_err(|_| format!("{what} is not readable"));
+        set("ATLAS_LEAK_DENYLIST", read(denylist, "the denylist")?)?;
+        let acc = match accepted {
+            Some(p) => read(p, "the accepted-hits file")?,
+            None => Vec::new(),
+        };
+        set("ATLAS_LEAK_ACCEPTED", if acc.iter().all(u8::is_ascii_whitespace) { NO_ACCEPTED.as_bytes().to_vec() } else { acc })
     }
 }
 
@@ -649,6 +699,24 @@ pub fn not_ready(p: &PrInfo, owner: &str) -> Vec<String> {
     v
 }
 
+/// Whether a [`not_ready`] line is only the owner's missing approval (none
+/// yet, or one of an earlier head): what unattended ship waits for. Never
+/// the owner's own request for changes, a dismissal or a check. Ship never
+/// gives the approval itself: it is the owner's, on GitHub.
+pub fn only_the_owners_approval(m: &str, owner: &str) -> bool {
+    m == format!("no review from {owner}") || (m.starts_with(&format!("{owner} approved ")) && m.ends_with(": approve the head"))
+}
+
+/// Whether every [`not_ready`] line is something time alone settles: a
+/// check not yet run or still going, or the owner's approval on GitHub. A
+/// failed check or a request for changes is not.
+pub fn only_waiting(missing: &[String], owner: &str) -> bool {
+    missing.iter().all(|m| {
+        only_the_owners_approval(m, owner)
+            || (m.starts_with("check ") && (m.ends_with(" has not run") || [" is queued", " is in_progress", " is pending", " is waiting", " is requested", " is expected"].iter().any(|s| m.ends_with(s))))
+    })
+}
+
 // ---------------------------------------------------------------- state
 
 /// Run 1's record (`<stage>/ship/state.json`).
@@ -730,6 +798,14 @@ pub struct Ship<'a> {
     pub confirm: &'a dyn Confirm,
     /// `release check` here (run when no current stamp stands).
     pub check: &'a dyn Fn() -> R<bool>,
+    /// Every other check the release-pr and release workflows make, run
+    /// here before anything is dispatched (`preflight`); given the fresh
+    /// clone of the public repository run 1 made.
+    pub preflight: &'a dyn Fn(&Path) -> R,
+    /// Unattended (no `--attended`): run 2 waits, with no prompt, for the
+    /// owner's approval on GitHub, the one human gate, and goes on once it
+    /// is there. Ship never approves the pull request itself.
+    pub unattended: bool,
 }
 
 /// Where a ship stopped.
@@ -936,10 +1012,20 @@ fn open(s: &Ship, reexport: Option<&PrInfo>) -> R<Done> {
     }
     say(&format!("  2. dispatch release-pr on {DEV_REPO} for {version} at {head}: it leak-checks the export and a Linux build,"));
     say(&format!("     pushes branch release/{tag} to the PUBLIC repository {} and opens the pull request", s.repo));
-    say("  3. watch the run and print the pull request; then review and approve it on GitHub, and run ship again");
+    if s.unattended {
+        say("  3. watch the run and print the pull request; then wait, with no prompt, for its checks and the owner's approval on GitHub (the one human gate), then merge, build, sign and publish");
+    } else {
+        say("  3. watch the run and print the pull request; then review and approve it on GitHub, and run ship again");
+    }
+    // Every gate the release-pr and release workflows run, here first, so
+    // a failure stops before anything is dispatched, with its own line.
+    (s.preflight)(&public).map_err(|e| format!("preflight: {e}\nnothing was dispatched"))?;
     if !stamped {
         (s.check)()?;
     }
+    // The linux-leak job's denylist and accepted hits are these files.
+    s.hub.sync_secrets(&s.denylist, s.accepted.as_deref())?;
+    say(&format!("secrets ATLAS_LEAK_DENYLIST and ATLAS_LEAK_ACCEPTED of the {LEAK_ENV} environment set from the local files"));
     say(&dispatch_note(tag, &head, &s.repo, reexport));
     let mut st = State { tag: tag.clone(), commit: head.clone(), nonce: nonce(), run: 0 };
     st.write(&s.state_file())?;
@@ -1011,7 +1097,15 @@ fn merge_step(s: &Ship, p: &PrInfo) -> R<Done> {
         for m in &missing {
             say(&format!("  {m}"));
         }
-        say("nothing changed; run ship again when it is");
+        if s.unattended && only_waiting(&missing, s.owner()) {
+            say(&format!(
+                "nothing changed; waiting, with no prompt, for {}'s approval of the head {} on GitHub (the one human gate) and for the checks",
+                s.owner(),
+                short(&p.head_oid)
+            ));
+        } else {
+            say("nothing changed; run ship again when it is");
+        }
         return Ok(Done::Waiting(missing));
     }
     let to_github = !Path::new(&s.remote).is_dir();
@@ -1130,12 +1224,160 @@ fn after_merge(s: &Ship, p: &PrInfo, draft: Option<Draft>) -> R<Done> {
 pub fn run(root: &Path, args: Vec<String>) -> R {
     let mut it = args.into_iter().skip(1);
     let tag = it.next().filter(|t| t.starts_with('v')).ok_or(crate::release_ci::USAGE)?;
-    if let Some(a) = it.next() {
-        return Err(format!("unknown argument {a}\n{}", crate::release_ci::USAGE));
+    let mut attended = false;
+    for a in it {
+        match a.as_str() {
+            "--attended" => attended = true,
+            _ => return Err(format!("unknown argument {a}\n{}", crate::release_ci::USAGE)),
+        }
     }
     if env("ATLAS_GITHUB_STUB").is_some() {
         return Err("ship talks to GitHub; the dry paths are `release --pr --remote PATH` and `release sign vX.Y.Z --remote PATH` with ATLAS_GITHUB_STUB".into());
     }
+    let set = settings(root)?;
+    if let Some(d) = &set.wsl_distro {
+        std::env::set_var("ATLAS_WSL_DISTRO", d);
+    }
+    let update_rs = read_text(&root.join("src/update.rs"))?;
+    let (Some(trusted), Some(test_key)) = (crate::release::key_const(&update_rs, "TRUSTED_KEY_HEX"), crate::release::key_const(&update_rs, "TEST_KEY_HEX")) else {
+        return Err("cannot read TRUSTED_KEY_HEX and TEST_KEY_HEX from src/update.rs".into());
+    };
+    if !attended {
+        unattended_signing(set.key.as_deref())?;
+    }
+    let repo = env("ATLAS_PUBLIC_REPO").unwrap_or_else(|| crate::release::DEFAULT_PUBLIC_REPO.into());
+    let stage = crate::release_ci::stage_root(root).join(&tag);
+    let (denylist, accepted) = (set.denylist.clone(), set.accepted.clone());
+    let check = || crate::release_check::check_here(root, &tag, &denylist, accepted.as_deref(), false);
+    let (pre_stage, pre_repo) = (stage.join("preflight"), repo.clone());
+    let preflight = |public: &Path| crate::release_check::preflight(root, &pre_stage, public, &pre_repo, &denylist, accepted.as_deref());
+    let api = crate::public_repo::api();
+    let rel = crate::release_ci::GhReleases { repo: repo.clone() };
+    let hub = GhHub { repo: repo.clone() };
+    let s = Ship {
+        tag: tag.clone(),
+        root: root.to_path_buf(),
+        check_origin: true,
+        remote: format!("https://github.com/{repo}.git"),
+        repo,
+        stage,
+        denylist: set.denylist,
+        accepted: set.accepted,
+        key: set.key,
+        trusted,
+        test_key,
+        ident: Ident::from_env(),
+        api: api.as_ref(),
+        rel: &rel,
+        hub: &hub,
+        confirm: if attended { &crate::release_check::Tty as &dyn Confirm } else { &Unattended },
+        check: &check,
+        preflight: &preflight,
+        unattended: !attended,
+    };
+    if attended {
+        match ship(&s)? {
+            Done::Published => say(&format!("{tag} is out; nothing to do")),
+            Done::Opened(u) => say(&format!("run 1 done: {u}")),
+            Done::Waiting(_) => {}
+            Done::Released(c) => say(&format!("released {tag} on {c}")),
+        }
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let done = drive(&s, &mut || {
+        if started.elapsed() > WAIT_LIMIT {
+            return Err(format!("still waiting after {} minutes: run ship again to go on from here", WAIT_LIMIT.as_secs() / 60));
+        }
+        std::thread::sleep(PAUSE);
+        Ok(())
+    })?;
+    match done {
+        Done::Released(c) => say(&format!("released {tag} on {c}")),
+        _ => say(&format!("{tag} is out; nothing to do")),
+    }
+    Ok(())
+}
+
+/// How long unattended ship waits for the checks and the owner's approval
+/// in all; a later run goes on from where GitHub stands.
+const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The pause between two looks at a pull request that waits.
+const PAUSE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Unattended ship: takes the next step until the release is out. After
+/// run 1 opens the pull request it goes straight on; while the pull
+/// request waits only for checks to finish or for the owner's approval on
+/// GitHub (the one human gate), `pause` waits and it looks again, with no
+/// prompt. Anything else that
+/// stops a step (a failed check, a request for changes, any refusal) ends
+/// the run with that step's error, as an attended run would.
+pub fn drive(s: &Ship, pause: &mut dyn FnMut() -> R) -> R<Done> {
+    loop {
+        match ship(s)? {
+            Done::Opened(_) => {}
+            Done::Waiting(m) if only_waiting(&m, s.owner()) => {
+                let before = git_out(&s.root, &["rev-parse", "HEAD"])?;
+                say(&format!("waiting a minute, then looking again: the owner's approval on GitHub is the one human gate ({})", m.join("; ")));
+                pause()?;
+                // A commit landed while it waited: the next look would export
+                // it again on its own. Stop and leave that to a new run.
+                let now = git_out(&s.root, &["rev-parse", "HEAD"])?;
+                if now != before {
+                    return Err(format!(
+                        "HEAD moved from {} to {} while ship waited for the owner's approval: an unattended run does not export new code on its own; check the change, then run ship again to export it",
+                        short(&before),
+                        short(&now)
+                    ));
+                }
+            }
+            Done::Waiting(m) => return Err(format!("the release pull request cannot merge: {}", m.join("; "))),
+            d => return Ok(d),
+        }
+    }
+}
+
+/// The typed prompts of an unattended run (Brandon 2026-11-19, "We need
+/// this to be a process you can do autonomously"): each public act is said,
+/// not asked. The gates before each act stand as they are; `--attended`
+/// asks at the terminal instead.
+pub struct Unattended;
+
+impl Confirm for Unattended {
+    fn confirm(&self, prompt: &str, expect: &str) -> R {
+        say(&format!("{prompt}: `{expect}` (unattended)"));
+        Ok(())
+    }
+}
+
+/// Before an unattended run starts: on Windows the stored passphrase must
+/// be there (`release store-passphrase`) and must open the configured key,
+/// so a run never stops at the signature after the merge; it is armed for
+/// `sign_manifest`. Elsewhere there is no store: openssl asks at the end.
+fn unattended_signing(key: Option<&Path>) -> R {
+    if !crate::passphrase::SUPPORTED {
+        say("no DPAPI on this platform: openssl will ask for the signing key's passphrase");
+        return Ok(());
+    }
+    let store = crate::passphrase::store_path();
+    crate::passphrase::require(&store)?;
+    if let (Some(key), Some(openssl)) = (key, crate::release::which("openssl")) {
+        let pass = crate::passphrase::load(&store)?;
+        if !crate::passphrase::opens(&openssl, key, &pass)? {
+            return Err(format!("the stored passphrase does not open the signing key {}: run `cargo xtask release store-passphrase` again", key.display()));
+        }
+        say(&format!("signing: the stored passphrase ({}) opens the key", store.display()));
+    }
+    crate::passphrase::arm(&store);
+    Ok(())
+}
+
+/// The settings ship works from (environment over the release config),
+/// each placement checked and each source printed (paths, never contents);
+/// the denylist must be readable. Also `release check`, `gate` and
+/// `accept-hit` when ATLAS_LEAK_DENYLIST is not set.
+pub fn settings(root: &Path) -> R<Settings> {
     let file = config_file(env("ATLAS_RELEASE_CONFIG"))?;
     let cfg = match &file {
         Some(f) => parse_config(&read_text(f)?)?,
@@ -1156,46 +1398,23 @@ pub fn run(root: &Path, args: Vec<String>) -> R {
     if std::fs::File::open(&set.denylist).is_err() {
         return Err("the denylist is not readable".into());
     }
-    if let Some(d) = &set.wsl_distro {
-        std::env::set_var("ATLAS_WSL_DISTRO", d);
+    Ok(set)
+}
+
+/// `release store-passphrase`: the owner, once, at a terminal.
+pub fn store_passphrase(root: &Path, args: Vec<String>) -> R {
+    if let Some(a) = args.into_iter().nth(1) {
+        return Err(format!("unknown argument {a}\n{}", crate::release_ci::USAGE));
     }
-    let update_rs = read_text(&root.join("src/update.rs"))?;
-    let (Some(trusted), Some(test_key)) = (crate::release::key_const(&update_rs, "TRUSTED_KEY_HEX"), crate::release::key_const(&update_rs, "TEST_KEY_HEX")) else {
-        return Err("cannot read TRUSTED_KEY_HEX and TEST_KEY_HEX from src/update.rs".into());
+    let file = config_file(env("ATLAS_RELEASE_CONFIG"))?;
+    let cfg = match &file {
+        Some(f) => parse_config(&read_text(f)?)?,
+        None => Config::default(),
     };
-    let repo = env("ATLAS_PUBLIC_REPO").unwrap_or_else(|| crate::release::DEFAULT_PUBLIC_REPO.into());
-    let stage = crate::release_ci::stage_root(root).join(&tag);
-    let (denylist, accepted) = (set.denylist.clone(), set.accepted.clone());
-    let check = || crate::release_check::check_here(root, &tag, &denylist, accepted.as_deref(), false);
-    let api = crate::public_repo::api();
-    let rel = crate::release_ci::GhReleases { repo: repo.clone() };
-    let hub = GhHub { repo: repo.clone() };
-    let s = Ship {
-        tag: tag.clone(),
-        root: root.to_path_buf(),
-        check_origin: true,
-        remote: format!("https://github.com/{repo}.git"),
-        repo,
-        stage,
-        denylist: set.denylist,
-        accepted: set.accepted,
-        key: set.key,
-        trusted,
-        test_key,
-        ident: Ident::from_env(),
-        api: api.as_ref(),
-        rel: &rel,
-        hub: &hub,
-        confirm: &crate::release_check::Tty,
-        check: &check,
-    };
-    match ship(&s)? {
-        Done::Published => say(&format!("{tag} is out; nothing to do")),
-        Done::Opened(u) => say(&format!("run 1 done: {u}")),
-        Done::Waiting(_) => {}
-        Done::Released(c) => say(&format!("released {tag} on {c}")),
-    }
-    Ok(())
+    let key = env("ATLAS_SIGN_KEY").map(PathBuf::from).or(cfg.key);
+    let store = crate::passphrase::store_path();
+    placement("the passphrase store", &store, root)?;
+    crate::passphrase::store_cmd(&store, key.as_deref())
 }
 
 #[cfg(test)]
@@ -1300,6 +1519,11 @@ mod tests {
         fn wait(&self) {
             self.waits.set(self.waits.get() + 1);
         }
+        fn sync_secrets(&self, denylist: &Path, accepted: Option<&Path>) -> R {
+            assert!(denylist.is_file());
+            self.calls.borrow_mut().push(format!("secrets {}", accepted.is_some()));
+            Ok(())
+        }
     }
 
     /// A person who types the given answers, one per prompt, in order.
@@ -1363,6 +1587,11 @@ mod tests {
         rel: StubReleases,
         hub: FakeHub,
         checks: Cell<u32>,
+        /// Preflights run, and the error the next one gives.
+        preflights: Cell<u32>,
+        preflight_err: RefCell<Option<String>>,
+        /// Unattended: run 2 waits for the approval.
+        unattended: Cell<bool>,
         /// GitHub's REST answers by path (none: every call fails, as NoApi).
         gh: RefCell<std::collections::HashMap<String, String>>,
     }
@@ -1379,7 +1608,7 @@ mod tests {
         let dev = dev_checkout(&fx.d);
         let rel = StubReleases(fx.stub.clone());
         let hub = FakeHub::new(&fx.stub);
-        World { fx, dev, rel, hub, checks: Cell::new(0), gh: RefCell::default() }
+        World { fx, dev, rel, hub, checks: Cell::new(0), preflights: Cell::new(0), preflight_err: RefCell::default(), unattended: Cell::new(false), gh: RefCell::default() }
     }
 
     impl World {
@@ -1407,6 +1636,13 @@ mod tests {
             State::read(&self.stage().join("ship/state.json")).unwrap()
         }
         fn ship(&self, confirm: &dyn Confirm, key: Option<(PathBuf, String)>) -> R<Done> {
+            self.ship_with(confirm, key, &|s| ship(s))
+        }
+        fn ship_with(&self, confirm: &dyn Confirm, key: Option<(PathBuf, String)>, go: &dyn Fn(&Ship) -> R<Done>) -> R<Done> {
+            let preflight = |_: &Path| {
+                self.preflights.set(self.preflights.get() + 1);
+                self.preflight_err.borrow().clone().map_or(Ok(()), Err)
+            };
             let check = || {
                 self.checks.set(self.checks.get() + 1);
                 Ok(true)
@@ -1415,7 +1651,7 @@ mod tests {
                 Some((k, h)) => (Some(k), h),
                 None => (None, "1".repeat(64)),
             };
-            ship(&Ship {
+            go(&Ship {
                 tag: TAG.into(),
                 root: self.dev.clone(),
                 check_origin: false,
@@ -1433,6 +1669,8 @@ mod tests {
                 hub: &self.hub,
                 confirm,
                 check: &check,
+                preflight: &preflight,
+                unattended: self.unattended.get(),
             })
         }
         /// A file standing for the key: the preflight passes on it.
@@ -1485,7 +1723,7 @@ mod tests {
         assert!(t.asked.borrow().is_empty(), "run 1 asks nothing: {:?}", t.asked.borrow());
         let st = w.state().unwrap();
         assert_eq!((st.tag.as_str(), st.commit.as_str(), st.run), (TAG, head.as_str(), 7));
-        assert_eq!(*w.hub.calls.borrow(), [format!("dispatch 1.2.3 {head} {}", st.nonce), format!("watch {DEV_REPO} 7")]);
+        assert_eq!(*w.hub.calls.borrow(), ["secrets false".to_string(), format!("dispatch 1.2.3 {head} {}", st.nonce), format!("watch {DEV_REPO} 7")], "the secrets are set from the local files just before the dispatch");
         assert_eq!(w.hub.waits.get(), 1);
         w.done();
     }
@@ -1850,7 +2088,7 @@ mod tests {
         let now = w.state().unwrap();
         assert_eq!((now.commit.as_str(), now.run), (head.as_str(), 7));
         assert_ne!(now.nonce, "n");
-        assert_eq!(*w.hub.calls.borrow(), [format!("dispatch 1.2.3 {head} {}", now.nonce), format!("watch {DEV_REPO} 7")]);
+        assert_eq!(*w.hub.calls.borrow(), ["secrets false".to_string(), format!("dispatch 1.2.3 {head} {}", now.nonce), format!("watch {DEV_REPO} 7")]);
         assert_eq!(w.hub.pr.borrow().as_ref().unwrap().head_oid, new_export);
         // The owner's approval of the old head does not carry over.
         match w.ship(&Typed::new(&["merge v1.2.3"]), None).unwrap() {
@@ -1974,6 +2212,8 @@ mod tests {
             hub: &w.hub,
             confirm: &No,
             check: &check,
+            preflight: &|_| Ok(()),
+            unattended: false,
         })
         .unwrap_err();
         assert!(e.starts_with("origin fetches from "), "{e}");
@@ -2350,5 +2590,150 @@ Co-authored-by: P <pub@example.invalid>",
         w.gh.borrow_mut().insert(format!("repos/{REPO}/commits/{outside}/pulls"), owners);
         assert!(w.ship(&No, None).unwrap_err().contains(" 1 address "));
         w.done();
+    }
+
+    // ------------------------------------------------------------ unattended
+
+    /// The release pull request as the release-pr run opens it: no review
+    /// yet, every check still running.
+    fn fresh(head: &str) -> PrInfo {
+        let mut p = ready(head);
+        p.reviews.clear();
+        for c in p.checks.iter_mut() {
+            c.status = "IN_PROGRESS".into();
+            c.conclusion = String::new();
+        }
+        p
+    }
+
+    #[test]
+    fn unattended_ship_goes_from_run_1_to_the_release_with_no_prompt() {
+        let w = world("ship-auto");
+        w.hide_draft_until_built();
+        w.unattended.set(true);
+        *w.hub.opens.borrow_mut() = Some(fresh(&w.fx.target));
+        w.hub.rel_runs.borrow_mut().push(run_of("in_progress", ""));
+        let key = temp_key(&w.fx.d);
+        let pauses = Cell::new(0);
+        let r = w.ship_with(&Unattended, key.clone(), &|s| {
+            let mut pause = || {
+                pauses.set(pauses.get() + 1);
+                let mut pr = w.hub.pr.borrow_mut();
+                let pr = pr.as_mut().unwrap();
+                if pauses.get() == 1 {
+                    // The public checks finish while ship waits.
+                    for c in pr.checks.iter_mut() {
+                        c.status = "COMPLETED".into();
+                        c.conclusion = "SUCCESS".into();
+                    }
+                } else {
+                    // Then the owner approves the head on GitHub.
+                    let head = pr.head_oid.clone();
+                    pr.reviews.push(Review { author: "acme".into(), state: "APPROVED".into(), commit: head, submitted_at: "2099-01-01T00:00:00Z".into() });
+                }
+                Ok(())
+            };
+            drive(s, &mut pause)
+        });
+        let calls = w.hub.calls.borrow().clone();
+        let at = |what: &str| calls.iter().position(|c| c.starts_with(what)).unwrap_or_else(|| panic!("no {what} in {calls:?}"));
+        // The preflight ran once, then the secrets were set, then the dispatch.
+        assert_eq!(w.preflights.get(), 1);
+        assert!(at("secrets false") < at("dispatch"), "{calls:?}");
+        // It waited, with no prompt, for the checks and then for the owner's
+        // approval on GitHub (never giving it), then merged the head.
+        assert_eq!(pauses.get(), 2);
+        assert!(!calls.iter().any(|c| c.starts_with("approve")), "ship never approves: {calls:?}");
+        assert!(calls.contains(&format!("merge 5 {}", w.fx.target)), "merged at the approved head: {calls:?}");
+        assert_eq!(w.hub.count("merge"), 1);
+        match key {
+            Some(_) => {
+                let Done::Released(commit) = r.unwrap() else { panic!("not released") };
+                assert_eq!(w.main(), commit);
+                assert!(uploaded(&w.fx));
+            }
+            None => assert!(r.unwrap_err().contains("openssl")),
+        }
+        w.done();
+    }
+
+    #[test]
+    fn a_preflight_failure_stops_before_any_dispatch_with_its_line() {
+        let w = world("ship-auto-pre");
+        w.no_draft();
+        w.unattended.set(true);
+        *w.hub.opens.borrow_mut() = Some(fresh(&w.fx.target));
+        *w.preflight_err.borrow_mut() = Some("hidden text:\nsrc/a.rs:3:7: U+200B zero-width character".into());
+        let e = w.ship_with(&Unattended, None, &|s| drive(s, &mut || Err("waited: the preflight did not stop the run".into()))).unwrap_err();
+        assert!(e.contains("src/a.rs:3:7: U+200B zero-width character") && e.contains("nothing was dispatched"), "{e}");
+        assert_eq!((w.hub.count("dispatch"), w.hub.count("secrets"), w.checks.get()), (0, 0, 0), "nothing dispatched, no secret set, no build");
+        w.done();
+    }
+
+    #[test]
+    fn unattended_ship_never_merges_past_a_failed_check_a_change_request_or_other_code() {
+        // A failed check: stops, no approval.
+        let w = world("ship-auto-fail");
+        w.no_draft();
+        w.unattended.set(true);
+        let mut p = fresh(&w.fx.target);
+        for c in p.checks.iter_mut() {
+            c.status = "COMPLETED".into();
+            c.conclusion = "SUCCESS".into();
+        }
+        p.checks[2].conclusion = "FAILURE".into();
+        *w.hub.pr.borrow_mut() = Some(p.clone());
+        let e = w.ship_with(&Unattended, None, &|s| drive(s, &mut || panic!("a failed check is not waited on"))).unwrap_err();
+        assert!(e.contains("check test (macos-latest) is failure"), "{e}");
+        // The owner's own request for changes stands.
+        p.checks[2].conclusion = "SUCCESS".into();
+        p.reviews.push(Review { author: "acme".into(), state: "CHANGES_REQUESTED".into(), commit: w.fx.target.clone(), submitted_at: "2026-01-01T00:00:00Z".into() });
+        *w.hub.pr.borrow_mut() = Some(p.clone());
+        let e = w.ship_with(&Unattended, None, &|s| drive(s, &mut || panic!("not waited on"))).unwrap_err();
+        assert!(e.contains("acme's latest review is CHANGES_REQUESTED"), "{e}");
+        // Checks green and the owner's approval given, but this checkout
+        // holds other code: the tree check refuses before the merge.
+        p.reviews = vec![Review { author: "acme".into(), state: "APPROVED".into(), commit: w.fx.target.clone(), submitted_at: "2026-01-02T00:00:00Z".into() }];
+        *w.hub.pr.borrow_mut() = Some(p);
+        commit_files(&w.dev, &[("xtask/src/main.rs", "fn other() {}\n")], "other code");
+        let e = w.ship_with(&Unattended, None, &|s| drive(s, &mut || Err("waited instead of refusing".into()))).unwrap_err();
+        assert!(e.starts_with("this checkout is not the release's source"), "{e}");
+        assert_eq!(w.hub.count("merge"), 0);
+        w.done();
+    }
+
+    /// A commit while ship waits for the approval: it stops with a message
+    /// rather than export the new HEAD on its own.
+    #[test]
+    fn unattended_ship_stops_when_head_moves_during_the_wait() {
+        let w = world("ship-auto-moved");
+        w.no_draft();
+        w.unattended.set(true);
+        *w.hub.pr.borrow_mut() = Some(fresh(&w.fx.target));
+        let e = w
+            .ship_with(&Unattended, None, &|s| {
+                drive(s, &mut || {
+                    commit_files(&w.dev, &[("xtask/src/main.rs", "fn moved() {}\n")], "a commit during the wait");
+                    Ok(())
+                })
+            })
+            .unwrap_err();
+        assert!(e.starts_with("HEAD moved from ") && e.contains("run ship again to export it"), "{e}");
+        assert_eq!((w.hub.count("dispatch"), w.hub.count("merge")), (0, 0), "nothing re-exported or merged");
+        w.done();
+    }
+
+    #[test]
+    fn only_checks_still_running_and_the_owners_approval_are_waited_on() {
+        let owner = "acme";
+        let wait = |m: &[&str]| only_waiting(&m.iter().map(|s| s.to_string()).collect::<Vec<_>>(), owner);
+        assert!(wait(&["no review from acme", "check test (ubuntu-latest) has not run", "check clippy (windows-latest) is in_progress", "check x is queued"]));
+        assert!(wait(&["acme approved bbbbbbbbbbbb, not the head aaaaaaaaaaaa: approve the head"]));
+        for stop in ["check test (macos-latest) is failure", "check x is cancelled", "helper requested changes", "acme's latest review is CHANGES_REQUESTED", "acme's latest review is DISMISSED"] {
+            assert!(!wait(&["no review from acme", stop]), "{stop}");
+        }
+        assert!(!only_the_owners_approval("no review from someone", owner));
+        // An unattended run's prompts are said, never asked.
+        assert!(Unattended.confirm("merge it", "merge v1.2.3").is_ok());
     }
 }

@@ -1,10 +1,22 @@
-//! Accepted hits: the leak check's known false positives in release
-//! binaries (the release process, Q2). A linker packs unrelated string
-//! literals side by side, and the matcher's white-space and concatenation
-//! folding (`leak.rs`, rules 5 and 6) can join them into a denylist term,
-//! as v0.3.0's flag strings did. Rather than cut the term, the one known
-//! place is accepted, by a digest of the term and the text around it; any
-//! other place of the same term still stops the release.
+//! The binary leak gate's judgement (the release process, Q2), and the
+//! accepted-hits file.
+//!
+//! Every place of every term in a release binary is found by the matcher
+//! (`leak.rs`), then explained against the source the binary was built from
+//! (`explain.rs`): a place whole literal values of different files packed
+//! end to end make (the linker's string pool, in an order that changes per
+//! build and per target), reaching past the term on both sides, passes and
+//! is listed with its pieces; a place a dependency's or the toolchain's
+//! literal value holds, with [`MIN_CONTEXT`] bytes beyond the term, is
+//! third-party text, reported by crate and file, and passes only by an entry
+//! here; a join (known strings end to end that are not such a split) passes
+//! only by an entry keyed on its pieces; every other place stops the release
+//! and can never be accepted: one the tree's source holds (the text gate
+//! refuses it there too), a dependency's string that is not a literal value
+//! or holds too little beyond the term, and one the source does not explain
+//! at all (a path, a user or host name, an environment value the build put
+//! in). A text file, a path, the exported tree and the wiki pages are never
+//! explained or accepted.
 //!
 //! # The file
 //!
@@ -17,36 +29,32 @@
 //!
 //! # The digest
 //!
-//! SHA-256, in lowercase hex, of the UTF-8 bytes
-//! `atlas-accept-v1 NUL term-number NUL sha256hex(term) NUL window`, where
-//! the term number is decimal, `term` is the normalised term and `window` is
-//! the normalised text of the place: the match and up to [`WINDOW`]
-//! normalised characters on each side, fewer at either end of the reading.
-//! Normalised text, not raw bytes or offsets: offsets and string-pool order
-//! change between builds, and the false positive comes from the folding.
-//! Binding the term's own digest means renumbering the denylist cannot point
-//! an entry at another term.
-//!
-//! # Where entries apply
-//!
-//! Only to the contents of executables (ELF, PE or Mach-O by their first
-//! bytes) in a binary gate: the local `release check`, the CI gate and
-//! `sign`'s release assets. Never to a path, the exported tree, the wiki
-//! pages or a text file beside the binaries. Every place of every term is
-//! listed (overlapping ones too), and each must be accepted on its own, so an
-//! accepted first place cannot hide a real leak later in the same file.
+//! SHA-256, in lowercase hex, of the bytes
+//! `atlas-accept-src-v1 NUL term-number NUL sha256hex(term) NUL crate NUL string`,
+//! where the term number is decimal, `term` the normalised term, `crate` the
+//! crate's name (`rust` for the toolchain's library) and `string` the known
+//! string that holds the place, as the source spells it once decoded. Source
+//! content only: no offset, no neighbouring bytes, no version or file path,
+//! so the entry holds on every rebuild and target, and voids when that
+//! string changes. Binding the term's own digest means renumbering the
+//! denylist cannot point an entry at another term. A join's entry is
+//! [`join_digest`]: `atlas-accept-join-v1 NUL term-number NUL sha256hex(term)`
+//! then, per piece in order, `NUL crate NUL length NUL string`. Entries of
+//! the earlier forms (digests of the binary's bytes around a place) match
+//! nothing; the gate says once how many entries matched no place.
 
 use std::collections::BTreeSet;
 
+use crate::explain::{Corpus, Kind, Piece, Verdict, MIN_CONTEXT};
 use crate::leak::{line_col, readings, Matcher, Norm};
 
 type R<T = ()> = Result<T, String>;
 
-/// Normalised characters taken on each side of a match for its digest.
-pub const WINDOW: usize = 48;
-
 /// The digest's domain, so it is never another digest's input.
-const DOMAIN: &str = "atlas-accept-v1";
+const DOMAIN: &str = "atlas-accept-src-v1";
+
+/// The domain of a join's digest.
+const JOIN_DOMAIN: &str = "atlas-accept-join-v1";
 
 /// The default file name, in the denylist's folder.
 pub const DEFAULT_NAME: &str = "leak-accepted.txt";
@@ -60,8 +68,10 @@ pub struct Place {
     pub term: usize,
     /// (byte offset, line, column) in the file; `None` for a path hit.
     pub at: Option<(usize, usize, usize)>,
-    /// The place's digest; `None` for a path hit, which is never accepted.
-    pub digest: Option<String>,
+    /// The byte just after the place (0 for a path hit).
+    pub end: usize,
+    /// Found in the UTF-8 reading (a UTF-16 one is never explained).
+    pub utf8: bool,
 }
 
 impl Place {
@@ -75,8 +85,8 @@ impl Place {
     }
 }
 
-/// The digest of one place (see the module docs).
-pub fn digest(term_no: usize, term: &str, window: &str) -> String {
+/// The digest of an entry for a place a known string of crate `krate` holds.
+pub fn digest(term_no: usize, term: &str, krate: &str, string: &[u8]) -> String {
     let mut h = atlas::sha256::Hasher::new();
     h.update(DOMAIN.as_bytes());
     h.update(b"\0");
@@ -84,22 +94,15 @@ pub fn digest(term_no: usize, term: &str, window: &str) -> String {
     h.update(b"\0");
     h.update(atlas::sha256::hex(term.as_bytes()).as_bytes());
     h.update(b"\0");
-    h.update(window.as_bytes());
+    h.update(krate.as_bytes());
+    h.update(b"\0");
+    h.update(string);
     h.hex()
 }
 
-/// The match at bytes `start..end` of normalised `text` and up to
-/// [`WINDOW`] characters on each side.
-fn window(text: &str, start: usize, end: usize) -> &str {
-    let from = text[..start].char_indices().rev().nth(WINDOW - 1).map_or(0, |(i, _)| i);
-    let to = text[end..].char_indices().nth(WINDOW).map_or(text.len(), |(i, _)| end + i);
-    &text[from..to]
-}
-
 /// Every place of every term in `files`: each occurrence in each reading of
-/// the contents, overlapping ones included (one place per offset and
-/// digest), and the path when it holds the term, whatever the contents hold
-/// (an accepted place in the contents must not hide a path hit).
+/// the contents, overlapping ones included, and the path when it holds the
+/// term, whatever the contents hold.
 pub fn places(m: &Matcher, files: &[(String, Vec<u8>)]) -> Vec<Place> {
     let mut out = Vec::new();
     for (rel, body) in files {
@@ -112,23 +115,27 @@ pub fn places(m: &Matcher, files: &[(String, Vec<u8>)]) -> Vec<Place> {
                 (r, n)
             })
             .collect();
+        // The UTF-8 reading is the first, but after a UTF-16 byte-order mark.
+        let utf16_bom = body.starts_with(&[0xFF, 0xFE]) || body.starts_with(&[0xFE, 0xFF]);
         for term in m.terms() {
-            let (k, t) = (&term.num, &term.text);
+            let k = term.num;
             let mut seen = BTreeSet::new();
-            for (r, n) in &reads {
+            for (i, (r, n)) in reads.iter().enumerate() {
                 let mut from = 0;
                 while let Some(p) = term.find(&n.text, from) {
                     let at = n.at[p];
-                    let d = digest(*k, t, window(&n.text, p, p + t.len()));
-                    if seen.insert((at, d.clone())) {
+                    let last = n.at[p + term.text.len() - 1];
+                    let end = r.partition_point(|&(o, _)| o <= last);
+                    let end = r.get(end).map_or(body.len(), |&(o, _)| o);
+                    if seen.insert((at, end)) {
                         let (line, col) = line_col(r, at);
-                        out.push(Place { file: rel.clone(), term: *k, at: Some((at, line, col)), digest: Some(d) });
+                        out.push(Place { file: rel.clone(), term: k, at: Some((at, line, col)), end, utf8: i == 0 && !utf16_bom });
                     }
                     from = p + n.text[p..].chars().next().map_or(1, char::len_utf8);
                 }
             }
             if term.find(&name.text, 0).is_some() {
-                out.push(Place { file: rel.clone(), term: *k, at: None, digest: None });
+                out.push(Place { file: rel.clone(), term: k, at: None, end: 0, utf8: false });
             }
         }
     }
@@ -184,31 +191,124 @@ pub fn is_executable(b: &[u8]) -> bool {
     }
 }
 
+/// A place's verdict: `None` for a place that is never explained (a path,
+/// a text file, a UTF-16 reading).
+pub fn verdict(p: &Place, files: &[(String, Vec<u8>)], corpus: &Corpus) -> Option<Verdict> {
+    let (at, _, _) = p.at?;
+    let body = &files.iter().find(|(f, _)| *f == p.file)?.1;
+    (p.utf8 && is_executable(body)).then(|| corpus.explain(body, at, p.end))
+}
+
+/// The digest of an entry for a place a chain of known strings makes
+/// ([`Verdict::Join`]): each piece's crate and string, in order.
+pub fn join_digest(term_no: usize, term: &str, pieces: &[(&str, &[u8])]) -> String {
+    let mut h = atlas::sha256::Hasher::new();
+    h.update(JOIN_DOMAIN.as_bytes());
+    h.update(b"\0");
+    h.update(term_no.to_string().as_bytes());
+    h.update(b"\0");
+    h.update(atlas::sha256::hex(term.as_bytes()).as_bytes());
+    for (krate, string) in pieces {
+        h.update(b"\0");
+        h.update(krate.as_bytes());
+        h.update(b"\0");
+        h.update(string.len().to_string().as_bytes());
+        h.update(b"\0");
+        h.update(string);
+    }
+    h.hex()
+}
+
+/// Whether a known string or chain may be an entry's key: it holds
+/// [`MIN_CONTEXT`] bytes beyond the place, so an entry for it does not
+/// accept the term wherever else it shows up.
+fn enough_context(context: usize) -> bool {
+    context >= MIN_CONTEXT
+}
+
+/// The entry that would accept a place, when one can: a place a
+/// dependency's or the toolchain's literal value holds with context around
+/// the term, or a [`Verdict::Join`] whose pieces hold context beyond it.
+pub fn entry(m: &Matcher, p: &Place, v: &Option<Verdict>) -> Option<(usize, String)> {
+    let term = m.terms().iter().find(|t| t.num == p.term)?;
+    match v {
+        Some(Verdict::Contained { string, origin, literal: true, context, .. }) if origin.kind != Kind::Tree && enough_context(*context) => Some((p.term, digest(p.term, &term.text, &origin.name, string))),
+        Some(Verdict::Join(pieces, _)) => {
+            let (at, _, _) = p.at?;
+            let total: usize = pieces.iter().map(|x| x.string.len()).sum();
+            enough_context(total.saturating_sub(p.end - at)).then(|| {
+                let keys: Vec<(&str, &[u8])> = pieces.iter().map(|x| (x.origin.name.as_str(), x.string.as_slice())).collect();
+                (p.term, join_digest(p.term, &term.text, &keys))
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether text holds a term of the matcher.
+fn holds_term(m: &Matcher, s: &str) -> bool {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let n = m.normalise(&chars);
+    m.terms().iter().any(|t| t.find(&n.text, 0).is_some())
+}
+
+/// A source file as a report names it: crate, file and line, unless that
+/// text holds a term (a file named after one), which is never printed.
+fn source(m: &Matcher, krate: &str, file: &str, line: usize) -> String {
+    let s = if krate == "tree" { format!("the tree's {file}:{line}") } else { format!("{krate} {file}:{line}") };
+    if holds_term(m, &s) {
+        "a source file whose name holds a denylist term".into()
+    } else {
+        s
+    }
+}
+
+/// Why a place passes or stops, after its report line.
+pub fn reason(m: &Matcher, v: &Option<Verdict>) -> String {
+    let chain = |ps: &[Piece]| ps.iter().map(|x| source(m, &x.origin.krate, &x.origin.file, x.line)).collect::<Vec<_>>().join(" + ");
+    match v {
+        None => String::new(),
+        Some(Verdict::Split(ps)) => format!(" (literals packed side by side: {})", chain(ps)),
+        Some(Verdict::Join(ps, why)) => format!(" (known strings end to end, but {why}: {}; the owner checks the place, and only an entry passes it)", chain(ps)),
+        Some(Verdict::Unexplained) => " (not explained by the source: what the build put there, a path, a user or host name, the environment)".into(),
+        Some(Verdict::Contained { origin, line, .. }) if origin.kind == Kind::Tree => format!(" (in {}: the source holds the term)", source(m, &origin.krate, &origin.file, *line)),
+        Some(Verdict::Contained { origin, line, literal: false, .. }) => format!(" (in {}: third-party text that is not a literal value: never accepted)", source(m, &origin.krate, &origin.file, *line)),
+        Some(Verdict::Contained { origin, line, context, .. }) if !enough_context(*context) => format!(" (in {}: third-party text with {context} byte(s) beside the term, fewer than {MIN_CONTEXT}: never accepted)", source(m, &origin.krate, &origin.file, *line)),
+        Some(Verdict::Contained { origin, line, .. }) => format!(" (in {}: third-party text, accepted only by an entry)", source(m, &origin.krate, &origin.file, *line)),
+    }
+}
+
 /// What a binary gate found.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Judged {
-    /// The report lines of places not accepted.
+    /// The report lines of places that stop, each with its reason.
     pub leaks: Vec<String>,
-    /// Places an entry accepted.
-    pub accepted: usize,
+    /// The report lines of places literals packed side by side make, each
+    /// with its pieces.
+    pub split: Vec<String>,
+    /// The report lines of places an entry accepted, with crate and file.
+    pub accepted: Vec<String>,
     /// Entries no place used.
     pub unused: usize,
 }
 
-/// Splits places into accepted and not: a place is accepted only when it is
-/// in an executable's contents and its (term, digest) is an entry.
-pub fn judge(places: &[Place], files: &[(String, Vec<u8>)], acc: &Accepted) -> Judged {
-    let exes: BTreeSet<&str> = files.iter().filter(|(_, b)| is_executable(b)).map(|(f, _)| f.as_str()).collect();
+/// Judges every place (see the module docs).
+pub fn judge(m: &Matcher, places: &[Place], files: &[(String, Vec<u8>)], acc: &Accepted, corpus: &Corpus) -> Judged {
     let mut used = BTreeSet::new();
     let mut j = Judged::default();
     for p in places {
-        let key = p.digest.as_ref().filter(|_| exes.contains(p.file.as_str())).map(|d| (p.term, d.clone()));
-        match key {
-            Some(k) if acc.0.contains(&k) => {
-                j.accepted += 1;
+        let v = verdict(p, files, corpus);
+        let line = format!("{}{}", p.line(), reason(m, &v));
+        if matches!(v, Some(Verdict::Split(_))) {
+            j.split.push(line);
+            continue;
+        }
+        match entry(m, p, &v).filter(|k| acc.0.contains(k)) {
+            Some(k) => {
+                j.accepted.push(line);
                 used.insert(k);
             }
-            _ => j.leaks.push(p.line()),
+            None => j.leaks.push(line),
         }
     }
     j.unused = acc.0.len() - used.len();
@@ -216,159 +316,9 @@ pub fn judge(places: &[Place], files: &[(String, Vec<u8>)], acc: &Accepted) -> J
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "accept_tests.rs"]
+mod tests;
 
-    fn db() -> crate::ucd::Db {
-        crate::ucd::Db::load(&crate::pack_embedder::default_ucd()).unwrap()
-    }
-
-    /// An ELF-looking file: the magic, padding, then `body`.
-    fn elf(body: &str) -> Vec<u8> {
-        let mut b = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
-        b.extend_from_slice(body.as_bytes());
-        b
-    }
-
-    /// A PE-looking file: `MZ`, e_lfanew at 0x3c pointing at `PE\0\0`, then `body`.
-    fn pe(body: &str) -> Vec<u8> {
-        let mut b = vec![0u8; 0x40];
-        b[..2].copy_from_slice(b"MZ");
-        b[0x3c] = 0x40;
-        b.extend_from_slice(b"PE\0\0");
-        b.extend_from_slice(body.as_bytes());
-        b
-    }
-
-    const LIST: &str = "# comment\nquillfeather\nmarrow vale\n";
-
-    fn entries_for(m: &Matcher, files: &[(String, Vec<u8>)]) -> Accepted {
-        Accepted(places(m, files).into_iter().filter_map(|p| p.digest.map(|d| (p.term, d))).collect())
-    }
-
-    #[test]
-    fn the_exact_context_passes_and_one_changed_character_fails() {
-        let db = db();
-        let m = Matcher::new(&db, LIST);
-        // Two pooled literals the concatenation folding joins (rule 6).
-        let body = "\0\0--flags\0\"quill\" + \"feather\"\0--other--padding-text-here\0";
-        let files = vec![("bin/atlas-x".to_string(), elf(body))];
-        let acc = entries_for(&m, &files);
-        assert_eq!(acc.0.len(), 1);
-        let j = judge(&places(&m, &files), &files, &acc);
-        assert_eq!(j, Judged { leaks: vec![], accepted: 1, unused: 0 });
-
-        // One character changed inside the window, 40 characters away.
-        let changed = vec![("bin/atlas-x".to_string(), elf(&body.replace("--other", "--oth3r")))];
-        let j = judge(&places(&m, &changed), &changed, &acc);
-        assert_eq!(j.leaks.len(), 1, "{j:?}");
-        assert_eq!((j.accepted, j.unused), (0, 1));
-    }
-
-    #[test]
-    fn an_unaccepted_second_place_in_the_same_file_fails() {
-        let db = db();
-        let m = Matcher::new(&db, LIST);
-        let one = format!("{}AAAA", "x".repeat(60) + "quillfeather" + &"y".repeat(60));
-        let files = vec![("atlas.exe".to_string(), pe(&one))];
-        let acc = entries_for(&m, &files);
-        let two = format!("{one}{}quillfeather{}", "z".repeat(60), "w".repeat(60));
-        let files2 = vec![("atlas.exe".to_string(), pe(&two))];
-        let ps = places(&m, &files2);
-        assert_eq!(ps.len(), 2, "every place is listed, not only the first");
-        let j = judge(&ps, &files2, &acc);
-        assert_eq!((j.leaks.len(), j.accepted), (1, 1), "{j:?}");
-    }
-
-    #[test]
-    fn a_whole_word_term_lists_only_its_whole_word_places() {
-        let db = db();
-        let m = Matcher::new(&db, "#[word]\nquill\n");
-        let files = vec![("f".to_string(), elf("squill quills quill_x (quill) a-quill"))];
-        let ps = places(&m, &files);
-        assert_eq!(ps.iter().filter_map(|p| p.at.map(|a| a.0)).collect::<Vec<_>>(), vec![16 + 23, 16 + 32], "{ps:?}");
-        assert!(places(&m, &[("bin/quills".to_string(), elf("clean"))]).is_empty(), "a path inside a word");
-    }
-
-    #[test]
-    fn overlapping_places_are_each_listed() {
-        let db = db();
-        let m = Matcher::new(&db, "abab\n");
-        let files = vec![("f".to_string(), elf("ababab"))];
-        assert_eq!(places(&m, &files).len(), 2);
-    }
-
-    #[test]
-    fn a_wrong_term_number_or_term_digest_fails() {
-        let db = db();
-        let m = Matcher::new(&db, LIST);
-        let files = vec![("bin/a".to_string(), elf(&format!("{}quillfeather{}", "a".repeat(50), "b".repeat(50))))];
-        let p = &places(&m, &files)[0];
-        let (term, d) = (p.term, p.digest.clone().unwrap());
-        // The right digest under another term's number.
-        let other = Accepted([(2, d.clone())].into_iter().collect());
-        assert_eq!(judge(&places(&m, &files), &files, &other).leaks.len(), 1);
-        // A digest made with another term's text under this number.
-        let wrong = digest(term, "marrow vale", "the same window");
-        let wrong = Accepted([(term, wrong)].into_iter().collect());
-        assert_eq!(judge(&places(&m, &files), &files, &wrong).leaks.len(), 1);
-        // And the right one passes.
-        let right = Accepted([(term, d)].into_iter().collect());
-        assert!(judge(&places(&m, &files), &files, &right).leaks.is_empty());
-    }
-
-    #[test]
-    fn an_accepted_place_outside_an_executable_or_in_a_path_still_fails() {
-        let db = db();
-        let m = Matcher::new(&db, LIST);
-        let text = format!("{}quillfeather{}", "a".repeat(50), "b".repeat(50));
-        let exe = vec![("bin/a".to_string(), elf(&text))];
-        let acc = entries_for(&m, &exe);
-        // The same bytes without the magic: a text file (the tree, the wiki).
-        let txt = vec![("wiki/Home.md".to_string(), text.clone().into_bytes())];
-        let mut acc_txt = acc.clone();
-        acc_txt.0.extend(entries_for(&m, &txt).0);
-        let j = judge(&places(&m, &txt), &txt, &acc_txt);
-        assert_eq!(j.leaks.len(), 1, "a text file is never accepted");
-        // A path hit has no digest.
-        let path = vec![("bin/quillfeather".to_string(), elf("clean"))];
-        let ps = places(&m, &path);
-        assert_eq!(ps, vec![Place { file: "bin/quillfeather".into(), term: 1, at: None, digest: None }]);
-        assert_eq!(judge(&ps, &path, &acc).leaks, vec!["bin/quillfeather (path): denylist term #1".to_string()]);
-        // A path hit beside an accepted place in the contents still fails.
-        let both = vec![("bin/quillfeather".to_string(), elf(&text))];
-        let acc_both = entries_for(&m, &both);
-        let j = judge(&places(&m, &both), &both, &acc_both);
-        assert_eq!((j.leaks, j.accepted), (vec!["bin/quillfeather (path): denylist term #1".to_string()], 1));
-    }
-
-    #[test]
-    fn malformed_lines_and_unknown_terms_are_refused() {
-        let db = db();
-        let m = Matcher::new(&db, LIST);
-        let d = "a".repeat(64);
-        assert_eq!(Accepted::parse(&format!("# c\n\n1 {d}\n2\t{d}\n"), &m).unwrap().0.len(), 2);
-        for bad in [format!("1 {}", &d[1..]), format!("1 {}", "A".repeat(64)), format!("x {d}"), format!("1 {d} 3"), "1".into(), format!("1 {}g", &d[1..])] {
-            let e = Accepted::parse(&bad, &m).unwrap_err();
-            assert!(e.contains("line 1") && e.contains("not `TERM-NUMBER SHA256`"), "{bad}: {e}");
-        }
-        let e = Accepted::parse(&format!("\n3 {d}\n"), &m).unwrap_err();
-        assert!(e.contains("line 2") && e.contains("term #3 is not a term"), "{e}");
-        let e = Accepted::parse(&format!("0 {d}\n"), &m).unwrap_err();
-        assert!(e.contains("term #0"), "{e}");
-    }
-
-    #[test]
-    fn the_digest_is_pinned() {
-        // The format is part of every accepted-hits file: a change here
-        // voids every entry, so it must be deliberate.
-        assert_eq!(digest(7, "ab", "x ab y"), atlas::sha256::hex(format!("atlas-accept-v1\x007\x00{}\x00x ab y", atlas::sha256::hex(b"ab")).as_bytes()));
-        let long = format!("{}T{}", "a".repeat(100), "b".repeat(100));
-        assert_eq!(window(&long, 100, 101),format!("{}T{}", "a".repeat(WINDOW), "b".repeat(WINDOW)));
-        assert_eq!(window("xxTyy", 2, 3), "xxTyy", "clamped at both ends");
-        assert!(is_executable(b"\x7fELF..") && is_executable(&pe("x")) && is_executable(&[0xcf, 0xfa, 0xed, 0xfe]) && !is_executable(b"#!/bin/sh"));
-        // Text that starts with MZ, and a Java class file, are not.
-        assert!(!is_executable(format!("MZ text{}", " ".repeat(80)).as_bytes()) && !is_executable(b"MZ"));
-        assert!(!is_executable(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 52]) && is_executable(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2]));
-    }
-}
+#[cfg(test)]
+#[path = "accept_join_tests.rs"]
+mod join_tests;

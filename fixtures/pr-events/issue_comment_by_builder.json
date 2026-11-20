@@ -1,0 +1,16 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 12,
+    "title": "Add the widget parser",
+    "user": { "login": "octo-author", "id": 2002, "type": "User" },
+    "pull_request": { "url": "https://api.github.com/repos/octo-org/widgets/pulls/12", "merged_at": null }
+  },
+  "comment": {
+    "id": 1014,
+    "user": { "login": "octo-builder", "id": 2004, "type": "User" },
+    "body": "Fixed in 6e828cc: the parser keeps the last line."
+  },
+  "repository": { "id": 3001, "name": "widgets", "full_name": "octo-org/widgets" },
+  "sender": { "login": "octo-builder", "id": 2004, "type": "User" }
+}

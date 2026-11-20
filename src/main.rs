@@ -157,7 +157,7 @@ Subcommands:
   atlas settings orchestrate [--yes [--builders N] [--reviewers N] [--research N] [--mode M] [--handoff N] [--limit N] [--fresh auto|ask] | --no]
   atlas settings on|off update
   atlas rules [scan | counts | sitting 1|2 | link | answer KEY | unmark KEY]   which ruling replaces which (experimental, off by default)
-  atlas queue [list | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next | release AGENT | add | plan]   the work queue: launches waiting to start, the batch that can start now, and freeing a dead agent's lane
+  atlas queue [list | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next | release SLOT|AGENT|LANE | add | plan]   the work queue: launches waiting to start, the batch that can start now, and freeing a dead agent's lane
   atlas backlog [--all] [--as-of TIME] [--json] | dismiss ID --because KEY   ruled work that fell off the queue: aging and waiting items (proposed; the written order is unchanged)
   atlas pr-events serve [--port N] [--lane LANE]   run one gh webhook forward per repository, listen on 127.0.0.1 for their signed GitHub PR events, and file each as a journal note
   atlas track check | smoke [--issue KEY] [--page ID] [--jql Q] [--cql Q] | issue KEY | jql Q [--fields LIST] | page ID | cql Q | snapshot ITEM   project tracking: read Jira and Confluence directly, read-only, with a token from the environment variable project_tracking.atlassian names

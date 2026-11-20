@@ -337,6 +337,15 @@ Older builds refuse the unknown key, so add it only once a build with it is inst
 | `pr_events` | the section, optional |
 | `pr_events.port` | the port to listen on (1 to 65535; no default) |
 | `pr_events.lane` | the lane for an event no item waits on (default `pr-events`) |
+| `pr_events.ignore_logins` | GitHub logins whose reviews, review comments and PR comments file nothing, compared without case (default none) |
+
+A review, review comment or PR comment files nothing, so it neither meets a wait nor surfaces a notice, when it
+comes from a bot (the user or sender type `Bot`, such as `Copilot`, or a login ending in `[bot]`) or from a login
+in `ignore_logins`; a review by the PR's own author files nothing either. A review comment or PR comment from the
+user gh is logged in as files nothing too (read once with `gh api user` at start, for each host served, so agents
+replying as that user wake no one), but that user's reviews still meet waits: the gh user is also the person
+reviewing. Logins may carry `_` (Enterprise Managed Users). When gh is not logged in, the listener says so at
+start and only the other rules apply. Merges and closes are filed whoever made them.
 
 ## Project tracking: Jira and Confluence (`project_tracking`)
 

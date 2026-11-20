@@ -1061,11 +1061,7 @@ impl MemoryStore {
     ///
     /// [`Error::Db`].
     pub fn active_entries_since_no_body(&self, sub: &str, since: &str) -> Result<Vec<Head>> {
-        let sql =
-            format!("{HEAD_SQL_NO_BODY} WHERE r.kind = 'journal' AND r.sub = ?1 AND r.status = 'active' AND v.time > ?2 ORDER BY r.rid");
-        let mut st = self.conn.prepare_cached(&sql)?;
-        let rows = st.query_map([sub, since], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
-        Ok(rows)
+        entries_since_on(&self.conn, sub, since)
     }
 
     fn entries(&self, head_sql: &str, sub: &str) -> Result<Vec<Head>> {
@@ -1693,6 +1689,15 @@ pub fn contains_word(hay: &str, word: &str) -> bool {
     false
 }
 
+/// [`MemoryStore::active_entries_since_no_body`] on a connection, or inside
+/// a write batch.
+fn entries_since_on(conn: &Connection, sub: &str, since: &str) -> Result<Vec<Head>> {
+    let sql = format!("{HEAD_SQL_NO_BODY} WHERE r.kind = 'journal' AND r.sub = ?1 AND r.status = 'active' AND v.time > ?2 ORDER BY r.rid");
+    let mut st = conn.prepare_cached(&sql)?;
+    let rows = st.query_map([sub, since], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// [`MemoryStore::heads`] on a connection, or inside a write batch.
 fn heads_on(conn: &Connection, kind: Option<&str>, scope: Option<&str>) -> Result<Vec<Head>> {
     let sql = format!("{HEAD_SQL} WHERE (?1 IS NULL OR r.kind = ?1) AND (?2 IS NULL OR r.scope = ?2) ORDER BY r.rid");
@@ -2167,6 +2172,16 @@ impl Writer<'_> {
     /// [`Error::Db`].
     pub fn next_key(&self, prefix: &str, width: usize) -> Result<String> {
         next_key(&self.tx, prefix, width)
+    }
+
+    /// [`MemoryStore::active_entries_since_no_body`] as this batch sees
+    /// them, under its write lock.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn active_entries_since_no_body(&self, sub: &str, since: &str) -> Result<Vec<Head>> {
+        entries_since_on(&self.tx, sub, since)
     }
 
     #[allow(clippy::too_many_arguments)]

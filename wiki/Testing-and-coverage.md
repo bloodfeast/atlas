@@ -26,6 +26,12 @@ counts lock waits that drop a change after 5 s (`state_changes_from_many_process
 times each hook against a bar (`hooks::hostile_prompts_and_events`). No test is retried. Both steps run even when the first fails, and the last line
 sums them up (`test-gate: PASS in 277s; nextest ok 271s; doctest ok 5s`).
 
+No new test waits on the real clock or bounds work by it (`sleep(`, `.elapsed()`, `recv_timeout(`,
+`wait_timeout`, `park_timeout(`), since each passes or fails with the load on the machine. Use an injected clock,
+a channel or barrier, an explicit file time (`File::set_modified`), or a count of the work done.
+`tests/wall_clock_lint.rs` enforces it: the uses that remain are counted per file in `tests/wall_clock_allow.txt`,
+each with its reason, and a count must match exactly, so a new use fails and a removed one lowers the list.
+
 On Linux from any machine with Docker (Docker Desktop on Windows and macOS), the public CI's Linux checks on the
 checkout:
 

@@ -991,6 +991,13 @@ pub struct Agents {
     kinds: HashMap<String, Kind>,
     /// When a real finish was seen for each agent.
     finished: HashMap<String, SystemTime>,
+    /// The machine's boot time, where a caller set it ([`Agents::set_dead_evidence`]):
+    /// an unfinished agent last written before it died in a reboot (#389).
+    boot: Option<SystemTime>,
+    /// Agents whose owning Claude Code process is provably gone (#389).
+    owner_gone: HashSet<String>,
+    /// The agents [`Agents::running`] last left out as dead on that evidence.
+    dead: Vec<DeadSlot>,
     /// Agents told to wrap up: (lane, kind), for the fresh-agent line.
     passed: HashMap<String, (String, Kind)>,
     /// The running list the last admitted launch was counted against, and
@@ -1052,6 +1059,59 @@ struct Pending {
 /// [`PENDING_TTL`] holds nothing.
 pub const PENDING_TABLE: &str = "CREATE TABLE IF NOT EXISTS agent_pending(tool_use_id TEXT NOT NULL, transcript TEXT NOT NULL, kind TEXT NOT NULL, lane TEXT NOT NULL, description TEXT NOT NULL, time INTEGER NOT NULL);";
 
+/// How much later than an agent's last write the machine must have booted
+/// for that agent to count as dead in the reboot: a boot time read as now
+/// less the uptime may sit a little off.
+pub const BOOT_SLACK: Duration = Duration::from_secs(5);
+
+/// Why an unfinished agent's slot counts as released without its finish
+/// recorded (#389).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadReason {
+    /// The machine booted after the agent last wrote.
+    Rebooted,
+    /// The Claude Code process that ran it is gone.
+    OwnerGone,
+}
+
+impl DeadReason {
+    /// The reason as the held-slot listing shows it.
+    pub fn text(self) -> &'static str {
+        match self {
+            DeadReason::Rebooted => "boot after last write",
+            DeadReason::OwnerGone => "owning Claude Code process gone",
+        }
+    }
+}
+
+/// Whether an unfinished agent last written at `last` is dead, and why: only
+/// on positive evidence (#389). `boot` is the machine's boot time (`None`:
+/// unknown); `owner_alive` whether the Claude Code process that ran it still
+/// runs (`None`: unknown, or not provable). Anything short of proof keeps
+/// the slot held, so a live agent never loses it.
+pub fn dead_holder(last: SystemTime, boot: Option<SystemTime>, owner_alive: Option<bool>) -> Option<DeadReason> {
+    if boot.is_some_and(|b| b > last + BOOT_SLACK) {
+        return Some(DeadReason::Rebooted);
+    }
+    if owner_alive == Some(false) {
+        return Some(DeadReason::OwnerGone);
+    }
+    None
+}
+
+/// An unfinished agent [`Agents::running`] left out as dead ([`dead_holder`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadSlot {
+    /// The agent id.
+    pub id: String,
+    /// The kind whose slot it held.
+    pub kind: Kind,
+    /// Its launch's description; empty when none.
+    pub description: String,
+    /// Why it counts as released.
+    pub reason: DeadReason,
+}
+
 /// A cap slot held now: by a running agent, or by a launch admitted whose
 /// agent has not started yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1067,6 +1127,16 @@ pub struct HeldSlot {
     pub since: String,
     /// `false` for a launch whose agent has not started.
     pub running: bool,
+    /// The agent id; empty for a launch whose agent has not started.
+    pub agent: String,
+    /// Set for an agent that holds nothing now, though it never finished:
+    /// why its slot counts as released (#389).
+    pub released: Option<DeadReason>,
+    /// The number its launch entry carries (`#N` in the listing, which
+    /// `atlas queue release` takes; [`crate::queue::launch_slot`]); `None`
+    /// for a launch not started or an entry filed before slots were
+    /// numbered.
+    pub slot: Option<u32>,
 }
 
 /// The launches [`PENDING_TABLE`] holds, admitted less than [`PENDING_TTL`]
@@ -1092,6 +1162,9 @@ pub fn pending_slots(store: &crate::memory::MemoryStore, now: SystemTime) -> Vec
                     description,
                     since: crate::store::utc(since),
                     running: false,
+                    agent: String::new(),
+                    released: None,
+                    slot: None,
                 },
             ))
         })?;
@@ -1128,6 +1201,9 @@ impl Agents {
             sub_lanes: HashMap::new(),
             kinds: HashMap::new(),
             finished: HashMap::new(),
+            boot: None,
+            owner_gone: HashSet::new(),
+            dead: Vec::new(),
             passed: HashMap::new(),
             seen: None,
             kind_refused: false,
@@ -1357,6 +1433,22 @@ impl Agents {
         self.opened.insert(dir.to_path_buf(), at);
     }
 
+    /// The evidence [`Agents::running`] leaves an unfinished agent out on
+    /// (#389): the machine's boot time (`None`: none read), and the agents
+    /// whose owning Claude Code process is provably gone. Unset, it is none:
+    /// the admission hook's own session needs none, since its process
+    /// started after any reboot and counts from then.
+    pub fn set_dead_evidence(&mut self, boot: Option<SystemTime>, owner_gone: HashSet<String>) {
+        self.boot = boot;
+        self.owner_gone = owner_gone;
+    }
+
+    /// The agents the last [`Agents::running`] left out as dead
+    /// ([`dead_holder`]), by id order of the folder listing.
+    pub fn dead(&self) -> &[DeadSlot] {
+        &self.dead
+    }
+
     /// The session start set for the agents folder `dir` ([`Agents::set_opened`]).
     pub fn opened(&self, dir: &Path) -> Option<SystemTime> {
         self.opened.get(dir).copied()
@@ -1451,6 +1543,7 @@ impl Agents {
             std::fs::read_to_string(p).ok().and_then(|t| crate::json::parse(&t).ok())
         };
         let mut out = Vec::new();
+        self.dead.clear();
         let mut started: Vec<(SystemTime, String, String)> = Vec::new();
         let entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
         // atlas's own release records (`atlas queue release`, SubagentStop),
@@ -1507,6 +1600,15 @@ impl Agents {
             }
             let Some(meta) = meta.or_else(|| read(&e.path())) else { continue };
             if meta.get("finished").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            // An agent that died in a reboot, or with its Claude Code process
+            // (#389): only on that positive evidence.
+            let owner = self.owner_gone.contains(id).then_some(false);
+            if let Some(reason) = dead_holder(last, self.boot, owner) {
+                let description = meta.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+                let kind = self.kind_of(s, dir, id, "");
+                self.dead.push(DeadSlot { id: id.to_string(), kind, description, reason });
                 continue;
             }
             // An agent that died on a full disk never gets its finish written

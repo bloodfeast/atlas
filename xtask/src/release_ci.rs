@@ -39,8 +39,8 @@
 //!     public main, brought in as development pull requests with their
 //!     authors kept: see `public_contrib.rs`.
 //! cargo xtask release check [--force]
-//! cargo xtask release gate --dir DIR [--export]
-//! cargo xtask release accept-hit FILE... [--print]
+//! cargo xtask release gate --dir DIR [--src TREE] [--export]
+//! cargo xtask release accept-hit FILE... [--src TREE] [--print]
 //!     The binary leak check before anything is public, its CI half, and
 //!     the accepted-hits file's writer: see `release_check.rs`.
 //! ```
@@ -84,11 +84,12 @@ type R<T = ()> = Result<T, String>;
 pub const USAGE: &str = "usage: cargo xtask release --pr --remote URL [--expect vX.Y.Z] [--dry-run]
        cargo xtask release assets --dir DIR --notes FILE [--expect vX.Y.Z]
        cargo xtask release sign vX.Y.Z [--remote URL] [--dry-run]
-       cargo xtask release ship vX.Y.Z
+       cargo xtask release ship vX.Y.Z [--attended]
+       cargo xtask release store-passphrase
        cargo xtask release import [--remote URL] [--dry-run]
        cargo xtask release check [--force]
-       cargo xtask release gate --dir DIR [--export]
-       cargo xtask release accept-hit FILE... [--print]";
+       cargo xtask release gate --dir DIR [--src TREE] [--export]
+       cargo xtask release accept-hit FILE... [--src TREE] [--print]";
 
 /// The binaries table row of the pull request's notes: the binaries are
 /// built after the merge.
@@ -96,7 +97,7 @@ pub const PENDING_BINARIES: &str = "| Every platform | built by the release work
 
 /// Whether `release` arguments ask for a CI mode.
 pub fn wants(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("assets" | "sign" | "ship" | "import" | "check" | "gate" | "accept-hit"))
+    matches!(args.first().map(String::as_str), Some("assets" | "sign" | "ship" | "store-passphrase" | "import" | "check" | "gate" | "accept-hit"))
         || args.iter().any(|a| a == "--pr")
 }
 
@@ -324,12 +325,27 @@ fn sign_checkout(root: &Path, remote: &str, stub: bool) -> R<Option<PathBuf>> {
 
 /// The paths of HEAD that `git archive HEAD` leaves out: every tracked path
 /// git itself finds export-ignore, from HEAD's own `.gitattributes` files
-/// at every depth (`check-attr --source`, git 2.40 or later), so a pattern
-/// or a folder's own `* export-ignore` is matched as the export matches it.
-fn export_ignored(checkout: &Path) -> R<std::collections::HashSet<String>> {
+/// at every depth, so a pattern or a folder's own `* export-ignore` is
+/// matched as the export matches it. HEAD is read into a temporary index
+/// and asked with `check-attr --cached`, which reads only that index's
+/// `.gitattributes`, never the working files: `check-attr --source` would
+/// do the same but needs git 2.40, and the release's Linux job runs 2.30.
+pub(crate) fn export_ignored(checkout: &Path) -> R<std::collections::HashSet<String>> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let index = std::env::temp_dir().join(format!("atlas-export-index-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_file(&index);
+    let r = export_ignored_in(checkout, &index);
+    let _ = std::fs::remove_file(&index);
+    r
+}
+
+/// `export_ignored` with HEAD read into the index file `index`.
+fn export_ignored_in(checkout: &Path, index: &Path) -> R<std::collections::HashSet<String>> {
+    output(git(checkout).env("GIT_INDEX_FILE", index).args(["read-tree", "HEAD"]))?;
     let paths = git_out(checkout, &["ls-tree", "-r", "-z", "--name-only", "--full-tree", "HEAD"])?;
     let mut c = git(checkout);
-    c.args(["check-attr", "--stdin", "-z", "--source=HEAD", "export-ignore"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    c.env("GIT_INDEX_FILE", index).args(["check-attr", "--stdin", "-z", "--cached", "export-ignore"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().map_err(|e| format!("{c:?}: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("git check-attr: no stdin")?;
     // Written from a thread: check-attr answers as it reads, so a large
@@ -338,7 +354,7 @@ fn export_ignored(checkout: &Path) -> R<std::collections::HashSet<String>> {
     let o = child.wait_with_output().map_err(|e| format!("{c:?}: {e}"))?;
     let fed = feed.join().map_err(|_| "git check-attr: the input thread panicked".to_string())?;
     if !o.status.success() {
-        return Err(format!("{c:?} failed: {} (export-ignore needs git 2.40 or later)", String::from_utf8_lossy(&o.stderr).trim()));
+        return Err(format!("{c:?} failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
     }
     fed.map_err(|e| format!("{c:?}: {e}"))?;
     // -z output: path NUL attribute NUL value NUL, per path.
@@ -398,10 +414,14 @@ fn leak_gate(dir: &Path, denylist: &Path, what: &str) -> R {
 }
 
 /// Leak-checks the release binaries in a folder: as `leak_gate`, but a
-/// place in an executable's contents that the accepted-hits file lists
-/// (`accept.rs`) passes. Every other place refuses: in a text file, in a
-/// path, or not listed. Reports places, term numbers and counts only.
-pub(crate) fn binary_leak_gate(dir: &Path, denylist: &Path, accepted: Option<&Path>, what: &str) -> R {
+/// place in an executable's contents is explained against the source the
+/// binaries were built from, `src` (`explain.rs`): literals packed side by
+/// side pass, listed; a dependency's literal or a join passes when the
+/// accepted-hits file lists it (`accept.rs`). Every other place refuses: in
+/// a text file, in a path, in the tree's source, or not explained. Without
+/// `src` nothing is explained. Reports places, term numbers, source files
+/// and counts only.
+pub(crate) fn binary_leak_gate(dir: &Path, denylist: &Path, accepted: Option<&Path>, src: Option<&Path>, what: &str) -> R {
     let mut files = Vec::new();
     crate::release::files_under(dir, Path::new(""), &mut files)?;
     files.sort_by_key(|s| crate::release::collate_key(s));
@@ -417,22 +437,66 @@ pub(crate) fn binary_leak_gate(dir: &Path, denylist: &Path, accepted: Option<&Pa
         Some(p) => crate::accept::Accepted::parse(&read_text(p)?, &m)?,
         None => crate::accept::Accepted::default(),
     };
-    let j = crate::accept::judge(&crate::accept::places(&m, &named), &named, &acc);
+    let places = crate::accept::places(&m, &named);
+    let corpus = source_corpus(&places, &named, src, what)?;
+    let j = crate::accept::judge(&m, &places, &named, &acc, &corpus);
+    for s in &j.split {
+        say(&format!("leak check of {what}: passes: {s}"));
+    }
+    for a in &j.accepted {
+        say(&format!("leak check of {what}: accepted: {a}"));
+    }
+    if j.unused > 0 {
+        // Once per run: an entry of the earlier forms (a digest of the
+        // binary's bytes) can never match, so it only ever shows here.
+        say(&format!(
+            "leak check of {what}: {} accepted-hits entr(ies) matched no place: a stale entry, or one of the earlier forms (a digest of the binary's bytes) that never matches; delete the ones no release needs",
+            j.unused
+        ));
+    }
     if !j.leaks.is_empty() {
         for l in &j.leaks {
             eprintln!("release: leak: {what}: {l}");
         }
-        return Err(format!("{} leak(s) in {what} ({}); {} place(s) accepted", j.leaks.len(), dir.display(), j.accepted));
+        // The places and term numbers, never a term: the line to act on.
+        return Err(format!(
+            "{} leak(s) in {what} ({}); {} place(s) of literals side by side, {} accepted:\n{}\nA new hit stops the release: the owner checks the place; only a dependency's literal or a join of known strings can be accepted (`cargo xtask release accept-hit`)",
+            j.leaks.len(),
+            dir.display(),
+            j.split.len(),
+            j.accepted.len(),
+            j.leaks.join("\n")
+        ));
     }
     say(&format!(
-        "leak check of {what}: {} terms, {} files, no hits but {} accepted place(s); {} accepted-hits entr(ies), {} unused",
+        "leak check of {what}: {} terms, {} files, no hits but {} place(s) of literals side by side and {} accepted; {} accepted-hits entr(ies), {} unused",
         m.len(),
         named.len(),
-        j.accepted,
+        j.split.len(),
+        j.accepted.len(),
         acc.0.len(),
         j.unused
     ));
     Ok(())
+}
+
+/// The source corpus for `places`: built from `src` only when a place is in
+/// an executable (it reads the tree, the dependencies and the toolchain's
+/// library, all of them whatever the places are), and empty without `src`.
+pub(crate) fn source_corpus(places: &[crate::accept::Place], named: &[(String, Vec<u8>)], src: Option<&Path>, what: &str) -> R<crate::explain::Corpus> {
+    let in_exe = places.iter().any(|p| p.at.is_some() && named.iter().any(|(f, b)| *f == p.file && crate::accept::is_executable(b)));
+    match src {
+        Some(s) if in_exe => {
+            let c = crate::explain::Corpus::release(s)?;
+            say(&format!("leak check of {what}: places explained against {}: {}", s.display(), c.summary.join("; ")));
+            Ok(c)
+        }
+        None if in_exe => {
+            say(&format!("leak check of {what}: no source to explain places by: every place stops"));
+            Ok(crate::explain::Corpus::default())
+        }
+        _ => Ok(crate::explain::Corpus::default()),
+    }
 }
 
 /// The accepted-hits file: ATLAS_LEAK_ACCEPTED when set (it must be
@@ -498,6 +562,7 @@ pub fn run(args: Vec<String>) -> R {
     match args.first().map(String::as_str) {
         Some("check" | "gate" | "accept-hit") => crate::release_check::run(&root, args),
         Some("ship") => crate::release_ship::run(&root, args),
+        Some("store-passphrase") => crate::release_ship::store_passphrase(&root, args),
         Some("import") => crate::public_contrib::run(&root, args, &repo, api.as_ref()),
         Some("assets") => {
             let (mut dir, mut notes, mut expect) = (None, None, None);
@@ -1288,7 +1353,9 @@ pub fn sign(s: &Sign) -> R<Signed> {
     let m = verify_assets(&dir, tag, &s.repo)?;
     say(&format!("assets: {} binaries match the manifest (sha256 and size)", m.files.len()));
     let _ = std::fs::remove_file(dir.join("manifest.json.sig"));
-    binary_leak_gate(&dir, &s.denylist, s.accepted.as_deref(), "the release assets")?;
+    // Explained against the development checkout: the guard below holds it
+    // to the release's commit (`same_code`).
+    binary_leak_gate(&dir, &s.denylist, s.accepted.as_deref(), s.checkout.as_deref(), "the release assets")?;
     secret_gate(&dir, "the release assets")?;
     // Who built the bytes: the manifest comes from the same draft as the
     // binaries, so only an attestation from the public release workflow at
@@ -1637,21 +1704,15 @@ pub(crate) mod tests {
     /// bump edits the workflows and this line.
     const RUST_CACHE_SHA: &str = "d1527c8f67ef9af357290475d4af4b0fab8f12e0";
     const RUST_CACHE: (&str, &str) = ("Swatinem/rust-cache", RUST_CACHE_SHA);
-    /// cargo-nextest's installer, `taiki-e/install-action` v2.90.1 (it
-    /// checks the download's checksum), public CI only.
-    const INSTALL_ACTION: (&str, &str) = ("taiki-e/install-action", "c509219cf42fba86913069efd0ade2458c59337b");
-    /// The Windows test job's Dev Drive, `samypr100/setup-dev-drive` v4.1.0,
-    /// public CI only.
-    const DEV_DRIVE: (&str, &str) = ("samypr100/setup-dev-drive", "562171fe8df7401fdf582d766cd3b6ab80d5b1a0");
-
     /// The third-party actions each workflow may use, each at its one
-    /// commit. The rule (Brandon, 2026-11-19: "Allow cache, not leak job"):
-    /// the public ci.yml the three above, dev-pr.yml the cache, and none in
-    /// release-pr.yml (its leak job holds the denylist) or release.yml (a
-    /// published binary is built from clean).
+    /// commit. The rule (Brandon, 2026-11-19: "Allow cache, not leak job",
+    /// then "Replace with GitHub/inline"): dev-pr.yml the cache, and none in
+    /// the public ci.yml (the public repository's Actions policy runs only
+    /// GitHub's own actions, so its cache, nextest and Dev Drive are
+    /// actions/cache and inline steps), release-pr.yml (its leak job holds
+    /// the denylist) or release.yml (a published binary is built from clean).
     fn third_party_allowed(file: &str) -> &'static [(&'static str, &'static str)] {
         match file.rsplit('/').next().unwrap_or(file) {
-            "ci.yml" => &[RUST_CACHE, INSTALL_ACTION, DEV_DRIVE],
             "dev-pr.yml" => &[RUST_CACHE],
             _ => &[],
         }
@@ -1661,7 +1722,11 @@ pub(crate) mod tests {
     /// one of `allowed` at its commit, pinned by a full commit SHA with its
     /// version named.
     fn action_policy(file: &str, text: &str, allowed: &[(&str, &str)]) -> Result<(), String> {
-        for l in text.lines().filter(|l| l.trim_start().starts_with("uses:") || l.trim_start().starts_with("- uses:")) {
+        for l in text.lines().filter(|l| !l.trim_start().starts_with('#') && l.contains("uses:")) {
+            let t = l.trim_start();
+            if !(t.starts_with("uses:") || t.starts_with("- uses:")) {
+                return Err(format!("{file}: a uses: line is `uses: owner/action@sha # vX`: {l}"));
+            }
             let spec = l.split("uses:").nth(1).unwrap_or_default().trim();
             let (action, rest) = spec.split_once('@').ok_or_else(|| format!("{file}: not pinned: {l}"))?;
             let sha = rest.split_whitespace().next().unwrap_or_default();
@@ -1679,9 +1744,8 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The public CI (ci.yml, exported) uses GitHub's own actions and
-    /// exactly the three [`third_party_allowed`] names, each at its one
-    /// commit (a tag, another commit or any other action fails); it holds no
+    /// The public CI (ci.yml, exported) uses GitHub's own actions only, each
+    /// pinned by a full commit SHA (a tag or any other action fails); it holds no
     /// secret, reads the contents only, keeps no credential in a checkout,
     /// saves a cache from main only, and reports every failing test of a
     /// run. Brandon, 2026-11-19: "Allow cache, not leak job".
@@ -1702,9 +1766,11 @@ pub(crate) mod tests {
         );
         // A pull request (a fork's too) restores main's cache and saves none,
         // so no pull request can plant what main or another one builds from.
-        let caches = ci.matches(&format!("uses: Swatinem/rust-cache@{RUST_CACHE_SHA} # v2.9.3")).count();
+        let restores = ci.matches("uses: actions/cache/restore@").count();
+        let saves = ci.matches("uses: actions/cache/save@").count();
+        let main_only = "if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}";
         assert!(
-            caches >= 2 && ci.matches("save-if: ${{ github.ref == 'refs/heads/main' }}").count() == caches,
+            restores >= 2 && saves == restores && ci.matches(main_only).count() == saves && !ci.contains("uses: actions/cache@"),
             "ci.yml: every cache saves from main only"
         );
         // Every failure in one run, and the doc tests nextest does not run.
@@ -1713,9 +1779,12 @@ pub(crate) mod tests {
                 && ci.contains("cargo test --workspace --profile ci --locked --doc"),
             "ci.yml: nextest, no fail-fast, doc tests"
         );
-        assert!(ci.contains("tool: cargo-nextest@") && ci.contains("fallback: none"), "ci.yml: a pinned nextest, never built from source");
+        assert!(
+            ci.contains("NEXTEST: \"0.9.") && ci.contains("cargo-nextest checksum mismatch") && !ci.contains("cargo install"),
+            "ci.yml: a pinned nextest, its sha256 checked, never built from source"
+        );
         assert!(!ci.contains("sccache") && !ci.contains("RUSTC_WRAPPER"), "ci.yml: no compiler wrapper");
-        assert!(!ci.contains("actions/cache"), "ci.yml: no cache but rust-cache");
+        assert!(!ci.contains("rust-cache"), "ci.yml: GitHub's own cache only");
         // release.yml (exported, so checked here too) builds from clean.
         let release = read_text(&root.join(".github/workflows/release.yml")).unwrap();
         for c in ["rust-cache", "actions/cache", "sccache", "RUSTC_WRAPPER"] {
@@ -1724,18 +1793,22 @@ pub(crate) mod tests {
 
         let checkout = "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
         let pin = format!("      - uses: Swatinem/rust-cache@{RUST_CACHE_SHA} # v2.9.3\n");
-        let install = format!("        uses: {}@{} # v2.90.1\n", INSTALL_ACTION.0, INSTALL_ACTION.1);
+        let install = "        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1\n";
+        let cache = "        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n";
         let other = "      - uses: someone/thing@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v1\n";
         let ci_ok = third_party_allowed("ci.yml");
-        assert!(action_policy("ci.yml", checkout, ci_ok).is_ok());
-        assert!(action_policy("ci.yml", &pin, ci_ok).is_ok() && action_policy("ci.yml", &install, ci_ok).is_ok());
-        assert!(action_policy("ci.yml", "      - uses: Swatinem/rust-cache@v2\n", ci_ok).is_err(), "a tag");
-        assert!(action_policy("ci.yml", &pin.replace("d1527c8f", "00000000"), ci_ok).is_err(), "another commit");
+        assert!(action_policy("ci.yml", checkout, ci_ok).is_ok() && action_policy("ci.yml", cache, ci_ok).is_ok());
+        assert!(action_policy("ci.yml", &pin, ci_ok).is_err(), "no third-party cache in the public CI");
+        assert!(action_policy("ci.yml", install, ci_ok).is_err(), "no third-party installer in the public CI");
+        assert!(action_policy("ci.yml", "      - uses: actions/cache/restore@v6\n", ci_ok).is_err(), "a tag");
         assert!(action_policy("ci.yml", other, ci_ok).is_err(), "any unlisted action");
-        assert!(action_policy("ci.yml", &pin.replace(" # v2.9.3", ""), ci_ok).is_err(), "the version unnamed");
-        // dev-pr.yml: the cache only; release-pr.yml and release.yml nothing.
-        assert!(action_policy("dev-pr.yml", &pin, third_party_allowed("dev-pr.yml")).is_ok());
-        assert!(action_policy("dev-pr.yml", &install, third_party_allowed("dev-pr.yml")).is_err());
+        assert!(action_policy("ci.yml", &cache.replace(" # v6.1.0", ""), ci_ok).is_err(), "the version unnamed");
+        // dev-pr.yml: the cache only, at its one commit; release-pr.yml and
+        // release.yml nothing.
+        let dev_ok = third_party_allowed("dev-pr.yml");
+        assert!(action_policy("dev-pr.yml", &pin, dev_ok).is_ok());
+        assert!(action_policy("dev-pr.yml", &pin.replace("d1527c8f", "00000000"), dev_ok).is_err(), "another commit");
+        assert!(action_policy("dev-pr.yml", install, dev_ok).is_err());
         assert!(
             action_policy(".github/workflows/release-pr.yml", &pin, third_party_allowed(".github/workflows/release-pr.yml")).is_err(),
             "the leak job builds from clean"
@@ -2012,10 +2085,9 @@ pub(crate) mod tests {
 
     /// One commit in [`ADDRESS_LOG`] format.
     fn entry(sha: &str, author: &str, committer: &str, trailers: &[&str]) -> String {
-        let mut e = format!("{sha}{author}{committer}");
-        e.push_str(&trailers.join(""));
-        e + "
-"
+        let mut e = format!("{sha}\x1f{author}\x1f{committer}\x1f");
+        e.push_str(&trailers.join("\x1f"));
+        e + "\x1e\n"
     }
 
     #[test]
@@ -2028,7 +2100,7 @@ pub(crate) mod tests {
         let log = format!("{log}{}{}", entry(&b, "b@example.com", "noreply@github.com", &[]), entry(&c, "b@example.com", me, &[]));
         assert_eq!(other_addresses(&log, me), ["b@example.com"]);
         assert_eq!(other_addresses(&entry(&a, "", me, &[]), me), ["<empty>"]);
-        assert_eq!(other_addresses(&format!("{a}"), me), ["<malformed>"], "a commit without its addresses");
+        assert_eq!(other_addresses(&format!("{a}\x1e"), me), ["<malformed>"], "a commit without its addresses");
         assert_eq!(other_addresses("abc123 x@example.com
 ", me), ["<malformed>"], "the old format is refused");
         assert_eq!(refused(&["x".into()]), "1 address");
@@ -2619,19 +2691,18 @@ Signed-off-by: S <s@example.invalid>");
         assert!(!e.to_lowercase().contains(&term()), "the term is never printed: {e}");
         assert!(!uploaded(&fx));
 
-        // The place in the accepted-hits file: the binary passes. The
-        // manifest beside it is a text file, never accepted.
+        // A path the build put in is never accepted: an entry for the term
+        // (a dependency's string) leaves it stopped.
         let db = crate::ucd::Db::load(&crate::pack_embedder::default_ucd()).unwrap();
         let m = crate::leak::Matcher::new(&db, &read_text(&denylist(&fx.d)).unwrap());
-        let named = vec![("atlas-aarch64-unknown-linux-gnu".to_string(), std::fs::read(&f).unwrap())];
-        let acc = crate::accept::Accepted(crate::accept::places(&m, &named).into_iter().map(|p| (p.term, p.digest.unwrap())).collect());
+        let t = &m.terms()[0];
+        let acc = crate::accept::Accepted([(t.num, crate::accept::digest(t.num, &t.text, "quire", format!("/home/{}/src", term()).as_bytes()))].into_iter().collect());
         let acc_file = fx.d.join("accepted.txt");
         std::fs::write(&acc_file, acc.lines()).unwrap();
         let mut s = signer(&fx, &rel, true, None);
         s.accepted = Some(acc_file);
-        if let Err(e) = sign(&s) {
-            assert!(!e.contains("leak"), "{e}");
-        }
+        let e = sign(&s).unwrap_err();
+        assert!(e.contains("1 leak(s) in the release assets") && e.contains("not explained by the source"), "{e}");
         let _ = std::fs::remove_dir_all(&fx.d);
     }
 
@@ -2919,6 +2990,27 @@ Signed-off-by: S <s@example.invalid>");
         assert!(gate(&mk(true, false, &Yes)).unwrap_err().contains("needs ATLAS_PUBLISH=v1.2.3"));
         assert_eq!(gate(&mk(false, true, &No)).unwrap_err(), "refused at `open v1.2.3`; nothing was changed", "ATLAS_PUBLISH does not stand for the prompt");
         assert!(gate(&mk(false, false, &Yes)).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `export_ignored` reads HEAD's `.gitattributes` at every depth and
+    /// nothing else: an edited, staged or deleted working `.gitattributes`
+    /// changes nothing.
+    #[test]
+    fn export_ignored_reads_heads_gitattributes_not_the_working_tree() {
+        let d = tmp("export-head");
+        let dev = dev_checkout(&d);
+        commit_files(&dev, &[("notes/held/.gitattributes", "* export-ignore\n"), ("notes/held/a.md", "a\n"), ("keys/b.txt", "b\n")], "nested");
+        let want: std::collections::HashSet<String> = [DEV_ONLY.0, "notes/held/.gitattributes", "notes/held/a.md"].map(String::from).into();
+        assert_eq!(export_ignored(&dev).unwrap(), want);
+        // The working files say otherwise: the root ignores keys/, the
+        // nested file is gone, and the root rule for DEV_ONLY is dropped.
+        std::fs::write(dev.join(".gitattributes"), "keys/** export-ignore\n").unwrap();
+        std::fs::remove_file(dev.join("notes/held/.gitattributes")).unwrap();
+        assert_eq!(export_ignored(&dev).unwrap(), want, "working files");
+        // Staged in the checkout's own index: still HEAD.
+        sh(&dev, &["add", "-A"]);
+        assert_eq!(export_ignored(&dev).unwrap(), want, "staged");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

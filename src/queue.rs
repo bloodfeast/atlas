@@ -13,7 +13,7 @@
 //! atlas queue [list]      the waiting launches, oldest first: key, kind, lane, age, description
 //! atlas queue show KEY    one launch with its brief
 //! atlas queue drop KEY    removes one without starting it
-//! atlas queue release ID  counts a dead agent finished: its lane and slots are free
+//! atlas queue release SEL counts a dead agent finished (a slot number, agent id or lane): its lane and slots are free
 //! ```
 //!
 //! The entries live in the memory store, so the queue outlives a command
@@ -1119,7 +1119,56 @@ pub fn launch_holders(
     store: &MemoryStore,
     now: std::time::SystemTime,
 ) -> std::result::Result<(Vec<crate::lanes::Holder>, usize), String> {
-    launch_holders_counted(orch, store, now).map(|(h, read, _)| (h, read))
+    launch_holders_at(orch, store, now, &DeadProbe::machine())
+}
+
+/// [`launch_holders`] on the evidence `probe` rather than this machine's.
+///
+/// # Errors
+///
+/// Store errors reading the launch entries.
+pub fn launch_holders_at(
+    orch: &crate::orchestrate::OrchSettings,
+    store: &MemoryStore,
+    now: std::time::SystemTime,
+    probe: &DeadProbe<'_>,
+) -> std::result::Result<(Vec<crate::lanes::Holder>, usize), String> {
+    let s = session_agents(orch, store, now, Some(probe))?;
+    Ok((session_holders(orch, &s), s.sessions.len()))
+}
+
+/// The running agents of `s` as holders, each with its launch entry's lane.
+fn session_holders(orch: &crate::orchestrate::OrchSettings, s: &SessionAgents) -> Vec<crate::lanes::Holder> {
+    let mut out = Vec::new();
+    for (dir, r) in &s.sessions {
+        let mut hs = holders(r, dir, &[], &orch.lanes, &|_| None);
+        for (a, h) in r.iter().zip(hs.iter_mut()) {
+            if let Some(l) = s.lane_of.get(&a.id) {
+                h.class.lane = Some(l.clone());
+                h.class.lane_src = crate::lanes::Source::Declared;
+            }
+        }
+        out.extend(hs);
+    }
+    out
+}
+
+/// The evidence that an unfinished agent died (#389,
+/// [`crate::orchestrate::dead_holder`]): the machine's boot time, and
+/// whether the Claude Code process an agent's launch entry names as its
+/// `owner:` still runs (`None`: not provable either way).
+pub struct DeadProbe<'a> {
+    /// The machine's boot time; `None` when unknown.
+    pub boot: Option<std::time::SystemTime>,
+    /// Whether the process an `owner:` tag names still runs.
+    pub owner_alive: &'a dyn Fn(&str) -> Option<bool>,
+}
+
+impl DeadProbe<'static> {
+    /// This machine's boot time and process table.
+    pub fn machine() -> DeadProbe<'static> {
+        DeadProbe { boot: crate::platform::boot::boot_time(), owner_alive: &crate::restart::server_live }
+    }
 }
 
 /// [`launch_holders`], and how many sessions the launch entries named: a
@@ -1134,19 +1183,10 @@ pub fn launch_holders_counted(
     store: &MemoryStore,
     now: std::time::SystemTime,
 ) -> std::result::Result<(Vec<crate::lanes::Holder>, usize, usize), String> {
-    let s = session_agents(orch, store, now)?;
-    let mut out = Vec::new();
-    for (dir, r) in &s.sessions {
-        let mut hs = holders(r, dir, &[], &orch.lanes, &|_| None);
-        for (a, h) in r.iter().zip(hs.iter_mut()) {
-            if let Some(l) = s.lane_of.get(&a.id) {
-                h.class.lane = Some(l.clone());
-                h.class.lane_src = crate::lanes::Source::Declared;
-            }
-        }
-        out.extend(hs);
-    }
-    Ok((out, s.sessions.len(), s.named))
+    // The worktree gc acts on this view and deletes, so it releases no
+    // agent on reboot or owner evidence (#389): only on a recorded finish.
+    let s = session_agents(orch, store, now, None)?;
+    Ok((session_holders(orch, &s), s.sessions.len(), s.named))
 }
 
 /// The cap slots held now (public #16): every running agent of the sessions
@@ -1162,24 +1202,55 @@ pub fn held_slots(
     store: &MemoryStore,
     now: std::time::SystemTime,
 ) -> std::result::Result<Vec<crate::orchestrate::HeldSlot>, String> {
-    let s = session_agents(orch, store, now)?;
-    let mut out: Vec<crate::orchestrate::HeldSlot> = Vec::new();
+    Ok(held_slots_at(orch, store, now, &DeadProbe::machine())?.into_iter().map(|(_, h)| h).collect())
+}
+
+/// [`held_slots`] on the evidence `probe`, each running agent's with its
+/// agents folder: the held slots in listing order, then the agents
+/// released on that evidence ([`crate::orchestrate::HeldSlot::released`]),
+/// which hold nothing. A row's number (`#N`, which `atlas queue release`
+/// takes) is its launch's own ([`launch_slot`]), not its place here.
+///
+/// # Errors
+///
+/// Store errors reading the launch entries.
+pub fn held_slots_at(
+    orch: &crate::orchestrate::OrchSettings,
+    store: &MemoryStore,
+    now: std::time::SystemTime,
+    probe: &DeadProbe<'_>,
+) -> std::result::Result<Vec<(Option<std::path::PathBuf>, crate::orchestrate::HeldSlot)>, String> {
+    let s = session_agents(orch, store, now, Some(probe))?;
+    let slot = |id: &str, description: &str, kind, running, released| crate::orchestrate::HeldSlot {
+        slot: s.slot_of.get(id).copied(),
+        kind,
+        lane: s.lane_of.get(id).cloned().unwrap_or_default(),
+        description: if description.is_empty() { id.to_string() } else { description.to_string() },
+        since: s.time_of.get(id).cloned().unwrap_or_default(),
+        running,
+        agent: id.to_string(),
+        released,
+    };
+    let mut out = Vec::new();
     let mut started: Vec<&str> = Vec::new();
-    for (_, r) in &s.sessions {
+    for (dir, r) in &s.sessions {
         for a in r {
             started.push(&a.tool_use_id);
-            out.push(crate::orchestrate::HeldSlot {
-                kind: a.kind,
-                lane: s.lane_of.get(&a.id).cloned().unwrap_or_default(),
-                description: if a.description.is_empty() { a.id.clone() } else { a.description.clone() },
-                since: s.time_of.get(&a.id).cloned().unwrap_or_default(),
-                running: true,
-            });
+            out.push((Some(dir.clone()), slot(&a.id, &a.description, a.kind, true, None)));
         }
     }
-    out.sort_by(|a, b| a.since.cmp(&b.since));
+    out.sort_by(|a, b| a.1.since.cmp(&b.1.since));
     // A launch whose agent is already listed running holds one slot.
-    out.extend(crate::orchestrate::pending_slots(store, now).into_iter().filter(|(t, _)| !started.contains(&t.as_str())).map(|(_, h)| h));
+    out.extend(
+        crate::orchestrate::pending_slots(store, now).into_iter().filter(|(t, _)| !started.contains(&t.as_str())).map(|(_, h)| (None, h)),
+    );
+    let mut dead: Vec<_> = s
+        .dead
+        .iter()
+        .map(|(dir, d)| (Some(dir.clone()), slot(&d.id, &d.description, d.kind, true, Some(d.reason))))
+        .collect();
+    dead.sort_by(|a, b| a.1.since.cmp(&b.1.since));
+    out.extend(dead);
     Ok(out)
 }
 
@@ -1187,11 +1258,7 @@ pub fn held_slots(
 /// description, since), each launch not yet started marked so. `now` is the
 /// store's time text. Empty when no slot is held.
 pub fn held_text(held: &[crate::orchestrate::HeldSlot], now: &str) -> String {
-    if held.is_empty() {
-        return String::new();
-    }
-    let mut out = format!("{} agent cap slot{} held, oldest first:\n", held.len(), if held.len() == 1 { " is" } else { "s are" });
-    for h in held {
+    let line = |h: &crate::orchestrate::HeldSlot| {
         let lane = if h.lane.is_empty() { "-" } else { h.lane.as_str() };
         let since = if h.since.is_empty() {
             "?".to_string()
@@ -1199,9 +1266,91 @@ pub fn held_text(held: &[crate::orchestrate::HeldSlot], now: &str) -> String {
             format!("{} ({} ago)", &h.since[..h.since.len().min(16)], age(&h.since, now))
         };
         let state = if h.running { "" } else { "  [launched, not started]" };
-        out.push_str(&format!("  {}  lane {lane}  since {since}  {}{state}\n", h.kind.name(), h.description));
+        let agent = if h.agent.is_empty() || h.agent == h.description { String::new() } else { format!(" (agent {})", h.agent) };
+        format!("{}  lane {lane}  since {since}  {}{agent}{state}\n", h.kind.name(), h.description)
+    };
+    // The launch's own number (#389 review M1): the same in every view.
+    let num = |h: &crate::orchestrate::HeldSlot| h.slot.map_or_else(|| "--".to_string(), |n| format!("#{n}"));
+    let (dead, live): (Vec<_>, Vec<_>) = held.iter().partition(|h| h.released.is_some());
+    let mut out = String::new();
+    if !live.is_empty() {
+        out = format!("{} agent cap slot{} held, oldest first:\n", live.len(), if live.len() == 1 { " is" } else { "s are" });
+        for h in live {
+            out.push_str(&format!("  {}  {}", num(h), line(h)));
+        }
+    }
+    for h in dead {
+        let why = h.released.map_or("", crate::orchestrate::DeadReason::text);
+        out.push_str(&format!("  {}  released: {why}  {}", num(h), line(h)));
     }
     out
+}
+
+/// The slot number a launch entry's meta carries (`slot: N`, #389 review
+/// M1): the SubagentStart hook numbers each launch when it files it, so a
+/// held slot keeps its number whatever else starts, finishes or is
+/// filtered out of a listing. `None` for an entry filed before slots were
+/// numbered.
+pub fn launch_slot(meta: &str) -> Option<u32> {
+    crate::memory::import::front_value(meta, "slot").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0)
+}
+
+/// The number the next launch takes: one past the highest among `metas`,
+/// the launch entries filed in the last [`SLOT_WINDOW_FACTOR`] stale
+/// windows. While any launch numbered in that window remains, no number
+/// is given twice; the count starts again at 1 only after a quiet spell
+/// longer than any listing that could show the old numbers.
+pub fn next_launch_slot<'a>(metas: impl IntoIterator<Item = &'a str>) -> u32 {
+    metas.into_iter().filter_map(launch_slot).max().map_or(1, |n| n.saturating_add(1))
+}
+
+/// How many `stale_minutes` windows back [`next_launch_slot`] looks: two,
+/// so a number a listing showed (its launches are within one window) is
+/// not handed out again while that listing can still be acted on.
+pub const SLOT_WINDOW_FACTOR: u32 = 2;
+
+/// The agent `atlas queue release SELECTOR` names among the slots
+/// [`held_slots_at`] lists (#389): `Ok(Some((folder, id)))`, or `Ok(None)`
+/// when it names no listed agent (an agent id is then looked up on disk).
+/// A selector is a slot number as the listing shows it (`3` or `#3`: the
+/// launch's own, [`launch_slot`]), an agent id, or a lane holding exactly
+/// one started agent. Rows listed released match too: their release is
+/// recorded, so the worktree gc frees them as well (#389 review S4).
+///
+/// # Errors
+///
+/// A slot number no listed agent carries, or a selector that names more
+/// than one agent (each one listed).
+pub fn release_target<'a>(
+    sel: &str,
+    slots: &'a [(Option<std::path::PathBuf>, crate::orchestrate::HeldSlot)],
+) -> std::result::Result<Option<(&'a std::path::Path, &'a str)>, String> {
+    // A pending launch (no folder) has no agent to release.
+    let started = slots.iter().filter_map(|(d, h)| d.as_deref().filter(|_| h.running && !h.agent.is_empty()).map(|d| (d, h)));
+    let n = sel.strip_prefix('#').unwrap_or(sel);
+    let number = (!n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.parse::<u32>().ok()).flatten();
+    let bare = sel.strip_prefix("agent-").unwrap_or(sel);
+    let mut hits: Vec<(&std::path::Path, &crate::orchestrate::HeldSlot)> = Vec::new();
+    for (d, h) in started {
+        let named = match number {
+            Some(i) => h.slot == Some(i),
+            None => h.agent == bare || h.lane.eq_ignore_ascii_case(sel),
+        };
+        if named && !hits.iter().any(|(_, x)| x.agent == h.agent) {
+            hits.push((d, h));
+        }
+    }
+    match hits.as_slice() {
+        // A number names a slot or nothing: never an agent on disk.
+        [] if number.is_some() => Err(format!("no slot #{n}: no held slot carries that number now (atlas queue list numbers them)")),
+        [] => Ok(None),
+        [(d, h)] => Ok(Some((d, h.agent.as_str()))),
+        many => Err(format!(
+            "{sel:?} names {} held slots; name one by its agent id or slot number:\n{}",
+            many.len(),
+            many.iter().map(|(_, h)| format!("  agent {}  lane {}  {}", h.agent, if h.lane.is_empty() { "-" } else { &h.lane }, h.description)).collect::<Vec<_>>().join("\n")
+        )),
+    }
 }
 
 /// The running agents of the sessions the launch entries name.
@@ -1213,14 +1362,21 @@ struct SessionAgents {
     /// When each agent's launch entry was written (the store's UTC time
     /// text), by agent id.
     time_of: std::collections::HashMap<String, String>,
+    /// The slot number each agent's launch entry carries ([`launch_slot`]),
+    /// by agent id.
+    slot_of: std::collections::HashMap<String, u32>,
     /// How many sessions the launch entries named.
     named: usize,
+    /// The unfinished agents left out as dead on the probe's evidence
+    /// (#389), with their session folders.
+    dead: Vec<(std::path::PathBuf, crate::orchestrate::DeadSlot)>,
 }
 
 fn session_agents(
     orch: &crate::orchestrate::OrchSettings,
     store: &MemoryStore,
     now: std::time::SystemTime,
+    probe: Option<&DeadProbe<'_>>,
 ) -> std::result::Result<SessionAgents, String> {
     use crate::memory::import::front_value;
     let floor = crate::store::utc(now.checked_sub(orch.stale).unwrap_or(std::time::UNIX_EPOCH));
@@ -1228,6 +1384,8 @@ fn session_agents(
     let mut lane_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut session_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut time_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut owner_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut slot_of: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for h in store.active_entries_no_body(crate::hooks::LAUNCH_ENTRY).map_err(|e| e.to_string())? {
         if h.time <= floor {
             continue;
@@ -1247,8 +1405,25 @@ fn session_agents(
         }
         if !id.is_empty() {
             time_of.insert(id.to_string(), h.time.clone());
+            if let Some(n) = launch_slot(&h.meta) {
+                slot_of.insert(id.to_string(), n);
+            }
+            if let Some(o) = front_value(&h.meta, "owner").map(str::trim).filter(|o| !o.is_empty()) {
+                owner_of.insert(id.to_string(), o.to_string());
+            }
         }
     }
+    // Each owner probed once: (tag, provably gone).
+    let mut gone: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+    let mut owner_gone = std::collections::HashSet::new();
+    if let Some(p) = probe {
+        for (id, tag) in &owner_of {
+            if *gone.entry(tag.as_str()).or_insert_with(|| (p.owner_alive)(tag) == Some(false)) {
+                owner_gone.insert(id.clone());
+            }
+        }
+    }
+    let mut dead = Vec::new();
     let mut sessions = Vec::new();
     for t in &transcripts {
         let dir = crate::orchestrate::subagents_dir(t);
@@ -1264,6 +1439,9 @@ fn session_agents(
             Ok(_) => {}
             Err(e) => eprintln!("atlas queue next: session start: {e}"),
         }
+        if let Some(p) = probe {
+            agents.set_dead_evidence(p.boot, owner_gone.clone());
+        }
         let r = match agents.running(orch, &dir, Some(store), now) {
             Ok(r) => r,
             Err(e) => {
@@ -1271,9 +1449,10 @@ fn session_agents(
                 continue;
             }
         };
+        dead.extend(agents.dead().iter().map(|d| (dir.clone(), d.clone())));
         sessions.push((dir, r));
     }
-    Ok(SessionAgents { sessions, lane_of, time_of, named: transcripts.len() })
+    Ok(SessionAgents { sessions, lane_of, time_of, slot_of, named: transcripts.len(), dead })
 }
 
 /// The proposal for what runs now: free slots per kind and in total from
@@ -1342,7 +1521,7 @@ pub(crate) fn age(time: &str, now: &str) -> String {
 }
 
 /// The usage of `atlas queue`.
-pub const USAGE: &str = "usage: atlas queue [list [--lane LANE] | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next [--transcript PATH] | release AGENT [--force] [--transcript PATH] | add --description TEXT [--kind KIND] FILE|- | plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT] [--ticket KEY] | plan --from-jql QUERY [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--scope TEXT] [--order-from N] [--lane-from key|fixed:LANE] [--limit N]]";
+pub const USAGE: &str = "usage: atlas queue [list [--lane LANE] | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next [--transcript PATH] | release SLOT|AGENT|LANE [--force] | release AGENT --transcript PATH [--force] | add --description TEXT [--kind KIND] FILE|- | plan --lane LANE --title TEXT [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--order N] [--scope TEXT] [--ticket KEY] | plan --from-jql QUERY [--kind KIND] [--priority P] [--uses LIST] [--after LIST] [--scope TEXT] [--order-from N] [--lane-from key|fixed:LANE] [--limit N]]";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -1500,7 +1679,7 @@ pub fn cli(
                 );
             }
             println!(
-                "`atlas queue show KEY` prints one; `atlas queue next` proposes what starts now, counting the running agents of the session `--transcript PATH` names or, without it, of every session in the store that filed a launch record in the `stale_minutes` window (conservative: the admission hook counts its own session only); a launch whose brief has `Queue: KEY` takes that item off the queue; `atlas queue drop KEY` removes one, `atlas queue done KEY` marks one done, `atlas queue met KEY [CONDITION]` marks a condition met; `atlas queue release AGENT` frees the lane and slots of an agent that died without its finish recorded. KEY is an item's full key, or its lane when one item is open there (waiting, or started and not yet done; `show` and `drop` take waiting items only)."
+                "`atlas queue show KEY` prints one; `atlas queue next` proposes what starts now, counting the running agents of the session `--transcript PATH` names or, without it, of every session in the store that filed a launch record in the `stale_minutes` window (conservative: the admission hook counts its own session only); a launch whose brief has `Queue: KEY` takes that item off the queue; `atlas queue drop KEY` removes one, `atlas queue done KEY` marks one done, `atlas queue met KEY [CONDITION]` marks a condition met; `atlas queue release SLOT|AGENT|LANE` frees the lane and slots of an agent that died without its finish recorded, named by its slot number above (the launch's own, the same in every listing), its agent id, or a lane one started agent holds; with `--transcript PATH` it takes an agent id in that session only. KEY is an item's full key, or its lane when one item is open there (waiting, or started and not yet done; `show` and `drop` take waiting items only)."
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -1626,13 +1805,30 @@ pub fn cli(
                     "--transcript" => transcript = Some(it.next().ok_or_else(|| format!("--transcript needs a path\n{USAGE}"))?.clone()),
                     f if f.starts_with('-') => return Err(format!("unknown release flag {f:?}\n{USAGE}")),
                     a if id.is_none() => id = Some(a.to_string()),
-                    a => return Err(format!("release takes one agent id, not also {a:?}\n{USAGE}")),
+                    a => return Err(format!("release takes one slot, agent id or lane, not also {a:?}\n{USAGE}")),
                 }
             }
-            let id = id.ok_or_else(|| format!("name an agent id (agent-<id> in the session's subagents folder)\n{USAGE}"))?;
-            let bare = id.strip_prefix("agent-").unwrap_or(&id);
-            let dir = match transcript {
-                Some(t) => {
+            let id = id.ok_or_else(|| format!("name a held slot: its number in `atlas queue list`, its agent id or its lane\n{USAGE}"))?;
+            let mut bare = id.strip_prefix("agent-").unwrap_or(&id).to_string();
+            // A slot number, an agent id or a lane among the held slots
+            // (#389); else an agent id looked up on disk, as before. With
+            // `--transcript` the selector is an agent id in that session.
+            let mut found = None;
+            if transcript.is_none() {
+                // The slots are an aid: a failed read leaves the id lookup.
+                let slots = held_slots_at(orch, store, std::time::SystemTime::now(), &DeadProbe::machine()).unwrap_or_else(|e| {
+                    eprintln!("atlas queue release: held slots: {e}");
+                    Vec::new()
+                });
+                if let Some((d, a)) = release_target(&id, &slots)? {
+                    found = Some(d.to_path_buf());
+                    bare = a.to_string();
+                }
+            }
+            let bare = bare.as_str();
+            let dir = match (found, transcript) {
+                (Some(d), _) => d,
+                (None, Some(t)) => {
                     let dir = crate::orchestrate::subagents_dir(&t);
                     if !dir.join(format!("agent-{bare}.meta.json")).is_file() {
                         return Err(format!(
@@ -1642,10 +1838,10 @@ pub fn cli(
                     }
                     dir
                 }
-                None => {
+                (None, None) => {
                     let projects = crate::chain::projects_dir().ok_or("no home folder is known (set HOME, USERPROFILE or CLAUDE_CONFIG_DIR)")?;
                     crate::orchestrate::find_agent_dir(&projects, bare)
-                        .ok_or_else(|| format!("no agent {bare} under {}; name its session with --transcript PATH", projects.display()))?
+                        .ok_or_else(|| format!("no held slot, agent or lane {bare} (atlas queue list shows the held slots), and no agent {bare} under {}; name its session with --transcript PATH", projects.display()))?
                 }
             };
             println!("{}", crate::orchestrate::release(store, &dir, bare, force, std::time::SystemTime::now())?);

@@ -64,11 +64,23 @@ On an Agent PreToolUse, while caps are on:
      not empty (the agent waits on its own background work; Claude Code 2.1.325 puts the field in
      SubagentStop's input as in Stop's) records no finish (#222);
    - no release record (a row of the memory store's `agent_releases(agent, time)` table, written at a
-     SubagentStop and by `atlas queue release AGENT`) is newer than its last write. The command refuses an
-     agent that wrote in the last 5 minutes unless `--force`, finds the agent under Claude Code's projects
-     folder or in the session `--transcript PATH` names, and never edits the meta file. An agent that writes
+     SubagentStop and by `atlas queue release SLOT|AGENT|LANE`, #389) is newer than its last write. The
+     selector resolves among the held slots, released rows included, and one naming more than one agent is
+     refused. A slot number is the launch's own: the SubagentStart hook writes `slot: N` on each launch entry,
+     one past the highest among the launch entries of the last two `stale_minutes` windows, under the store's
+     write lock, so a number stays with its agent whatever else starts, finishes or is filtered from a
+     listing, and is not handed out again while a listing that showed it can be acted on. A number no listed
+     agent carries is refused, never looked up on disk. The command refuses an agent that wrote in the last 5
+     minutes unless `--force`, finds the agent under Claude Code's projects folder or, with `--transcript
+     PATH`, by its agent id in that session alone, and never edits the meta file. An agent that writes
      after its release counts again, and its row goes. The `agent-<id>.atlas-released` files atlas 0.6.1 and
      earlier wrote beside the meta files are read into the table once and deleted;
+   - in the cross-session views (`atlas queue list`, `atlas queue next`, `recall op=status`; not worktree gc
+     nor the admission hook), the machine did not boot more than 5 s after its last write, and the Claude Code
+     process its launch entry names (`owner: <pid> <start>`) is not provably gone (#389). The resident
+     server writes that line only when the first ancestor past known shells and launchers (`cmd`, `sh`,
+     `bash`, `pwsh`, `env`, an `atlas` shim, ...) runs as Claude Code (`claude`, `node` or `bun`); any other
+     parent writes none. An unknown boot time or owner keeps the agent counted;
    - the `user` lines after its transcript's last `assistant` line (one per result of parallel tool calls;
      the hook attachments, `api-request` and `system` lines Claude Code writes after a tool result, and a
      torn last line, are passed over) hold no tool error saying the disk is full (`ENOSPC`, "no space left",

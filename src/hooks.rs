@@ -1006,6 +1006,10 @@ pub struct Hooks {
     /// ([`crate::restart::server_tag`]): while it runs, a crash offer skips
     /// its agents. `None` in a command hook.
     server: Option<String>,
+    /// The Claude Code process that started the resident server, as its
+    /// launch entries name it ([`crate::restart::owner_tag`], #389): once it
+    /// is gone, so are its agents. `None` in a command hook or unread.
+    owner: Option<String>,
     /// The scheduled-restart warnings the resident server's poll leaves for
     /// the main session's next prompt (#221); `None` in a command hook.
     restart_warn: Option<crate::restart_warn::Notices>,
@@ -1136,6 +1140,7 @@ impl Hooks {
             restart: None,
             restart_due: false,
             server: None,
+            owner: None,
             restart_sessions: HashMap::new(),
             sessions_seen: HashSet::new(),
             restart_warn: None,
@@ -1151,6 +1156,7 @@ impl Hooks {
         if self.restart.is_none() {
             self.restart = crate::restart::Refresher::start(self.settings.orchestrate.runq_root.clone());
             self.server = Some(crate::restart::server_tag());
+            self.owner = crate::restart::owner_tag();
         }
     }
 
@@ -3067,12 +3073,15 @@ impl Hooks {
             .map(|h| h.key);
         let description = crate::redact::redact(l.description.trim());
         let model = if l.model.is_empty() { "inherit" } else { l.model };
-        let server = self.server.as_deref().map_or(String::new(), |t| format!("server: {t}\n"));
+        let mut server = self.server.as_deref().map_or(String::new(), |t| format!("server: {t}\n"));
+        if let Some(o) = &self.owner {
+            server.push_str(&format!("owner: {o}\n"));
+        }
         let body = match &same {
             Some(k) => format!("The same brief as {k}; recall {k} for its text.\n"),
             None => text,
         };
-        let d = crate::memory::Draft {
+        let mut d = crate::memory::Draft {
             title: if description.is_empty() { format!("launch of agent {agent}") } else { format!("launch: {description}") },
             meta: format!(
                 "agent: {agent}\ntype: {}\nmodel: {model}\ndescription: {description}\nstart: {}\nsession: {}\ntranscript: {}\n{server}",
@@ -3088,7 +3097,13 @@ impl Hooks {
             provenance: None,
             time: None,
         };
+        // The launch's slot number (#389 review M1), taken under the write
+        // lock so two sessions starting agents at once never share one.
+        let window = self.settings.orchestrate.stale.saturating_mul(crate::queue::SLOT_WINDOW_FACTOR);
+        let floor = crate::store::utc(std::time::SystemTime::now().checked_sub(window).unwrap_or(std::time::UNIX_EPOCH));
         let mut w = self.store.writer()?;
+        let recent = w.active_entries_since_no_body(LAUNCH_ENTRY, &floor)?;
+        d.meta.push_str(&format!("slot: {}\n", crate::queue::next_launch_slot(recent.iter().map(|h| h.meta.as_str()))));
         let key = w.next_key(&format!("journal:{lane}:"), 4)?;
         w.create(&key, "journal", LAUNCH_ENTRY, &lane, &d, None)?;
         w.add_refs(&key, &[("lane".to_string(), lane.clone())])?;

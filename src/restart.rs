@@ -72,6 +72,59 @@ pub fn server_tag() -> String {
     }
 }
 
+/// The Claude Code process that runs this server's session, as a launch
+/// entry's `owner:` line (#389), tagged as [`server_tag`] tags (`<pid>
+/// <start>`): [`owner_pid`] on this machine's process table. `None` when no
+/// ancestor is provably Claude Code; the line is then left out, and no
+/// slot is ever released on owner evidence.
+pub fn owner_tag() -> Option<String> {
+    let pid = owner_pid(&crate::platform::process::table(), std::process::id())?;
+    Some(match crate::platform::process::start_time(pid) {
+        Some(t) => format!("{pid} {t}"),
+        None => format!("{pid} -"),
+    })
+}
+
+/// The shells and launchers [`owner_pid`] walks past between the server
+/// and Claude Code (`cmd /c`, a non-exec `sh -c`, the MSYS bash stub, an
+/// atlas shim), by executable name without `.exe`.
+const WRAPPERS: &[&str] = &["atlas", "bash", "cmd", "dash", "env", "fish", "ksh", "nice", "nohup", "powershell", "pwsh", "sh", "zsh"];
+
+/// The executable names Claude Code runs as: its own binary, or the
+/// JavaScript runtime it ships on.
+const CLAUDE_CODE: &[&str] = &["bun", "claude", "node"];
+
+/// The Claude Code process above `me` in `procs` ((pid, parent pid,
+/// executable name), [`owner_tag`], #389 review S2): the first ancestor
+/// that is not a known shell or launcher ([`WRAPPERS`]), and only when its
+/// name is Claude Code's ([`CLAUDE_CODE`]). `None` for anything else (an
+/// unknown parent, init, a pid namespace's edge, a loop, an unread table):
+/// a slot is released on owner evidence only when the owner is known.
+pub fn owner_pid(procs: &[(u32, u32, String)], me: u32) -> Option<u32> {
+    let name = |n: &str| {
+        let n = n.rsplit(['/', '\\']).next().unwrap_or(n);
+        let n = if n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(".exe") { &n[..n.len() - 4] } else { n };
+        n.to_ascii_lowercase()
+    };
+    let parent_of = |pid: u32| procs.iter().find(|p| p.0 == pid).map(|p| p.1);
+    let mut pid = parent_of(me)?;
+    // A short walk: a wrapper chain is a few deep; a loop is cut off.
+    for _ in 0..8 {
+        if pid <= 1 {
+            return None;
+        }
+        let n = name(&procs.iter().find(|p| p.0 == pid)?.2);
+        if CLAUDE_CODE.contains(&n.as_str()) {
+            return Some(pid);
+        }
+        if !WRAPPERS.contains(&n.as_str()) {
+            return None;
+        }
+        pid = parent_of(pid)?;
+    }
+    None
+}
+
 /// Whether the server `tag` ([`server_tag`]) names still runs: its pid is
 /// alive and, when both are known, started at the recorded time. `None`
 /// for a tag that does not parse.
@@ -1029,9 +1082,23 @@ mod tests {
 
     /// The catch, as the console handler and the signal thread call it:
     /// with agents running it writes the point; with none it writes nothing.
-    /// One test, since the catch's slot is process-wide.
+    /// One test, since the catch's slot is process-wide; and run alone in a
+    /// child of this test binary, since other tests here run servers that
+    /// set that slot, the stdin state and the pending hold in parallel.
     #[test]
     fn the_catch_writes_the_running_agents_and_nothing_without_them() {
+        if std::env::var_os("ATLAS_CATCH_ALONE").is_none() {
+            let _serial = catch_serial();
+            let o = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "restart::tests::the_catch_writes_the_running_agents_and_nothing_without_them", "--nocapture", "--test-threads", "1"])
+                .env("ATLAS_CATCH_ALONE", "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert!(o.status.success() && out.contains("1 passed"), "{out}");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("atlas-catch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("memory.sqlite");
@@ -1192,6 +1259,13 @@ mod tests {
         std::process::exit(0);
     }
 
+    /// One catch test at a time: each runs its catch in a child of this
+    /// binary, and children run apart from the parallel tests here.
+    fn catch_serial() -> std::sync::MutexGuard<'static, ()> {
+        static CATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        CATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The point files in `dir` (a helper child names its own).
     fn points_in(dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -1243,6 +1317,7 @@ mod tests {
     /// writes no restart point, though agents run.
     #[test]
     fn a_closed_stdin_exit_writes_nothing() {
+        let _serial = catch_serial();
         let dir = std::env::temp_dir().join(format!("atlas-catch-eof-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (mut c, _out) = helper(&dir, false);
@@ -1262,6 +1337,7 @@ mod tests {
     /// does.
     #[test]
     fn a_closed_stdin_with_a_restart_pending_marks_the_point_ended() {
+        let _serial = catch_serial();
         let dir = std::env::temp_dir().join(format!("atlas-catch-ended-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1327,6 +1403,7 @@ mod tests {
     #[test]
     fn sigterm_writes_the_point_and_still_ends_the_process() {
         use std::os::unix::process::ExitStatusExt;
+        let _serial = catch_serial();
         let dir = std::env::temp_dir().join(format!("atlas-catch-term-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (mut c, _out) = helper(&dir, false);
@@ -1354,6 +1431,7 @@ mod tests {
     fn a_shutdown_signal_with_the_end_of_input_still_writes_the_point() {
         use std::io::BufRead;
         use std::os::unix::process::ExitStatusExt;
+        let _serial = catch_serial();
         let dir = std::env::temp_dir().join(format!("atlas-catch-both-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (mut c, mut out) = helper(&dir, true);

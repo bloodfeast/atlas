@@ -742,9 +742,25 @@ pub(crate) fn sign_manifest(key: &Path, trusted: &str, manifest: &Path) -> R {
         let _ = std::fs::remove_file(&pub_der);
         e
     };
-    // openssl asks for the passphrase on the terminal: stdin is inherited.
-    let ok = Command::new(&openssl).args(["pkey", "-pubout", "-outform", "DER", "-in"]).arg(key).arg("-out").arg(&pub_der).status();
-    if !ok.map(|s| s.success()).unwrap_or(false) {
+    // With an armed passphrase store (ship and sign on Windows), openssl
+    // reads the passphrase from its standard input (`-passin stdin`), never
+    // from an argument or the environment; else it asks on the terminal,
+    // stdin inherited.
+    let pass = match crate::passphrase::armed() {
+        Some(store) => Some(crate::passphrase::load(store).map_err(cleanup)?),
+        None => None,
+    };
+    let run = |c: &mut Command| -> bool {
+        match &pass {
+            Some(p) => {
+                c.args(["-passin", "stdin"]);
+                crate::passphrase::run_with(c, p).unwrap_or(false)
+            }
+            None => c.status().map(|s| s.success()).unwrap_or(false),
+        }
+    };
+    let ok = run(Command::new(&openssl).args(["pkey", "-pubout", "-outform", "DER", "-in"]).arg(key).arg("-out").arg(&pub_der));
+    if !ok {
         return Err(cleanup("cannot read the signing key".into()));
     }
     let der = std::fs::read(&pub_der).map_err(|e| cleanup(e.to_string()))?;
@@ -752,15 +768,8 @@ pub(crate) fn sign_manifest(key: &Path, trusted: &str, manifest: &Path) -> R {
     if key_hex != trusted {
         return Err(cleanup(format!("ATLAS_SIGN_KEY is not the key built into atlas (its public half is {key_hex})")));
     }
-    let ok = Command::new(&openssl)
-        .args(["pkeyutl", "-sign", "-rawin", "-inkey"])
-        .arg(key)
-        .arg("-in")
-        .arg(manifest)
-        .arg("-out")
-        .arg(&sig)
-        .status();
-    if !ok.map(|s| s.success()).unwrap_or(false) {
+    let ok = run(Command::new(&openssl).args(["pkeyutl", "-sign", "-rawin", "-inkey"]).arg(key).arg("-in").arg(manifest).arg("-out").arg(&sig));
+    if !ok {
         return Err(cleanup("signing failed".into()));
     }
     if size_of(&sig).map_err(cleanup)? != 64 {

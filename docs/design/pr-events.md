@@ -139,7 +139,13 @@ atlas pr-events: PR #12 reviewed: changes requested, by octo-reviewer, lane L, w
 - One connection at a time, under one 10 s deadline per connection (each read waits only for the time left, then
   408), so a client that trickles bytes cannot hold the listener past it; the forwarders are few and the store has
   one writer, so a thread per connection buys nothing.
-- A review by the pull request's author, or by a login ending in `[bot]`, is answered 204 and meets no wait.
+- A review by the pull request's author is answered 204 and meets no wait.
+- A review, review comment or PR comment by a bot (`user.type` or `sender.type` `Bot`, else a login ending in
+  `[bot]`) or by a login in `pr_events.ignore_logins`, and a review comment or PR comment by the authenticated gh
+  user (read once at start with `gh api user`, with `--hostname` for each GitHub Enterprise host served; none when
+  gh is not logged in), is answered 204: it meets no wait and files no notice. A review by the gh user still meets
+  the wait: that user is also the person reviewing. Logins compare without case and may carry `_` (Enterprise
+  Managed Users).
 - `tests/protocol.rs` `no_network_code` allows this one file a socket, and checks it binds only
   `Ipv4Addr::LOCALHOST` and never connects out.
 

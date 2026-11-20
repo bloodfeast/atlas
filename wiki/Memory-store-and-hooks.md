@@ -347,8 +347,9 @@ poison a session's context. The context poisoning guard removes that hidden chan
   letters; it names `path:line:column` and the code point. It runs after the tests in the public CI's `test` job,
   as an xtask unit test in every local `cargo test`, in the release pull request beside the leak and secret gates,
   in `cargo xtask release check`, and on the exported tree in `cargo xtask release`. Deliberate cases are listed in
-  `xtask/hidden-allow.txt`, one `path:LINES:U+XXXX reason` per line naming the exact lines; a listed line that no
-  longer holds the character fails the gate, and an invisible character in code is never listed.
+  `xtask/hidden-allow.txt`, one `COUNT path:U+XXXX reason` per line, keyed by the file and the character (never by
+  line numbers, which went stale whenever code above a case moved) and bound to how many the file holds: one more (a
+  new hidden character slipped into an allowed file) or one fewer fails the gate with the count to set, and an invisible character in code is never listed: it is written as an escape.
 
 What it does not do: anything about visible text. A planted sentence in plain view ("ignore previous instructions")
 reaches the session as written, and is out of scope for now: plain filtering cannot tell it apart from a user's own
