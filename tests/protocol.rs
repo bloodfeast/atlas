@@ -207,9 +207,11 @@ fn no_network_code() {
             .filter(|n| !n.is_empty())
             .collect()
     };
-    // The only dev-dependency is atlas itself (its test seams), not a crate.
+    // The dev-dependencies are atlas itself (its test seams) and proptest, for
+    // the property tests in tests/proptest/. Neither brings a network crate
+    // (the lock scan above).
     let dev = section("[dev-dependencies]");
-    assert_eq!(keys(&dev), vec!["atlas".to_string()], "{dev}");
+    assert_eq!(keys(&dev), vec!["atlas".to_string(), "proptest".to_string()], "{dev}");
     assert!(dev.contains("path = \".\""), "{dev}");
     let deps = section("[dependencies]");
     let names = keys(&deps);
