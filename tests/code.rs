@@ -481,7 +481,12 @@ fn two_indexers_index_one_change_once() {
     let ib = Indexer::start(code.clone(), f.db.clone(), Some(RustSource::Analyzer(ra)));
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(ia.reports().len() + ib.reports().len(), 0, "the stored index is current");
-    write(&f.root.join("src/later.rs"), "pub fn later() {}\n");
+    // One change, renamed into place: with a debounce of 0, a walk between
+    // `fs::write`'s create and its write stored the empty file, and the full
+    // file was a second change (2 runs in 4 of 40 tries with every core busy).
+    let half = f.root.join("src/.later.rs.part");
+    fs::write(&half, "pub fn later() {}\n").unwrap();
+    fs::rename(&half, f.root.join("src/later.rs")).unwrap();
     let runs = settled_count(1, || ia.reports().len() + ib.reports().len());
     assert_eq!(runs, 1, "one change was indexed more than once");
 }
