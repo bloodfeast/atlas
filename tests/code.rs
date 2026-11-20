@@ -134,7 +134,17 @@ fn vaults(db: &Path) -> atlas::paths::Vaults {
 }
 
 fn setup(f: &Fixture) -> CodeSetup {
-    let spec = atlas::config::CodeSpec { roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: f.root.clone(), build_scripts: false, scip: Default::default() }], debounce_s: Some(0), ..Default::default() };
+    let spec = atlas::config::CodeSpec {
+        roots: vec![atlas::config::CodeRootSpec {
+            name: "app".into(),
+            root: f.root.clone(),
+            build_scripts: false,
+            scip: Default::default(),
+            exclude: Vec::new(),
+        }],
+        debounce_s: Some(0),
+        ..Default::default()
+    };
     let mut code = CodeSetup::from_spec(&spec, &f.db, false);
     // Another build on the machine must not stall the tests.
     code.defer_on_cargo = false;
@@ -151,7 +161,7 @@ fn server(f: &Fixture, code: CodeSetup, indexer: Option<Indexer>) -> Server {
 fn index(f: &Fixture, code: &CodeSetup) -> code_index::IndexReport {
     // The store's open makes the meta table first.
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     code_index::index_root(code, &mut conn, &code.roots[0], &RustSource::File(f.scip.clone())).unwrap()
 }
 
@@ -222,7 +232,7 @@ fn recall_against_grep_has_no_misses_and_counts_the_scan() {
     let f = fixture("code-recall");
     let code = setup(&f);
     index(&f, &code);
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     let r = atlas::recall::code_check(&conn, &code.roots).unwrap();
     assert!(r.misses.is_empty(), "{:?}", r.misses);
     assert_eq!(r.files, (2, 2));
@@ -243,7 +253,7 @@ fn reindex_replaces_one_root_and_scan_only_without_rust_analyzer() {
     let code = setup(&f);
     index(&f, &code);
     // No rust-analyzer: the line scan alone gives the definitions.
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     let rep = code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::ScanOnly("not installed".into())).unwrap();
     assert_eq!(rep.rust, "scan only: not installed");
     let mut s = server(&f, code.clone(), None);
@@ -283,7 +293,7 @@ fn background_indexer_indexes_at_start_and_after_a_change() {
     let reports = s.code().unwrap().indexer.as_ref().unwrap().reports();
     assert!(reports.len() >= 2, "{reports:?}");
     // The lease is free again.
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     assert!(code_index::take_lease(&mut conn, "test", Duration::from_secs(5)).unwrap());
     assert!(!code_index::take_lease(&mut conn, "other", Duration::from_secs(5)).unwrap(), "one holder at a time");
 }
@@ -319,7 +329,7 @@ fn symbol_is_one_statement_and_limits_each_section() {
     let f = fixture("code-limits");
     let code = setup(&f);
     index(&f, &code);
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     let a = code::symbol(&conn, "Store", Limits { defs: 1, refs: 1, impls: 1 }).unwrap();
     assert_eq!(a.totals, [1, 2, 2]);
     assert_eq!(a.hits.iter().map(|h| h.sect).collect::<Vec<_>>(), [0, 1, 2]);
@@ -329,7 +339,7 @@ fn symbol_is_one_statement_and_limits_each_section() {
     assert_eq!(none.totals, [0, 0, 0]);
     // A database the code index never touched answers empty.
     let t = Temp::new("code-empty");
-    let empty = rusqlite::Connection::open(t.path().join("e.sqlite")).unwrap();
+    let empty = atlas::db::Connection::open(t.path().join("e.sqlite")).unwrap();
     assert!(code::symbol(&empty, "Store", Limits { defs: 1, refs: 1, impls: 1 }).unwrap().hits.is_empty());
 }
 
@@ -340,7 +350,10 @@ fn code_config_is_read_and_unconfigured_symbol_is_refused() {
     fs::write(&p, r#"{"db": "s/a.sqlite", "code": {"roots": [{"name": "app", "root": "app"}], "debounce_s": 5}}"#).unwrap();
     let c = atlas::config::Config::load(&p).unwrap();
     let setup = CodeSetup::from_spec(c.code.as_ref().unwrap(), c.db.as_ref().unwrap(), true);
-    assert_eq!(setup.roots, [CodeRoot { name: "app".into(), root: t.path().join("app"), build_scripts: false, scip: Default::default() }]);
+    assert_eq!(
+        setup.roots,
+        [CodeRoot { name: "app".into(), root: t.path().join("app"), build_scripts: false, scip: Default::default(), exclude: Vec::new() }]
+    );
     assert!(setup.defer_on_cargo && setup.defer_lock.is_none(), "defaults: wait for cargo, no lock file");
     assert_eq!(setup.debounce, Duration::from_secs(5));
     assert_eq!(setup.dir, t.path().join("s").join("code"));
@@ -357,7 +370,7 @@ fn file_items_map_a_path_to_its_items_and_skip_stale_or_foreign_files() {
     write(&f.root.join("src/multi.rs"), src);
     let code = setup(&f);
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
     let path = f.root.join("src/multi.rs");
     let items = code::file_items(&conn, &path.to_string_lossy()).unwrap().expect("covered");
@@ -397,7 +410,7 @@ fn impl_blocks_are_items_so_methods_and_gaps_between_them_annotate() {
     write(&f.root.join("src/router.rs"), src);
     let code = setup(&f);
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
     let path = f.root.join("src/router.rs");
     let items = code::file_items(&conn, &path.to_string_lossy()).unwrap().expect("covered");
@@ -433,7 +446,7 @@ fn shell_reads_are_annotated_like_grep_and_read() {
     write(&f.root.join("src/router.rs"), src);
     let code = setup(&f);
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
     let post = line_of(src, "    pub fn post_tool_use(&mut self, ev: &HookEvent) -> Result<Option<Value>> {", 1);
     let post_end = line_of(src, "    }", post as usize);

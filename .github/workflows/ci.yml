@@ -1,8 +1,13 @@
-# The public repository's checks: the whole workspace's tests, in release,
-# on Linux, Windows and macOS. No secrets and a read-only token. Tests that
-# need something outside the repository (the private leak denylist, a real
-# configuration, the embedding model) skip themselves when it is absent, as
-# they do on any machine without it.
+# The public repository's checks: the whole workspace's tests on Linux,
+# Windows and macOS, and clippy. No secrets and a read-only token. Tests
+# that need something outside the repository (the private leak denylist, a
+# real configuration, the embedding model) skip themselves when it is
+# absent, as they do on any machine without it.
+#
+# Built for wall time: compiled dependencies come from a cache that only a
+# push to main saves (a pull request, a fork's too, restores main's and
+# saves nothing), the tests run on cargo-nextest with no fail-fast so one
+# run reports every failing test, and Windows builds and runs on a Dev Drive.
 name: ci
 
 on:
@@ -28,17 +33,67 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      # Nothing is rebuilt in place, so incremental state is only cost.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Windows: the workspace (so target/) and the temporary directory on a
+      # ReFS Dev Drive, which Defender scans in performance mode; the tests
+      # write many small files and start many processes.
+      - name: Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@562171fe8df7401fdf582d766cd3b6ab80d5b1a0 # v4.1.0
+        with:
+          drive-size: 16GB
+          workspace-copy: true
+          trusted-dev-drive: true
+          env-mapping: |
+            TMP,{{ DEV_DRIVE }}/tmp
+            TEMP,{{ DEV_DRIVE }}/tmp
+      - name: Temporary directory on the Dev Drive
+        if: runner.os == 'Windows'
+        run: New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
       # rust-toolchain.toml names the toolchain; rustup installs it on the
-      # first cargo call.
+      # first cargo call (the cache's own rustc call). The cache holds the
+      # compiled registry crates only (the action removes the workspace's
+      # own crates before it saves), keyed on the job, the runner, rustc's
+      # version, Cargo.lock, the Cargo.toml files and rust-toolchain.toml.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ${{ env.DEV_DRIVE_WORKSPACE || '.' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Compiled crates only: nextest is installed fresh each run.
+          cache-bin: false
+      # A prebuilt nextest, its checksum checked; never built from source.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-nextest@0.9.118
+          fallback: none
       - name: Test
-        run: cargo test --workspace --release --locked
-        env:
-          CARGO_TERM_COLOR: always
-          CARGO_BUILD_JOBS: 4
+        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
+        # The ci profile (Cargo.toml): a debug build, no debug information,
+        # dependencies optimised. Every failure is reported, and listed
+        # again at the end of the run.
+        run: cargo nextest run --workspace --cargo-profile ci --locked --no-fail-fast --failure-output immediate-final
+      # nextest does not run doc tests.
+      - name: Doc tests
+        if: ${{ !cancelled() }}
+        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
+        run: cargo test --workspace --profile ci --locked --doc
+      # No tracked file may hold a character a reviewer cannot see
+      # (xtask/src/hidden.rs; deliberate cases in xtask/hidden-allow.txt).
+      # The xtask unit test the_tracked_tree_passes_the_gate already runs it
+      # inside Test; this step gives the finding its own line in the run.
+      # In the same profile as Test, so it reuses its graph and links only
+      # xtask.
+      - name: Context poisoning guard (hidden text)
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        run: cargo run --profile ci --locked --quiet --package xtask -- hidden
   clippy:
     # Same rule as the tests. On a pinned toolchain, so a new Rust release's
     # lints cannot fail an unrelated release: bump it in xtask/src/release.rs
@@ -50,19 +105,21 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned clippy
         run: rustup toolchain install 1.99.0 --profile minimal -c clippy
+      # As the test job's: saved from main only.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy, all targets with dev
         run: cargo +1.99.0 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings
-        env:
-          CARGO_TERM_COLOR: always
-          CARGO_BUILD_JOBS: 4
       - name: Clippy, default targets
+        if: ${{ !cancelled() }}
         run: cargo +1.99.0 clippy --workspace --locked -- -D warnings
-        env:
-          CARGO_TERM_COLOR: always
-          CARGO_BUILD_JOBS: 4

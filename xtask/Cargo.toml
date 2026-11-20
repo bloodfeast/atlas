@@ -6,8 +6,14 @@ description = "Development tasks for atlas (cargo xtask ...). Never shipped."
 license = "Apache-2.0"
 publish = false
 
+[features]
+# The SQLite backend atlas is built with (see atlas's Cargo.toml); exactly
+# one. xtask reaches SQLite only through `atlas::db`.
+default = ["rusqlite-backend"]
+rusqlite-backend = ["atlas/rusqlite-backend"]
+owned-sqlite = ["atlas/owned-sqlite"]
+
 [dependencies]
-# Only what atlas itself uses: the atlas library (with the `dev` feature
-# that `cargo xtask` builds atlas with; its JSON and SHA-256) and its SQLite.
-atlas = { path = "..", features = ["dev"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+# Only the atlas library (with the `dev` feature that `cargo xtask` builds
+# atlas with): its JSON, its SHA-256 and its SQLite binding.
+atlas = { path = "..", default-features = false, features = ["dev"] }

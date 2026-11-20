@@ -216,7 +216,7 @@ or `"off"`.
   dangling ref, nothing when all resolve. Each compaction is a `compact_log` row (`preTokens`, `postTokens`,
   summary size, refs, changed, dangling, the hook's own time). A main-session lookup (a Read, Grep, Glob or MCP
   lookup with the same target) made before the compaction and again after it is a `compact:miss` row.
-  `--token-report` ends with the totals; `atlas --compact-report --transcripts DIR` replays recorded sessions and
+  `--token-report --verbose` ends with the totals; `atlas --compact-report --transcripts DIR` replays recorded sessions and
   prints the same numbers, never transcript text. Design: `docs/design/compaction.md`.
 - **Instructions for the summary:** once the checkpoint is written, PreCompact replies with the Compact instructions
   as plain text (1,344 bytes, 336 tokens), by both `atlas --hook` and the `hook` tool; Claude Code adds that text to
@@ -228,7 +228,8 @@ or `"off"`.
   untested. On a manual `/compact` the text also lands in the conversation as `local-command-stdout`, about 340 tokens
   on each later request until the next compaction; the automatic path is unread.
 - **Checkpoint and card:** the PreCompact checkpoint is a `journal` entry of kind `checkpoint` whose body is ref
-  lines: `since` (the previous checkpoint), `lanes` (each active lane and its current step), `open` (unanswered
+  lines: `since` (the previous checkpoint), `lanes` (each active lane and its current step), `agents` (each live
+  agent: see below), `open` (unanswered
   questions), `owed` (`next` entries no commit followed), `rulings` (rules written since), then the in-task state
   read from the transcript since the last compaction: `files` touched, `tools` (the last six calls, each with its
   result's `turn:<session8>:<line>@hash` ref), `pending` (a call still running) and `intent` (the last line of
@@ -236,6 +237,43 @@ or `"off"`.
   (`src/redact.rs`: denied file names, key-shaped tokens, `.env`-style assignments, the `ATLAS_LEAK_DENYLIST`
   terms). After the compaction SessionStart injects the newest checkpoint as a card headed by its own ref, within
   `compact.card_tokens` (default 400), before the ref report.
+- **The live agents and their PRs:** the `agents` line names each agent of the session the host lists as running,
+  by its lane (`LANE/NAME` when two share a lane), with `PR #N @head7 (ready|draft)` when atlas finds its PR, each
+  part only when known. The PR is found without the agent's help, in order: the lane's newest `pr:` journal entry
+  since the launch that is the agent's own (`pr:N head:SHA`, as the text's first line or as `pr:`/`head:` meta
+  lines); else the launch's `Uses: worktree:NAME`, found in the worktree ledger, whose branch and head are read
+  from its `.git` files; a PR event atlas filed for that head; else one `gh pr list --head=BRANCH` per (repo,
+  branch), run in the worktree, all by one deadline (1.5 s, or the hook's time left if that is less; once it has
+  passed no gh is started). A PR the agent's newer entry (`pr:N merged`) or a PR event says is merged or closed
+  is not shown. The word counts as the `state:`/`verdict:` value, or as the first word after the `pr:` value
+  that is not `key:value` or a dash (`pr:N head:SHA -- merged as abc`), or as a `pr:` meta entry's first word
+  (`Merged.`), and only when it ends its clause: `pr:N head:SHA ... Not merged.` and `-- merged origin/main`
+  keep the PR. gh runs in its own process group (a job object on Windows), so a git it starts is ended with it
+  at the deadline. When a lookup fails the agent is named without a PR and a `prs:` line says why (`gh not found`,
+  `gh not logged in`, `gh over 1.5 s`, `gh skipped: hook budget spent`, `gh: no network`,
+  `worktree NAME gone`). At most six agents are named, running ones first, then `+N more`; the line comes after
+  `open`, `owed`, `rulings` and `files`, so it cannot push them out of the card's budget. The PreCompact instructions end with the same items ("Live agents now ..."), so
+  the summary can copy exact PR numbers. Six agents with PRs cost about 280 bytes on the card (about 70 tokens at 4
+  bytes a token) and about 330 bytes after the instructions; more agents add only `, +N more`. The lookup also
+  runs for the checkpoint written at a /clear (SessionEnd), so a /clear can take up to 1.5 s longer.
+- **An agent's own entries:** an entry is an agent's own when its `agent:` meta names it, or it names the agent's
+  worktree or branch (a `worktree:`/`branch:` word or meta line, or the worktree's name as a word or path part of
+  its first line; a branch only as `branch:`, since a branch such as `main` is a common word); one naming nobody
+  counts only on a lane no other agent of the session shares. A `pr:` entry is read in each form the journal
+  takes (`N`, `#N`, `repo#N`, `owner/repo#N`); one naming another repo than the agent's worktree is skipped. When
+  a later agent is launched on the same worktree, an entry tied by worktree or branch is the newest agent's
+  launched before it, and the line names that worktree once, for its newest launch.
+- **Parked agents:** an agent launched in the session that the host no longer lists stays on the `agents` line
+  only as `parked (own job running)`, and only while its own newest entry since the launch is a note whose first
+  line is `waiting: <job> (<worktree or branch>)`. Any other own entry since (a hand-back, a handoff, more work), or
+  none at all, takes it off. This is read from the journal, never from the host's task status. An agent stopped
+  mid-wait, or lost to a session restart, stays parked until an entry ties to it or its launch is 3 days old.
+  On a lane with one agent, the orchestrator's own entries count as the agent's: entries carry no session or
+  agent id to tell them apart, so a builder should name its worktree in each entry.
+- **The model's checkpoint entry:** the card's `model:` line names the session's own `checkpoint` journal entry
+  written in the segment, in lane `session:<id>`, else in a work lane (an orchestrator's own lane) when this
+  session wrote it: its transcript holds the atlas `journal` call whose result names the entry's key. Another
+  session's entries and the hook's checkpoints never count.
 - **Which lanes the card lists:** with a project active (a configuration with `projects`), the store is the
   project's own, so the card lists its lanes and rulings. With no project the store may hold every project's
   lanes, so the card keeps to the session's own lane (the previous checkpoint) plus the transcript side. An
@@ -262,6 +300,68 @@ or `"off"`.
   twice and should drop the block (`atlas settings undo`, or delete it by hand).
 - **Token ledger:** every hook answer is a `token_log` row (`hook:<event>`), empty ones included, with the
   counterfactual of reading the injected records without atlas.
+
+## Context poisoning guard
+
+Atlas returns text other people and other sessions wrote: records, vault notes, source lines. Some of it can hide
+text from the person who reviews it while the model that reads it still sees it: hidden-text injection, a way to
+poison a session's context. The context poisoning guard removes that hidden channel
+(`src/hidden.rs`):
+
+- **Invisible characters are removed on the way out.** One table (`atlas::hidden::HIDDEN_RANGES`: Unicode
+  `Default_Ignorable_Code_Point` less the sixteen basic variation selectors emoji use, plus the interlinear
+  annotation controls, tested against the committed Unicode 15.1.0 `DerivedCoreProperties.txt`) names them: bidi
+  overrides and isolates, zero-width spaces, word joiners, tag characters, Hangul fillers, the combining grapheme
+  joiner, Mongolian and supplementary variation selectors, and the unassigned tag plane. A carriage return before a
+  line feed is dropped, and every other control character (a terminal escape, a bell, a lone carriage return) is
+  written visibly, as `\u{1b}`. A keyword split by zero-width characters therefore reads whole, a tag-character
+  message vanishes, and an escape does nothing.
+- **Real text keeps what it needs.** A lone zero-width joiner or non-joiner between two non-ASCII characters (emoji
+  sequences, Persian, Indic conjuncts), a lone bidi mark (LRM, RLM, ALM), the three RGI subdivision flags (England,
+  Scotland, Wales) and the visible Arabic marks stay. A basic variation selector (VS1 to VS16) stays only straight
+  after the visible character it selects a glyph for, and only when the pair is a variation sequence Unicode 15.1.0
+  defines (`atlas::hidden::VARIATION_PAIRS`: the 1974 pairs in the committed `StandardizedVariants.txt` and
+  `emoji-variation-sequences.txt`, so CJK compatibility forms, math variants and emoji text or emoji style); after
+  an ASCII base only VS15 or VS16 after a digit, `#` or `*` (keycaps), and never after another selector, a joiner
+  or an invisible character, so a joiner never keeps a selector on its right. Every other tag sequence goes (an unknown subdivision draws as the plain black flag
+  either way). A run of two or more invisible characters or selectors never stays, since a run can encode bytes.
+- **Visible text is left exactly as written.** Nothing is wrapped, labelled or rewritten: `Option<SystemTime>`, a
+  `<details>` block and any tag reach the session byte for byte, and JSON answers are bare JSON.
+- **What is scrubbed.** Every tool answer (text or JSON, a repeat read's changed-lines delta, the help), every tool
+  error (the refused-store server's included), the `initialize` instructions, the protocol's echo of an unknown
+  tool, method or resource, every hook's `additionalContext` (records, the compact checkpoint card, task-notification replies, notices),
+  its `systemMessage` and its block and deny reasons, and the store-refusal notice. A size cap (the subagent block,
+  the prompt's record budget) is measured on the scrubbed text, so shown escapes cannot push it past Claude Code's
+  10,000-character cut.
+- **What is left as the tool gave it.** `updatedToolOutput`, the Bash, Read and Grep output a hook rewrites:
+  removing characters from a file view would make an exact `Edit` match fail. On a Grep that output also carries
+  atlas's code-index notes (symbol names from the files the match lines are in), unscrubbed too; they come from
+  the same checkout the model can read whole. The PreCompact summary instructions are atlas's
+  own constant text.
+- **Nothing on disk changes.** The scrub is on the read side: a record, a note and a file keep their bytes, so the
+  integrity check, the exports and the history are as written. A write (`journal`, `remember`, `handoff`, a note
+  edit) whose text held characters the scrub would remove or show says so in its reply, with the count.
+- **The tree is checked.** `cargo xtask hidden` fails on any character the scrub would remove or show, on a
+  lone carriage return, on bytes that are not UTF-8 in a text file, and, in code (`.rs`, `.yml`, `.toml`, `.sh`,
+  `.json` and the like), on any invisible character at all and on a token that mixes Latin with Cyrillic or Greek
+  letters; it names `path:line:column` and the code point. It runs after the tests in the public CI's `test` job,
+  as an xtask unit test in every local `cargo test`, in the release pull request beside the leak and secret gates,
+  in `cargo xtask release check`, and on the exported tree in `cargo xtask release`. Deliberate cases are listed in
+  `xtask/hidden-allow.txt`, one `path:LINES:U+XXXX reason` per line naming the exact lines; a listed line that no
+  longer holds the character fails the gate, and an invisible character in code is never listed.
+
+What it does not do: anything about visible text. A planted sentence in plain view ("ignore previous instructions")
+reaches the session as written, and is out of scope for now: plain filtering cannot tell it apart from a user's own
+correction ("stop doing that"), so it is left for the user to catch. Look-alike letters in prose (outside code) are
+left alone too. What stays is one choice per place, never a run: a lone bidi mark beside ASCII, or a lone joiner
+between two non-ASCII letters, still lets a gap carry a bit or so (mark, other mark, nothing), and a kept selector
+picks one of the at most three its base defines (one bit on most of the 1450 bases that have any, nothing on any
+other character); no model decodes that without a visible instruction to, which is the visible-text case above.
+Variant forms outside VS1 to VS16 are lost: the ideographic variation selectors (U+E0100 to U+E01EF) and the
+Mongolian free variation selectors (U+180B to U+180D, U+180F) go wherever they stand, so a Japanese name written
+with an ideographic variation sequence and Mongolian text that picks a positional form show their default glyphs
+in atlas's output (the characters themselves stay). The update notice's highlights and the leak check drop every format character (Unicode `Cf`,
+`atlas::hidden::is_format_char`, tested against the committed `UnicodeData.txt`).
 
 ## Rulings and log entries
 

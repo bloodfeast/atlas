@@ -863,7 +863,13 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
             if !has_code {
                 let cname = unique(&format!("{}-code", r.name), &taken);
                 taken.insert(cname.clone());
-                e.code.get_or_insert_with(CodeSpec::default).roots.push(CodeRootSpec { name: cname, root: path.clone(), build_scripts: false, scip: Default::default() });
+                e.code.get_or_insert_with(CodeSpec::default).roots.push(CodeRootSpec {
+                    name: cname,
+                    root: path.clone(),
+                    build_scripts: false,
+                    scip: Default::default(),
+                    exclude: Vec::new(),
+                });
             }
         }
         let has_export = |m: &MemorySpec, n: &str| m.exports.iter().any(|x| x.name == n);

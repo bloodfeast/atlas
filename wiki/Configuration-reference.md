@@ -2,6 +2,21 @@ One JSON file, `atlas.json`, read by hand with every key checked (a misspelt key
 ones). Relative paths are taken from the file's folder. Where the file lives is on [[Install and setup]];
 per-project settings are on [[Projects and multi-repo]].
 
+## Minimal configuration
+
+```json
+{
+  "vaults": [{"name": "notes", "path": "../Notes"}],
+  "sources": [{"name": "docs", "root": "../my-project", "include": ["**/*.md"], "exclude": ["target/**"]}],
+  "code": {"roots": [{"name": "app", "root": "../my-project"}]}
+}
+```
+
+Vaults are folders atlas may add to; sources are folders it only indexes; code roots feed `symbol`. After an
+edit, run `/mcp` and reconnect atlas, or restart Claude Code.
+
+## A full example
+
 ```json
 {
   "db": "state/atlas.sqlite",
@@ -74,6 +89,7 @@ See [[Code index]].
 | `code.roots[].name` | the root's short name |
 | `code.roots[].root` | a Cargo workspace or package for Rust; any folder for WGSL and Protocol Buffers |
 | `code.roots[].build_scripts` | let rust-analyzer run this root's build scripts and proc macros (default false: nothing is compiled) |
+| `code.roots[].exclude` | globs, relative to the root with `/` separators, of folders and files the code index leaves out (default none). A glob without `/` names a folder or file anywhere below the root (`OctoPrint-Slow`), one with `/` a path from the root (`plugins/slow`, `**/generated`); matching ignores case, and a leading `./` or trailing `/` is dropped. Nothing below a match is walked, so a package there is no unit of its own: its indexer (scip-python, scip-typescript and the others) never runs and nothing in it is scanned. An indexer whose unit or workspace holds the folder still reads it (rust-analyzer over a Cargo workspace, or a unit whose project file sits above it); the rows it gives for excluded files are dropped. Example: `["OctoPrint-Slow", "tools/gen"]` |
 | `code.roots[].scip` | prebuilt SCIP indexes for this root's units, written elsewhere (CI, WSL, Docker): `true` or absent reads an `index.scip` in a unit's folder; `false` reads none; a path is the file for the root's own folder; an object maps a unit folder (below the root, `"."` for the root) to a path, or to `false` to read none there, other folders following the `index.scip` convention. Paths are relative to this file. A source file newer than the prebuilt file is scanned instead (see [[Code index]]). Example: `{"services/api": "ci/api.scip", "tools": false}` |
 | `code.rust_analyzer` | the rust-analyzer binary (default: `rust-analyzer` on `PATH`, else a rustup toolchain's `bin`; each must answer `--version`) |
 | `code.indexers` | the SCIP indexers of the other languages (scip-go, scip-typescript, scip-dotnet, scip-python): `false` runs none (every unit is scanned), `true` or absent finds each one (see [[Code index]]), or an object from indexer name to a path, which runs that binary (for scip-typescript and scip-python also its npm package folder or its `.js` script, run with `node`; a path given for scip-python is run on Windows too, so a wrapper script that runs it in WSL or Docker works), or to `false`, which turns that one off; an indexer not named is found as usual. Example: `{"scip-go": "/opt/go/bin/scip-go", "scip-typescript": false}` |
@@ -193,12 +209,12 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `recall.cos_alone` | a cosine at or above this passes on meaning alone |
 | `recall.query_tokens` | the prompt tokens the cosine is taken over (default 32) |
 | `recall.inject_floor` | the cosine below which a hook injects a record not at all (records without a vector are not held to it). Default 0.60: on 14 days of hook data it dropped 3,480 pointer rows (about 37k tokens a week) for 8.3% of the hits, with the memory eval and its hook replay unchanged (61/70 informed, 52/70 strict); 0.66 lost 2 informed and 1 strict replay answers. 0 holds no record to it. Tuned on hit data by `atlas --hook-report --tune-floor 1`, which never goes below the active floor (the hook logs nothing below it) |
-| `recall.session_budget_tokens` | the tokens one session's (or one subagent's) recall injections may use in all, lanes and pointers together; past it the hooks inject nothing more, and `recall {query}` still answers. 0 (the default) is no cap. Judge it against the `hook injections` block of `--token-report`, which gives a main session's injections per prompt and a subagent's per agent, and the measured "brief without atlas" beside it |
+| `recall.session_budget_tokens` | the tokens one session's (or one subagent's) recall injections may use in all, lanes and pointers together; past it the hooks inject nothing more, and `recall {query}` still answers. 0 (the default) is no cap. Judge it against the `hook injections` block of `--token-report --verbose`, which gives a main session's injections per prompt and a subagent's per agent, and the measured "brief without atlas" beside it |
 | `recall.prompt_pointers` | the most pointers one main-session prompt gets (2); the rest are counted in the `+N more` line, and a subagent's brief is not capped. 0 is no cap. On the 70 hook questions of the memory eval, 2 against no cap cost 2 informed passes and 1 strict at floor 0 for 22% fewer injected tokens |
 | `recall.subagent_context` | what a subagent is given at its start: `"recall"` (the default, today's lane views and pointers), `"binding"` (only the Binding block: the keys its brief names, key and title, and the lane its brief declares by a `Lane:` line or an exact upper-case id after "lane", with each other lane a named key is filed in, matched to the agent by its launch's tool use id, no lane view and no pointers, the whole answer at most 9,000 characters) or `"off"` (nothing from the store; orchestration lines stay). The AB-2 toggle of the brief-only design |
 | `recall.main_lane_bytes` | the bytes the one lane view a main-session prompt gets may take: the prompt's `Lane:` lane, else the first lane it names; every other named lane is a one-line head. 0 (the default) is no cap: every named lane's view, each up to `recall.lane_budget_tokens` |
 | `recall.pointer_anchors` | whether each `recall {query}` pointer ends with `@src:path:line`, the vault or source, file and line its record's text starts at, so a follow-up can `read_note {vault: src, path, lines}` instead of `recall {key}` (default off; see the anchors rows of `cargo xtask memory-eval`) |
-| `recall.select` | context selection of what the hooks inject (on by default): near-duplicates sent as refs, pointers and older lane entries trimmed to the clauses that match the prompt, each excerpt the record's own text. Measured by the hook rows of `cargo xtask memory-eval` (each floor with selection off, then on) and the `context selection` line of `--token-report` |
+| `recall.select` | context selection of what the hooks inject (on by default): near-duplicates sent as refs, pointers and older lane entries trimmed to the clauses that match the prompt, each excerpt the record's own text. Measured by the hook rows of `cargo xtask memory-eval` (each floor with selection off, then on) and the `context selection` line of `--token-report --verbose` |
 | `recall.select.enabled` | `false` sends every pointer and lane entry whole, as before (the gate and budgets still apply) |
 | `recall.select.dup_cos` | the cosine between two records' vectors at which one may be sent as `- KEY: near-duplicate of OTHER` (default 0.82; without the embedding model nothing collapses) |
 | `recall.select.dup_overlap` | the share of a record's distinct words the record sent before it must hold for it to collapse (default 0.90). One way, so a record that adds something (a memory saying a rule was reversed) is never hidden behind the ref |
@@ -210,6 +226,8 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `cap.warn_every` | the warning repeats after this many more tokens (default 25,000) |
 | `cap.main_session` | tell the main session to ask the user for /compact (or /clear) past its compact point; advice only, never blocked (default true) |
 | `cap.main_warn_tokens` | the main session's compact point: from this many context tokens it is told to ask the user for /compact while `cap.main_session` is on (default 0: `cap.warn_tokens`) |
+| `hooks` | the hooks' own settings |
+| `hooks.budget_ms` | the time budget of every hook event, in milliseconds, counted from when the event arrived (default 3,000; at least 1; at most 10,000, Claude Code's shortest hook timeout in the shipped hooks). A hook works in phases (for a prompt: session, recall, ideas, main_context, restart_warn, drift; for a session start: the clear card, resume card, restart offer and compaction card) and starts none once the budget is spent: it answers with what it has and one line, `atlas: hook time budget (N ms) spent; skipped: ...`, and exits 0. A wait on another writer's lock of the memory store ends at the budget too. A resident server answers a hook still running 250 ms past its budget itself (a hook waiting behind a slow one included) and drops the late answer; `atlas --hook` does the same and exits. That answer is the line alone for UserPromptSubmit, SessionStart and SubagentStart; for a gate that can refuse the call it is a refusal, `atlas: gate check did not finish within its budget; refused, retry the call` (it fails closed: a PreToolUse of a subagent's tool other than the handoff, of an `Agent`/`Task` launch, of a `SendMessage`, or of a shell command with a `gh pr merge`); for any other event it is empty and the call passes through. The merge gate's `gh pr view` waits at most the budget left. Work after an answer waits 50 ms at most on another writer's lock, and what the lock refused (a session start, a filed idea) is retried after a later answer. `ATLAS_HOOK_TIMINGS=1` prints each hook's phases and milliseconds on stderr; `ATLAS_HOOK_BUDGET_OFF=1` turns the budget off, for measuring without it; it turns off the fail-closed refusal too, so a gate that runs past Claude Code's own timeout is not refused by atlas (every gate still runs to the end and refuses on its own checks) |
 | `orchestrate` | orchestrator mode: caps on how many agents of each kind run at once, and per-kind context limits (see [[Orchestration]], the `orchestrate` skill and `docs/design/orchestrate.md`) |
 | `orchestrate.enabled` | turn the agent caps on (default false). Context limits apply without it. `atlas --setup` and `atlas settings orchestrate` ask for it and store the answers |
 | `orchestrate.window` | the context window the limits scale to (default 0: 200,000 when `CLAUDE_CODE_DISABLE_1M_CONTEXT` is set, else 1,000,000; `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is where Claude Code compacts, never read as the window) |
@@ -221,7 +239,7 @@ and `atlas --hook-report --tune-floor`, never by hand.
 | `orchestrate.aging_minutes` | minutes a queued item waits before it rises one priority class (default 60; 0 turns aging off) |
 | `orchestrate.bare_gpu_words` | the bare words capture, screenshot, bench, benchmark and bake in a brief infer the gpu (default false). A project file (`atlas.project.json`) may set it for its project, and sets no other `orchestrate` key |
 | `orchestrate.worktree_roots` | folders, made absolute against the configuration's folder, that a `Uses: worktree:NAME` resolves under for the worktree ownership ledger (`atlas worktrees`). Unset: every linked worktree that `git worktree list` gives for the project's repositories. A name that matches no worktree, or more than one, writes no row. A user configuration key: a project file does not set it |
-| `orchestrate.runq_root` | runq's state folder, read for the restart point's runq holders (#221). The `RUNQ_ROOT` environment variable comes first (as runq itself reads it), then this key (made absolute against the configuration's folder), then runq's Windows default `Z:/scratch/gpulock/state`; on Linux and macOS with neither set, no holders are read. Only holders under the server's own Claude Code process are recorded; with that process unknown, none are |
+| `orchestrate.runq_root` | Optional: runq's state folder, read for the restart point's runq holders (#221). The `RUNQ_ROOT` environment variable comes first (as runq itself reads it), then this key (made absolute against the configuration's folder); with neither set, no holders are read and no folder is assumed. Only holders under the server's own Claude Code process are recorded; with that process unknown, none are |
 | `orchestrate.reviews` | the required-reviews merge gate: a `gh pr merge` in a shell command needs a passing review of the PR's head from each role (see `docs/design/reviews.md`) |
 | `orchestrate.reviews.roles` | the review roles every PR needs, named by job, e.g. `["simplicity", "cost"]` (default none: the gate is off) |
 | `orchestrate.reviews.mode` | `enforced` denies the merge, `advisory` adds a warning, `off` does nothing (default `advisory`) |
@@ -287,6 +305,22 @@ proposes only and never changes the queue's order. The section is optional; ever
 | `backlog.stop` | ID-shaped words that are never work |
 | `backlog.asker` | the name that leads a line in the user's own words (`- 2026-11-04 Name:` or `Name 2026-11-10:`); only such lines (and ideas) count as asks. Default none: no lead counts, so set it to your own name to rank asks |
 
+## Worktree gc (`worktrees`)
+
+`atlas worktrees gc` lists the stale worktrees of the ownership ledger with what it would remove and the sizes;
+`--apply` carries it out. A worktree that holds any work is never removed (see [[Orchestration]], Worktree gc). A
+user configuration key: a project file does not set it. Older builds refuse the unknown key.
+
+| Key | Meaning |
+|---|---|
+| `worktrees` | the section, optional |
+| `worktrees.auto_gc` | gc acts by itself (default false): from the hook, at most once an hour (SessionStart, SubagentStop) and at once after a merged PR event note, a detached `atlas worktrees gc --auto` that the hook never waits on. Off, that run only measures, and session start says one line when the stale space reaches `notify_gb` |
+| `worktrees.dirty` | what a stale worktree that holds work gets: `report` (default; left alone and listed with the kind of work), `remove_target` (only its build output is deleted: the linked `target_dirs` folder and an ignored in-tree `target/`), or `commit_delete` (every change committed as a WIP commit on its branch, untracked files that are not ignored included, pushed without force, the remote ref read back and compared with HEAD, then removed; any failure leaves everything and is reported, with any `index.lock` a failed call left (never deleted); the writing git calls get 300 s; work a commit cannot save, such as a lock, a stash, a rebase under way or an ignored file outside the build folders, is only reported, and so is a tree with an untracked file over 10 MB, with a denied name such as `.env`, or holding a line the redaction rules or the leak denylist flag). `remove_target` skips a locked worktree |
+| `worktrees.disposable` | globs of ignored paths in a worktree that are not work (default `["target/"]`). Each is matched from the worktree's top: `*` and `?` stay inside one folder name, `**` is any number of folders, and a trailing `/` matches folders only. So `target/` is the top-level build folder (not `crates/x/target/`), `*.cache` a file or folder at the top, and `**/__pycache__/` that folder at any depth; e.g. `["target/", "*.cache", "**/__pycache__/"]`. It applies to ignored paths only: an untracked file is always work, and so is a secret (`.env`, `.env.*`, keys and the other denied names) whatever glob covers it. git lists an ignored folder whole, so before a worktree is removed its whole tree is walked (no link or junction followed, stopping at the first hit; at the plan for a tree gc would delete, and again just before the delete): a matched folder that holds a secret (`.envrc` included) or a checkout (`.git`, `.hg`, `.jj`, `.svn`, a bare repository) at any depth, or cannot be read, keeps the tree. Absolute globs, `..`, backslashes and globs made only of `*`, `?` and `/` (such as `**`, `?*` or `**/?*`) are refused. List only caches: an ignored file it leaves out (captures, notes) keeps the worktree |
+| `worktrees.notify_gb` | the session-start line's threshold with `auto_gc` off, in GB (default 10); that hourly run removes nothing and makes no quiet-period or guard walk: it only sums the sizes of the trees it would remove, up to the threshold. The sum is an upper bound, since a tree the removal would refuse (a secret or a checkout in a build folder) is still counted |
+| `worktrees.quiet_minutes` | the quiet period, in minutes (default 120): a worktree whose files, linked build folders, git folder or ledger row changed within it is in use and never stale. Build output is looked at two folders deep (`target/debug/deps` itself, not its files), and the walk stops at the first newer file; files are walked last, only for a worktree gc would touch. It covers a main session working in a worktree and a ledger row whose lane is unknown |
+| `worktrees.target_dirs` | build folders outside the tree that belong to a worktree, each holding `{name}` (the worktree's folder name), made absolute against the configuration's folder, e.g. `["D:/targets/{name}"]`. One is deleted with its worktree, never when another ledger worktree links the same folder, and never when it holds a checkout or a secret at any depth (a clone or `git init` anywhere inside it; the walk follows no link or junction and runs at plan and again just before the delete), lies inside any git checkout (configured or not) unless it carries a `CACHEDIR.TAG` with the generic Cache Directory Tagging signature (cargo writes one) and that repository tracks nothing in it, or is, holds or lies in a checkout (refused and reported). So an untagged folder, or one with a tracked file, under a parent folder that is itself a git repository is refused; a tagged, untracked one there is deleted like any other. Ignored files inside one are build output, not work, but a folder that lies inside its own worktree is walked with the tree (a checkout or a secret in it keeps the tree). A folder without `{name}` is refused |
+
 ## PR events (`pr_events`)
 
 `atlas pr-events serve [--port N] [--lane LANE]` listens on `127.0.0.1` only for the deliveries `gh webhook forward`
@@ -303,6 +337,32 @@ Older builds refuse the unknown key, so add it only once a build with it is inst
 | `pr_events` | the section, optional |
 | `pr_events.port` | the port to listen on (1 to 65535; no default) |
 | `pr_events.lane` | the lane for an event no item waits on (default `pr-events`) |
+
+## Project tracking: Jira and Confluence (`project_tracking`)
+
+`atlas track` reads Jira and Confluence over REST, read-only, with a credential from environment variables the
+section names; atlas never holds the credential. Setup, token scopes, commands and how the token is kept:
+[[Project tracking]]. Older builds refuse the unknown key, so add it only once a build with it is installed.
+
+| Key | Meaning |
+|---|---|
+| `project_tracking` | the section, optional |
+| `project_tracking.atlassian` | the Atlassian site, optional |
+| `project_tracking.atlassian.site` | the site, `https://example.atlassian.net` (Data Center: Jira's URL); required |
+| `project_tracking.atlassian.confluence_site` | Confluence's own URL (default `<site>/wiki` on Cloud, `site` on Data Center) |
+| `project_tracking.atlassian.email_env` | Cloud: the variable holding the account email |
+| `project_tracking.atlassian.token_env` | Cloud: the variable holding the API token |
+| `project_tracking.atlassian.confluence_token_env` | Cloud: the variable holding Confluence's own API token, for a scoped token per product (default: `token_env`'s) |
+| `project_tracking.atlassian.confluence_email_env` | Cloud: the variable holding the email for `confluence_token_env` (default: `email_env`'s); only with `confluence_token_env` |
+| `project_tracking.atlassian.pat_env` | Data Center or Server: the variable holding a personal access token (bearer); not with `email_env` and `token_env` |
+| `project_tracking.atlassian.timeout_s` | seconds one request may take (default 30) |
+| `project_tracking.atlassian.min_interval_ms` | the least time between two requests to the site (default 200) |
+| `project_tracking.atlassian.max_retries` | retries after a 429 or a 5xx (default 3) |
+| `project_tracking.atlassian.max_wait_s` | the longest wait for one retry; a longer `Retry-After` is capped (default 60) |
+| `project_tracking.atlassian.backoff_ms` | the first backoff without a `Retry-After`, doubled per try (default 500) |
+
+A variable name is upper case letters, digits and `_`, at most 64 characters; anything else (a pasted token) is
+refused without being repeated.
 
 ## Routing, handles and records (`lean`)
 
@@ -379,3 +439,12 @@ See [[Projects and multi-repo]] for the whole shape.
 | `vaults` | vaults for this project |
 | `sources` | sources for this project |
 | `ids` | identifier patterns for this project |
+
+## Sessions with no user (`ATLAS_UNATTENDED`)
+
+An environment variable, not a key of `atlas.json`. It tells atlas's hooks whether a user is there to answer, for a
+client that is not Claude Code (a wrapper or an SDK harness), which sets neither of Claude Code's own variables.
+
+| Variable | Meaning |
+|---|---|
+| `ATLAS_UNATTENDED` | `1`: no user is there, so no SessionStart offer is asked (the Claude Code settings, orchestrated mode, adding the folder or its repositories as a project, the unmapped-folder notice, the restart point and the update notice); `0`: a user is there. It covers every offer atlas makes now and any added later, since all of them read the one flag it sets. Surrounding spaces are ignored, so cmd's `set ATLAS_UNATTENDED=1 && client` works. Empty or unset leaves the decision to Claude Code; any other value is ignored, with one stderr line naming it at SessionStart. Precedence: `ATLAS_UNATTENDED`, then `CLAUDE_CODE_SESSION_ATTENDED` (`1` attended, `0` not), then `CLAUDE_CODE_ENTRYPOINT` (`sdk-cli`, `sdk-ts` and `sdk-py` are unattended); with none of them set, a user is assumed |

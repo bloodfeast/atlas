@@ -95,6 +95,12 @@ pub struct CodeRootSpec {
     /// or `false`, other folders following the convention. Paths are
     /// relative to the configuration file.
     pub scip: crate::code::Prebuilt,
+    /// Globs, relative to the root, of folders and files the code index
+    /// leaves out ([`crate::code::excluded`]): the walk never enters them,
+    /// so no unit of their own is indexed and nothing there is scanned. An
+    /// indexer whose unit or workspace holds them (rust-analyzer, a unit
+    /// folder above them) still reads them; its rows for them are dropped.
+    pub exclude: Vec<String>,
 }
 
 /// `code.indexers` as an object: each named indexer's path, or `None` when
@@ -405,6 +411,14 @@ pub struct SelectSpec {
     pub lane_chars: Option<usize>,
 }
 
+/// The hooks' settings.
+#[derive(Debug, Clone, Default)]
+pub struct HooksSpec {
+    /// Every hook event answers within this many milliseconds (default
+    /// 3000, at most 10000; see [`crate::hook_budget`]).
+    pub budget_ms: Option<u64>,
+}
+
 /// The context-cap hook's settings.
 #[derive(Debug, Clone, Default)]
 pub struct CapSpec {
@@ -493,6 +507,8 @@ pub struct Config {
     pub recall: Option<RecallSpec>,
     /// The context-cap hook.
     pub cap: Option<CapSpec>,
+    /// The hooks' time budget (`hooks.budget_ms`).
+    pub hooks: Option<HooksSpec>,
     /// Compaction: the checkpoint card and `compact.defer`.
     pub compact: Option<CompactSpec>,
     /// Orchestrator mode: agent caps and per-kind context limits (see
@@ -504,6 +520,8 @@ pub struct Config {
     pub update: Option<UpdateSpec>,
     /// The self-calibration (`calibrate`).
     pub calibrate: Option<CalibrateSpec>,
+    /// Worktree gc (`worktrees`).
+    pub worktrees: Option<crate::worktree_gc::WorktreesSpec>,
     /// The `lean` section, passed through unparsed: each package reads its
     /// own subsection (`handles`, `digests`, `routing`; `setup`, `startup`).
     pub lean: Option<Value>,
@@ -513,6 +531,10 @@ pub struct Config {
     /// The `pr_events` section, passed through unparsed: `atlas pr-events
     /// serve` reads its port and lane (see [`crate::pr_listen::Settings`]).
     pub pr_events: Option<Value>,
+    /// The `project_tracking` section (`project_tracking.atlassian`), checked at load and
+    /// kept as written: it names environment variables, never a credential
+    /// (see [`crate::trackers::Settings`]).
+    pub trackers: Option<Value>,
     /// The projects, the user-level layer and the checkout map (see
     /// [`crate::project`]). Empty in a configuration without `projects`:
     /// the whole file is then one implicit project, as before projects.
@@ -522,7 +544,7 @@ pub struct Config {
 /// The keys of the configuration file's top level that are not about
 /// projects.
 pub const TOP_KEYS: &[&str] =
-    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "compact", "orchestrate", "models", "update", "lean", "calibrate", "backlog", "pr_events"];
+    &["db", "vaults", "sources", "ids", "wikilinks", "vault_id_keys", "refresh_limit", "watch", "rescan_interval_s", "bytes_per_token", "code", "semantic", "memory", "recall", "cap", "hooks", "compact", "orchestrate", "models", "update", "lean", "calibrate", "backlog", "pr_events", "project_tracking", "worktrees"];
 
 pub(crate) fn absolute(base: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -751,6 +773,27 @@ fn parse_orchestrate(v: &Value, base: &Path) -> Result<crate::orchestrate::Orche
     Ok(o)
 }
 
+/// Reads a code root's `exclude`: globs relative to the root, with `/`
+/// separators (none absolute, none with `..`). A leading `./` and a
+/// trailing `/` are dropped, so `./tools/gen/` is `tools/gen`.
+fn code_excludes(f: &Fields<'_>) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for raw in f.strings("exclude")?.unwrap_or_default() {
+        let g = raw.strip_prefix("./").unwrap_or(&raw).trim_end_matches('/');
+        let bad = g.is_empty()
+            || g != g.trim()
+            || g.starts_with('/')
+            || g.contains(':')
+            || g.contains('\\')
+            || g.split('/').any(|p| p.is_empty() || p == "..");
+        if bad {
+            return Err(f.bad("exclude", &format!("a list of globs relative to the root with / separators (not {raw:?})")));
+        }
+        out.push(g.to_string());
+    }
+    Ok(out)
+}
+
 /// Reads a code root's `scip`: `true` or absent (the convention), `false`
 /// (none), a path (the root folder's file), or an object from unit folder
 /// to a path or `false`.
@@ -924,12 +967,13 @@ impl Config {
                 ..CodeSpec::default()
             };
             for (i, x) in f.list("roots")?.iter().enumerate() {
-                let r = Fields::new(&format!("{pre}code.roots[{i}]"), x, &["name", "root", "build_scripts", "scip"])?;
+                let r = Fields::new(&format!("{pre}code.roots[{i}]"), x, &["name", "root", "build_scripts", "scip", "exclude"])?;
                 code.roots.push(CodeRootSpec {
                     name: r.req_string("name")?,
                     root: absolute(base, Path::new(&r.req_string("root")?)),
                     build_scripts: r.boolean("build_scripts")?.unwrap_or(false),
                     scip: prebuilt_spec(&r, &format!("code.roots[{i}].scip"), base)?,
+                    exclude: code_excludes(&r)?,
                 });
             }
             c.code = Some(code);
@@ -994,6 +1038,46 @@ impl Config {
                 }
             }
             c.update = Some(UpdateSpec { enabled: f.boolean("enabled")?, pin, url, notify: f.boolean("notify")? });
+        }
+        if let Some(wv) = top.get("worktrees") {
+            let f = Fields::new("worktrees", wv, &["auto_gc", "dirty", "notify_gb", "target_dirs", "quiet_minutes", "disposable"])?;
+            let dirty = match f.string("dirty")? {
+                None => None,
+                Some(d) => Some(crate::worktree_gc::Dirty::parse(&d).ok_or_else(|| f.bad("dirty", "report, remove_target or commit_delete"))?),
+            };
+            let mut target_dirs = Vec::new();
+            for t in f.strings("target_dirs")?.unwrap_or_default() {
+                if !t.contains("{name}") {
+                    return Err(f.bad("target_dirs", "folders that each hold {name}, the worktree's folder name"));
+                }
+                target_dirs.push(absolute(base, Path::new(&t)).to_string_lossy().into_owned());
+            }
+            c.worktrees = Some(crate::worktree_gc::WorktreesSpec {
+                auto_gc: f.boolean("auto_gc")?,
+                dirty,
+                notify_gb: f.uint("notify_gb")?.map(|n| n as u64),
+                target_dirs,
+                quiet_minutes: f.uint("quiet_minutes")?.map(|n| n as u64),
+                disposable: match f.strings("disposable")? {
+                    None => None,
+                    Some(globs) => {
+                        // Relative globs that name something: never every path.
+                        let bad = |g: &String| {
+                            let t = g.trim_end_matches('/');
+                            t.is_empty()
+                                || g.starts_with('/')
+                                || g.contains('\\')
+                                || g.split('/').any(|s| s == "..")
+                                || t.split('/').all(|s| s.chars().all(|c| c == '*' || c == '?'))
+                        };
+                        let want = "globs relative to a worktree's top, such as \"target/\" or \"**/__pycache__/\"";
+                        if globs.iter().any(bad) {
+                            return Err(f.bad("disposable", want));
+                        }
+                        Some(globs)
+                    }
+                },
+            });
         }
         if let Some(cv) = top.get("calibrate") {
             let f = Fields::new("calibrate", cv, &["auto", "skip", "handoff"])?;
@@ -1130,6 +1214,15 @@ impl Config {
                 main_warn_tokens: f.uint("main_warn_tokens")?,
             });
         }
+        if let Some(hv) = top.get("hooks") {
+            let f = Fields::new("hooks", hv, &["budget_ms"])?;
+            let budget_ms = f.uint("budget_ms")?.map(|n| n as u64);
+            // 0 would skip every phase of every hook (review N3 of #329).
+            if budget_ms == Some(0) {
+                return Err(Error::InvalidArgument("hooks.budget_ms must be at least 1 (milliseconds)".into()));
+            }
+            c.hooks = Some(HooksSpec { budget_ms });
+        }
         if let Some(cv) = top.get("compact") {
             let f = Fields::new("compact", cv, &["enabled", "defer", "window", "card_tokens", "checkpoint_prompt", "checkpoint_margin", "clear_floor", "model_windows"])?;
             let model_windows = match f.get("model_windows") {
@@ -1176,6 +1269,10 @@ impl Config {
         if let Some(pv) = top.get("pr_events") {
             crate::pr_listen::Settings::from_config(Some(pv)).map_err(Error::InvalidArgument)?;
             c.pr_events = Some(pv.clone());
+        }
+        if let Some(tv) = top.get("project_tracking") {
+            crate::trackers::Settings::from_config(Some(tv)).map_err(Error::InvalidArgument)?;
+            c.trackers = Some(tv.clone());
         }
         let mut names: Vec<&str> = c
             .vaults

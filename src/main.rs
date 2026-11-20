@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH]
-//!       [--rescan | --recall-check [--phrase TEXT ...] | --token-report [--tsv | --repeats [--since TIME]] [--transcripts DIR] | --calibrate [--audit FILE]
+//!       [--rescan | --recall-check [--phrase TEXT ...] | --token-report [--verbose | --tsv | --repeats [--since TIME]] [--transcripts DIR] | --calibrate [--audit FILE]
 //!        | --hook-report [--transcripts DIR] [--since TIME] [--rows]
 //!        | --code-index [NAME ...] [--scip FILE] | --version]
 //! ```
@@ -46,17 +46,20 @@
 //!   `--symbol-bench FILE [--runs N]` and `--recall-scores FILE [--runs N]`
 //!   print the semantic search, code index and recall gate measurements
 //!   (see `measure.rs`), and `--bench [RUNS] [--queries FILE] [--before EXE
-//!   CONFIG]` the timings.
+//!   CONFIG] [--cold-runs N]` the timings.
 //! * `atlas digest [--as SHAPE] FILE` prints the digest of a saved output
 //!   (a check log: its totals tables, failures, panics and verdicts only);
 //!   `atlas crop IN OUT ...` cuts frames or a region out of a picture strip
 //!   into a small PNG (see [`atlas::crop`]). Neither reads a configuration.
-//! * `--token-report` prints the token ledger's totals by tool and by day:
-//!   tokens returned, the counterfactual, and their ratio (see
-//!   [`atlas::tokens`]), headed by the measured ratio and the ledger ratio,
-//!   with the brief-without-atlas and hook-injection lines at the end (see
-//!   [`atlas::token_report`]); `--tsv` prints the same as tab-separated
-//!   lines, the format scripts read.
+//! * `--token-report` prints the token ledger in about 15 lines: the
+//!   measured ratio, credit, cost and net, the savings by source and the
+//!   last 7 days (see [`atlas::token_report::summary`]). With `--verbose` it
+//!   prints the full report: the totals by tool and by day, tokens returned,
+//!   the counterfactual, and their ratio (see [`atlas::tokens`]), headed by
+//!   the measured ratio and the ledger ratio, with the brief-without-atlas
+//!   and hook-injection lines at the end (see [`atlas::token_report`]);
+//!   `--tsv` prints the full report as tab-separated lines, the format
+//!   scripts read.
 //!   With `--repeats [--since TIME]` it lists instead the 20 targets looked
 //!   up again after a compaction most (see [`atlas::compact::repeats`]).
 //! * `--calibrate [--audit FILE]` measures the pre-atlas baseline the
@@ -92,10 +95,10 @@ mod bench;
 mod measure;
 
 #[cfg(not(feature = "dev"))]
-const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --token-report [--tsv | --repeats [--since TIME]] [--transcripts DIR] | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | settings on|off update | --version]";
+const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --token-report [--verbose | --tsv | --repeats [--since TIME]] [--transcripts DIR] | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | settings on|off update | --version]";
 /// With the `dev` feature: the measuring modes too.
 #[cfg(feature = "dev")]
-const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --bench [RUNS] [--queries FILE] [--before EXE CONFIG] | --token-report [--tsv | --repeats [--since TIME]] [--transcripts DIR] | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | --judge FILE [--modes M,M] [--runs N] | --symbol-bench FILE [--runs N] | --recall-scores FILE [--runs N] | settings on|off update | --version]";
+const USAGE: &str = "usage: atlas [--config PATH] [--project NAME] [--vault NAME=PATH ...] [--db PATH] [--setup | --rescan | --recall-check [--phrase TEXT ...] | --bench [RUNS] [--queries FILE] [--before EXE CONFIG] | --token-report [--verbose | --tsv | --repeats [--since TIME]] [--transcripts DIR] | --calibrate [--audit FILE] | --misses-week [--since TIME] | --hook-report [--transcripts DIR] [--since TIME] [--rows] [--tune-floor SCALE] | --compact-report --transcripts DIR [--since TIME] [--rows] [--sweep T,T,...] | --code-index [NAME ...] [--scip FILE] | --embed [THREADS] | --embed-check DIR | --judge FILE [--modes M,M] [--runs N] | --symbol-bench FILE [--runs N] | --recall-scores FILE [--runs N] | settings on|off update | --version]";
 
 /// `atlas --help`: every mode, subcommand and flag, one per line.
 const HELP: &str = "\
@@ -113,9 +116,10 @@ Modes:
   --hook                 a Claude Code command hook: the event JSON on stdin, the answer on stdout
   --statusline           the update badge for a Claude Code status line (reads the update state file only; prints nothing when no update is pending)
   --recall-check [--phrase TEXT ...]   every identifier and phrase is found by lookup
-  --token-report         the token ledger: what atlas answered against what reading would cost
-  --token-report --tsv   the same ledger as tab-separated lines, for scripts
-  --token-report [--tsv] --transcripts DIR   also count the cost atlas left in Claude Code transcripts (read only)
+  --token-report         the token ledger in about 15 lines: the measured ratio, credit, cost and net, the savings by source, the last 7 days
+  --token-report --verbose   the full report: what atlas answered against what reading would cost, every block
+  --token-report --tsv   the full report as tab-separated lines, for scripts
+  --token-report [--verbose | --tsv] --transcripts DIR   also count the cost atlas left in Claude Code transcripts (read only)
   --token-report --repeats [--since TIME]   the targets looked up again after a compaction most
   --calibrate [--audit FILE]   measure the pre-atlas baseline of the measured ratio now
   --misses-week [--since TIME]         lookups that found nothing, this week
@@ -135,7 +139,7 @@ Modes:
 
 Subcommands:
   atlas run [--digest SHAPE] [--timeout S] [--label TEXT] -- CMD [ARGS...]   run a command, keep its output as a handle
-  atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --page K | --digest]
+  atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --page K | --digest] [--out FILE]
   atlas slice --list [N]  the newest handles
   atlas digest [--as SHAPE] FILE|-   a digest of a file or stdin
   atlas doctor                       say what it can check of the atlas hooks and project roots
@@ -156,8 +160,9 @@ Subcommands:
   atlas queue [list | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next | release AGENT | add | plan]   the work queue: launches waiting to start, the batch that can start now, and freeing a dead agent's lane
   atlas backlog [--all] [--as-of TIME] [--json] | dismiss ID --because KEY   ruled work that fell off the queue: aging and waiting items (proposed; the written order is unchanged)
   atlas pr-events serve [--port N] [--lane LANE]   run one gh webhook forward per repository, listen on 127.0.0.1 for their signed GitHub PR events, and file each as a journal note
+  atlas track check | smoke [--issue KEY] [--page ID] [--jql Q] [--cql Q] | issue KEY | jql Q [--fields LIST] | page ID | cql Q | snapshot ITEM   project tracking: read Jira and Confluence directly, read-only, with a token from the environment variable project_tracking.atlassian names
   atlas ideas [list | show ID | file TEXT... | dismiss ID... | answer ID yes|no | convert ID ruling|queue | labels]   ideas caught from prompts, and the questions about them
-  atlas worktrees [list | history PATH | backfill]   the worktree ownership ledger: open owners, one path's spans, and an owner row for each worktree without one
+  atlas worktrees [list | history PATH | backfill | gc [--apply]]   the worktree ownership ledger: open owners, one path's spans, an owner row for each worktree without one, and the cleanup of stale worktrees, their build output and atlas's Docker objects (a dry run without --apply)
 
 SHAPE is test, build, grep, listing, source, summary or generic. More: https://github.com/bloodfeast/atlas/wiki
 ";
@@ -169,12 +174,14 @@ enum Mode {
     Recall(Vec<String>),
     #[cfg(feature = "dev")]
     Bench(usize, bench::Opts),
-    /// `--token-report [--tsv | --repeats [--since TIME]] [--transcripts DIR]`: the ledger, or with
+    /// `--token-report [--verbose | --tsv | --repeats [--since TIME]] [--transcripts DIR]`: the ledger, or with
     /// `--repeats` the targets looked up again after a compaction most.
     TokenReport {
         repeats: bool,
         since: String,
         tsv: bool,
+        /// `--verbose`: the full report, not the summary.
+        verbose: bool,
         transcripts: Option<PathBuf>,
     },
     /// `--calibrate [--audit FILE]`.
@@ -573,7 +580,7 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
 /// The bare words recognised as `argv[1]`, or after leading
 /// [`LEADING_OPTIONS`].
 const SUBCOMMANDS: &[&str] =
-    &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules", "backlog", "pr-events", "worktrees"];
+    &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules", "backlog", "pr-events", "worktrees", "track"];
 
 /// The usage of a subcommand asked for its help, `None` when it was not: only
 /// the first word after it counts, so `atlas run -- cargo --help` still runs and a
@@ -598,6 +605,7 @@ fn sub_help(word: &str, rest: &[String]) -> Option<&'static str> {
         "rules" => atlas::memory::rules::USAGE,
         "backlog" => atlas::backlog::USAGE,
         "pr-events" => atlas::pr_listen::USAGE,
+        "track" => atlas::trackers::USAGE,
         _ => return None,
     })
 }
@@ -743,10 +751,14 @@ fn run() -> Result<ExitCode, String> {
             "--config" => config = Some(PathBuf::from(args.next().ok_or("--config needs a path")?)),
             "--rescan" => mode = Mode::Rescan,
             "--setup" => mode = Mode::Setup,
-            "--token-report" => mode = Mode::TokenReport { repeats: false, since: String::new(), tsv: false, transcripts: None },
+            "--token-report" => mode = Mode::TokenReport { repeats: false, since: String::new(), tsv: false, verbose: false, transcripts: None },
             "--tsv" => match &mut mode {
                 Mode::TokenReport { tsv, .. } => *tsv = true,
                 _ => return Err("--tsv goes after --token-report".into()),
+            },
+            "--verbose" => match &mut mode {
+                Mode::TokenReport { verbose, .. } => *verbose = true,
+                _ => return Err("--verbose goes after --token-report".into()),
             },
             "--repeats" => match &mut mode {
                 Mode::TokenReport { repeats, .. } => *repeats = true,
@@ -858,6 +870,8 @@ fn run() -> Result<ExitCode, String> {
             "--phrase" => phrases.push(args.next().ok_or("--phrase needs text")?),
             #[cfg(feature = "dev")]
             "--queries" => bench_opts.queries = Some(PathBuf::from(args.next().ok_or("--queries needs a file")?)),
+            #[cfg(feature = "dev")]
+            "--cold-runs" => bench_opts.cold_runs = args.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--cold-runs needs a count of 1 or more")?,
             #[cfg(feature = "dev")]
             "--before" => {
                 let exe = args.next().ok_or("--before needs EXE CONFIG")?;
@@ -1013,6 +1027,19 @@ fn run() -> Result<ExitCode, String> {
                 settings_mode(config.as_deref(), rest[0] == "on", "update")
             }
             "settings" => atlas::claude_settings::cli(rest, config.as_deref(), &setup.db, setup.memory.user_state.as_deref(), project.as_deref()),
+            "queue" if atlas::trackers::plan::wants(&rest) => {
+                // `queue plan --from-jql`: reads the tracker (#305).
+                let settings = atlas::trackers::Settings::from_config(loaded.as_ref().and_then(|c| c.trackers.as_ref()))?;
+                let env = |n: &str| std::env::var(n).ok();
+                let ctx = atlas::trackers::Ctx {
+                    settings: settings.as_ref(),
+                    db: &setup.db,
+                    lean: loaded.as_ref().and_then(|c| c.lean.as_ref()),
+                    store: &setup.memory.store,
+                    env: &env,
+                };
+                atlas::trackers::plan::cli(&rest[1..], &ctx, &atlas::pr_events::served(setup.memory.graph.as_deref()))
+            }
             "queue" => {
                 let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
                 let orch = atlas::orchestrate::resolve(loaded.as_ref().and_then(|c| c.orchestrate.as_ref()), None, None, |k| std::env::var(k).ok());
@@ -1024,6 +1051,10 @@ fn run() -> Result<ExitCode, String> {
                     std::env::var(k).ok()
                 });
                 let repos = setup.memory.graph.as_deref().map_or(&[][..], |g| &g.repos[..]);
+                if rest.first().map(String::as_str) == Some("gc") {
+                    print!("{}", atlas::worktree_gc::cli(&rest[1..], &store, &orch, repos, &setup.memory.worktrees)?);
+                    return Ok(ExitCode::SUCCESS);
+                }
                 atlas::worktree_ledger::cli(&rest, &store, &orch, repos)
             }
             "ideas" => {
@@ -1049,6 +1080,18 @@ fn run() -> Result<ExitCode, String> {
                 let s = atlas::pr_listen::Settings::from_config(loaded.as_ref().and_then(|c| c.pr_events.as_ref()))?;
                 let graph = setup.memory.graph.as_deref();
                 atlas::pr_listen::cli(&rest, &mut store, &atlas::pr_events::served(graph), &atlas::pr_events::forwarded(graph), &s)
+            }
+            "track" => {
+                let settings = atlas::trackers::Settings::from_config(loaded.as_ref().and_then(|c| c.trackers.as_ref()))?;
+                let env = |n: &str| std::env::var(n).ok();
+                let ctx = atlas::trackers::Ctx {
+                    settings: settings.as_ref(),
+                    db: &setup.db,
+                    lean: loaded.as_ref().and_then(|c| c.lean.as_ref()),
+                    store: &setup.memory.store,
+                    env: &env,
+                };
+                atlas::trackers::cli(&rest, &ctx)
             }
             "ruling" | "entry" => {
                 let mut store = setup.open()?;
@@ -1077,6 +1120,40 @@ fn run() -> Result<ExitCode, String> {
             };
             // The index store first, read only: the hook's token log and
             // reports write to it, and nothing may once a newer atlas made it.
+            // The budget counts from the process's start; past it (and a
+            // short grace) the process answers the overrun line and exits 0,
+            // whatever is still running.
+            // Whether the answer is out: whoever prints holds it while
+            // printing, so the other never exits before the answer is
+            // flushed or prints a second one (review N1 of #329).
+            let answered = std::sync::Arc::new(std::sync::Mutex::new(false));
+            if atlas::hook_budget::enforced() {
+                let limit = setup.memory.hook_budget;
+                let (done, overrun) = (answered.clone(), ev.clone());
+                let due = atlas::hook_budget::process_start() + limit + std::time::Duration::from_millis(250);
+                let _ = std::thread::Builder::new().name("atlas-hook-watch".into()).spawn(move || {
+                    std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+                    // Answered already: the work after the answer is cut
+                    // (Claude Code waits for the process, not only its answer).
+                    let mut done = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !*done {
+                        print!("{}", atlas::hooks::overrun_answer(&overrun, limit));
+                        *done = true;
+                    }
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    std::process::exit(0);
+                });
+            }
+            // Tests: a hook that stalls past its budget (the watchdog's test).
+            // Only with the `test-seams` feature, never in a shipped build
+            // (review N2 of #329).
+            #[cfg(feature = "test-seams")]
+            if let Some(ms) = std::env::var("ATLAS_TEST_HOOK_STALL_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            let timings = atlas::hook_budget::timings_on();
+            let t_setup = atlas::hook_budget::ms_since(atlas::hook_budget::process_start());
+            let t_open = std::time::Instant::now();
             if let Some(e) = atlas::store::index_skew(&setup.db).into_iter().next() {
                 return refuse(e);
             }
@@ -1087,7 +1164,12 @@ fn run() -> Result<ExitCode, String> {
             };
             h.detect_offer_paths();
             h.set_command_hook();
-            let unattended = atlas::claude_settings::unattended_session(|k| std::env::var(k).ok());
+            // An ignored value is named once a session, at SessionStart, not
+            // on every hook event.
+            let (unattended, note) = atlas::claude_settings::unattended_decision(|k| std::env::var(k).ok());
+            if let Some(note) = note.filter(|_| ev.event == "SessionStart") {
+                eprintln!("{note}");
+            }
             h.set_unattended(unattended);
             // SessionStart's first-run project offer needs the configuration file
             // (to add to) and the folders it already indexes.
@@ -1097,7 +1179,11 @@ fn run() -> Result<ExitCode, String> {
                 h.set_offer_ctx(offer_ctx.clone());
             }
             h.set_roots(ref_roots(&setup));
-            let mut a = h.handle(&ev);
+            if timings {
+                eprintln!("atlas hook timings --hook: setup={t_setup:.1} open={:.1}", atlas::hook_budget::ms_since(t_open));
+            }
+            // The budget counts from the process's start.
+            let mut a = h.handle_from(&ev, atlas::hook_budget::process_start());
             // The update notice (issue #190): a line the user sees, never the
             // model's context, once per version. Local files only: the
             // server's check fetched what it says. A session with no user
@@ -1108,8 +1194,25 @@ fn run() -> Result<ExitCode, String> {
                     a.system_message = b;
                 }
             }
-            print!("{}", a.to_json(&ev.event));
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let t_out = std::time::Instant::now();
+            {
+                let mut done = answered.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *done {
+                    // The watchdog answered; it exits the process.
+                    drop(done);
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                print!("{}", a.to_json(&ev.event));
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                *done = true;
+            }
+            if timings {
+                let answered = atlas::hook_budget::ms_since(atlas::hook_budget::process_start());
+                eprintln!("atlas hook timings --hook: output={:.1} answered={answered:.1}", atlas::hook_budget::ms_since(t_out));
+            }
+            h.after_command_hook();
             h.file_ideas();
             h.index_transcripts();
             Ok(ExitCode::SUCCESS)
@@ -1330,7 +1433,6 @@ fn run() -> Result<ExitCode, String> {
         }
         Mode::TokenReport { repeats: true, since, .. } => {
             let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
-            conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
             let rows = atlas::compact::repeats(&conn, &since, 20).map_err(|e| e.to_string())?;
             let when = if since.is_empty() { "ever".to_string() } else { format!("since {since}") };
             if rows.is_empty() {
@@ -1343,16 +1445,21 @@ fn run() -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Mode::TokenReport { tsv, transcripts, .. } => {
+        Mode::TokenReport { tsv, verbose, transcripts, .. } => {
             let conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
-            // A background calibration may be writing; its first read may add columns.
-            conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+            // A background calibration may be writing; its first read may add
+            // columns, and open_raw's handler waits for it.
             let (mut by_tool, mut by_day) = atlas::tokens::report(&conn, bytes_per_token).map_err(|e| e.to_string())?;
             let mut by_day_net =
                 atlas::tokens::report_days_without(&conn, bytes_per_token, &atlas::token_report::NOT_IN_DAYS).map_err(|e| e.to_string())?;
             // Hook rows are credited by hit (#217), by the verdict
-            // --hook-report gives, read from memory as it is now and bounded
-            // to the ledger's last row.
+            // --hook-report gives, bounded to the ledger's last row. A
+            // settled transcript's verdicts are stored (#348), so they hold
+            // memory as it was when they were judged, not as it is now;
+            // they are judged again when the judge or the transcript changes.
+            // The credits not in token_log's columns, with where each was
+            // put into context: their re-read is priced as the cost's (#294).
+            let mut credits = atlas::token_cost::Credits::default();
             let hook_hits = if setup.memory.store.is_file() {
                 let mem = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
                 let until: String =
@@ -1362,6 +1469,7 @@ fn run() -> Result<ExitCode, String> {
                 atlas::tokens::add_hook_credit(&mut by_tool, &credit.by, false, bytes_per_token);
                 atlas::tokens::add_hook_credit(&mut by_day, &credit.by, true, bytes_per_token);
                 atlas::tokens::add_hook_credit(&mut by_day_net, &credit.by, true, bytes_per_token);
+                credits.hits = credit.at;
                 Some((credit.injected, credit.hits))
             } else {
                 None
@@ -1391,11 +1499,14 @@ fn run() -> Result<ExitCode, String> {
             let compact = atlas::compact::totals(&conn, bytes_per_token).map_err(|e| e.to_string())?;
             // What atlas itself costs (#227): the store, and the
             // transcripts when given (read only).
-            let mut cost = atlas::token_cost::measure(&conn, bytes_per_token, transcripts.as_deref()).map_err(|e| e.to_string())?;
+            credits.reads = read_credit.rows.clone();
             // Net counts the rulebook only as measured, never its file size,
             // and less the recall-by-record credit that may read the same
-            // rulebook windows.
+            // rulebook windows; the counterfactual compaction counts it alike.
             let recall_records = atlas::tokens::recall_records_credit(&conn, bytes_per_token).map_err(|e| e.to_string())?;
+            credits.rulebook = atlas::token_cost::rulebook_net(matched.as_ref(), recall_records);
+            let mut cost =
+                atlas::token_cost::measure_with(&conn, bytes_per_token, transcripts.as_deref(), &credits).map_err(|e| e.to_string())?;
             cost.credit_rulebook(matched.as_ref(), recall_records);
             let inputs = atlas::token_report::Inputs {
                 bytes_per_token,
@@ -1415,7 +1526,16 @@ fn run() -> Result<ExitCode, String> {
                 read_credit: Some(&read_credit),
                 cost: Some(&cost),
             };
-            print!("{}", if tsv { atlas::token_report::tsv(&inputs) } else { atlas::token_report::human(&inputs) });
+            print!(
+                "{}",
+                if tsv {
+                    atlas::token_report::tsv(&inputs)
+                } else if verbose {
+                    atlas::token_report::human(&inputs)
+                } else {
+                    atlas::token_report::summary(&inputs)
+                }
+            );
             Ok(ExitCode::SUCCESS)
         }
         Mode::MissesWeek(since) => {
@@ -1462,8 +1582,7 @@ fn run() -> Result<ExitCode, String> {
             let load_ms = t0.elapsed().as_secs_f64() * 1e3;
             let threads = if threads == 0 { setup.embed_threads } else { threads };
             let mut conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
-            conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
-            let pending = atlas::semantic::missing(&conn, &model.id).map_err(|e| e.to_string())?;
+            let pending =atlas::semantic::missing(&conn, &model.id).map_err(|e| e.to_string())?;
             let (unsplit, _) = atlas::semantic::windows_pending(&conn, &model.id).map_err(|e| e.to_string())?;
             let t1 = std::time::Instant::now();
             let mut done = atlas::semantic::Progress::default();
@@ -1509,8 +1628,7 @@ fn run() -> Result<ExitCode, String> {
             // Opening the store brings the schema up to date first.
             drop(setup.open()?);
             let mut conn = atlas::store::open_raw(&setup.db).map_err(|e| e.to_string())?;
-            conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
-            let holder = format!("pid {} (--code-index)", std::process::id());
+            let holder =format!("pid {} (--code-index)", std::process::id());
             if !atlas::code_index::take_lease(&mut conn, &holder, code.timeout * 2).map_err(|e| e.to_string())? {
                 return Err("another atlas process is indexing code now".into());
             }
@@ -2012,6 +2130,7 @@ fn taskjudge_time(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn main() -> ExitCode {
+    atlas::hook_budget::mark_process_start();
     match run() {
         Ok(c) => c,
         Err(e) => {

@@ -45,7 +45,13 @@ fn vaults(db: &Path) -> atlas::paths::Vaults {
 
 fn setup(root: &Path, db: &Path, indexers: Indexers) -> CodeSetup {
     let spec = atlas::config::CodeSpec {
-        roots: vec![atlas::config::CodeRootSpec { name: "svc".into(), root: root.to_path_buf(), build_scripts: false, scip: Default::default() }],
+        roots: vec![atlas::config::CodeRootSpec {
+            name: "svc".into(),
+            root: root.to_path_buf(),
+            build_scripts: false,
+            scip: Default::default(),
+            exclude: Vec::new(),
+        }],
         debounce_s: Some(0),
         ..Default::default()
     };
@@ -98,7 +104,7 @@ fn recorded(dir: &Path) -> Vec<Vec<String>> {
 fn indexed(root: &Path, db: &Path, indexers: Indexers) -> (IndexReport, Server) {
     let code = setup(root, db, indexers);
     drop(atlas::store::Store::open(db, vaults(db)).unwrap());
-    let mut conn = rusqlite::Connection::open(db).unwrap();
+    let mut conn = atlas::db::Connection::open(db).unwrap();
     let rep = code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
     let store = atlas::store::Store::open(db, vaults(db)).unwrap();
     let mut s = Server::new(store);
@@ -120,7 +126,7 @@ fn answer(s: &mut Server, name: &str) -> (Vec<String>, Vec<String>) {
 }
 
 fn labels(db: &Path, file: &Path) -> Vec<String> {
-    let conn = rusqlite::Connection::open(db).unwrap();
+    let conn = atlas::db::Connection::open(db).unwrap();
     code::file_items(&conn, &file.to_string_lossy()).unwrap().expect("covered").iter().map(|i| i.label()).collect()
 }
 
@@ -173,7 +179,7 @@ fn the_scanner_alone_gives_definitions_and_ranges() {
             "fn Sums::Total 27-35"
         ]
     );
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let r = atlas::recall::code_check(&conn, &setup(&root, &db, Indexers::Search).roots).unwrap();
     assert_eq!(
         r.langs,
@@ -213,7 +219,7 @@ fn a_found_indexer_runs_on_the_solution_and_the_scanner_fills_inactive_branches(
     // brace matcher's, else the scanner's.
     let l = labels(&db, &p);
     assert!(l.contains(&"class Shapes::Square 10-23".to_string()) && l.contains(&"class Shapes::Extra 38-41".to_string()), "{l:?}");
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let r = atlas::recall::code_check(&conn, &setup(&root, &db, Indexers::Search).roots).unwrap();
     assert_eq!(
         (r.langs[0].truth, r.langs[0].indexed, r.langs[0].scan_only, r.langs[0].missing),
@@ -260,7 +266,7 @@ fn an_edited_csharp_file_is_rescanned_at_once() {
     let text = format!("// A header line.\n{}", fs::read_to_string(&p).unwrap());
     std::thread::sleep(std::time::Duration::from_millis(20));
     fs::write(&p, text).unwrap();
-    let mut conn = rusqlite::Connection::open(&db).unwrap();
+    let mut conn = atlas::db::Connection::open(&db).unwrap();
     assert!(matches!(code::reindex_file(&mut conn, &p.to_string_lossy()).unwrap(), Reindexed::Rows(_)));
     assert_eq!(labels(&db, &p)[..2], ["interface Shapes::IShape 5-8", "fn IShape::Area 7-7"]);
     let (defs, refs) = answer(&mut s, "Area");

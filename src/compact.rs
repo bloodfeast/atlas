@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use crate::db::{params, Connection};
 
 use crate::error::Result;
 use crate::json::Value;
@@ -393,7 +393,7 @@ pub(crate) fn bare_keys<'a>(text: &'a str, prefixes: &HashSet<String>) -> Vec<&'
 /// The part before the first `:` of every stored key that has one.
 pub(crate) fn key_prefixes(store: &MemoryStore) -> Result<HashSet<String>> {
     let mut st = store.conn().prepare_cached("SELECT DISTINCT substr(key, 1, instr(key, ':') - 1) FROM records WHERE instr(key, ':') > 1")?;
-    let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<HashSet<_>>>()?;
+    let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<crate::db::Result<HashSet<_>>>()?;
     Ok(rows)
 }
 
@@ -1011,7 +1011,7 @@ pub fn repeats(conn: &Connection, since: &str, limit: usize) -> Result<Vec<Repea
         .query_map(params![since, limit as i64], |r| {
             Ok(Repeat { sig: r.get(0)?, misses: r.get(1)?, changed: r.get(2)?, unstamped: r.get(3)? })
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<crate::db::Result<Vec<_>>>()?;
     Ok(rows)
 }
 

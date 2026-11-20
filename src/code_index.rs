@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::code::{self, CodeRoot, CodeSetup, Rows, RowStats, WriteStats};
 use crate::error::{Error, Result};
@@ -308,7 +308,7 @@ fn decode_mem(ix: &scip::Index<'_>, file: usize) -> usize {
 /// is written from the line scan and the report says why.
 pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rust: &RustSource) -> Result<IndexReport> {
     let t0 = Instant::now();
-    let walk = code::walk(&root.root)?;
+    let walk = root.walk()?;
     let fingerprint = walk.fingerprint_with(&root.scip.configured());
     let mut rep = IndexReport { root: root.name.clone(), ..IndexReport::default() };
     let mut scip_bytes: Option<Vec<u8>> = None;
@@ -436,6 +436,10 @@ pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rus
         crate::proto::mention_rows(&mention_texts, &rpcs, &taken, &mut rows, &mut files);
         crate::proto::mention_rows(&lang_texts, &rpcs, &taken, &mut rows, &mut files);
     }
+    // rust-analyzer reads the whole Cargo workspace, and a SCIP file may
+    // cover the whole root: what they gave for an excluded file goes.
+    rows.drop_excluded(&root.exclude);
+    code::record_exclude(conn, &root.name, &root.exclude)?;
     let by_path: HashMap<&str, &str> =
         rust_texts.iter().chain(&wgsl_texts).chain(&proto_texts).chain(&mention_texts).chain(&lang_texts).map(|(p, t)| (p.as_str(), t.as_str())).collect();
     let text_of = |i: usize| -> Option<String> {
@@ -1065,7 +1069,6 @@ fn set(shared: &Shared, name: &str, s: RootState) {
 
 fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, watcher: &Watcher) -> Result<()> {
     let mut conn = crate::store::open_raw(db)?;
-    conn.busy_timeout(Duration::from_secs(30))?;
     code::ensure_schema(&conn)?;
     let rust = rust.unwrap_or_else(|| match find_rust_analyzer(setup.rust_analyzer.as_deref()) {
         Ok(p) => RustSource::Analyzer(p),
@@ -1105,7 +1108,7 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                     changed[i] = Some(if walk_all && seen_fp[i].is_empty() { Instant::now() - setup.debounce } else { Instant::now() });
                 }
                 seen_fp[i] = fp;
-            } else if snap.paths.iter().any(|p| code::relevant(p)) {
+            } else if snap.paths.iter().any(|p| code::relevant(p) && !code::excluded(&r.exclude, p)) {
                 changed[i] = Some(Instant::now());
             }
             watcher.clear(i, snap.seq);

@@ -14,6 +14,245 @@ Sections are not written here by hand. Each pull request adds a fragment, `chang
 and section, and `cargo xtask version` folds the pending fragments into one section for the next release, in
 the order above, and sets the version by replaying them in merge order (`changes/README.md`).
 
+## v0.9.0
+
+### Highlights
+
+- **A quoted `|`, `$`, `;` or `(` in a shell command no longer crashes the atlas server.** A routed command such
+  as `grep -n "a\|b\|c" file` could overflow the hook thread's stack and take atlas's tools and hooks out of the
+  session; the check now always ends.
+- **`code.roots[].exclude` keeps a package out of the code index.** A package that hangs its indexer is skipped
+  outright instead of costing the indexer's whole timeout on every reindex.
+- **An agent launch Claude Code rejects no longer holds its cap slot**, and `recall op=status` and `atlas queue
+  list` show which agents hold the slots.
+- **This release also carries everything listed under v0.8.0, which was never published on its own:** Jira and
+  Confluence tracking with queue items from a JQL search, `atlas worktrees gc`, a fast and short
+  `--token-report`, and the owned SQLite build.
+
+### Features
+
+- **Leave a package out of the code index with `code.roots[].exclude`.** Globs relative to a code root name
+  folders and files the index leaves out: `["OctoPrint-Slow", "tools/gen"]`. Nothing below a match is walked,
+  so a package that is its own unit gets no indexer run at all, instead of costing `code.timeout_s` on every
+  reindex, and nothing in it is scanned. An indexer that reads a wider folder anyway (rust-analyzer over the
+  Cargo workspace) has its rows for excluded files dropped.
+
+### Fixes
+
+- **A quoted `|`, `$`, `;` or `(` in a shell command no longer crashes the atlas server.** The hook check for
+  git writes in a routed command (`grep -n "a\|b\|c" file`, `git log --format="%h|%s"`) recursed forever on
+  the unclosed quote that splitting at those characters leaves. The hook thread overflowed its stack and the
+  server aborted, taking atlas's tools and hooks out of the session. The check now always ends, still finds a
+  git write after such a quote, and the hook thread has a larger stack as a backstop.
+- **An Agent launch the tool rejected no longer holds its slot under the agent cap.** A refused launch kept
+  counting against its lane until its timeout, so the next launches were refused or numbered past the cap. The
+  cap now frees a slot as soon as the launch's error answer is in the transcript. `atlas queue list` and
+  `recall op=status` (text and the json `held_slots` key) list the slots still held, so a stuck lane shows why.
+
+## v0.8.0
+
+### Highlights
+
+- **atlas reads your Jira and Confluence, and turns a JQL search into queue items in one command.** `atlas track`
+  reads issues, searches and pages with a token atlas never holds and prints a digest (a Jira issue about 17x
+  smaller than its raw response on the test fixture, 30x on a live site). `atlas queue plan --from-jql` makes one
+  queue item per ticket, and an item can wait on a ticket's status.
+- **`atlas worktrees gc` cleans up stale worktrees, their build output and atlas's own Docker objects, and never
+  loses work.** A dry run with sizes by default. Anything with uncommitted, unpushed or recent work is left alone.
+- **`atlas --token-report` is fast and short.** On a 237 MB store a repeat report takes a median 1.71 s, down from
+  133 s, and the default view is about 15 lines; `--verbose` prints the full report.
+- **An owned SQLite binding, behind the `owned-sqlite` build feature.** It builds atlas over the vendored SQLite
+  3.53.2 with ed25519-compact as its only crate dependency, and gives byte-identical answers to the default build.
+
+### Features
+
+- **An owned SQLite binding, behind a build feature.** `cargo build --no-default-features --features
+  owned-sqlite` builds atlas on its own binding over the vendored SQLite 3.53.2 amalgamation, compiled by
+  atlas's own build script with no build dependency: that build's only crate is ed25519-compact. The default
+  build is unchanged (rusqlite, the same SQLite version). The two give byte-identical answers and open each
+  other's databases. A source build with the feature needs a C compiler (MSVC, gcc or clang).
+- **Project tracking: read Jira and Confluence directly, read-only, with a token atlas never holds.** Name the site and the environment variables in `project_tracking.atlassian` (Cloud API token or Data Center PAT); `atlas track issue|jql|page|cql` prints a digest (a Jira issue about 17x smaller than its raw response on the test fixture, 30x on a live site) and keeps the full response as a handle, `atlas track snapshot` writes a queue item's ticket status, and `atlas track check` and `smoke` confirm a setup while printing only shapes and sizes. Writes stay with the Atlassian MCP connector. See the Project tracking wiki page, which also lists the pieces not yet verified against a real site (the Confluence write probe, Confluence through the API gateway, Data Center `mypermissions` and the Cloud CQL next link).
+- **`ATLAS_UNATTENDED` tells atlas there is no user, whatever client runs it.** A wrapper or SDK harness that is
+  not Claude Code can set `ATLAS_UNATTENDED=1` so that no SessionStart offer is asked, or `0` to say a user is
+  there. It comes before Claude Code's own `CLAUDE_CODE_SESSION_ATTENDED` and `CLAUDE_CODE_ENTRYPOINT`, covers
+  every offer atlas makes now and any added later, and a value other than `0` or `1` is ignored with one line
+  on stderr. See the Configuration reference.
+- **A JQL search becomes queue items in one command, snapshots refresh, and items can wait on a ticket's status.**
+  `atlas queue plan --from-jql QUERY [--kind K --priority P --order-from N --lane-from key|fixed:LANE --limit N]`
+  makes one item per issue, with its lane and ticket the issue key, its title the summary and its snapshot taken from
+  the same search, and skips an issue that already has an open item, so a backlog of N tickets takes one command
+  rather than 2N. `atlas track snapshot --all [--older-than DUR]` fetches every open item's ticket again, once per
+  ticket, and each ticket a waiting item's unmet ticket condition names (a failed fetch keeps the old snapshot and is
+  reported), and snapshots now record the status category. An `--after`
+  condition `ticket KEY STATUS` (a status name, or To Do, In Progress or Done) is met from the ticket's latest
+  snapshot, with no `atlas queue met`. Every call is a read.
+- **`atlas worktrees gc` cleans up stale worktrees, their build output and atlas's own Docker objects, and never
+  loses work.** A ledger worktree whose branch is merged (or whose PR was merged or closed), with no running agent
+  and no waiting queue item, is removed with `git worktree remove` (never `--force`), with its linked build
+  folder and its `atlas-linux-target-*` volume and stopped `atlas-linux-test-*` container. A worktree in use is
+  never stale: a running agent or waiting item holds it, the running agents cannot all be read, it has no commits
+  of its own (new, not done, however far main moves), or it or its linked build folder changed within
+  `worktrees.quiet_minutes` (2 hours by default; files are walked last, only for a worktree gc would touch, and
+  the hourly notify-only run makes no quiet-period or guard walk; it only sums sizes, up to
+  `worktrees.notify_gb`); the check runs again before each removal. A worktree holding any work
+  (changed, staged or untracked files, ignored files outside its build folders and `worktrees.disposable`
+  (default `target/`), unpushed commits, an operation under way, a lock, a stash on its branch, or a
+  check git could not answer) is never removed; `worktrees.dirty` reports it (the default), deletes
+  only its build output, or commits, pushes and verifies the work before removing it (refused for an untracked
+  file over 10 MB, a denied name or a line that looks secret, in untracked files or added to tracked ones). Every
+  delete goes through one guard that walks what it deletes immediately before (links and junctions never entered)
+  and refuses on a checkout (`.git`, `.hg`, `.jj`, `.svn` or a bare repository, at any depth), a secret (a denied
+  name, `.envrc`, a name that is not UTF-8) or a folder it cannot read: a worktree's whole tree (its ignored and
+  build folders included, its tracked files passed over), the in-tree `target/` and the linked build folder. The
+  plan makes the same walk only for a worktree it would delete from, and reports a refusal as work. A build
+  folder that lies inside any git checkout (save a `CACHEDIR.TAG`-tagged one the repository tracks nothing in),
+  or is, holds or lies in a checkout is never deleted, and one run goes at a time (an operating-system file lock). Other Docker containers and
+  volumes are reported with their verified activity, never touched. Without `--apply` it is a dry run with sizes;
+  `worktrees.auto_gc` runs it from the hook at most hourly and after a merged PR, and with it off session start
+  says one line once the stale space passes `worktrees.notify_gb`.
+- **Agents work lean by default.** The `orchestrate` skill's brief gains a "Work lean" step that an
+  orchestrator puts in every brief: find with atlas's `symbol`, `lookup`, `grep` and `section` before reading,
+  small edits, logs read by their tail, images downscaled before reading, briefs read once, shared scratch
+  files prefixed with the lane, and `pr:N head:SHA` journaled when a PR opens. The `atlas` skill states the
+  atlas side beside its context limits. An agent waiting on its own background job journals `waiting: <job>`,
+  and the orchestrator leaves such a parked agent alone until its next notification (#327).
+- **Review entries take GitHub's words.** `journal entry=review` reads `approve` and `approved` as `pass`, and
+  `request_changes`, `changes_requested` and `changes` as `request changes`, in any case, and files the
+  canonical verdict; any other word is still refused with the list (#325).
+- **No built-in runq folder.** The restart point reads runq holders only when `RUNQ_ROOT` or
+  `orchestrate.runq_root` names runq's state folder; no machine path is assumed.
+- **The compaction card names the PR each live agent is working on.** A new `agents:` line lists each live agent
+  with `PR #N @head7 (ready|draft)`. atlas finds the PR without the agent's help. It checks the lane's newest
+  `pr:N head:SHA` journal entry of its own since the launch, then the declared worktree's branch, then a PR event
+  filed for its head. As a last step it runs one `gh pr list` per repo and branch, all within 1.5 s together. A
+  merged or closed PR is not shown. A failed lookup is named on one `prs:` line. The line names at most six agents,
+  running ones first, then `+N more`, after the card's open, owed, rulings and files lines. The PreCompact
+  instructions end with the same list, so the summary can copy exact numbers.
+- **A parked builder is no longer shown as finished.** An agent the host no longer lists stays on the line as
+  `parked (own job running)` while its own newest entry is a `waiting: <job> (<worktree or branch>)` note. On a
+  shared lane an entry is an agent's own only when it names that agent's worktree or branch (#327). On a worktree
+  reused by a later agent, the earlier agent no longer takes the later one's entries, and the worktree is named
+  once. `pr:` entries are read in the `owner/repo#N` and `repo#N` forms too. A PR counts as merged or closed only
+  when that word follows the `pr:` value (past any `head:SHA` words, as in `pr:N head:SHA -- merged as abc`) or
+  is the `state:`/`verdict:` value, so a hand-back saying "Not merged." keeps its PR on the line. The gh lookup never runs past the hook's own time budget.
+- **A checkpoint journaled to a work lane is found.** The card's `model:` line now accepts the model's checkpoint
+  entry from an orchestrator's own lane when this session's transcript shows it wrote it, preferring the session
+  lane (#324).
+- **linux-test uses the CPUs it is given.** `cargo xtask linux-test --cpus N`, or `ATLAS_LINUX_TEST_CPUS=N` when the
+  flag is not given, sets the container's CPUs and cargo's jobs to N (default 4); nextest runs max(N, 16) test
+  threads, as `test-gate` does, since the tests mostly wait on processes of their own. N is a whole number of 1 or
+  more, lowered with a note to the Docker VM's CPU count when above it; the startup line prints the count and where
+  it came from. A scheduler that grants the run cores should pass the same number (#334).
+- **`atlas --token-report` prints a short summary; `--verbose` prints the full report.** The bare report is about 15 lines: the calibration date and the answers the ratio is measured over, the measured ratio (mean and median), credit / cost / net, the "Where the savings live" rows under short labels (two or more sources under 1% of both the total credit and the total cost folded into one "small sources" row), the answers and ledger ratio of the 7 days to the newest logged day, and a pointer to `--verbose`. Every line fits 80 columns. Its figures are the full report's, computed once. `--token-report --verbose` is the report as it was, byte for byte; `--tsv`, `--repeats` and `--transcripts` are unchanged.
+- **Dependencies are built once, locally and in the development checks.** `cargo xtask linux-test` runs rustc
+  through sccache (pinned, checksum-verified in the image) in its test steps, with its cache on one shared volume,
+  `atlas-linux-sccache` (capped at 80 MiB, 0.08 GiB, about twice the 0.04 GiB it was seen to hold), so a new worktree
+  reuses the dependencies another checkout already compiled; the run ends with the hit and miss counts per step.
+  `--no-cache` or `ATLAS_LINUX_TEST_NO_CACHE` runs without it, and `--clean --all` removes the volume. The
+  development repository's pull request check caches dependencies with `Swatinem/rust-cache`, which helps that pull
+  request's later pushes and re-runs only; the public CI and the release workflow build uncached (#354).
+
+### Fixes
+
+- **The token report prices re-reads on both sides of the ledger.** With `--transcripts`, atlas's answers, tool output and routed digests stay in context and are re-read, and so would the grep output, files and raw output they replaced. Each credited counterfactual is now carried by the same priced multiplier as its answer, to the next compaction, or earlier where the counterfactual's larger context would have compacted first; a hook hit's from when it was used, and a repeated lookup's Read as Claude Code's "file unchanged" stub. Tool definitions are re-read by every request, through compactions. Routed digests no longer end with a newline, so the ledger logs the bytes the session receives and the report matches them by size (older rows one byte over still match; pairs are taken nearest in time first, so a row one byte over that is nearer than an answer's own row can still win, tracked in #303). The headline net says it counts re-reads on both sides (45.7M on the maintainer's store, against 4.14M when re-reads were priced on the cost side only; the largest overstatement, different lookups reading the same file, up to 30.3M of lookup credit re-read, is unpriced and tracked in #300), keeps the once-only net (17.8M) beside it, names the share of answers with no transcript, and says why it may be too high or too low, each reason sized where it can be, naming the larger side only when the other holds nothing unweighed.
+- **The restart point and the compaction card name exactly the agents that are live.** An agent waiting on its
+  own background work (a CI monitor) stays in the restart point after its stop, after the interim notification
+  and after the atlas server restarts mid-session. Its lane and launch key are read from its launch entry when
+  the server did not see it start. A finish seen only in the agent's task notification is now recorded in the
+  store, so the next session's offer no longer lists that agent. A session resumed after Claude Code restarts
+  is offered its own agents that died with the old process. The card's `lanes:` line lists the live agents'
+  lanes first and ends with `+N more` past its cap instead of dropping lanes silently.
+- **The token report no longer pairs a routed answer with the wrong ledger row.** Atlas now records where
+  rows with trimmed digests begin in the ledger. Only rows logged before that point may be one byte over their
+  answer, so a stray row one byte over can no longer take an answer away from its own row.
+- **Reviewer and research subagents start lean.** In the default `recall.subagent_context = "recall"` mode, a
+  reviewer or research start gets no lane view and no recall pointers (the sub-lane line stays). Its kind is read as
+  the agent caps read it: a `Kind: reviewer`, `Kind: review`, `Kind: research`, `Kind: researcher` or `Kind: design`
+  line, else a launch type mapped in `orchestrate.types` or built in (`Explore`, `Plan`, `claude-code-guide` and
+  `research` launches are research, `reviewer` launches are reviewers). On eight real briefs the reviewer and research starts went from 2313 bytes to none. Any subagent's start also leaves
+  out the records its brief already names (a `recall key=`, a `Queue:` key, a Gherkin tag) and their near-duplicates,
+  so the room goes to the next record, and a lane whose every entry the brief names shows no lane view at all (#275).
+- **Project tracking works with scoped Atlassian Cloud tokens, and its handles are lossless.** Confluence can have its own token (`confluence_token_env`, since a scoped token holds one product), read only when a Confluence request is made, so Jira reads and ticket snapshots never need it; a Jira gateway `site` with no `confluence_site` refuses Confluence reads with the fix rather than sending them to Jira's gateway; `atlas track check` names the `api.atlassian.com` gateway URL when a scoped token is refused on the site URL, says "unknown (auth failed)" for write permissions after a failed login, reports a 200 that the site answered anonymously as a failed login rather than an empty result, and counts any Confluence operation it does not know as a possible write. An issue handle's JSON item now equals the raw response as a JSON value (pretty-printed) with only the auth material redacted (the account email stays), its JSON and its markdown are separate items (`item=json`, `item=description-md`), `atlas track jql --fields LIST|*all` asks for more fields, and `atlas slice --out FILE` writes a whole handle past the 8 KB slice cap (saying "replaced" when the file existed). Credential scrubbing also matches unpadded and URL-safe base64. The Project tracking wiki page lists the token scopes to tick for Jira and for Confluence.
+- **`atlas queue next` counts the agents already running.** Run from a shell without `--transcript`, it used to
+  count no running agents, so it proposed 8 starts while 7 builders ran under a cap of 8. It now finds them from
+  the launch records atlas files at each agent's start (every session with a launch in the last
+  `orchestrate.stale_minutes`), keeps the lanes they hold, and says where the count came from. `--transcript`
+  still reads only the session it names (#305).
+- **The restart point and the card name exactly the agents that are still running.** An agent that stops with
+  background work, a server restarted mid-session, and a resume of the same session after Claude Code restarts no
+  longer drop a live agent from the point or offer it as crashed; a resumed session is not offered an agent that a
+  live server's point still lists. The card's `lanes:` line names every live agent's lane first and ends with
+  `+N more` past six instead of dropping lanes silently (#306, #309).
+- **The post-compaction card's `intent:` names the task, not the compaction.** A closing line such as "Please
+  run `/compact`." or "handoff written" is skipped for the line before it, and an active `/goal` (one not
+  cleared) is used as the intent. The card and the resume card now read the goal the same way: a `/goal
+  clear` run as a local command is honoured, and a later unmet goal check does not bring a cleared goal
+  back. The resume card now shows a goal set by `/goal TEXT` before any goal check, and a goal too long to
+  show names the record it came from. The card's group header now reads "groups (recall a key for its text):",
+  since a recalled group of one piece has no digest; cards saved under the old header still read back.
+- **A stored output's hint works where it is printed.** `atlas slice` takes `recall`'s selector form as well as its own flags (`atlas slice h:ID lines=1-3`, `grep="a b"`, `item=NAME`), so a hint copied from either works; `atlas track` prints its hint in the form of where its output goes (`atlas slice h:ID --lines A-B` on a terminal, the `recall` form otherwise); and `recall` with an `h:` key and a record argument such as `query` says where the selector goes. A new selector, `digest-grep=RE` (`atlas slice --digest-grep RE`), returns the matching digest rows of a handle, every issue or hit of a tracker search rather than only those the digest had room for.
+- **`atlas queue next` stops counting the agents of a session that restarted.** An agent last written before its
+  session's recorded start died with the old Claude Code process (a crash or a closed terminal); it no longer holds a
+  slot for the whole `stale` window, so `queue next` no longer under-proposes. A session with no recorded start counts
+  its agents as before (#315).
+- **No atlas hook runs long enough for Claude Code to discard it.** Every hook event now answers within a time
+  budget, `hooks.budget_ms` (default 3 s, at most 10 s), counted from when it arrived. A hook that runs out
+  answers with what it has plus one line naming what it skipped, and a store locked by another writer is waited
+  on only until the budget runs out. A session start no longer waits up to 30 s on the memory store's lock, which
+  could hold the prompt queued behind it past Claude Code's 30 s hook limit. `ATLAS_HOOK_TIMINGS=1` prints each
+  hook's phases and their times. A gate that can refuse a call (the merge gate, the agent caps, the context
+  cap) still refuses it when its check runs out of time: it fails closed, never open (#329).
+- **A short shell output is never digested into losing its first line.** An output of at most 24 lines keeps every
+  line, each long one cut to 120 characters (a JSON-object line to 80) with the count it dropped, where a few long
+  lines used to push it over the threshold and leave only its tail; it does so only when that costs at most half the
+  output, and no generic digest is ever larger than the output it stands for. A longer output shows its first two
+  lines beside its tail. Lines that are JSON objects are counted as "N JSONL records" and never match
+  error|fail|panic inside their strings, but one whose top-level `level`, `severity` or `lvl` is error, err, fatal,
+  panic, critical, crit, alert, emerg or emergency (any case), whose `level` is an integer from 50 to 60 (pino,
+  bunyan), or whose `is_error` is true (or "true"), is a match and is quoted. A match line too long for the quote
+  budget is skipped, never the end of the quotes, so it hides no match after it; when no match fits, the first is
+  quoted cut to the budget's bytes on a character boundary and marked "...". However small a digest must get, it
+  keeps line 1 and, budget allowing, a quoted match, and its header says "N lines match, K shown" when it shows
+  fewer, counting each match the head, the quotes or the tail shows once (#326).
+- **A tool call no longer fails with "database is locked" when many servers write to one store.** A writer
+  waiting on the store lock used to sleep longer the longer it had waited, up to 100 ms between tries, so
+  writers that had just arrived took every free moment first. Under load, one could wait out its whole 30 s
+  behind holds of about a tenth of a second. The vault index and the memory store now check again every 2 ms at
+  most, with the same 30 s limit (#343). So do the other writers to the index database (stored output
+  handles, the token ledger and hook log, compaction rows, embeddings and the code index), each keeping its own
+  limit, and the hook log no longer stops writing for the rest of the session when the lock refuses its first
+  write.
+- **`atlas pr-events serve` no longer loses its own refusal to a connection reset.** A delivery refused before it
+  was read in full (a body over 5 MB, or a request still trickling in at the deadline) was answered and the
+  connection closed with bytes unread, which reset it and dropped the answer: the sender saw a broken connection
+  in place of the 413 or 408. The listener now ends its side and drains what the sender still sends for up to
+  500 ms before closing, so any body a local sender delivers within that time gets its answer (#342).
+- **No server log line is lost when several appenders create the log at once.** Two threads that started a
+  fresh `atlas-server.log` in the same instant could share a header temporary, and the second could truncate
+  the log the first had just made, dropping a line another appender had written. Each appender now has a
+  temporary of its own and never truncates one in use.
+- **Worktree gc never costs a prompt its recall, and walks into submodules.** The hook's hourly gc check now
+  runs after recall, in a time budget phase of its own (`worktree_gc` in the timings): when the store is busy
+  and the budget is spent, the check is skipped and retried on the next event instead of recall being skipped.
+  The skip shows in the hook timings only, never in the model's context, and the session-start notice of stale
+  space is still shown. An event whose own work fails still runs the check. Before deleting a worktree, gc's
+  guard now also walks every submodule and embedded repository in it: a worktree with a submodule or embedded
+  repository checked out is kept by gc's own guard (its nested `.git`; git refused it too). The notify-only
+  run's size is documented as an upper bound.
+- **`atlas --token-report` is fast on a large ledger.** The hook hit credit re-read and re-judged every transcript an injection landed in on every run (over 99% of a 133 s report on a 237 MB store). A hit verdict is now stored once its transcript has been still for six hours, as the routed Reads' verdicts are, so a repeat report reads only the transcripts still changing, and quote checks look the record's 8-word runs up in a per-transcript index. A stored verdict, a hit's or a routed Read's, is judged again when the judge changes or its transcript is appended to after it settled. On that store the summary takes a median 1.71 s on a repeat run (17.8 to 23.5 s on the first), with the same output. The summary's title names the answers the ratio is over only when there is a ratio, and a source label over 40 columns is cut to fit.
+
+### Security hardening
+
+- **Context poisoning guard: hidden text cannot reach a session or a release.** Every tool answer, tool error and
+  hook injection drops the characters that draw nothing yet can carry text (bidi overrides, zero-width, tag and
+  Hangul filler characters, variation selectors outside a variation sequence Unicode defines, tag runs other than
+  the RGI flags) and shows terminal escapes as text; emoji, Persian and Indic joiners, bidi marks and the England,
+  Scotland and Wales flags are kept, visible text is left exactly as written, and a write whose text held hidden
+  characters says so. Stored bytes are unchanged.
+- **The context poisoning guard's `cargo xtask hidden` checks every tracked file** in CI and before each release,
+  naming `path:line:column` and the code point; deliberate cases go in `xtask/hidden-allow.txt` by line, with a
+  reason.
+
 ## v0.7.0
 
 ### Highlights

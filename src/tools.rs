@@ -445,7 +445,8 @@ const TOOLS: &[ToolDef] = &[
                     "key": s("A record key, or h:ID (a stored output), or h: (list them)."), "query": s(""), "lane": s(""), "kind": s(""), "scope": s(""), "history": b(""), "limit": n("Default 8 (20 for h:)."), "budget_tokens": n(""),
                     "lines": s("h:ID only: lines A-B."), "item": s("h:ID only: one item by name (a test, error:2, a file, Type::fn)."), "failures": b("h:ID only: every failure block."),
                     "grep": s("h:ID only: lines matching this regex."), "context": n("h:ID only, with grep: context lines (default 2)."), "head": n("h:ID only: the first N lines."),
-                    "tail": n("h:ID only: the last N lines."), "page": n("h:ID only: from line K (a PR file's next page)."), "digest": b("h:ID only: the digest again.")
+                    "tail": n("h:ID only: the last N lines."), "page": n("h:ID only: from line K (a PR file's next page)."), "digest": b("h:ID only: the digest again."),
+                    "digest-grep": s("h:ID only: digest rows matching this regex (every issue or hit of a tracker search).")
                 }),
                 &[],
             )
@@ -817,6 +818,57 @@ pub enum Answer {
     JsonText(String),
 }
 
+/// An answer as it leaves for the session ([`crate::hidden::scrub`]):
+/// invisible characters removed and control characters shown, visible text
+/// as it is (JSON stays JSON); a write whose arguments held hidden
+/// characters says so in its answer (they are stored as written).
+fn outgoing(read_only: bool, args: &Value, answer: Answer) -> Answer {
+    let warning = if read_only { None } else { crate::hidden::write_warning(hidden_in(args)) };
+    match answer {
+        Answer::Text(t) => {
+            let mut t = crate::hidden::scrub(&t).into_owned();
+            if let Some(w) = warning {
+                if !t.is_empty() && !t.ends_with('\n') {
+                    t.push('\n');
+                }
+                t.push_str(&w);
+            }
+            Answer::Text(t)
+        }
+        Answer::JsonText(t) => {
+            let mut t = crate::hidden::scrub_json(&t).into_owned();
+            if let Some(w) = warning {
+                // An object gets a `warning` field; any other JSON (an
+                // array, a bare value) the line after it.
+                if t.starts_with('{') && t.ends_with('}') {
+                    t.pop();
+                    if t.len() > 1 {
+                        t.push(',');
+                    }
+                    t.push_str("\"warning\":");
+                    t.push_str(&Value::String(w).to_string());
+                    t.push('}');
+                } else {
+                    t.push('\n');
+                    t.push_str(&w);
+                }
+            }
+            Answer::JsonText(t)
+        }
+        a => a,
+    }
+}
+
+/// The hidden characters in every string of a call's arguments.
+fn hidden_in(v: &Value) -> usize {
+    match v {
+        Value::String(s) => crate::hidden::hidden_count(s),
+        Value::Array(a) => a.iter().map(hidden_in).sum(),
+        Value::Object(m) => m.values().map(hidden_in).sum(),
+        _ => 0,
+    }
+}
+
 impl Answer {
     /// The answer as the text a client reads: the text itself, or the JSON
     /// written compactly.
@@ -1083,7 +1135,7 @@ impl Server {
         // A listed tool's op runs its full tool, and the ledger counts it
         // under that name (its counterfactual is the full tool's).
         let Some((routed, routed_args)) = surface::route(name, &args)? else {
-            return Ok(Answer::Text(help()));
+            return Ok(outgoing(true, &args, Answer::Text(help())));
         };
         let (name, args) = (routed.as_str(), &routed_args);
         self.writer = caller.clone();
@@ -1093,14 +1145,20 @@ impl Server {
             Answer::Json(v) => Answer::JsonText(v.to_string()),
             a => a,
         };
+        let read_only = all_tools().find(|t| t.name == name).is_some_and(|t| t.read_only);
         if let Some(c) = caller {
-            let read_only = all_tools().find(|t| t.name == name).is_some_and(|t| t.read_only);
             let reuse = !fresh && dedup::dedupable(name, read_only, args);
             answer = match answer {
                 Answer::Text(t) => Answer::Text(self.dedup.answer(&c, name, args, t, reuse)),
                 Answer::JsonText(t) => Answer::JsonText(self.dedup.answer(&c, name, args, t, reuse)),
                 a => a,
             };
+        }
+        // After dedup, so a changed-lines delta is scrubbed as the whole
+        // answer would be. A hook's answer was made safe by the hook itself
+        // (`HookAnswer::to_json`).
+        if name != "hook" {
+            answer = outgoing(read_only, args, answer);
         }
         // A hook answer is logged once, by the hook itself: its
         // `hook:<event>` row, with the keys it injected. A bare `hook` row
@@ -1990,5 +2048,33 @@ impl NoteWindow {
         let a = self.starts[self.first - 1];
         let b = if self.last < self.total { self.starts[self.last] } else { self.whole.len() };
         self.whole[a..b].to_string()
+    }
+}
+
+#[cfg(test)]
+mod hidden_tests {
+    use super::*;
+
+    /// A write's answer says when its text held hidden characters, whatever
+    /// shape the answer has (#299 review N3); a read's never does.
+    #[test]
+    fn a_write_warning_reaches_every_answer_shape() {
+        let args = json!({"text": "a\u{200B}b"});
+        let warned = |a: Answer| match outgoing(false, &args, a) {
+            Answer::Text(t) | Answer::JsonText(t) => t,
+            Answer::Json(v) => v.to_string(),
+        };
+        let t = warned(Answer::JsonText("{\"ok\":true}".into()));
+        assert_eq!(json::parse(&t).unwrap()["warning"].as_str().map(|w| w.contains("held 1 hidden")), Some(true), "{t}");
+        let t = warned(Answer::JsonText("{}".into()));
+        assert!(json::parse(&t).unwrap()["warning"].is_string(), "{t}");
+        let t = warned(Answer::JsonText("[1,2]".into()));
+        assert!(t.starts_with("[1,2]\n") && t.contains("held 1 hidden"), "{t}");
+        let t = warned(Answer::Text("ok".into()));
+        assert!(t.starts_with("ok\n") && t.contains("held 1 hidden"), "{t}");
+        match outgoing(true, &args, Answer::Text("ok".into())) {
+            Answer::Text(t) => assert_eq!(t, "ok"),
+            _ => unreachable!(),
+        }
     }
 }

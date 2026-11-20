@@ -280,6 +280,7 @@ fn shape_word(s: Shape) -> String {
         Shape::Source(_) => "source".into(),
         Shape::Summary => "summary".into(),
         Shape::Generic => "generic".into(),
+        Shape::Tracker => "tracker".into(),
     }
 }
 

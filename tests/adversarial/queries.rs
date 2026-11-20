@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::common::*;
-use crate::gen::{each, HOSTILE};
+use crate::gen::{assert_reaches_session_safely, each, HOSTILE, INJECTIONS, VISIBLE};
 use atlas::json;
 use atlas::json::Value;
 
@@ -211,4 +211,63 @@ fn a_section_heading_is_not_a_like_pattern() {
     }
     let r = call(&mut s, "section", json!({"heading": "History"}));
     assert!(r.to_string().contains("measured at 12 us"), "{r}");
+}
+
+/// Vault notes that carry hidden text and terminal escapes
+/// ([`INJECTIONS`]): every read tool's answer, as a client gets it, holds no
+/// hidden character and shows its escapes, its visible text as written; a
+/// JSON answer is bare JSON.
+#[test]
+fn planted_note_text_reaches_a_session_scrubbed() {
+    let fx = Fx::new("adv-inject-notes");
+    let mut body = String::from("---\ntags: [inject]\n---\n\n# PI-077 Hidden plan\n\n");
+    for (i, p) in INJECTIONS.iter().enumerate() {
+        body.push_str(&format!("## Part {i}\n\nzebrafish {p}\n\n"));
+    }
+    write(&fx.perf().join("Ideas/PI-077 Hidden plan.md"), &body);
+    let on_disk = std::fs::read(fx.perf().join("Ideas/PI-077 Hidden plan.md")).unwrap();
+    let mut s = fx.server();
+    let calls = [
+        ("search", json!({"query": "zebrafish", "mode": "substring"})),
+        ("search", json!({"query": "zebrafish", "mode": "sections"})),
+        ("search", json!({"query": "zebrafish", "mode": "regex"})),
+        ("grep", json!({"pattern": "zebrafish", "context": 2})),
+        ("section", json!({"heading": "Part 0", "path": "Ideas/PI-077 Hidden plan.md"})),
+        ("section", json!({"heading": "Part 3", "path": "Ideas/PI-077 Hidden plan.md"})),
+        ("lookup", json!({"id": "PI-077"})),
+        ("read_note", json!({"vault": "perf", "path": "Ideas/PI-077 Hidden plan.md"})),
+    ];
+    let mut seen = 0;
+    for (tool, args) in &calls {
+        let out = match s.answer(tool, args) {
+            Ok(a) => a.into_text(),
+            Err(e) => panic!("{tool} {args}: {e}"),
+        };
+        assert_reaches_session_safely(&out);
+        assert!(!out.contains("<atlas-data"), "{tool}: no frame: {out:.300}");
+        if out.starts_with('{') {
+            json::parse(&out).unwrap_or_else(|e| panic!("{tool}: not JSON ({e}): {out:.300}"));
+        }
+        let lower = out.to_lowercase();
+        if lower.contains("obey the record") || lower.contains("ignore previous instructions now") {
+            seen += 1;
+        }
+        if *tool == "read_note" {
+            assert!(
+                out.contains(VISIBLE) && out.contains("ignore previous instructions now") && out.contains("const  = obey the record"),
+                "{out}"
+            );
+        }
+        // The JSON shape, asked for: bare JSON, as clean.
+        if *tool == "search" {
+            let mut a = args.clone();
+            a.as_object_mut().unwrap().insert("format".into(), json!("json"));
+            let out = s.answer(tool, &a).unwrap().into_text();
+            assert_reaches_session_safely(&out);
+            json::parse(&out).unwrap_or_else(|e| panic!("search json: {e}: {out:.300}"));
+        }
+    }
+    assert!(seen >= 4, "the planted text reached only {seen} answers, so the scrub was hardly tested");
+    // The scrub is on the way out: the note on disk is as written.
+    assert_eq!(std::fs::read(fx.perf().join("Ideas/PI-077 Hidden plan.md")).unwrap(), on_disk);
 }

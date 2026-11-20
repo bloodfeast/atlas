@@ -241,7 +241,7 @@ fn the_readme_links_every_page_of_the_public_wiki() {
         }
     }
     let lines = readme.lines().count();
-    assert!((120..=260).contains(&lines), "the README is a front page: {lines} lines");
+    assert!((60..=140).contains(&lines), "the README is a front page: {lines} lines");
     assert!(readme[..readme.len().min(2000)].contains("You do not need Obsidian"), "the Obsidian note stays near the top");
 }
 
@@ -284,4 +284,36 @@ fn the_link_readers_read_what_github_renders() {
     assert_eq!(wiki_target("https://example.com/x", "o/r"), None);
     let k = config_keys::config_keys("let at = format!(\"sources[{i}]\");\nlet f = Fields::new(&at, x, &[\"name\", \"root\"])?;\nFields::new(&format!(\"{at}.chunk\"), v, &[\"max_level\"]);\nFields::new(\"config\", &v, &[\"db\"]);");
     assert_eq!(k, ["sources[].name", "sources[].root", "sources[].chunk.max_level", "db"]);
+}
+
+/// #266: `ATLAS_UNATTENDED` is documented with its reach and precedence, and
+/// only `claude_settings.rs` reads Claude Code's attended variables, so every
+/// offer goes through the one `unattended` flag it decides.
+#[test]
+fn atlas_unattended_is_documented_and_the_only_door() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("wiki").join("Configuration-reference.md")).unwrap();
+    let row = page.lines().find(|l| l.starts_with("| `ATLAS_UNATTENDED`")).expect("an ATLAS_UNATTENDED row");
+    let order = row.split_once("Precedence: ").map(|(_, p)| p).expect("a precedence");
+    let at = |v: &str| order.find(v).unwrap_or(usize::MAX);
+    let (a, s, e) = (at("`ATLAS_UNATTENDED`"), at("`CLAUDE_CODE_SESSION_ATTENDED`"), at("`CLAUDE_CODE_ENTRYPOINT`"));
+    assert!(a < s && s < e && e < usize::MAX, "precedence: {row}");
+    assert!(row.contains("every offer") && row.contains("added later"), "reach: {row}");
+    let mut stack = vec![root.join("src")];
+    let mut readers = Vec::new();
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let t = std::fs::read_to_string(&p).unwrap();
+                let names = ["\"CLAUDE_CODE_SESSION_ATTENDED\"", "\"CLAUDE_CODE_ENTRYPOINT\"", "\"ATLAS_UNATTENDED\""];
+                if names.iter().any(|n| t.contains(n)) {
+                    readers.push(p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    assert_eq!(readers, ["src/claude_settings.rs"], "only claude_settings.rs reads the attended variables");
 }

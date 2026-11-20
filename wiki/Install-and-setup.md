@@ -68,6 +68,28 @@ An older Claude Code is untested.
    classifier may block `atlas --setup` and `atlas settings` commands that Claude runs (the reason reads "No
    reason provided") until you tell Claude you allow them.
 
+   Claude Code permissions. Nothing in Claude Code's own permissions marks atlas's tools as allowed, so in
+   auto mode its classifier judges every atlas tool call like any other, and can block a plain read (a
+   `section` or `search` whose path looks like a file a brief told agents not to open, for example). Allow
+   the server once, in the project's `.claude/settings.json` (shared) or your own `~/.claude/settings.json`:
+
+   ```json
+   {
+     "permissions": {
+       "allow": ["mcp__plugin_atlas_atlas"]
+     }
+   }
+   ```
+
+   That is the rule for the plugin install above, whose tools Claude Code names
+   `mcp__plugin_atlas_atlas__<tool>`. A server you added yourself under the name `atlas` (in `.mcp.json` or
+   with `claude mcp add`) has tools named `mcp__atlas__<tool>`, so its rule is `"mcp__atlas"`; `/mcp` shows
+   which you have. The server-wide rule allows all of atlas's tools, the ones that read and the ones that
+   write to the store, and any tool a later release adds. To allow fewer, list tools one by one
+   (`"mcp__plugin_atlas_atlas__recall"`, and so on). Project rules apply once you have accepted the folder's
+   trust prompt. Subagents run under the permissions of the session that starts them, so one rule covers an
+   orchestrated session's agents too.
+
    In a configuration with `projects`, add-project writes into the project the folder belongs to (its
    `projects[]` entry: `sources`, `code.roots`, `vaults`), never the top level, whose lists every project
    reads; `atlas --project NAME settings add-project DIR` picks the project, else the folder's own, else
@@ -122,7 +144,8 @@ An older Claude Code is untested.
    ```
 
    Setup never asks about [[Memory and rule files]], which is experimental and off by default. Turning it
-   on is a deliberate `atlas settings set memory-rules true`.
+   on is a deliberate `atlas settings set memory-rules true`. For atlas as Claude's memory,
+   [[Reference configuration]] has a complete configuration and the checks that it works.
 
    Last, when the folder setup runs in has no rules (no `CLAUDE.md`, `.claude/CLAUDE.md`, `CLAUDE.local.md`
    up to its repository's root, no `.claude/atlas-rules.md` and no intent file), setup offers atlas's
@@ -176,6 +199,36 @@ An older Claude Code is untested.
    Claude Code. To keep the model download off entirely, set `"models": {"auto_download": false, ...}`;
    recall then stays lexical.
 
+### First session
+
+1. Install the plugin (above) and restart Claude Code. Optionally run `atlas --setup` first (step 3 above).
+   Run by Claude, it has no terminal, so it lists its questions instead of asking them and records nothing;
+   Claude puts them to you at the next session.
+2. Open a session in your project. Claude asks you about atlas: *create a vault for this project at
+   `<path>`? yes / other folder / no*, and, unless `atlas --setup` asked already, whether to work in
+   orchestrated mode (caps on how many agents run at once; no is fine; on yes the caps and compile slots start
+   from this machine's cores, see [[Orchestration]]). It may also offer Claude Code settings. Say yes to the
+   first: its Markdown becomes a searchable source, a folder holding code becomes a code root, and a new vault
+   (an Obsidian-compatible folder) holds the project's notes and discussion threads. `atlas settings undo`
+   reverts it all; it never deletes a note. A question you do not answer comes back at your next new session,
+   until you answer it, and Claude may not always put it. A session with no user (`claude -p`, the SDK) asks
+   nothing and counts as nothing asked, and atlas stays silent if it could not record your answer.
+   `atlas settings add-project .` and `atlas settings orchestrate` do the same from a terminal. The vault
+   question is per folder.
+3. Work as usual. Large Bash, Read and Grep results now arrive as digests with a handle; Claude pulls what it
+   needs with `recall key=h:ID item=NAME` or `failures=true`. Grep and Read results name the enclosing item
+   and its line range.
+4. Ask Claude to remember a decision (`remember`), and start the next session: relevant records are recalled
+   on each prompt, within a 600-token budget (`recall.budget_tokens`). The recall defaults (600 tokens, a 0.53
+   `recall.cos_floor`) were chosen by a sweep that measured off-topic records as well as on-topic recall.
+5. Optionally, `atlas settings offer` proposes the Claude Code settings that cut cost (the 1-hour subagent
+   cache, fewer goal check-ins). Nothing is written without a yes, and `atlas settings undo` reverts (it shows
+   the change and asks first; `--yes` without a terminal). With the compaction features on (the default;
+   `"compact": {"enabled": false}` or `atlas settings off compact` turns them off), `atlas settings
+   compact-md` offers a Compact instructions block for a project's `CLAUDE.md` the same way. For a project
+   with no rules, `atlas --setup` and `atlas settings rules-template` offer a starter `CLAUDE.md` and
+   `.claude/atlas-rules.md` (see [[Memory and rule files]]).
+
 To build from source instead (any platform with a Rust toolchain):
 
 ```sh
@@ -187,6 +240,9 @@ and copy `target/release/atlas` (`atlas.exe` on Windows) into the plugin's `bin`
 Build it last, after any test run: `cargo test --release` (or `cargo build --all-targets`) rebuilds that same
 `target/release/atlas` with the tests' `test-seams` feature on, so if you ran the tests, run the plain
 `cargo build --release --locked` again before you copy.
+On macOS, remove the old binary before you copy the new one (`rm bin/atlas-aarch64-apple-darwin`, then `cp`):
+macOS kills a signed binary that was overwritten in place, so a copy over the old file fails at launch with exit
+137.
 With a local-folder (directory) marketplace, Claude Code runs the plugin from the clone itself, not from its
 plugin cache, so the binary goes into the clone's `bin/` folder; a copy in the plugin cache is not found and the
 server fails to start (seen on Claude Code 2.1.325). Put the binary in place before the first session: a start

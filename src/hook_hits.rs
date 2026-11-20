@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rusqlite::{params, Connection};
+use crate::db::{params, Connection};
 
 use crate::error::Result;
 use crate::json::Value;
@@ -87,21 +87,25 @@ pub fn log_injection(conn: &Connection, hook: &str, session: &str, agent: &str, 
 pub fn logged(conn: &Connection, since: &str) -> Result<Vec<Injection>> {
     conn.execute_batch(crate::tokens::TOKEN_TABLE)?;
     let mut st = conn.prepare("SELECT time, hook, session, agent, transcript, key, fts, cos, bytes, read FROM hook_inject WHERE time >= ?1 ORDER BY id")?;
-    let rows = st.query_map([since], |r| {
-        Ok(Injection {
-            time: r.get(0)?,
-            hook: r.get(1)?,
-            session: r.get(2)?,
-            agent: r.get(3)?,
-            transcript: r.get(4)?,
-            key: r.get(5)?,
-            fts: r.get(6)?,
-            cos: r.get::<_, Option<f64>>(7)?.map(|c| c as f32),
-            bytes: r.get::<_, i64>(8)? as usize,
-            read: r.get::<_, i64>(9)? as usize,
-        })
-    })?;
+    let rows = st.query_map([since], |r| injection_at(r, 0))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// An [`Injection`] from a row's columns `time, hook, session, agent,
+/// transcript, key, fts, cos, bytes, read` from column `o` on.
+fn injection_at(r: &crate::db::Row<'_>, o: usize) -> crate::db::Result<Injection> {
+    Ok(Injection {
+        time: r.get(o)?,
+        hook: r.get(o + 1)?,
+        session: r.get(o + 2)?,
+        agent: r.get(o + 3)?,
+        transcript: r.get(o + 4)?,
+        key: r.get(o + 5)?,
+        fts: r.get(o + 6)?,
+        cos: r.get::<_, Option<f64>>(o + 7)?.map(|c| c as f32),
+        bytes: r.get::<_, i64>(o + 8)? as usize,
+        read: r.get::<_, i64>(o + 9)? as usize,
+    })
 }
 
 /// The record keys already pointed to in one scope, read back from
@@ -116,8 +120,8 @@ pub fn injected_keys(db: &Path, session: &str, agent: &str) -> HashSet<String> {
     if session.is_empty() && agent.is_empty() {
         return HashSet::new();
     }
-    let read = || -> rusqlite::Result<HashSet<String>> {
-        let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let read = || -> crate::db::Result<HashSet<String>> {
+        let conn = Connection::open_with_flags(db, crate::db::OpenFlags::SQLITE_OPEN_READ_ONLY | crate::db::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let mut st = if agent.is_empty() {
             conn.prepare("SELECT key FROM hook_inject WHERE session = ?1 AND agent = '' AND key NOT LIKE 'lane:%'")?
@@ -125,7 +129,7 @@ pub fn injected_keys(db: &Path, session: &str, agent: &str) -> HashSet<String> {
             conn.prepare("SELECT key FROM hook_inject WHERE agent = ?1 AND key NOT LIKE 'lane:%'")?
         };
         let id = if agent.is_empty() { session } else { agent };
-        let keys = st.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<HashSet<String>>>()?;
+        let keys = st.query_map([id], |r| r.get::<_, String>(0))?.collect::<crate::db::Result<HashSet<String>>>()?;
         Ok(keys)
     };
     read().unwrap_or_default()
@@ -366,6 +370,45 @@ fn acts(path: &Path) -> Vec<Act> {
     out
 }
 
+/// Hashes a shingle, already an FNV hash, as itself.
+#[derive(Default)]
+struct ShingleHasher(u64);
+
+impl std::hash::Hasher for ShingleHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*b);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+/// Each shingle of a transcript's acts, with the acts it is in (their
+/// indices, ascending): a quote check looks up the record's shingles
+/// rather than scanning every later act's (#348).
+type QuoteIndex = HashMap<u64, Vec<u32>, std::hash::BuildHasherDefault<ShingleHasher>>;
+
+fn quote_index(acts: &[Act]) -> QuoteIndex {
+    let mut index = QuoteIndex::default();
+    for (i, a) in acts.iter().enumerate() {
+        let i = i as u32;
+        for &s in &a.shingles {
+            let at = index.entry(s).or_default();
+            if at.last() != Some(&i) {
+                at.push(i);
+            }
+        }
+    }
+    index
+}
+
 /// What a hit check needs to know of a record.
 struct RecordInfo {
     memory: bool,
@@ -379,16 +422,25 @@ pub struct Judge<'a> {
     mem: &'a MemoryStore,
     export_files: HashMap<String, String>,
     acts: HashMap<String, Vec<Act>>,
+    /// Each transcript's [`QuoteIndex`], built at its first quote check.
+    quotes: HashMap<String, QuoteIndex>,
     records: HashMap<String, Option<RecordInfo>>,
     /// Only acts at or before this time are read (empty: all).
     until: String,
+    /// Transcripts read and parsed so far.
+    parsed: usize,
 }
 
 impl<'a> Judge<'a> {
     /// A judge over the store, given each export's file name.
     pub fn new(mem: &'a MemoryStore, exports: &[crate::memory::export::ExportSpec]) -> Judge<'a> {
         let export_files = exports.iter().map(|e| (e.name.clone(), e.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default())).collect();
-        Judge { mem, export_files, acts: HashMap::new(), records: HashMap::new(), until: String::new() }
+        Judge { mem, export_files, acts: HashMap::new(), quotes: HashMap::new(), records: HashMap::new(), until: String::new(), parsed: 0 }
+    }
+
+    /// How many transcripts this judge has read and parsed.
+    pub fn parsed(&self) -> usize {
+        self.parsed
     }
 
     /// The same judge reading only the transcript acts at or before `until`
@@ -415,8 +467,15 @@ impl<'a> Judge<'a> {
     /// The rule that marks this injection a hit (`key`, `source`, `quote`),
     /// or `None`.
     pub fn hit(&mut self, inj: &Injection) -> Option<&'static str> {
+        self.hit_at(inj).map(|(rule, _)| rule)
+    }
+
+    /// [`Judge::hit`], with the time of the first act the rule counted: when
+    /// the record was used (#297, S3).
+    pub fn hit_at(&mut self, inj: &Injection) -> Option<(&'static str, String)> {
         if !self.acts.contains_key(&inj.transcript) {
             let mut a = acts(Path::new(&inj.transcript));
+            self.parsed += 1;
             if !self.until.is_empty() {
                 a.retain(|a| a.time <= self.until);
             }
@@ -428,37 +487,54 @@ impl<'a> Judge<'a> {
         if let Some(lane) = key.strip_prefix("lane:").or_else(|| key.strip_prefix("lane-head:")) {
             let (j, h, l) = (format!("journal:{lane}:"), format!("handoff:{lane}:"), format!("\"lane\":\"{lane}\""));
             let acts = &self.acts[&inj.transcript];
-            let used = acts.iter().filter(|a| a.time > inj.time && !a.tool.is_empty()).any(|a| a.text.contains(&j) || a.text.contains(&h) || (a.tool.ends_with("recall") && a.text.contains(&l)));
-            return used.then_some("key");
+            let used = first(
+                acts.iter()
+                    .filter(|a| a.time > inj.time && !a.tool.is_empty())
+                    .filter(|a| a.text.contains(&j) || a.text.contains(&h) || (a.tool.ends_with("recall") && a.text.contains(&l))),
+            );
+            return used.map(|t| ("key", t));
         }
-        if self.acts[&inj.transcript].iter().any(|a| a.time > inj.time && !a.tool.is_empty() && a.text.contains(&key)) {
-            return Some("key");
+        if let Some(t) =
+            first(self.acts[&inj.transcript].iter().filter(|a| a.time > inj.time && !a.tool.is_empty() && a.text.contains(&key)))
+        {
+            return Some(("key", t));
         }
         let acts = self.acts.remove(&inj.transcript).unwrap_or_default();
+        let mut quotes = self.quotes.remove(&inj.transcript);
         let verdict = self.record(&key).and_then(|r| {
             let after = || acts.iter().filter(|a| a.time > inj.time);
             if r.memory {
                 let file = format!("{key}.md");
-                if after().any(|a| !a.tool.is_empty() && a.text.contains(&file)) {
-                    return Some("source");
+                if let Some(t) = first(after().filter(|a| !a.tool.is_empty() && a.text.contains(&file))) {
+                    return Some(("source", t));
                 }
             } else {
-                for a in after() {
-                    let Some((pattern, fold, place)) = &a.grep else { continue };
-                    if !r.files.iter().any(|f| place.contains(f.as_str())) {
-                        continue;
-                    }
-                    let re = crate::regex::RegexBuilder::new(pattern).case_insensitive(*fold).build();
-                    if re.is_ok_and(|re| re.is_match(&r.text)) {
-                        return Some("source");
-                    }
+                let source = first(after().filter(|a| {
+                    let Some((pattern, fold, place)) = &a.grep else { return false };
+                    r.files.iter().any(|f| place.contains(f.as_str()))
+                        && crate::regex::RegexBuilder::new(pattern).case_insensitive(*fold).build().is_ok_and(|re| re.is_match(&r.text))
+                }));
+                if let Some(t) = source {
+                    return Some(("source", t));
                 }
             }
-            after().any(|a| a.shingles.iter().any(|s| r.shingles.contains(s))).then_some("quote")
+            // The earliest later act sharing a shingle, looked up by the
+            // record's shingles in the transcript's index (#348).
+            let index = quotes.get_or_insert_with(|| quote_index(&acts));
+            let after = r.shingles.iter().filter_map(|s| index.get(s)).flatten().map(|&i| &acts[i as usize]).filter(|a| a.time > inj.time);
+            first(after).map(|t| ("quote", t))
         });
+        if let Some(q) = quotes {
+            self.quotes.insert(inj.transcript.clone(), q);
+        }
         self.acts.insert(inj.transcript.clone(), acts);
         verdict
     }
+}
+
+/// The earliest time of some acts, `None` when there is none.
+fn first<'a>(acts: impl Iterator<Item = &'a Act>) -> Option<String> {
+    acts.map(|a| a.time.as_str()).min().map(str::to_string)
 }
 
 /// The hooks' credit by hit (#217): for each logged injection the
@@ -473,21 +549,143 @@ pub struct HitCredit {
     pub injected: usize,
     /// Of them, hits.
     pub hits: usize,
+    /// Each hit's place and credited bytes, for the credit side's re-read
+    /// ([`crate::token_cost::Credits::hits`], #294).
+    pub at: Vec<crate::token_cost::Hit>,
+    /// Of the injections, those whose stored verdict was used (their
+    /// transcript not read, #348).
+    pub stored: usize,
+    /// Transcripts read and parsed by this run.
+    pub parsed: usize,
+}
+
+/// The hit judge's version (#357). Bump it whenever a change could change
+/// a stored verdict: [`SHINGLE`] or how words are cut, how a transcript's
+/// acts are parsed, the key, source or quote rules, or the export names
+/// they match. A stored verdict of another version is judged again while
+/// its transcript exists. A bump does not reach the verdicts of deleted
+/// transcripts, which keep their old credit; to retract those, delete the
+/// rows (or rename the table).
+pub const HIT_JUDGE: i64 = 1;
+
+/// The stored hit verdicts (#348): each settled `hook_inject` row's rule
+/// (`key`, `source` or `quote`; NULL for no hit) and the time it was used,
+/// by its `hook_inject` id, with the judge's version and its transcript's
+/// [`crate::tokens::Stamp`] (#357). Created on first use, as `read_verdict`
+/// is. The row's `key` is joined too: `hook_inject.id` has no
+/// AUTOINCREMENT, so an id reused after its rows were deleted must not
+/// inherit another injection's verdict (a prune of `hook_inject` should
+/// delete the matching rows here as well).
+const HIT_VERDICT_TABLE: &str =
+    "CREATE TABLE IF NOT EXISTS hit_verdict(id INTEGER PRIMARY KEY, key TEXT NOT NULL, judge INTEGER NOT NULL, mtime TEXT NOT NULL, size INTEGER NOT NULL, rule TEXT, used TEXT)";
+
+/// A stored rule back as the judge's own name; `None` for a name it does
+/// not give (the row is judged again).
+fn rule_named(rule: &str) -> Option<&'static str> {
+    ["key", "source", "quote"].into_iter().find(|r| *r == rule)
 }
 
 /// Judges every logged injection and sums the hits' reads ([`HitCredit`]).
+/// An injection whose transcript has been still for
+/// [`crate::tokens::SETTLED`] (and ends within the judge's bound) has its
+/// verdict stored, as `read_credit` does; it is judged again only when the
+/// judge's version or the transcript changes, or a run is bounded before
+/// the transcript's last change (#357).
 ///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
 pub fn hit_credit(conn: &Connection, judge: &mut Judge) -> Result<HitCredit> {
+    hit_credit_at(conn, judge, SystemTime::now(), crate::tokens::SETTLED)
+}
+
+/// [`hit_credit`] as of `now`, storing the verdicts of transcripts still
+/// for `settled`.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn hit_credit_at(conn: &Connection, judge: &mut Judge, now: SystemTime, settled: std::time::Duration) -> Result<HitCredit> {
+    conn.execute_batch(crate::tokens::TOKEN_TABLE)?;
+    conn.execute_batch(HIT_VERDICT_TABLE)?;
+    type Verdict = Option<(&'static str, String)>;
+    // A stored verdict: the rule and use, the judge's version, the stamp.
+    type Stored = Option<(Verdict, i64, crate::tokens::Stamp)>;
+    let rows: Vec<(i64, Injection, Stored)> = conn
+        .prepare(
+            "SELECT i.id, i.time, i.hook, i.session, i.agent, i.transcript, i.key, i.fts, i.cos, i.bytes, i.read, v.id, v.rule, v.used, v.judge, v.mtime, v.size \
+             FROM hook_inject i LEFT JOIN hit_verdict v ON v.id = i.id AND v.key = i.key ORDER BY i.id",
+        )?
+        .query_map([], |r| {
+            let verdict = match r.get::<_, Option<i64>>(11)? {
+                None => None,
+                Some(_) => match (r.get::<_, Option<String>>(12)?, r.get::<_, Option<String>>(13)?) {
+                    (None, _) => Some(None),
+                    (Some(rule), Some(used)) => rule_named(&rule).map(|rule| Some((rule, used))),
+                    (Some(_), None) => None,
+                },
+            };
+            let stored = match verdict {
+                Some(v) => Some((v, r.get(14)?, crate::tokens::Stamp { mtime: r.get(15)?, size: r.get(16)? })),
+                None => None,
+            };
+            Ok((r.get(0)?, injection_at(r, 1)?, stored))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
     let mut c = HitCredit::default();
-    for i in logged(conn, "")? {
+    let parsed = judge.parsed();
+    // Each transcript with stored rows as it is now, stat'ed once.
+    let mut stamps: HashMap<String, Option<crate::tokens::Stamp>> = HashMap::new();
+    // Whether each transcript's verdicts may be stored, asked once after it
+    // is read, and the stamp to store with them.
+    let mut still: HashMap<String, Option<crate::tokens::Stamp>> = HashMap::new();
+    let mut verdicts: Vec<(i64, String, Verdict, crate::tokens::Stamp)> = Vec::new();
+    for (id, i, stored) in rows {
         c.injected += 1;
-        if judge.hit(&i).is_some() {
+        // A stored verdict stands while its transcript is unchanged (or gone)
+        // and was still at the judge's bound (#357).
+        let usable = stored.filter(|(_, version, s)| {
+            (judge.until.is_empty() || s.mtime <= judge.until) && {
+                let now = stamps.entry(i.transcript.clone()).or_insert_with(|| crate::tokens::stamp(Path::new(&i.transcript)));
+                crate::tokens::verdict_current(Some(*version), HIT_JUDGE, (Some(s.mtime.as_str()), Some(s.size)), now.as_ref())
+            }
+        });
+        let verdict = if let Some((v, _, _)) = usable {
+            c.stored += 1;
+            v
+        } else {
+            let v = judge.hit_at(&i);
+            let keep = still.entry(i.transcript.clone()).or_insert_with(|| {
+                crate::tokens::settled_since(Path::new(&i.transcript), now, settled).filter(|s| judge.until.is_empty() || s.mtime <= judge.until)
+            });
+            if let Some(s) = keep {
+                verdicts.push((id, i.key.clone(), v.clone(), s.clone()));
+            }
+            v
+        };
+        if let Some((_, used)) = verdict {
             c.hits += 1;
             *c.by.entry((format!("hook:{}", i.hook), i.time.get(..10).unwrap_or("").to_string())).or_default() += i.read as i64;
+            c.at.push(crate::token_cost::Hit {
+                session: i.session,
+                agent: i.agent,
+                time: i.time,
+                used,
+                hook: i.hook,
+                read: i.read as i64,
+                bytes: i.bytes as i64,
+            });
         }
+    }
+    c.parsed = judge.parsed() - parsed;
+    if !verdicts.is_empty() {
+        crate::store::guarded(conn, || {
+            let mut st = conn.prepare_cached("INSERT OR REPLACE INTO hit_verdict(id, key, judge, mtime, size, rule, used) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+            for (id, key, v, s) in &verdicts {
+                st.execute(params![id, key, HIT_JUDGE, s.mtime, s.size, v.as_ref().map(|v| v.0), v.as_ref().map(|v| v.1.as_str())])?;
+            }
+            Ok(())
+        })?;
     }
     Ok(c)
 }
@@ -658,5 +856,57 @@ mod tests {
         let b = shingles("one two three four five six seven eight");
         assert_eq!(a.len(), 2);
         assert_eq!(a[0], b[0]);
+    }
+
+    /// A judge over an empty store, its record and acts given, so `hit_at`
+    /// reads neither the store nor a transcript.
+    fn judge_of<'a>(mem: &'a MemoryStore, key: &str, record: Option<RecordInfo>, acts: Vec<Act>) -> Judge<'a> {
+        let mut j = Judge::new(mem, &[]);
+        j.records.insert(key.to_string(), record);
+        j.acts.insert("t.jsonl".into(), acts);
+        j
+    }
+
+    fn injection(key: &str) -> Injection {
+        Injection { time: "2026-11-15T10:00:01.000Z".into(), transcript: "t.jsonl".into(), key: key.into(), ..inj(None, 10, 100) }
+    }
+
+    fn act(time: &str, tool: &str, text: &str) -> Act {
+        Act { time: time.into(), tool: tool.into(), text: text.into(), shingles: shingles(text), grep: None }
+    }
+
+    /// #297, S-b: a hit's use time is the first act its rule counted after
+    /// the injection, whatever order the acts are read in; one per rule.
+    #[test]
+    fn a_hit_is_used_at_the_first_act_its_rule_counts() {
+        let dir = std::env::temp_dir().join(format!("atlas-hook-hits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mem = MemoryStore::open(&dir.join("memory.sqlite")).unwrap();
+        let (before, first, later) = ("2026-11-15T10:00:00.000Z", "2026-11-15T10:00:03.000Z", "2026-11-15T10:00:05.000Z");
+        // key: the key in a tool input.
+        let k = |t: &str| act(t, "mcp__atlas__recall", "{\"key\":\"widget-cache\"}");
+        let mut j = judge_of(&mem, "widget-cache", None, vec![k(later), k(before), k(first)]);
+        assert_eq!(j.hit_at(&injection("widget-cache")), Some(("key", first.to_string())));
+        // source: a Grep in the record's file whose pattern matches its text.
+        let text = "gadget exporter rule\n- the gadget exporter writes with temp files and renames them into place.";
+        let rec = || RecordInfo {
+            memory: false,
+            text: text.into(),
+            files: vec!["INTENT.md".into()],
+            shingles: shingles(text).into_iter().collect(),
+        };
+        let g = |t: &str| Act {
+            grep: Some(("gadget exporter".into(), false, "H:/x/INTENT.md ".into())),
+            ..act(t, "Grep", "{\"pattern\":\"gadget exporter\"}")
+        };
+        let mut j = judge_of(&mem, "rules:r00001", Some(rec()), vec![g(later), g(before), g(first)]);
+        assert_eq!(j.hit_at(&injection("rules:r00001")), Some(("source", first.to_string())));
+        // quote: a run of the record's words in the assistant's text.
+        let q = |t: &str| act(t, "", "Per the rule, the gadget exporter writes with temp files and renames them into place.");
+        let mut j = judge_of(&mem, "rules:r00001", Some(rec()), vec![q(later), q(before), q(first)]);
+        assert_eq!(j.hit_at(&injection("rules:r00001")), Some(("quote", first.to_string())));
+        drop(mem);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

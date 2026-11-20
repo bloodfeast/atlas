@@ -17,7 +17,7 @@
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
@@ -416,7 +416,9 @@ fn reason(status: u16) -> &'static str {
 pub type Shared<'a> = Mutex<&'a mut MemoryStore>;
 
 /// Serves one connection: reads the request, answers, and returns what it
-/// did. The store is held only while the request is handled.
+/// did. The store is held only while the request is handled. After the
+/// answer the server ends its side and drains what the client still sends
+/// for up to [`LINGER`] (500 ms), so an early answer is not lost to a reset.
 ///
 /// The connection is read through a borrow, never a `try_clone`: on Windows
 /// the cloned socket handle is inheritable, so a process started meanwhile
@@ -433,8 +435,9 @@ pub fn serve_conn(stream: TcpStream, store: &Shared<'_>, ctx: &Ctx) -> io::Resul
 /// [`serve_conn`] with the request's whole read bounded by `limit` (M1):
 /// a client that trickles its request is answered 408 once it runs out.
 /// One connection at a time stays: with the deadline, one slow peer holds
-/// the listener for `limit` at most, and the forwarder retries a refused
-/// post.
+/// the listener for `limit` plus the answer's drain ([`LINGER`], 500 ms)
+/// at most (and the write timeout, should the answer itself stall), and
+/// the forwarder retries a refused post.
 ///
 /// # Errors
 ///
@@ -449,7 +452,36 @@ pub fn serve_conn_within(stream: TcpStream, store: &Shared<'_>, ctx: &Ctx, limit
     let mut w = &stream;
     write!(w, "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", out.status, reason(out.status))?;
     w.flush()?;
+    linger(&stream);
     Ok(out)
+}
+
+/// How long the server reads and discards after its answer. Bounded by
+/// time only: a byte cap is outrun by a fast local sender (a body a few MB
+/// over [`MAX_BODY`] arrives in milliseconds on loopback), and reading for
+/// 500 ms costs the listener the same thread-time whatever the byte count.
+const LINGER: Duration = Duration::from_millis(500);
+
+/// Ends the server's side and reads what the client still sends, for at
+/// most [`LINGER`], before the socket is closed. A socket closed with
+/// unread bytes (a body after a 413, a trickle after a 408) sends a reset,
+/// and the client loses an answer it has not read yet.
+fn linger(stream: &TcpStream) {
+    if stream.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    let until = Instant::now() + LINGER;
+    let mut buf = [0u8; 8 << 10];
+    let mut r = stream;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        if matches!(r.read(&mut buf), Ok(0) | Err(_)) {
+            return;
+        }
+    }
 }
 
 /// Writes one line to stderr and ignores a failure: `eprintln!` panics when
@@ -1158,7 +1190,7 @@ mod tests {
         let listener = bind(0).unwrap();
         let addr = listener.local_addr().unwrap();
         let shared = Mutex::new(&mut s);
-        let (status, took) = std::thread::scope(|sc| {
+        let (status, took, sent) = std::thread::scope(|sc| {
             let client = sc.spawn(move || {
                 let mut t = TcpStream::connect_timeout(&addr, CLIENT_WAIT).unwrap();
                 let req = b"POST /github HTTP/1.1\r\nHost: x\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
@@ -1168,10 +1200,12 @@ mod tests {
                 // answer came: a write into a closed socket would reset it
                 // and lose the answer.
                 t.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+                let mut sent = 0;
                 for b in req.iter().take(40) {
                     if t.write_all(&[*b]).is_err() {
                         break;
                     }
+                    sent += 1;
                     let mut peek = [0u8; 1];
                     match t.peek(&mut peek) {
                         Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
@@ -1188,19 +1222,80 @@ mod tests {
                     }
                     got.extend_from_slice(&buf[..n]);
                 }
-                String::from_utf8_lossy(&got).split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0)
+                let status = String::from_utf8_lossy(&got).split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                (status, sent)
             });
             let (conn, _) = listener.accept().unwrap();
             let at = Instant::now();
             let out = serve_conn_within(conn, &shared, &c, Duration::from_secs(1)).unwrap();
             let took = at.elapsed();
-            assert_eq!(client.join().unwrap(), 408);
-            (out.status, took)
+            let (answer, sent) = client.join().unwrap();
+            assert_eq!(answer, 408);
+            (out.status, took, sent)
         });
         assert_eq!(status, 408);
-        assert!(took < Duration::from_secs(3), "the deadline let the client hold the listener for {took:?}");
+        // The property is the order: the answer came while the client still
+        // had bytes to trickle, so the deadline ended the request, not the
+        // client. At a byte per >= 300 ms the 1 s deadline lets about 5
+        // through; load can raise that (a late accept or a slow server
+        // thread starts the deadline later while the client keeps sending),
+        // so the bar is 20 (6 s): load-proof, and still red for a server
+        // that ignores `limit` or stretches it 5x. The wall ceiling is a
+        // backstop at 10x the 1 s deadline.
+        assert!(sent <= 20, "the client sent {sent} bytes before the answer: no deadline cut it off in time ({took:?})");
+        assert!(took < Duration::from_secs(10), "the deadline let the client hold the listener for {took:?}");
         assert_eq!(MAX_BODY, 5 << 20);
         let read = |raw: &str| read_request(&mut BufReader::new(raw.as_bytes()));
         assert_eq!(read(&format!("POST /github HTTP/1.1\r\nContent-Length: {}\r\n\r\n", (5 << 20) + 1)).unwrap_err(), 413);
+    }
+
+    /// An answer given before the request was read in full (a 413 on the
+    /// header, a 408 at the deadline) reaches the client: closing a socket
+    /// with unread bytes sends a reset, which drops the answer the client
+    /// has not read yet, so the server ends its side and drains first.
+    #[test]
+    fn an_answer_before_the_whole_request_is_not_lost_to_a_reset() {
+        // Part of a body, more than the server's read buffer, so bytes stay
+        // unread when it answers.
+        assert_eq!(early_answer(MAX_BODY + 1, 32 << 10), 413, "the client lost the answer to a reset (32 KB sent)");
+        // A whole body 2 MB over the cap: the drain is bounded by time, not
+        // by a byte count a fast local sender outruns.
+        let big = MAX_BODY + (2 << 20);
+        assert_eq!(early_answer(big, big), 413, "the client lost the answer to a reset ({big} bytes sent)");
+    }
+
+    /// Sends a request header naming `content_length` and `body` bytes of
+    /// body in one write (two writes could be split by a descheduled client
+    /// past the server's drain), then reads the status the server answered.
+    fn early_answer(content_length: usize, body: usize) -> u16 {
+        let (_d, mut s) = store("early-answer");
+        let c = ctx();
+        let listener = bind(0).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = Mutex::new(&mut s);
+        std::thread::scope(|sc| {
+            let client = sc.spawn(move || {
+                let mut t = TcpStream::connect_timeout(&addr, CLIENT_WAIT).unwrap();
+                let mut req = format!("POST /github HTTP/1.1\r\nHost: x\r\nContent-Length: {content_length}\r\n\r\n").into_bytes();
+                req.resize(req.len() + body, b'a');
+                // A reset fails the write; the read below then finds no answer.
+                let _ = t.write_all(&req);
+                // Read only after the server has answered and closed.
+                std::thread::sleep(Duration::from_millis(500));
+                t.set_read_timeout(Some(CLIENT_WAIT)).unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 256];
+                while let Ok(n) = t.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                String::from_utf8_lossy(&got).split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0)
+            });
+            let (conn, _) = listener.accept().unwrap();
+            assert_eq!(serve_conn_within(conn, &shared, &c, Duration::from_secs(5)).unwrap().status, 413);
+            client.join().unwrap()
+        })
     }
 }

@@ -212,7 +212,7 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
         lines.push(format!("- other handoffs: {}", rest.join("; ")));
     }
 
-    let goal_line = prev.as_deref().and_then(|p| goal(p).map(|g| goal_line(&g, p))).unwrap_or_default();
+    let goal_line = prev.as_deref().and_then(|p| goal_within(p, GOAL_TAIL_BYTES).map(|(g, from)| goal_line(&g, from, p))).unwrap_or_default();
     if lines.is_empty() && goal_line.is_empty() && resume.is_empty() {
         return Ok(None);
     }
@@ -231,15 +231,16 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
 /// The card's goal line, ending in a newline: the goal whole, or, past
 /// [`GOAL_CHARS`], where to read it (a cut goal restated with `/goal` would
 /// lose its end).
-fn goal_line(goal: &str, transcript: &Path) -> String {
+fn goal_line(goal: &str, from: GoalFrom, transcript: &Path) -> String {
     let n = goal.chars().count();
     if n <= GOAL_CHARS {
         return format!("- the previous session's goal, not met (restate it with /goal to keep it): {goal}\n");
     }
-    format!(
-        "- the previous session's goal, not met, is {n} characters, too long to show here: it is the `condition` of the last `goal_status` record in {}; restate it with /goal to keep it\n",
-        transcript.display()
-    )
+    let record = match from {
+        GoalFrom::Command => "the text of the last `/goal TEXT` command",
+        GoalFrom::Status => "the `condition` of the last `goal_status` record",
+    };
+    format!("- the previous session's goal, not met, is {n} characters, too long to show here: it is {record} in {}; restate it with /goal to keep it\n", transcript.display())
 }
 
 /// A scope the card lists as a lane: not a session's or an agent's own, and
@@ -354,21 +355,23 @@ pub fn previous_transcript(current: &Path) -> Option<PathBuf> {
         .map(|(_, p)| p)
 }
 
-/// A transcript's goal, when its newest goal record says it was not met: a
-/// `goal_status` attachment (`sentinel: true`) with `met: false` gives its
-/// condition; any `met: true` or a later `/goal clear` gives none. The transcript
-/// is read backward from its end in [`GOAL_BLOCK`] blocks, up to
-/// [`GOAL_TAIL_BYTES`], and the search stops at the newest goal record.
+/// A transcript's goal, by the newest goal record ([`goal_event`]): a
+/// `/goal TEXT` gives its text; a `goal_status` attachment (`sentinel: true`)
+/// with `met: false` gives its condition unless a `/goal clear` came before
+/// it with no `/goal TEXT` between; any `met: true` or a later `/goal clear`
+/// gives none. The transcript is read backward from its end in
+/// [`GOAL_BLOCK`] blocks, up to [`GOAL_TAIL_BYTES`], and the search stops
+/// once the records read settle the goal.
 pub fn goal(transcript: &Path) -> Option<String> {
-    goal_within(transcript, GOAL_TAIL_BYTES)
+    goal_within(transcript, GOAL_TAIL_BYTES).map(|(g, _)| g)
 }
 
 /// [`goal`] over the whole transcript, for a caller that must not miss one.
 pub fn goal_anywhere(transcript: &Path) -> Option<String> {
-    goal_within(transcript, u64::MAX)
+    goal_within(transcript, u64::MAX).map(|(g, _)| g)
 }
 
-fn goal_within(transcript: &Path, tail: u64) -> Option<String> {
+fn goal_within(transcript: &Path, tail: u64) -> Option<(String, GoalFrom)> {
     let mut f = std::fs::File::open(transcript).ok()?;
     let len = f.metadata().ok()?.len();
     let floor = len.saturating_sub(tail);
@@ -376,6 +379,7 @@ fn goal_within(transcript: &Path, tail: u64) -> Option<String> {
     // The bytes after `pos` not yet searched: the start of a line whose
     // beginning is in an earlier block.
     let mut carry: Vec<u8> = Vec::new();
+    let mut back = GoalBack::default();
     while pos > floor {
         let start = pos.saturating_sub(GOAL_BLOCK).max(floor);
         let mut buf = vec![0u8; usize::try_from(pos - start).ok()?];
@@ -388,46 +392,173 @@ fn goal_within(transcript: &Path, tail: u64) -> Option<String> {
         // floor is the file's start.
         let first = if pos > 0 { buf.iter().position(|&b| b == b'\n').map_or(buf.len(), |i| i + 1) } else { 0 };
         for line in buf[first..].split(|&b| b == b'\n').rev() {
-            if let Some(decided) = std::str::from_utf8(line.strip_suffix(b"\r").unwrap_or(line)).ok().and_then(goal_record) {
+            if let Some(decided) = std::str::from_utf8(line.strip_suffix(b"\r").unwrap_or(line)).ok().and_then(|l| goal_record(l, &mut back)) {
                 return decided;
             }
         }
         buf.truncate(first);
         carry = buf;
     }
-    None
+    // An unmet goal with no clear before it in the window read.
+    back.unmet.map(|c| (c, GoalFrom::Status))
 }
 
-/// What one transcript line says about the goal: `Some(Some(condition))`
-/// for an unmet goal, `Some(None)` for a met or cleared one, and `None` when
-/// the line is not a goal record.
-fn goal_record(line: &str) -> Option<Option<String>> {
-    if line.contains("\"type\":\"goal_status\"") {
-        let v = crate::json::parse(line).ok()?;
-        let a = v.get("attachment").filter(|a| a.get("type").and_then(Value::as_str) == Some("goal_status"))?;
-        // The usual completion record has `iterations` and no `sentinel`. A
-        // `met: false` with no `sentinel` is one check of a goal still running.
-        let met = a.get("met").and_then(Value::as_bool);
-        if met == Some(true) {
-            return Some(None);
+/// Newest first, the goal records seen so far: `Some(decided)` once they
+/// settle the goal, `None` while an older record may still decide. An unmet
+/// goal waits for what came before it: a `/goal clear` with no newer
+/// `/goal TEXT` voids it, as [`Goal::apply`] does reading forward.
+#[derive(Default)]
+struct GoalBack {
+    unmet: Option<String>,
+}
+
+/// The record a goal was read from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GoalFrom {
+    /// The arguments of a `/goal TEXT` command.
+    Command,
+    /// The `condition` of a sentinel `goal_status` record.
+    Status,
+}
+
+impl GoalBack {
+    fn older(&mut self, e: GoalEvent) -> Option<Option<(String, GoalFrom)>> {
+        match (self.unmet.take(), e) {
+            (None, GoalEvent::Set(t)) => Some(Some((t, GoalFrom::Command))),
+            (Some(t), GoalEvent::Set(_)) => Some(Some((t, GoalFrom::Status))),
+            (_, GoalEvent::Clear) | (None, GoalEvent::Met) => Some(None),
+            (None, GoalEvent::Unmet(c)) | (Some(c), GoalEvent::Met | GoalEvent::Unmet(_)) => {
+                self.unmet = Some(c);
+                None
+            }
         }
-        if a.get("sentinel").and_then(Value::as_bool) != Some(true) {
-            return None;
-        }
-        if met != Some(false) {
-            return Some(None);
-        }
-        return Some(a.get("condition").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string));
     }
-    if line.contains("<command-name>/goal</command-name>") {
-        let v = crate::json::parse(line).ok()?;
-        let typed = v.get("type").and_then(Value::as_str) == Some("user");
-        let content = v.get("message").and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("");
-        if typed && content.contains("<command-name>/goal</command-name>") && content.contains("<command-args>clear</command-args>") {
-            return Some(None);
+}
+
+/// What one transcript line says about the goal, newest first.
+fn goal_record(line: &str, back: &mut GoalBack) -> Option<Option<(String, GoalFrom)>> {
+    if !maybe_goal(line) {
+        return None;
+    }
+    let v = crate::json::parse(line).ok()?;
+    // A subagent's record or a compaction summary quoting a command is not
+    // the session's goal, as the card skips both ([`crate::checkpoint`]).
+    if ["isSidechain", "isCompactSummary"].iter().any(|k| v.get(k).and_then(Value::as_bool) == Some(true)) {
+        return None;
+    }
+    back.older(goal_event(&v)?)
+}
+
+/// The `/goal` command's name as Claude Code records it.
+pub(crate) const GOAL_CMD: &str = "<command-name>/goal</command-name>";
+
+/// One goal record, as Claude Code writes them: the one parser the card
+/// ([`crate::checkpoint`]) and resume read the goal with.
+#[derive(Debug, PartialEq)]
+pub(crate) enum GoalEvent {
+    /// `/goal TEXT`.
+    Set(String),
+    /// `/goal clear`.
+    Clear,
+    /// A `goal_status` saying the goal was met (or a sentinel without
+    /// `met: false`): the goal ends.
+    Met,
+    /// A sentinel `goal_status` with `met: false`: the goal carried past a
+    /// compaction that dropped the `/goal` command itself.
+    Unmet(String),
+}
+
+/// Whether a raw line can hold a goal record: a prefilter, the parsed
+/// record decides.
+pub(crate) fn maybe_goal(line: &str) -> bool {
+    line.contains(GOAL_CMD) || line.contains("\"goal_status\"")
+}
+
+/// What a parsed record says about the goal, `None` for any other record.
+/// The command is a user record (`message.content`, a string or text
+/// blocks with no tool result beside them) or a `system` record of subtype
+/// `local_command` (top-level `content`); a bare `/goal` asks for the status
+/// and changes nothing. The usual `goal_status` completion record has
+/// `iterations` and no `sentinel`; a `met: false` with no `sentinel` is one
+/// check of a goal still running and changes nothing.
+pub(crate) fn goal_event(v: &Value) -> Option<GoalEvent> {
+    let content = match v.get("type").and_then(Value::as_str)? {
+        "attachment" => return goal_status(v.get("attachment")?),
+        "system" if v.get("subtype").and_then(Value::as_str) == Some("local_command") => v.get("content")?,
+        "user" => v.pointer("/message/content")?,
+        _ => return None,
+    };
+    let text = match content.as_str() {
+        Some(s) => s,
+        None => {
+            let blocks = content.as_array()?;
+            if blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")) {
+                return None;
+            }
+            blocks.iter().find_map(|b| b.get("text").and_then(Value::as_str))?
+        }
+    };
+    if !text.contains(GOAL_CMD) {
+        return None;
+    }
+    match text.split_once("<command-args>")?.1.split_once("</command-args>")?.0.trim() {
+        "" => None,
+        "clear" => Some(GoalEvent::Clear),
+        args => Some(GoalEvent::Set(goal_text(args))),
+    }
+}
+
+fn goal_status(a: &Value) -> Option<GoalEvent> {
+    if a.get("type").and_then(Value::as_str) != Some("goal_status") {
+        return None;
+    }
+    let met = a.get("met").and_then(Value::as_bool);
+    if met == Some(true) {
+        return Some(GoalEvent::Met);
+    }
+    if a.get("sentinel").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let c = a.get("condition").and_then(Value::as_str).map(goal_text).filter(|c| !c.is_empty());
+    match (met, c) {
+        (Some(false), Some(c)) => Some(GoalEvent::Unmet(c)),
+        _ => Some(GoalEvent::Met),
+    }
+}
+
+/// A goal's text on one line: its whitespace runs become one space, so a
+/// goal typed over several lines cannot split a card or resume line.
+fn goal_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The goal read forward through a segment's records.
+#[derive(Default)]
+pub(crate) struct Goal {
+    text: Option<String>,
+    /// A `/goal clear` with no `/goal TEXT` after it: a later unmet
+    /// `goal_status` (a check of the turn the clear interrupted) does not
+    /// bring the goal back.
+    cleared: bool,
+}
+
+impl Goal {
+    pub(crate) fn apply(&mut self, e: GoalEvent) {
+        match e {
+            GoalEvent::Set(t) => (self.text, self.cleared) = (Some(t), false),
+            GoalEvent::Clear => (self.text, self.cleared) = (None, true),
+            GoalEvent::Met => self.text = None,
+            GoalEvent::Unmet(c) => {
+                if !self.cleared {
+                    self.text = Some(c);
+                }
+            }
         }
     }
-    None
+
+    pub(crate) fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -444,7 +575,26 @@ mod tests {
         // As Claude Code writes them: a finished goal, and one failed check.
         let done = r#"{"type":"attachment","attachment":{"type":"goal_status","met":true,"iterations":3,"durationMs":9000,"tokens":1200}}"#;
         let check = r#"{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":"ship it"}}"#;
-        let cases: [(Vec<String>, Option<&str>); 9] = [
+        // N4 (#317): a `/goal clear` run as a system `local_command` record.
+        let sys = |args: &str| {
+            let c = format!("<command-name>/goal</command-name>\n<command-args>{args}</command-args>");
+            format!(r#"{{"type":"system","subtype":"local_command","content":{}}}"#, Value::String(c))
+        };
+        // N2 (#317 r3): a subagent's command and a summary quoting one are
+        // not the session's, as on the card.
+        let side = r#"{"type":"user","isSidechain":true,"message":{"content":"<command-name>/goal</command-name>\n<command-args>ship B</command-args>"}}"#;
+        let summary = r#"{"type":"user","isCompactSummary":true,"message":{"content":"<command-name>/goal</command-name>\n<command-args>clear</command-args>"}}"#;
+        let cases: [(Vec<String>, Option<&str>); 16] = [
+            (vec![status(false), side.into()], Some("ship it")),
+            (vec![status(false), summary.into()], Some("ship it")),
+            // A check with no `sentinel` after a met goal brings nothing back.
+            (vec![done.into(), check.into()], None),
+            (vec![status(false), sys("clear")], None),
+            // S2: an unmet check after a clear does not bring the goal back,
+            // unless a newer `/goal TEXT` set it again.
+            (vec![status(false), sys("clear"), status(false)], None),
+            (vec![sys("clear"), sys("ship B"), status(false)], Some("ship it")),
+            (vec![status(false), sys("ship B")], Some("ship B")),
             (vec![status(false), done.into()], None),
             (vec![status(false), done.into(), r#"{"type":"user","message":{"content":"hi"}}"#.into()], None),
             (vec![status(false), done.into(), status(false)], Some("ship it")),
@@ -726,7 +876,8 @@ mod tests {
             card(&s, &OrchSettings::default(), &new.to_string_lossy(), NOW, false).unwrap().unwrap()
         };
         // A full card: the goal and the instruction are whole.
-        let long_goal = format!("{} end of goal", "every word counts, ".repeat(14));
+        // One space between words: the goal is read onto one line (#317).
+        let long_goal = format!("{}end of goal", "every word counts, ".repeat(14));
         assert!(long_goal.chars().count() <= GOAL_CHARS);
         let c = the_card(&long_goal);
         assert!(c.len() <= CARD_BYTES, "{} bytes: {c}", c.len());
@@ -741,6 +892,13 @@ mod tests {
         let longer = format!("{} the end", "x".repeat(GOAL_CHARS));
         let c = the_card(&longer);
         assert!(!c.contains("xxxxx") && c.contains(&format!("is {} characters", longer.chars().count())) && c.contains(&old.display().to_string()), "{c}");
+        // S2 (#317 r3): the line names the record the goal came from.
+        assert!(c.contains("it is the `condition` of the last `goal_status` record in"), "{c}");
+        let cmd = Value::String(format!("<command-name>/goal</command-name>\n<command-args>{longer}</command-args>"));
+        std::fs::write(&old, format!(r#"{{"type":"user","message":{{"content":{cmd}}}}}"#) + "\n").unwrap();
+        let c = card(&s, &OrchSettings::default(), &new.to_string_lossy(), NOW, false).unwrap().unwrap();
+        assert!(!c.contains("xxxxx") && c.contains(&format!("is {} characters", longer.chars().count())), "{c}");
+        assert!(c.contains("it is the text of the last `/goal TEXT` command in") && !c.contains("goal_status"), "{c}");
         drop(s);
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -410,7 +410,7 @@ fn freshness_after_a_rebuild_is_a_count_not_a_file_list() {
     drop(open(&cfg));
     // An older derived schema on disk: the next open wipes the atlas rows.
     {
-        let conn = rusqlite::Connection::open(&db).unwrap();
+        let conn = atlas::db::Connection::open(&db).unwrap();
         conn.execute_batch("UPDATE meta SET value = 'older' WHERE key IN ('atlas', 'atlas_schema'); DELETE FROM meta WHERE key = 'open_stamp';")
             .unwrap();
     }
@@ -697,7 +697,7 @@ fn an_index_from_an_older_binary_rebuilds_itself() {
     let db = t.path().join("state/atlas.sqlite");
     drop(open(&cfg));
     {
-        let conn = rusqlite::Connection::open(&db).unwrap();
+        let conn = atlas::db::Connection::open(&db).unwrap();
         let schema: String = conn.query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| r.get(0)).unwrap();
         assert!(schema.contains("/parse-") && schema.ends_with(env!("CARGO_PKG_VERSION")), "{schema}");
         // What an older binary left: its stamp, and a row its rules produced.

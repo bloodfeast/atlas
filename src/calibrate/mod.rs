@@ -103,7 +103,7 @@ use std::collections::HashSet;
 use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::baseline::Baseline;
 use crate::config::Config;
@@ -495,9 +495,10 @@ impl Plan {
 ///
 /// The store cannot be opened.
 pub fn open(db: &Path) -> Result<Connection, String> {
-    let conn = crate::store::open_raw(db).map_err(|e| format!("{}: {e}", db.display()))?;
-    conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
-    Ok(conn)
+    // open_raw's handler waits for the server's writers with the same 2 ms
+    // polls they use; a busy_timeout here would replace it with SQLite's
+    // back-off, which loses every free moment to them (review F1 of #343).
+    crate::store::open_raw(db).map_err(|e| format!("{}: {e}", db.display()))
 }
 
 /// Why the store needs a calibration, or `None` when its latest baseline
@@ -541,7 +542,7 @@ pub struct Outcome {
     pub skipped: Vec<String>,
 }
 
-fn db_err(e: rusqlite::Error) -> String {
+fn db_err(e: crate::db::Error) -> String {
     e.to_string()
 }
 
@@ -779,10 +780,21 @@ mod tests {
     }
 
     /// The code of a source file: the part before its tests, without
-    /// comment lines and blank lines, each line trimmed.
+    /// comment lines and blank lines, each line trimmed, and without a
+    /// test-only statement (a `#[cfg(test)]` line and the line after it,
+    /// such as glob.rs's step counter), which no build runs.
     fn code_of(src: &str) -> String {
         let body = src.split("\n#[cfg(test)]").next().unwrap_or(src);
-        body.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).collect::<Vec<_>>().join("\n")
+        let mut out = Vec::new();
+        let mut lines = body.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//"));
+        while let Some(l) = lines.next() {
+            if l == "#[cfg(test)]" {
+                lines.next();
+            } else {
+                out.push(l);
+            }
+        }
+        out.join("\n")
     }
 
     fn rules_hash() -> String {

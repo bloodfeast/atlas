@@ -263,7 +263,7 @@ pub fn embed_all_pending_cached(settings: &atlas::memory::settings::Settings, ca
     }
     let model = atlas::embed::Model::load(&settings.model).map_err(|e| e.to_string())?;
     let mem = atlas::memory::MemoryStore::open(&settings.store).map_err(|e| e.to_string())?;
-    let err = |e: rusqlite::Error| format!("vector cache {}: {e}", cache.display());
+    let err = |e: atlas::db::Error| format!("vector cache {}: {e}", cache.display());
     atlas::memory::vectors::ensure_schema(&mem).map_err(|e| e.to_string())?;
     mem.conn().execute("ATTACH DATABASE ?1 AS vc", [cache.to_string_lossy()]).map_err(err)?;
     mem.conn().execute_batch(&atlas::memory::vectors::SCHEMA.replace("EXISTS rec_vec", "EXISTS vc.rec_vec")).map_err(err)?;
@@ -496,7 +496,7 @@ fn records_from_file(mem: &atlas::memory::MemoryStore, name: &str, path: &str) -
     let sql = "SELECT DISTINCT r.key FROM records r JOIN versions v ON v.rid = r.rid WHERE v.src = ?1 AND v.src_path = ?2";
     let mut st = mem.conn().prepare(sql).map_err(|e| e.to_string())?;
     let rows = st.query_map([name, path], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
-    rows.collect::<rusqlite::Result<HashSet<String>>>().map_err(|e| e.to_string())
+    rows.collect::<atlas::db::Result<HashSet<String>>>().map_err(|e| e.to_string())
 }
 
 /// The source text a question's facts must come from.
@@ -1510,8 +1510,8 @@ fn copy_store(from: &Path, to: &Path) -> Result<(), String> {
 /// copy of the main file alone is the whole store. An error when another
 /// connection still holds the log.
 fn checkpoint(path: &Path) -> Result<(), String> {
-    let err = |e: rusqlite::Error| format!("checkpoint {}: {e}", path.display());
-    let c = rusqlite::Connection::open(path).map_err(err)?;
+    let err = |e: atlas::db::Error| format!("checkpoint {}: {e}", path.display());
+    let c = atlas::db::Connection::open(path).map_err(err)?;
     let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0)).map_err(err)?;
     if busy != 0 {
         return Err(format!("checkpoint {}: another connection holds the log", path.display()));
@@ -1561,8 +1561,8 @@ impl Rewound {
 ///
 /// The copy failing to open or write, as text.
 pub fn rewind_store(path: &Path, time: &str) -> Result<Rewound, String> {
-    let err = |e: rusqlite::Error| format!("rewind {}: {e}", path.display());
-    let mut c = rusqlite::Connection::open(path).map_err(err)?;
+    let err = |e: atlas::db::Error| format!("rewind {}: {e}", path.display());
+    let mut c = atlas::db::Connection::open(path).map_err(err)?;
     let tx = c.transaction().map_err(err)?;
     // The append-only guard comes back below, from the schema.
     tx.execute_batch("DROP TRIGGER IF EXISTS versions_no_delete;").map_err(err)?;
@@ -1787,11 +1787,11 @@ fn names_under(root: &Path, out: &mut Vec<(PathBuf, String)>) {
 }
 
 fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBuf>, c: &atlas::config::Config) -> Result<bool, String> {
-    let conn = rusqlite::Connection::open(store).map_err(|e| e.to_string())?;
+    let conn = atlas::db::Connection::open(store).map_err(|e| e.to_string())?;
     let q = |sql: &str| -> Result<Vec<(String, i64, i64, i64)>, String> {
         let mut st = conn.prepare(sql).map_err(|e| e.to_string())?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| e.to_string())?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
+        rows.collect::<atlas::db::Result<Vec<_>>>().map_err(|e| e.to_string())
     };
     // Truth, per lane: entries, open questions (no `answers` ref), handoffs.
     let truth = q("SELECT scope, COUNT(*),
@@ -1854,14 +1854,14 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
             .prepare("SELECT scope, key FROM records WHERE kind = 'journal' AND sub = 'question' AND key NOT IN (SELECT target FROM refs WHERE kind = 'answers')")
             .map_err(|e| e.to_string())?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+        rows.collect::<atlas::db::Result<Vec<_>>>().map_err(|e| e.to_string())?
     };
     let newest: Vec<(String, String)> = {
         let mut st = conn
             .prepare("SELECT r.scope, r.key FROM records r JOIN versions v ON v.vid = r.head WHERE r.kind = 'handoff' AND r.status = 'active' AND v.time = (SELECT MAX(v2.time) FROM records r2 JOIN versions v2 ON v2.vid = r2.head WHERE r2.scope = r.scope AND r2.kind = 'handoff' AND r2.status = 'active')")
             .map_err(|e| e.to_string())?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+        rows.collect::<atlas::db::Result<Vec<_>>>().map_err(|e| e.to_string())?
     };
     // The newest `next` and `brief` of each lane: what a fresh agent acts on.
     let latest: Vec<(String, String)> = {
@@ -1869,7 +1869,7 @@ fn work_queue(call: &mut Call<'_>, store: &Path, roots: &BTreeMap<String, PathBu
             .prepare("SELECT scope, key FROM records r WHERE kind = 'journal' AND sub IN ('next', 'brief') AND rid = (SELECT MAX(rid) FROM records r2 WHERE r2.scope = r.scope AND r2.kind = 'journal' AND r2.sub = r.sub)")
             .map_err(|e| e.to_string())?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+        rows.collect::<atlas::db::Result<Vec<_>>>().map_err(|e| e.to_string())?
     };
     let (mut qs_shown, mut ho_shown, mut latest_shown, mut trimmed, mut counted) = (0, 0, 0, 0, 0i64);
     for (lane, entries, _, _) in &truth {
@@ -2397,7 +2397,7 @@ mod tests {
             assert!(m.head("rule:b").unwrap().is_none());
             assert_eq!(m.head("rule:c").unwrap().unwrap().status, "active");
         }
-        let c = rusqlite::Connection::open(&path).unwrap();
+        let c = atlas::db::Connection::open(&path).unwrap();
         let fts: String = c
             .query_row("SELECT title FROM records_fts WHERE rowid = (SELECT rid FROM records WHERE key = 'rule:a')", [], |r| r.get(0))
             .unwrap();

@@ -115,7 +115,7 @@ fn two_sessions_writing_at_once_never_see_an_error() {
     // Every snapshot left on disk verifies: no failed copies pile up.
     let snaps = t.path().join("state").join("snapshots");
     for e in std::fs::read_dir(&snaps).into_iter().flatten().flatten() {
-        let c = rusqlite::Connection::open_with_flags(e.path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let c = atlas::db::Connection::open_with_flags(e.path(), atlas::db::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let ic: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
         assert_eq!(ic, "ok", "{}", e.path().display());
     }
@@ -152,7 +152,7 @@ fn snapshots_taken_while_another_process_writes_never_fail() {
     assert!(failures.is_empty(), "{} of {tries} snapshots failed: {:?}", failures.len(), &failures[..failures.len().min(3)]);
     let live: i64 = store.conn().query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).unwrap();
     for e in std::fs::read_dir(&dir).unwrap().flatten() {
-        let c = rusqlite::Connection::open_with_flags(e.path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let c = atlas::db::Connection::open_with_flags(e.path(), atlas::db::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let ic: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
         let n: i64 = c.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).unwrap();
         assert!(ic == "ok" && n <= live, "{}: {ic}, {n} records", e.path().display());
@@ -784,7 +784,7 @@ fn opens_of_a_fresh_store_at_once_make_the_schema_once() {
     for o in opens {
         o.join().unwrap().expect("every open of a fresh store succeeds");
     }
-    let c = rusqlite::Connection::open(&path).unwrap();
+    let c = atlas::db::Connection::open(&path).unwrap();
     let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(v, atlas::memory::SCHEMA_VERSION);
     assert_eq!(atlas::memory::store_skew(&path), None);

@@ -229,7 +229,7 @@ pub struct OrchestrateSpec {
     /// none: every linked worktree of the project's repositories).
     pub worktree_roots: Vec<std::path::PathBuf>,
     /// runq's state root, for the restart point's holders (`orchestrate.runq_root`;
-    /// `RUNQ_ROOT` comes first, runq's Windows default last: see
+    /// optional; `RUNQ_ROOT` comes first, and with neither none is read: see
     /// [`crate::restart::runq_root`]).
     pub runq_root: Option<std::path::PathBuf>,
 }
@@ -532,6 +532,38 @@ pub fn tail_reads() -> usize {
     TAIL_READS.with(std::cell::Cell::get)
 }
 
+/// The file system calls [`Agents::running`] made on one thread (a test
+/// seam): the cost of an admit counted as work, which machine load does
+/// not move, rather than timed.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FsOps {
+    /// Folder listings.
+    pub listings: usize,
+    /// Meta files read and parsed.
+    pub reads: usize,
+    /// File times looked up (a listing entry's or a path's).
+    pub stats: usize,
+}
+
+thread_local! {
+    static FS_OPS: std::cell::Cell<FsOps> = const { std::cell::Cell::new(FsOps { listings: 0, reads: 0, stats: 0 }) };
+}
+
+/// The [`FsOps`] counted on this thread so far.
+#[doc(hidden)]
+pub fn fs_ops() -> FsOps {
+    FS_OPS.with(std::cell::Cell::get)
+}
+
+fn count_fs(f: impl FnOnce(&mut FsOps)) {
+    FS_OPS.with(|c| {
+        let mut o = c.get();
+        f(&mut o);
+        c.set(o);
+    });
+}
+
 /// Whether the `user` lines after a transcript's last `assistant` line hold
 /// a tool error that says the disk is full: `ENOSPC`, "no space left" (Node,
 /// Git Bash), or Windows' "not enough space on the disk" / "os error 112"
@@ -673,11 +705,57 @@ pub fn record_finish(store: &crate::memory::MemoryStore, id: &str, at: SystemTim
         conn.execute_batch(RELEASE_TABLE)?;
         conn.execute(
             "INSERT INTO agent_releases(agent, time) VALUES(?1, ?2) ON CONFLICT(agent) DO UPDATE SET time = max(time, excluded.time)",
-            rusqlite::params![id, nanos],
+            crate::db::params![id, nanos],
         )?;
         conn.execute("DELETE FROM agent_releases WHERE time < ?1", [keep])?;
         Ok(())
     })
+}
+
+/// The store table of each session's last start (SessionStart startup,
+/// resume or clear): when the Claude Code process that runs it began.
+pub const SESSION_START_TABLE: &str = "CREATE TABLE IF NOT EXISTS session_starts(session TEXT PRIMARY KEY, time INTEGER NOT NULL);";
+
+/// Writes session `session`'s start in `store`, timed `at` ([`SESSION_START_TABLE`];
+/// the later start wins). A server that restarts mid-session reads it
+/// ([`session_start`]) to count the agents its Claude Code process still
+/// runs, which wrote before the server started (#306). Rows older than
+/// [`RELEASE_KEEP`] before `at` are pruned.
+///
+/// # Errors
+///
+/// [`crate::Error::StoreTooNew`] (nothing written) or [`crate::Error::Db`].
+pub fn record_session_start(store: &crate::memory::MemoryStore, session: &str, at: SystemTime) -> crate::Result<()> {
+    let conn = store.conn();
+    let nanos = release_nanos(at);
+    let keep = release_nanos(at.checked_sub(RELEASE_KEEP).unwrap_or(UNIX_EPOCH));
+    crate::memory::guarded(conn, store.path(), || {
+        conn.execute_batch(SESSION_START_TABLE)?;
+        conn.execute(
+            "INSERT INTO session_starts(session, time) VALUES(?1, ?2) ON CONFLICT(session) DO UPDATE SET time = max(time, excluded.time)",
+            crate::db::params![session, nanos],
+        )?;
+        conn.execute("DELETE FROM session_starts WHERE time < ?1", [keep])?;
+        Ok(())
+    })
+}
+
+/// Session `session`'s last start in `store` ([`record_session_start`]),
+/// if one was recorded.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn session_start(store: &crate::memory::MemoryStore, session: &str) -> crate::Result<Option<SystemTime>> {
+    let conn = store.conn();
+    let exists: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_starts')", [], |r| r.get(0))?;
+    if !exists {
+        return Ok(None);
+    }
+    let mut st = conn.prepare_cached("SELECT time FROM session_starts WHERE session = ?1")?;
+    let n: Option<i64> = st.query_map([session], |r| r.get(0))?.next().transpose()?;
+    Ok(n.map(|n| UNIX_EPOCH + Duration::from_nanos(u64::try_from(n).unwrap_or(0))))
 }
 
 /// Removes agent `id`'s release record from `store`, if any: the agent
@@ -700,8 +778,13 @@ pub fn clear_finish(store: &crate::memory::MemoryStore, id: &str) -> crate::Resu
 }
 
 /// Whether the store has [`RELEASE_TABLE`]: a read, never DDL.
-fn has_release_table(conn: &rusqlite::Connection) -> crate::Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_releases')", [], |r| r.get(0))?)
+fn has_release_table(conn: &crate::db::Connection) -> crate::Result<bool> {
+    table_exists(conn, "agent_releases")
+}
+
+/// Whether the store has table `name`: a read, never DDL.
+fn table_exists(conn: &crate::db::Connection, name: &str) -> crate::Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)", [name], |r| r.get(0))?)
 }
 
 /// Every release record in `store`, by agent id (none without the table).
@@ -715,7 +798,7 @@ pub fn released(store: &crate::memory::MemoryStore) -> crate::Result<HashMap<Str
         return Ok(HashMap::new());
     }
     let mut st = conn.prepare_cached("SELECT agent, time FROM agent_releases")?;
-    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<crate::db::Result<Vec<_>>>()?;
     Ok(rows.into_iter().map(|(a, n)| (a, UNIX_EPOCH + Duration::from_nanos(u64::try_from(n).unwrap_or(0)))).collect())
 }
 
@@ -726,6 +809,7 @@ fn import_release_files(store: &crate::memory::MemoryStore, entries: &[std::fs::
     for e in entries {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(id) = name.strip_prefix("agent-").and_then(|n| n.strip_suffix(RELEASED_SUFFIX)) else { continue };
+        count_fs(|o| o.stats += 1);
         let Some(at) = e.metadata().and_then(|m| m.modified()).ok() else { continue };
         match record_finish(store, id, at) {
             Ok(()) => {
@@ -777,6 +861,7 @@ pub fn refused_launches(transcript: &Path, from: u64, ids: &[&str]) -> (Vec<Stri
     if ids.is_empty() {
         return (out, from);
     }
+    count_fs(|o| o.reads += 1);
     let Ok(mut f) = std::fs::File::open(transcript) else { return (out, from) };
     let mut buf = Vec::new();
     if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut buf).is_err() {
@@ -806,6 +891,7 @@ pub fn refused_launches(transcript: &Path, from: u64, ids: &[&str]) -> (Vec<Stri
 /// line (at most 200 lines, 64 KiB of text), so a long transcript is not
 /// read whole.
 pub fn brief_of(path: &Path) -> Option<String> {
+    count_fs(|o| o.reads += 1);
     let f = std::fs::File::open(path).ok()?;
     for line in std::io::BufReader::new(f).lines().take(200) {
         let line = line.ok()?;
@@ -875,8 +961,16 @@ pub struct Agents {
     /// When this process started, for a resident server; `None` for a
     /// command hook (a process per event).
     started: Option<SystemTime>,
+    /// When the Claude Code process of each agents folder's session started,
+    /// where known ([`session_start`]): an agent there counts from then, not
+    /// from [`Agents::started`], so a server restarted mid-session still
+    /// counts the agents that wrote before it (#306).
+    opened: HashMap<PathBuf, SystemTime>,
     /// Launches admitted whose agent has not started yet, oldest first.
     pending: Vec<Pending>,
+    /// The tool use ids of the pending launches [`Agents::sync_pending`]
+    /// last wrote to [`PENDING_TABLE`].
+    synced: Vec<String>,
     /// The next pending record's number.
     seq: u64,
     /// The pending record the last admitted launch made, until the hook's
@@ -940,6 +1034,73 @@ struct Pending {
     /// already its sub-lane, once the queue check set it
     /// ([`Agents::hold_last`]). Two launches of one message see each other.
     class: Option<crate::lanes::Class>,
+    /// The session transcript's length when it was admitted: its refusal,
+    /// if the harness refuses it, is written after this.
+    offset: u64,
+    /// The session transcript it was launched from.
+    transcript: String,
+    /// Its `description`, and the lane its brief names (empty if none), for
+    /// the held-slot listing ([`PENDING_TABLE`]).
+    description: String,
+    lane: String,
+}
+
+/// The launches admitted whose agent has not started, as the hook process
+/// holding them last wrote them (public #16): `atlas queue list` and
+/// `recall op=status` run elsewhere and list them as held slots. `time` is
+/// the admission in nanoseconds since the Unix epoch; a row older than
+/// [`PENDING_TTL`] holds nothing.
+pub const PENDING_TABLE: &str = "CREATE TABLE IF NOT EXISTS agent_pending(tool_use_id TEXT NOT NULL, transcript TEXT NOT NULL, kind TEXT NOT NULL, lane TEXT NOT NULL, description TEXT NOT NULL, time INTEGER NOT NULL);";
+
+/// A cap slot held now: by a running agent, or by a launch admitted whose
+/// agent has not started yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSlot {
+    /// The kind whose slot it holds.
+    pub kind: Kind,
+    /// The lane it runs under; empty when none is known.
+    pub lane: String,
+    /// The launch's description (else the agent id).
+    pub description: String,
+    /// When it was launched, as the store writes times (UTC,
+    /// `YYYY-MM-DDTHH:MM:SSZ`); empty when not known.
+    pub since: String,
+    /// `false` for a launch whose agent has not started.
+    pub running: bool,
+}
+
+/// The launches [`PENDING_TABLE`] holds, admitted less than [`PENDING_TTL`]
+/// before `now`, as held slots, with each one's tool use id. Errors read as
+/// none (the table is a listing aid, never a cap input).
+pub fn pending_slots(store: &crate::memory::MemoryStore, now: SystemTime) -> Vec<(String, HeldSlot)> {
+    let floor = release_nanos(now.checked_sub(PENDING_TTL).unwrap_or(UNIX_EPOCH));
+    let conn = store.conn();
+    let read = || -> crate::Result<Vec<(String, HeldSlot)>> {
+        if !table_exists(conn, "agent_pending")? {
+            return Ok(Vec::new());
+        }
+        let mut st = conn.prepare("SELECT tool_use_id, kind, lane, description, time FROM agent_pending WHERE time >= ?1 ORDER BY time")?;
+        let rows = st.query_map([floor], |r| {
+            let (id, kind, lane, description, t): (String, String, String, String, i64) =
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+            let since = UNIX_EPOCH + Duration::from_nanos(u64::try_from(t).unwrap_or(0));
+            Ok((
+                id,
+                HeldSlot {
+                    kind: Kind::parse(&kind).unwrap_or(Kind::None),
+                    lane,
+                    description,
+                    since: crate::store::utc(since),
+                    running: false,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    };
+    read().unwrap_or_else(|e| {
+        eprintln!("atlas agent cap: pending launches: {e}");
+        Vec::new()
+    })
 }
 
 impl Default for Agents {
@@ -957,7 +1118,9 @@ impl Agents {
     pub fn new(started: Option<SystemTime>) -> Agents {
         Agents {
             started,
+            opened: HashMap::new(),
             pending: Vec::new(),
+            synced: Vec::new(),
             seq: 0,
             last: None,
             paired: HashSet::new(),
@@ -989,6 +1152,74 @@ impl Agents {
             self.disk_full.insert(transcript.to_path_buf(), (len, at, full));
         }
         full
+    }
+
+    /// Writes this process's pending launches to [`PENDING_TABLE`] when they
+    /// changed since the last write (only rows it wrote itself are removed:
+    /// other servers share the store), and prunes rows past
+    /// [`PENDING_TTL`]. A launch with no tool use id is not listed.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::StoreTooNew`] (nothing written) or [`crate::Error::Db`].
+    pub fn sync_pending(&mut self, store: &crate::memory::MemoryStore) -> crate::Result<()> {
+        let clock = Instant::now();
+        let now: Vec<&Pending> =
+            self.pending.iter().filter(|p| !p.tool_use_id.is_empty() && clock.saturating_duration_since(p.at) < PENDING_TTL).collect();
+        if now.len() == self.synced.len() && now.iter().all(|p| self.synced.contains(&p.tool_use_id)) {
+            return Ok(());
+        }
+        let conn = store.conn();
+        let floor = release_nanos(SystemTime::now().checked_sub(PENDING_TTL).unwrap_or(UNIX_EPOCH));
+        crate::memory::guarded(conn, store.path(), || {
+            conn.execute_batch(PENDING_TABLE)?;
+            for gone in self.synced.iter().filter(|t| !now.iter().any(|p| &p.tool_use_id == *t)) {
+                conn.execute("DELETE FROM agent_pending WHERE tool_use_id = ?1", [gone.as_str()])?;
+            }
+            for p in now.iter().filter(|p| !self.synced.contains(&p.tool_use_id)) {
+                // The sub-lane it runs as, once the queue check gave it one.
+                let lane = p.class.as_ref().and_then(|c| c.lane.as_deref()).unwrap_or(&p.lane);
+                conn.execute(
+                    "INSERT INTO agent_pending(tool_use_id, transcript, kind, lane, description, time) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    crate::db::params![p.tool_use_id, p.transcript, p.kind.name(), lane, p.description, release_nanos(p.wall)],
+                )?;
+            }
+            conn.execute("DELETE FROM agent_pending WHERE time < ?1", [floor])?;
+            Ok(())
+        })?;
+        self.synced = now.iter().map(|p| p.tool_use_id.clone()).collect();
+        Ok(())
+    }
+
+    /// Drops the pending launches the session transcript records as
+    /// refused since each was admitted (a tool result with `is_error` for
+    /// its tool use id: the harness rejected it, e.g. an unknown agent
+    /// type, or the permission prompt did): such a launch starts no agent,
+    /// so it holds no slot (public #16). Read before every admission, so a
+    /// relaunch right after a rejection is counted without it.
+    ///
+    /// Every session's pending launches are checked, not only the
+    /// admitting one's: the cap counts them all. A launch made by a
+    /// subagent has its result in that agent's own transcript, which this
+    /// does not read: it holds its slot until [`PENDING_TTL`].
+    fn drop_refused(&mut self) {
+        let mut transcripts: Vec<String> =
+            self.pending.iter().filter(|p| !p.tool_use_id.is_empty()).map(|p| p.transcript.clone()).collect();
+        transcripts.sort();
+        transcripts.dedup();
+        for transcript in transcripts {
+            let mine: Vec<&Pending> = self.pending.iter().filter(|p| !p.tool_use_id.is_empty() && p.transcript == transcript).collect();
+            let Some(from) = mine.iter().map(|p| p.offset).min() else { continue };
+            let ids: Vec<&str> = mine.iter().map(|p| p.tool_use_id.as_str()).collect();
+            let (refused, next) = refused_launches(Path::new(&transcript), from, &ids);
+            // The next scan starts where this one ended.
+            for p in self.pending.iter_mut().filter(|p| p.transcript == transcript) {
+                p.offset = p.offset.max(next);
+            }
+            for t in refused {
+                self.forget_launch(&t);
+            }
+        }
     }
 
     /// Whether the last launch [`Agents::admit`] judged was refused at its
@@ -1120,6 +1351,17 @@ impl Agents {
         self.started = started;
     }
 
+    /// Sets when the session whose agents folder is `dir` started
+    /// ([`session_start`]): its agents count from then.
+    pub fn set_opened(&mut self, dir: &Path, at: SystemTime) {
+        self.opened.insert(dir.to_path_buf(), at);
+    }
+
+    /// The session start set for the agents folder `dir` ([`Agents::set_opened`]).
+    pub fn opened(&self, dir: &Path) -> Option<SystemTime> {
+        self.opened.get(dir).copied()
+    }
+
     /// Records a real finish of an agent, seen now.
     pub fn finished(&mut self, id: &str, at: SystemTime) {
         self.finished.insert(id.to_string(), at);
@@ -1150,6 +1392,7 @@ impl Agents {
         if let Some(k) = self.kinds.get(id) {
             return *k;
         }
+        count_fs(|o| o.reads += 1);
         let meta = std::fs::read_to_string(dir.join(format!("agent-{id}.meta.json"))).ok().and_then(|t| crate::json::parse(&t).ok());
         let field = |k: &str| meta.as_ref().and_then(|m| m.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
         let (k, source) = match self.admitted.get(&field("toolUseId")) {
@@ -1194,6 +1437,7 @@ impl Agents {
         store: Option<&crate::memory::MemoryStore>,
         now: SystemTime,
     ) -> std::io::Result<Vec<Running>> {
+        count_fs(|o| o.listings += 1);
         let rd = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1202,7 +1446,10 @@ impl Agents {
         // File times run on a coarser clock than the process's: a meta file
         // written just after a launch may read up to a tick earlier.
         let since = self.pending.iter().map(|p| p.wall).min().map(|w| w.checked_sub(FILE_CLOCK_SLACK).unwrap_or(w));
-        let read = |p: &Path| std::fs::read_to_string(p).ok().and_then(|t| crate::json::parse(&t).ok());
+        let read = |p: &Path| {
+            count_fs(|o| o.reads += 1);
+            std::fs::read_to_string(p).ok().and_then(|t| crate::json::parse(&t).ok())
+        };
         let mut out = Vec::new();
         let mut started: Vec<(SystemTime, String, String)> = Vec::new();
         let entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
@@ -1220,11 +1467,14 @@ impl Agents {
         };
         // Records whose agent wrote after them: the agent counts again.
         let mut written_since: Vec<String> = Vec::new();
+        // An agent last written before this floor ran in an earlier process.
+        let floor = self.opened.get(dir).copied().or(self.started);
         for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_prefix("agent-").and_then(|n| n.strip_suffix(".meta.json")) else { continue };
             // The listing's own times (free on Windows); a meta is read only
             // to pair a new agent or to count a live one.
+            count_fs(|o| o.stats += 1);
             let md = e.metadata().ok();
             let mut meta = None;
             if let (Some(since), Some(created)) = (since, md.as_ref().and_then(|m| m.created().or_else(|_| m.modified()).ok())) {
@@ -1235,6 +1485,7 @@ impl Agents {
                 }
             }
             let transcript = dir.join(format!("agent-{id}.jsonl"));
+            count_fs(|o| o.stats += 1);
             let tmd = std::fs::metadata(&transcript).ok();
             let Some(last) =
                 [md.as_ref().and_then(|m| m.modified().ok()), tmd.as_ref().and_then(|m| m.modified().ok())].into_iter().flatten().max()
@@ -1244,7 +1495,7 @@ impl Agents {
             if released.get(id).is_some_and(|r| *r < last) {
                 written_since.push(id.to_string());
             }
-            if self.started.is_some_and(|st| last < st) {
+            if floor.is_some_and(|st| last < st) {
                 continue;
             }
             let idle = now.duration_since(last).unwrap_or_default();
@@ -1319,6 +1570,7 @@ impl Agents {
         // A launch never counts against itself: a second PreToolUse of the
         // same tool call replaces its own pending slot.
         self.pending.retain(|p| clock.duration_since(p.at) < PENDING_TTL && (tool_use_id.is_empty() || p.tool_use_id != tool_use_id));
+        self.drop_refused();
         let of = |k: Kind| running.iter().filter(|r| r.kind == k).count() + self.pending.iter().filter(|p| p.kind == k).count();
         let total = running.len() + self.pending.len();
         let lim = s.limits(kind);
@@ -1365,7 +1617,21 @@ impl Agents {
         }
         self.seq += 1;
         self.last = Some(self.seq);
-        self.pending.push(Pending { seq: self.seq, tool_use_id: tool_use_id.to_string(), kind, at: clock, wall: now, class: None });
+        count_fs(|o| o.stats += 1);
+        let offset = std::fs::metadata(transcript).map_or(0, |m| m.len());
+        let lane = crate::hooks::brief_lane(brief, &[]).unwrap_or_default();
+        self.pending.push(Pending {
+            seq: self.seq,
+            tool_use_id: tool_use_id.to_string(),
+            kind,
+            at: clock,
+            wall: now,
+            class: None,
+            offset,
+            transcript: transcript.to_string(),
+            description: f("description"),
+            lane,
+        });
         self.seen = Some((dir, running));
         None
     }

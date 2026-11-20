@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::memory::MemoryStore;
 use crate::orchestrate::{Kind, OrchSettings};
@@ -254,7 +254,7 @@ pub enum Wrote {
     Nothing,
 }
 
-fn insert(conn: &Connection, w: &Worktree, lane: &str, o: &Owner<'_>, now: &str) -> rusqlite::Result<i64> {
+fn insert(conn: &Connection, w: &Worktree, lane: &str, o: &Owner<'_>, now: &str) -> crate::db::Result<i64> {
     conn.execute(
         "INSERT INTO worktree_owners(path, path_key, repo, branch, lane, description, tool_use_id, session, created_at, last_modified)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
@@ -263,7 +263,7 @@ fn insert(conn: &Connection, w: &Worktree, lane: &str, o: &Owner<'_>, now: &str)
     Ok(conn.last_insert_rowid())
 }
 
-fn open_row(conn: &Connection, key: &str) -> rusqlite::Result<Option<(i64, String)>> {
+fn open_row(conn: &Connection, key: &str) -> crate::db::Result<Option<(i64, String)>> {
     conn.query_row(&format!("SELECT id, lane FROM worktree_owners WHERE path_key = ?1 AND {OPEN}"), [key], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()
 }
@@ -337,7 +337,7 @@ pub struct Row {
 const COLUMNS: &str =
     "id, path, path_key, repo, branch, lane, description, tool_use_id, session, created_at, last_modified, removed_at, ended_at";
 
-fn rows(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<Row>> {
+fn rows(conn: &Connection, sql: &str, p: impl crate::db::Params) -> Result<Vec<Row>> {
     let mut st = conn.prepare(sql)?;
     let v = st
         .query_map(p, |r| {
@@ -357,7 +357,7 @@ fn rows(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<Ro
                 ended_at: r.get(12)?,
             })
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<crate::db::Result<Vec<_>>>()?;
     Ok(v)
 }
 
@@ -384,6 +384,18 @@ pub fn history(conn: &Connection, path: &str) -> Result<Vec<Row>> {
     )
 }
 
+/// The paths of every row stamped removed (worktree gc's Docker part reads
+/// them: a gone checkout's build volume may go).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn removed_paths(conn: &Connection) -> Result<Vec<String>> {
+    let mut st = conn.prepare("SELECT DISTINCT path FROM worktree_owners WHERE removed_at IS NOT NULL")?;
+    let v = st.query_map([], |r| r.get(0))?.collect::<crate::db::Result<Vec<String>>>()?;
+    Ok(v)
+}
+
 /// Stamps `removed_at` on every row not yet stamped whose path `gone`
 /// says is gone. Reads first and opens a write transaction only when there
 /// is something to stamp. Returns the ids stamped.
@@ -393,7 +405,7 @@ pub fn history(conn: &Connection, path: &str) -> Result<Vec<Row>> {
 /// [`crate::Error::StoreTooNew`] or [`crate::Error::Db`].
 pub fn stamp_gone(conn: &Connection, store: &Path, now: &str, gone: impl Fn(&str, &str) -> bool) -> Result<Vec<i64>> {
     let mut st = conn.prepare("SELECT id, path, path_key FROM worktree_owners WHERE removed_at IS NULL")?;
-    let live: Vec<(i64, String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    let live: Vec<(i64, String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<crate::db::Result<_>>()?;
     drop(st);
     let ids: Vec<i64> = live.into_iter().filter(|(_, p, k)| gone(p, k)).map(|(id, _, _)| id).collect();
     if ids.is_empty() {
@@ -528,7 +540,7 @@ pub fn hook(store: &MemoryStore, settings: &crate::memory::settings::Settings, e
 }
 
 /// The usage of `atlas worktrees`.
-pub const USAGE: &str = "usage: atlas worktrees [list | history PATH | backfill]";
+pub const USAGE: &str = "usage: atlas worktrees [list | history PATH | backfill | gc [--apply]]";
 
 /// `atlas worktrees`: the ledger's list (which first stamps rows whose
 /// folder is gone from both the disk and `git worktree list`), one path's

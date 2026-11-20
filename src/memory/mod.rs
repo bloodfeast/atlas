@@ -21,7 +21,7 @@ use std::fs::OpenOptions;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
 use crate::json::{self, Value};
@@ -116,16 +116,13 @@ fn schema_parts() -> [&'static str; 2] {
 /// `if from < N { ... }`; the version is written last. `fail` is the test
 /// failpoint, called after each statement with its number.
 fn migrate(conn: &Connection, from: i64, fail: &mut dyn FnMut(usize) -> Result<()>) -> Result<()> {
-    use rusqlite::fallible_iterator::FallibleIterator as _;
     debug_assert!(from < SCHEMA_VERSION);
     let mut step = 0;
     for part in schema_parts() {
-        let mut batch = rusqlite::Batch::new(conn, part);
-        while let Some(mut st) = batch.next()? {
-            st.raw_execute()?;
+        crate::db::execute_each(conn, part, || {
             step += 1;
-            fail(step)?;
-        }
+            fail(step)
+        })?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     fail(step + 1)
@@ -154,7 +151,7 @@ fn backup(path: &Path, from: i64) -> Result<PathBuf> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let src = Connection::open_with_flags(path, crate::db::OpenFlags::SQLITE_OPEN_READ_ONLY | crate::db::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     src.busy_timeout(BUSY_TIMEOUT)?;
     src.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])?;
     drop(src);
@@ -190,7 +187,7 @@ pub(crate) fn guarded<T>(conn: &Connection, path: &Path, f: impl FnOnce() -> Res
     if !conn.is_autocommit() {
         return f();
     }
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::db::Transaction::new_unchecked(conn, crate::db::TransactionBehavior::Immediate)?;
     check_locked(&tx, path)?;
     let r = f()?;
     tx.commit()?;
@@ -268,7 +265,7 @@ fn make_schema_with(conn: &Connection, path: &Path, fail: &mut dyn FnMut(usize) 
 /// without writing anything: a read-only open of `user_version` (for
 /// `atlas doctor`). `None` when it is not, or when it cannot be read.
 pub fn store_skew(path: &Path) -> Option<Error> {
-    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
+    let conn = Connection::open_with_flags(path, crate::db::OpenFlags::SQLITE_OPEN_READ_ONLY | crate::db::OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()?;
     too_new(path, v)
 }
@@ -503,12 +500,12 @@ fn jsonl_end(c: &Connection) -> Result<Option<u64>> {
 /// it says (a version's key, seq and sha; a supersede's row; a placement; a
 /// refs row; a status). None for a line that says nothing checkable (a
 /// respace, which only comes with a place).
-fn line_in_store(c: &Connection, line: &str) -> rusqlite::Result<Option<bool>> {
+fn line_in_store(c: &Connection, line: &str) -> crate::db::Result<Option<bool>> {
     let Ok(v) = json::parse(line) else { return Ok(Some(false)) };
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let rid: Option<i64> = c.prepare_cached("SELECT rid FROM records WHERE key = ?1")?.query_row([s("key")], |r| r.get(0)).optional()?;
     let Some(rid) = rid else { return Ok(Some(false)) };
-    let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<bool> { Ok(c.prepare_cached(sql)?.query_row(p, |_| Ok(())).optional()?.is_some()) };
+    let one = |sql: &str, p: &[&dyn crate::db::ToSql]| -> crate::db::Result<bool> { Ok(c.prepare_cached(sql)?.query_row(p, |_| Ok(())).optional()?.is_some()) };
     Ok(Some(match v.get("op").and_then(Value::as_str) {
         Some("create" | "version") => {
             let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(-1);
@@ -550,7 +547,7 @@ enum LineState {
     Unsure,
 }
 
-fn line_state(c: &Connection, line: &str) -> rusqlite::Result<LineState> {
+fn line_state(c: &Connection, line: &str) -> crate::db::Result<LineState> {
     let Ok(v) = json::parse(line) else {
         // A torn append that a whole line from another writer was appended
         // onto: that line is judged on its own, so it is never cut.
@@ -696,7 +693,7 @@ const HEAD_SQL: &str = head_sql!("v.body, v.sha, v.chain", "v.src_path, v.src_li
 /// after the body is, since reading one walks the body's overflow pages.
 const HEAD_SQL_NO_BODY: &str = head_sql!("'', '', ''", "NULL, NULL, NULL");
 
-fn head_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Head> {
+fn head_row(row: &crate::db::Row<'_>) -> crate::db::Result<Head> {
     Ok(Head {
         rid: row.get(0)?,
         key: row.get(1)?,
@@ -840,7 +837,8 @@ impl MemoryStore {
             std::fs::create_dir_all(d)?;
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // BUSY_TIMEOUT, polled without SQLite's back-off (#340).
+        crate::hook_budget::bound(&conn)?;
         // The schema is made once; a store at the current version opens
         // with two pragma reads (start to first answer is an aim of 5 ms).
         // A newer store is refused before anything is written: running this
@@ -863,7 +861,7 @@ impl MemoryStore {
             loop {
                 match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
                     Ok(_) => break,
-                    Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy && std::time::Instant::now() < deadline => {
+                    Err(e) if crate::db::is_busy(&e) && std::time::Instant::now() < deadline => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                     Err(e) => return Err(e.into()),
@@ -939,7 +937,7 @@ impl MemoryStore {
     /// [`Error::Db`] if the transaction cannot start; [`Error::Io`] if the
     /// copy cannot be cut back.
     pub fn writer(&mut self) -> Result<Writer<'_>> {
-        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.conn.transaction_with_behavior(crate::db::TransactionBehavior::Immediate)?;
         // Under the lock: a newer atlas may have upgraded the store since this
         // one opened it, and then nothing more is written (dropping `tx`
         // rolls back).
@@ -1056,10 +1054,24 @@ impl MemoryStore {
         self.entries(HEAD_SQL_NO_BODY, sub)
     }
 
+    /// [`MemoryStore::active_entries_no_body`] whose head version is newer
+    /// than `since` (the store's time form), oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn active_entries_since_no_body(&self, sub: &str, since: &str) -> Result<Vec<Head>> {
+        let sql =
+            format!("{HEAD_SQL_NO_BODY} WHERE r.kind = 'journal' AND r.sub = ?1 AND r.status = 'active' AND v.time > ?2 ORDER BY r.rid");
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let rows = st.query_map([sub, since], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     fn entries(&self, head_sql: &str, sub: &str) -> Result<Vec<Head>> {
         let sql = format!("{head_sql} WHERE r.kind = 'journal' AND r.sub = ?1 AND r.status = 'active' ORDER BY r.rid");
         let mut st = self.conn.prepare_cached(&sql)?;
-        let rows = st.query_map([sub], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([sub], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1072,7 +1084,23 @@ impl MemoryStore {
     pub fn lane_entries_no_body(&self, sub: &str, lane: &str) -> Result<Vec<Head>> {
         let sql = format!("{HEAD_SQL_NO_BODY} WHERE r.kind = 'journal' AND r.sub = ?1 AND r.scope = ?2 COLLATE NOCASE ORDER BY r.rid");
         let mut st = self.conn.prepare_cached(&sql)?;
-        let rows = st.query_map([sub, lane], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([sub, lane], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The journal entries of one kind, in any status, whose meta holds a
+    /// line starting `line` (the queue's `ticket:` items), oldest first:
+    /// meta and titles only.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Db`].
+    pub fn entries_with_line_no_body(&self, sub: &str, line: &str) -> Result<Vec<Head>> {
+        let sql = format!(
+            "{HEAD_SQL_NO_BODY} WHERE r.kind = 'journal' AND r.sub = ?1 AND (substr(v.meta, 1, length(?2)) = ?2 OR instr(v.meta, char(10) || ?2) > 0) ORDER BY r.rid"
+        );
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let rows = st.query_map([sub, line], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1106,7 +1134,7 @@ impl MemoryStore {
     pub fn note_metas(&self, prefix: &str) -> Result<Vec<String>> {
         let sql = "SELECT v.meta FROM records r JOIN versions v ON v.vid = r.head WHERE r.kind = 'journal' AND r.sub = 'note' AND substr(v.meta, 1, length(?1)) = ?1 ORDER BY r.rid";
         let mut st = self.conn.prepare_cached(sql)?;
-        let rows = st.query_map([prefix], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        let rows = st.query_map([prefix], |r| r.get(0))?.collect::<crate::db::Result<Vec<String>>>()?;
         Ok(rows)
     }
 
@@ -1129,7 +1157,7 @@ impl MemoryStore {
     pub fn notes_after(&self, rid: i64, prefix: &str) -> Result<Vec<Head>> {
         let sql = format!("{HEAD_SQL_NO_BODY} WHERE r.rid > ?1 AND r.kind = 'journal' AND r.sub = 'note' AND r.status = 'active' AND substr(v.meta, 1, length(?2)) = ?2 ORDER BY r.rid");
         let mut st = self.conn.prepare_cached(&sql)?;
-        let rows = st.query_map(rusqlite::params![rid, prefix], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map(crate::db::params![rid, prefix], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1144,7 +1172,7 @@ impl MemoryStore {
         let sql = "SELECT r.key, v.meta FROM records r JOIN versions v ON v.vid = r.head WHERE r.kind = 'journal' AND r.status = 'active'
             AND (r.sub = 'review' OR (r.sub = 'note' AND (substr(v.meta, 1, 7) = 'review:' OR instr(v.meta, char(10) || 'review:') > 0))) ORDER BY r.rid";
         let mut st = self.conn.prepare_cached(sql)?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<crate::db::Result<Vec<(String, String)>>>()?;
         Ok(rows)
     }
 
@@ -1191,7 +1219,7 @@ impl MemoryStore {
                     author: r.get(12)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1249,7 +1277,7 @@ impl MemoryStore {
         // One page is enough unless most of it is dropped. LIMIT gives the ranking
         // a top-N sort, far cheaper than sorting every match.
         let page = want * 2 + 8;
-        let first: Vec<(i64, f64)> = self.conn.prepare_cached(&format!("{ranking} LIMIT ?2"))?.query_map(params![q, page as i64], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let first: Vec<(i64, f64)> = self.conn.prepare_cached(&format!("{ranking} LIMIT ?2"))?.query_map(params![q, page as i64], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<crate::db::Result<_>>()?;
         let mut rows: Vec<(Head, f64)> = Vec::with_capacity(want);
         for &(rid, score) in &first {
             let Some(h) = st.query_row([rid], head_row).optional()? else { continue };
@@ -1268,7 +1296,7 @@ impl MemoryStore {
         if rows.len() < want && first.len() == page {
             rows.clear();
             let pass = self.passing_rids(kind, scope, mode)?;
-            let ranked: Vec<(i64, f64)> = self.conn.prepare_cached(ranking)?.query_map([&q], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            let ranked: Vec<(i64, f64)> = self.conn.prepare_cached(ranking)?.query_map([&q], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<crate::db::Result<_>>()?;
             for (rid, score) in ranked {
                 if !pass.contains(&rid) {
                     continue;
@@ -1301,7 +1329,7 @@ impl MemoryStore {
             (None, Some(s)) => ("SELECT EXISTS(SELECT 1 FROM records WHERE scope = ?1)", vec![s]),
             (Some(k), None) => ("SELECT EXISTS(SELECT 1 FROM records WHERE kind = ?1)", vec![k]),
         };
-        Ok(self.conn.prepare_cached(sql)?.query_row(rusqlite::params_from_iter(args), |r| r.get(0))?)
+        Ok(self.conn.prepare_cached(sql)?.query_row(crate::db::params_from_iter(args), |r| r.get(0))?)
     }
 
     /// The records [`MemoryStore::search_with`] may answer with, by `records` alone:
@@ -1321,7 +1349,7 @@ impl MemoryStore {
             args.push(k);
             sql.push_str(&format!(" AND kind = ?{}", args.len()));
         }
-        let rids = self.conn.prepare_cached(&sql)?.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let rids = self.conn.prepare_cached(&sql)?.query_map(crate::db::params_from_iter(args), |r| r.get(0))?.collect::<crate::db::Result<_>>()?;
         Ok(rids)
     }
 
@@ -1348,7 +1376,7 @@ impl MemoryStore {
         // Which rows count, known before the ranking so the ranking stays the
         // plain query: a filter inside it measured about 180x slower.
         let managed = "SELECT rid, status FROM records WHERE kind IN ('rule', 'memory') AND status IN ('active', 'superseded')";
-        let mut marked: std::collections::HashSet<i64> = self.conn.prepare_cached("SELECT rid FROM refs WHERE kind IN ('amends', 'amended_by')")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut marked: std::collections::HashSet<i64> = self.conn.prepare_cached("SELECT rid FROM refs WHERE kind IN ('amends', 'amended_by')")?.query_map([], |r| r.get(0))?.collect::<crate::db::Result<_>>()?;
         let mut rulings: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for row in self.conn.prepare_cached(managed)?.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
             let (rid, status) = row?;
@@ -1359,7 +1387,7 @@ impl MemoryStore {
         }
         let q = picked.iter().map(|t| format!("\"{}\"", t.replace('"', ""))).collect::<Vec<_>>().join(" OR ");
         let sql = "SELECT rowid, -bm25(records_fts, 2.0, 1.0) FROM records_fts WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts, 2.0, 1.0)";
-        let ranked: Vec<(i64, f64)> = self.conn.prepare_cached(sql)?.query_map([q], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let ranked: Vec<(i64, f64)> = self.conn.prepare_cached(sql)?.query_map([q], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<crate::db::Result<_>>()?;
         let mut out: Vec<(Head, f64, usize)> = Vec::new();
         let (mut others, mut read) = (0, 0);
         for (rid, score) in ranked {
@@ -1395,7 +1423,7 @@ impl MemoryStore {
     /// [`Error::Db`].
     pub fn linked_to(&self, kind: &str, key: &str) -> Result<Vec<String>> {
         let sql = "SELECT r.key FROM refs f JOIN records r ON r.rid = f.rid WHERE f.kind = ?1 AND f.target = ?2 ORDER BY r.rid";
-        let rows = self.conn.prepare_cached(sql)?.query_map(params![kind, key], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let rows = self.conn.prepare_cached(sql)?.query_map(params![kind, key], |r| r.get(0))?.collect::<crate::db::Result<_>>()?;
         Ok(rows)
     }
 
@@ -1406,7 +1434,7 @@ impl MemoryStore {
     /// [`Error::Db`].
     pub fn keys_with_ref(&self, kind: &str) -> Result<std::collections::HashSet<String>> {
         let sql = "SELECT DISTINCT r.key FROM refs f JOIN records r ON r.rid = f.rid WHERE f.kind = ?1";
-        let rows = self.conn.prepare_cached(sql)?.query_map([kind], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let rows = self.conn.prepare_cached(sql)?.query_map([kind], |r| r.get(0))?.collect::<crate::db::Result<_>>()?;
         Ok(rows)
     }
 
@@ -1423,7 +1451,7 @@ impl MemoryStore {
             // fts5vocab has no index on `term`: one pass into a map beats a
             // scan per word (measured 173 us per lookup on 12k terms).
             let mut st = self.conn.prepare_cached("SELECT term, doc FROM records_vocab")?;
-            let map = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            let map = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<crate::db::Result<_>>()?;
             *cache = Some((stamp, map));
         }
         let map = &cache.as_ref().map(|(_, m)| m).ok_or_else(|| Error::Db("vocabulary".into()))?;
@@ -1468,7 +1496,7 @@ impl MemoryStore {
     pub fn lane(&self, lane: &str) -> Result<Vec<Head>> {
         let sql = format!("{HEAD_SQL} WHERE r.scope = ?1 AND r.kind IN ('journal', 'handoff') ORDER BY r.rid");
         let mut st = self.conn.prepare_cached(&sql)?;
-        let rows = st.query_map([lane], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([lane], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1484,7 +1512,7 @@ impl MemoryStore {
         // `0` follows `/`: the range is every scope that starts `lane/`.
         let sql = format!("{HEAD_SQL} WHERE (r.scope = ?1 OR (r.scope >= ?1 || '/' AND r.scope < ?1 || '0')) AND r.kind IN ('journal', 'handoff') ORDER BY r.rid");
         let mut st = self.conn.prepare_cached(&sql)?;
-        let rows = st.query_map([lane], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([lane], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
         // A numbered sub-lane only: `lane/notes` is another lane.
         Ok(rows.into_iter().filter(|h| h.scope == lane || crate::lanes::parent_lane(&h.scope) == lane).collect())
     }
@@ -1525,7 +1553,7 @@ impl MemoryStore {
                     queued: r.get(8)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1539,7 +1567,7 @@ impl MemoryStore {
         let sql = "SELECT r.scope, r.key, v.title, v.time FROM records r JOIN versions v ON v.vid = r.head
             WHERE r.kind = 'handoff' AND r.status = 'active' ORDER BY v.time DESC, r.rid DESC";
         let mut st = self.conn.prepare_cached(sql)?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1552,7 +1580,7 @@ impl MemoryStore {
     pub fn open_questions(&self) -> Result<Vec<(String, String, String)>> {
         let sql = format!("SELECT r.scope, r.key, v.title FROM records r JOIN versions v ON v.vid = r.head WHERE {OPEN_QUESTION_SQL} ORDER BY r.rid DESC");
         let mut st = self.conn.prepare_cached(&sql)?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1563,7 +1591,7 @@ impl MemoryStore {
     /// [`Error::Db`].
     pub fn placement(&self, export: &str) -> Result<Vec<i64>> {
         let mut st = self.conn.prepare_cached("SELECT rid FROM placement WHERE export = ?1 ORDER BY ord")?;
-        let rows = st.query_map([export], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+        let rows = st.query_map([export], |r| r.get(0))?.collect::<crate::db::Result<Vec<i64>>>()?;
         Ok(rows)
     }
 
@@ -1574,7 +1602,7 @@ impl MemoryStore {
     /// [`Error::Db`].
     pub fn exports_of(&self, key: &str) -> Result<Vec<String>> {
         let mut st = self.conn.prepare_cached("SELECT DISTINCT p.export FROM placement p JOIN records r ON r.rid = p.rid WHERE r.key = ?1")?;
-        let rows = st.query_map([key], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        let rows = st.query_map([key], |r| r.get(0))?.collect::<crate::db::Result<Vec<String>>>()?;
         Ok(rows)
     }
 
@@ -1585,7 +1613,7 @@ impl MemoryStore {
     /// [`Error::Db`].
     pub fn counts(&self) -> Result<Vec<(String, i64)>> {
         let mut st = self.conn.prepare_cached("SELECT kind, COUNT(*) FROM records GROUP BY kind ORDER BY kind")?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<crate::db::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1636,7 +1664,7 @@ impl MemoryStore {
 fn next_key(conn: &Connection, prefix: &str, width: usize) -> Result<String> {
     let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
     let mut st = conn.prepare_cached("SELECT key FROM records WHERE key LIKE ?1 ESCAPE '\\'")?;
-    let keys = st.query_map([pattern], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let keys = st.query_map([pattern], |r| r.get::<_, String>(0))?.collect::<crate::db::Result<Vec<_>>>()?;
     let max = keys.iter().filter_map(|k| k[prefix.len()..].parse::<u64>().ok()).max().unwrap_or(0);
     Ok(format!("{prefix}{:0width$}", max + 1))
 }
@@ -1669,13 +1697,13 @@ pub fn contains_word(hay: &str, word: &str) -> bool {
 fn heads_on(conn: &Connection, kind: Option<&str>, scope: Option<&str>) -> Result<Vec<Head>> {
     let sql = format!("{HEAD_SQL} WHERE (?1 IS NULL OR r.kind = ?1) AND (?2 IS NULL OR r.scope = ?2) ORDER BY r.rid");
     let mut st = conn.prepare_cached(&sql)?;
-    let rows = st.query_map(params![kind, scope], head_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = st.query_map(params![kind, scope], head_row)?.collect::<crate::db::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
 /// One write batch. Dropped without [`Writer::commit`], nothing is written.
 pub struct Writer<'a> {
-    tx: rusqlite::Transaction<'a>,
+    tx: crate::db::Transaction<'a>,
     log: String,
     jsonl: PathBuf,
     pid: i64,
@@ -1831,7 +1859,7 @@ impl Writer<'_> {
     /// for a record that is no journal entry or is in another lane or
     /// entry, and as [`Writer::revise`] (the head must be `expected_sha`).
     pub fn amend_journal(&mut self, key: &str, expected_sha: &str, lane: &str, entry: &str, draft: &Draft) -> Result<Written> {
-        let h = rusqlite::OptionalExtension::optional(self.head(key))?.ok_or_else(|| Error::NotFound(format!("record {key:?}")))?;
+        let h = crate::db::OptionalExtension::optional(self.head(key))?.ok_or_else(|| Error::NotFound(format!("record {key:?}")))?;
         if h.kind != "journal" {
             return Err(Error::InvalidArgument(format!("{key} is a {} record; amend rewrites journal entries only", h.kind)));
         }
@@ -2064,7 +2092,7 @@ impl Writer<'_> {
     fn place(&mut self, export: &str, rid: i64, at: &Place) -> Result<i64> {
         let ords: Vec<i64> = {
             let mut st = self.tx.prepare_cached("SELECT ord FROM placement WHERE export = ?1 ORDER BY ord")?;
-            let v = st.query_map([export], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+            let v = st.query_map([export], |r| r.get(0))?.collect::<crate::db::Result<Vec<i64>>>()?;
             v
         };
         let ord = match at {
@@ -2097,7 +2125,7 @@ impl Writer<'_> {
     fn respace(&mut self, export: &str) -> Result<()> {
         let rows: Vec<(i64, i64)> = {
             let mut st = self.tx.prepare_cached("SELECT ord, rid FROM placement WHERE export = ?1 ORDER BY ord")?;
-            let v = st.query_map([export], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let v = st.query_map([export], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<crate::db::Result<Vec<_>>>()?;
             v
         };
         self.tx.prepare_cached("DELETE FROM placement WHERE export = ?1")?.execute([export])?;
@@ -2117,7 +2145,7 @@ impl Writer<'_> {
     /// # Errors
     ///
     /// `QueryReturnedNoRows` for an unknown key.
-    pub fn head(&self, key: &str) -> rusqlite::Result<Head> {
+    pub fn head(&self, key: &str) -> crate::db::Result<Head> {
         self.tx.prepare_cached(&format!("{HEAD_SQL} WHERE r.key = ?1"))?.query_row([key], head_row)
     }
 
@@ -2128,7 +2156,7 @@ impl Writer<'_> {
     /// [`Error::Db`].
     pub fn exports_of(&self, key: &str) -> Result<Vec<String>> {
         let mut st = self.tx.prepare_cached("SELECT DISTINCT p.export FROM placement p JOIN records r ON r.rid = p.rid WHERE r.key = ?1")?;
-        let rows = st.query_map([key], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        let rows = st.query_map([key], |r| r.get(0))?.collect::<crate::db::Result<Vec<String>>>()?;
         Ok(rows)
     }
 
@@ -2268,7 +2296,7 @@ mod skew_tests {
         let mut wal = path.as_os_str().to_owned();
         wal.push("-wal");
         assert!(!Path::new(&wal).exists(), "no WAL file");
-        let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let c = Connection::open_with_flags(path, crate::db::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, SCHEMA_VERSION + 1, "the version is not written back");
         let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
@@ -2475,15 +2503,14 @@ mod upgrade_tests {
 
     /// The statements a migration from 2 runs ([`migrate`] numbers them from 1).
     fn statements() -> usize {
-        use rusqlite::fallible_iterator::FallibleIterator as _;
         let c = Connection::open_in_memory().unwrap();
         let mut n = 0;
         for p in schema_parts() {
-            let mut b = rusqlite::Batch::new(&c, p);
-            while let Some(mut st) = b.next().unwrap() {
-                st.raw_execute().unwrap();
+            crate::db::execute_each(&c, p, || -> crate::Result<()> {
                 n += 1;
-            }
+                Ok(())
+            })
+            .unwrap();
         }
         n
     }

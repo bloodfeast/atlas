@@ -703,7 +703,7 @@ fn point_time(p: &Point) -> Option<String> {
 /// What an index knows up to: its newest indexed file's mtime (UTC, with
 /// milliseconds). A snapshot's files carry the time it was taken.
 fn index_as_of(db: &Path) -> Result<String, String> {
-    let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| format!("{}: {e}", db.display()))?;
+    let conn = atlas::db::Connection::open_with_flags(db, atlas::db::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| format!("{}: {e}", db.display()))?;
     conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', MAX(m) / 1e9, 'unixepoch') FROM (SELECT MAX(mtime_ns) AS m FROM docs UNION ALL SELECT MAX(mtime_ns) FROM notes)", [], |r| r.get::<_, Option<String>>(0))
         .map_err(|e| format!("{}: {e}", db.display()))?
         .ok_or(format!("{} indexes no file", db.display()))
@@ -729,8 +729,8 @@ pub(crate) fn prune_store(path: &Path, as_of: &str) -> Result<(usize, usize), St
 /// [`prune_store`], except that records whose key starts with `keep` (when
 /// not empty) keep every version: the rescore keeps a job's own checkpoint.
 fn prune_store_keeping(path: &Path, as_of: &str, keep: &str) -> Result<(usize, usize), String> {
-    let e = |x: rusqlite::Error| format!("{}: {x}", path.display());
-    let mut conn = rusqlite::Connection::open(path).map_err(e)?;
+    let e = |x: atlas::db::Error| format!("{}: {x}", path.display());
+    let mut conn = atlas::db::Connection::open(path).map_err(e)?;
     let tx = conn.transaction().map_err(e)?;
     tx.execute_batch(
         "DROP TRIGGER IF EXISTS versions_no_update; DROP TRIGGER IF EXISTS versions_no_delete; DROP TRIGGER IF EXISTS records_no_delete;

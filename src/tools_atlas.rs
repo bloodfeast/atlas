@@ -469,7 +469,6 @@ impl Server {
                 // background. Pending windows, not sections, are counted.
                 if ix.pending() <= crate::semantic::INLINE_BUDGET {
                     let mut c = crate::store::open_raw(&sem.db)?;
-                    c.busy_timeout(std::time::Duration::from_secs(30))?;
                     crate::semantic::embed_pending(&mut c, &model, crate::semantic::INLINE_BUDGET, 1)?;
                     ix = crate::semantic::VecIndex::load(conn, &model.id, model.dim)?;
                     // A section just split can have more windows than the

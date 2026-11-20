@@ -574,8 +574,10 @@ fn a_folder_above_home_is_not_offered() {
     let ask = |cwd: &Path| {
         let mut child = Command::new(bin())
             .arg("--hook")
+            .env("ATLAS_HOOK_BUDGET_OFF", "1")
             .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
+            .env_remove("ATLAS_UNATTENDED")
             .env("ATLAS_HOME", h.atlas())
             .env("CLAUDE_CONFIG_DIR", h.claude())
             .env("HOME", &home)
@@ -605,8 +607,10 @@ fn session_start_in(h: &Home, cwd: &Path, session: &[(&str, &str)]) -> String {
     use std::io::Write;
     let mut child = Command::new(bin())
         .arg("--hook")
+        .env("ATLAS_HOOK_BUDGET_OFF", "1")
         .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_UNATTENDED")
         .envs(session.iter().copied())
         .env("ATLAS_HOME", h.atlas())
         .env("CLAUDE_CONFIG_DIR", h.claude())
@@ -654,7 +658,7 @@ fn the_first_session_in_a_project_offers_it_once_and_add_project_indexes_it() {
     assert!(src.include == ["**/*.md"] && src.exclude.iter().any(|e| e == "target/**"));
     assert_eq!(c.code.as_ref().unwrap().roots.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["demo-app-code"]);
     let db = h.atlas().join("state").join("atlas.sqlite");
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM docs WHERE source = 'demo-app'", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 2);
     // Adding it again changes nothing; a folder inside it is not offered.
@@ -1866,4 +1870,112 @@ fn auto_compact_follows_the_limit_through_orchestrate_undo_and_offer() {
     let (ok, out) = h.run(&["set", "checkpoint-margin", "30000"]);
     assert!(ok && !out.contains("[auto-compact]"), "{out}");
     assert_eq!(h.read(&h.settings()), before);
+}
+
+/// The environment `unattended_session` reads, from `(name, value)` pairs.
+fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_string())
+}
+
+/// #266: `ATLAS_UNATTENDED=1` outranks Claude Code's own word, so a wrapper that
+/// is not Claude Code gets no SessionStart offer.
+#[test]
+fn atlas_unattended_1_wins_and_no_offer_is_asked() {
+    let unattended = cs::unattended_session(env_of(&[("ATLAS_UNATTENDED", "1"), ("CLAUDE_CODE_SESSION_ATTENDED", "1")]));
+    assert!(unattended, "ATLAS_UNATTENDED=1 must win over CLAUDE_CODE_SESSION_ATTENDED=1");
+    // End to end through `atlas --hook`, which reads the real environment: the
+    // same fixture asks once Claude Code's word is left alone.
+    let h = Home::new("cs-atlas-unattended");
+    let proj = h.t.path().join("work").join("demo");
+    write(&proj.join("README.md"), "# Demo\n");
+    let state = h.atlas().join("state").join(cs::OFFER_STATE);
+    let asked = |c: &str| {
+        ["is not indexed", "orchestrated mode", "Claude Code setting", "On by default"].iter().filter(|w| c.contains(**w)).count()
+    };
+    let c = session_start_in(&h, &proj, &[("ATLAS_UNATTENDED", "1"), ("CLAUDE_CODE_SESSION_ATTENDED", "1")]);
+    assert_eq!(asked(&c), 0, "{c}");
+    assert!(!state.exists(), "nothing counts as asked");
+    let attended = session_start_in(&h, &proj, &[("CLAUDE_CODE_SESSION_ATTENDED", "1")]);
+    assert_eq!(asked(&attended), 4, "the fixture does ask when attended: {attended}");
+}
+
+/// #266: `ATLAS_UNATTENDED=0` forces a user even under an SDK entry point.
+#[test]
+fn atlas_unattended_0_forces_attended() {
+    assert!(!cs::unattended_session(env_of(&[("ATLAS_UNATTENDED", "0"), ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")])));
+    assert!(!cs::unattended_session(env_of(&[("ATLAS_UNATTENDED", "0"), ("CLAUDE_CODE_SESSION_ATTENDED", "0")])));
+}
+
+/// #266: unset, empty or any other value leaves Claude Code's variables to decide;
+/// another value is named in a note, an empty one is taken as unset.
+#[test]
+fn atlas_unattended_unset_or_other_falls_through() {
+    for (claude, want) in [
+        (&[][..], false),
+        (&[("CLAUDE_CODE_SESSION_ATTENDED", "0")][..], true),
+        (&[("CLAUDE_CODE_SESSION_ATTENDED", "1"), ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")][..], false),
+        (&[("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")][..], true),
+        (&[("CLAUDE_CODE_ENTRYPOINT", "cli")][..], false),
+    ] {
+        let pairs: &'static [(&str, &str)] = claude;
+        assert_eq!(cs::unattended_session(env_of(pairs)), want, "{pairs:?}");
+        assert_eq!(cs::unattended_decision(env_of(pairs)), (want, None), "{pairs:?}");
+        let mut with: Vec<(&'static str, &'static str)> = pairs.to_vec();
+        with.push(("ATLAS_UNATTENDED", "yes"));
+        let with: &'static [(&str, &str)] = Box::leak(with.into_boxed_slice());
+        let (got, note) = cs::unattended_decision(env_of(with));
+        assert_eq!(got, want, "{with:?}");
+        let note = note.expect("another value is named");
+        assert!(note.contains("ATLAS_UNATTENDED") && note.contains("\"yes\"") && !note.contains('\n'), "{note}");
+        let mut empty: Vec<(&'static str, &'static str)> = pairs.to_vec();
+        empty.push(("ATLAS_UNATTENDED", ""));
+        let empty: &'static [(&str, &str)] = Box::leak(empty.into_boxed_slice());
+        assert_eq!(cs::unattended_decision(env_of(empty)), (want, None), "{empty:?}");
+    }
+}
+
+/// #266: the value is read trimmed, since cmd's `set ATLAS_UNATTENDED=1 && client`
+/// stores `1 ` with the space.
+#[test]
+fn atlas_unattended_value_is_trimmed() {
+    let one = env_of(&[("ATLAS_UNATTENDED", "1 "), ("CLAUDE_CODE_SESSION_ATTENDED", "1")]);
+    assert_eq!(cs::unattended_decision(one), (true, None));
+    let zero = env_of(&[("ATLAS_UNATTENDED", " 0\t"), ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")]);
+    assert_eq!(cs::unattended_decision(zero), (false, None));
+    let blank = env_of(&[("ATLAS_UNATTENDED", "  "), ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")]);
+    assert_eq!(cs::unattended_decision(blank), (true, None), "blank is unset, no note");
+}
+
+/// #266: an ignored `ATLAS_UNATTENDED` value is named once a session, at
+/// SessionStart, not on every hook event.
+#[test]
+fn an_ignored_value_is_named_at_session_start_only() {
+    use std::io::Write;
+    let h = Home::new("cs-atlas-unattended-note");
+    let stderr = |event: &str| {
+        let mut child = Command::new(bin())
+            .arg("--hook")
+            .env("ATLAS_HOOK_BUDGET_OFF", "1")
+            .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
+            .env("ATLAS_UNATTENDED", "yes")
+            .env("ATLAS_HOME", h.atlas())
+            .env("CLAUDE_CONFIG_DIR", h.claude())
+            .env("HOME", h.t.path())
+            .env("USERPROFILE", h.t.path())
+            .env_remove("ATLAS_CONFIG")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ev = json!({"hook_event_name": event, "session_id": "s", "source": "startup", "prompt": "hi", "cwd": h.t.path().to_string_lossy().to_string()});
+        child.stdin.take().unwrap().write_all(ev.to_string().as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{event}");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    assert!(stderr("SessionStart").contains("ATLAS_UNATTENDED=\"yes\""), "named at SessionStart");
+    let later = stderr("UserPromptSubmit");
+    assert!(!later.contains("ATLAS_UNATTENDED"), "not again on later events: {later}");
 }

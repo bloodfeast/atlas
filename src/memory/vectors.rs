@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use rusqlite::params;
+use crate::db::params;
 
 use crate::embed::{gemm, Model};
 use crate::error::Result;
@@ -101,7 +101,7 @@ fn store_vectors(store: &MemoryStore, model: &Model, todo: &[(String, String)], 
     if vecs.len() != todo.len() {
         return Err(crate::Error::InvalidArgument(format!("embedded {} vectors for {} texts", vecs.len(), todo.len())));
     }
-    let tx = rusqlite::Transaction::new_unchecked(store.conn(), rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::db::Transaction::new_unchecked(store.conn(), crate::db::TransactionBehavior::Immediate)?;
     // A store a newer atlas upgraded since this one opened it is not written.
     super::check_locked(&tx, store.path())?;
     {
@@ -238,7 +238,7 @@ impl RecVecs {
             next.read += 1;
             let mut vecs = get.query(params![model, sha])?;
             match vecs.next()?.map(|x| x.get_ref(0)).transpose()? {
-                Some(rusqlite::types::ValueRef::Blob(b)) if b.len() == dim * 4 => {
+                Some(crate::db::types::ValueRef::Blob(b)) if b.len() == dim * 4 => {
                     let floats = b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c));
                     next.push(rid, sha, |mat| mat.extend(floats));
                 }

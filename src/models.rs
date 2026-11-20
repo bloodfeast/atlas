@@ -122,7 +122,7 @@ pub struct Models {
     pub files: Vec<ModelFileSpec>,
 }
 
-fn default_curl() -> PathBuf {
+pub(crate) fn default_curl() -> PathBuf {
     if cfg!(windows) {
         // The copy Windows ships, so a different curl earlier on PATH is not
         // picked up by accident.

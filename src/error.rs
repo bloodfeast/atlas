@@ -58,6 +58,12 @@ impl Error {
     pub fn is_store_too_new(&self) -> bool {
         matches!(self, Error::StoreTooNew { .. })
     }
+
+    /// True for a store error from another writer's lock (SQLite's busy or
+    /// locked: "database is locked", "database table is locked").
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Error::Db(m) if m.contains("is locked") || m.contains("database is busy"))
+    }
 }
 
 impl fmt::Display for Error {
@@ -93,8 +99,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<crate::db::Error> for Error {
+    fn from(e: crate::db::Error) -> Self {
         Error::Db(e.to_string())
     }
 }

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::digest::{self, Item, Shape};
 use crate::error::{Error, Result};
@@ -161,6 +161,10 @@ pub enum Sel {
     /// A PR diff file part's default read from line k (its `next page`),
     /// any other output's lines from k.
     Page(usize),
+    /// The rows of its digest matching a pattern, in the digest's row
+    /// shape: for a tracker search every issue or hit, not only the rows the
+    /// digest had room for; for any other output the digest's lines.
+    DigestGrep(String),
     /// No selector: a PR diff file part read diff-native and paged at hunk
     /// boundaries ([`crate::pr_digest::file_slice`]), any other output's
     /// first 40 lines.
@@ -191,7 +195,7 @@ impl Handles {
             std::fs::create_dir_all(p).map_err(|e| Error::Io(format!("{}: {e}", p.display())))?;
         }
         let conn = crate::store::open_raw(db)?;
-        conn.busy_timeout(Duration::from_secs(10))?;
+        crate::hook_budget::bound_within::<10>(&conn)?;
         conn.execute_batch(crate::store::HANDLES_SCHEMA)?;
         let dir = db.parent().unwrap_or(Path::new(".")).join("handles");
         Ok(Handles { conn, dir, cfg })
@@ -432,6 +436,7 @@ impl Handles {
                     }
                 }
             }
+            Sel::DigestGrep(re) => return self.digest_grep(&row, &text, re),
             Sel::Failures => {
                 let items = digest::items(Handles::shape_of(&row, &text), &text);
                 for it in items.iter().filter(|i| i.status == "failed-output" || i.status == "error") {
@@ -447,6 +452,76 @@ impl Handles {
         }
         ranges.sort_unstable();
         Ok(render(&row.id, &lines, &ranges, &note, self.cfg.slice_bytes, focus.as_ref()))
+    }
+
+    /// The digest rows of a stored output that match `re`, capped at
+    /// `slice_bytes`: a tracker search's every issue or hit
+    /// ([`crate::trackers::digest::rows`]), any other output's digest lines.
+    fn digest_grep(&self, row: &Row, text: &str, re: &str) -> Result<String> {
+        let r = RegexBuilder::new(re).build().map_err(|e| Error::InvalidArgument(format!("pattern {re:?}: {e}")))?;
+        let shape = Handles::shape_of(row, text);
+        let rows = match shape {
+            Shape::Tracker => crate::trackers::digest::rows(text),
+            _ => None,
+        }
+        .unwrap_or_else(|| {
+            let d = digest::digest(&row.id, &row.meta.label, shape, text, row.meta.exit_code.map(|c| c as i32), self.cfg.digest_bytes);
+            d.lines().map(str::to_string).collect()
+        });
+        let mut hits = Vec::new();
+        for (i, x) in rows.iter().enumerate() {
+            r.check_text(x.len()).map_err(|e| Error::InvalidArgument(format!("pattern {re:?} on digest row {}: {e}", i + 1)))?;
+            if r.is_match(x) {
+                hits.push(x.as_str());
+            }
+        }
+        if hits.is_empty() {
+            return Ok(format!("{}: no digest row matches {re:?} ({} rows)\n", row.id, rows.len()));
+        }
+        let mut out = format!("{}: {} of {} digest rows match {re:?}\n", row.id, hits.len(), rows.len());
+        for (k, x) in hits.iter().enumerate() {
+            if out.len() + x.len() + 1 > self.cfg.slice_bytes {
+                out.push_str(&format!("truncated, {} more matching rows (a narrower pattern shows them)\n", hits.len() - k));
+                break;
+            }
+            out.push_str(x);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// The stored text a selection names, as stored: no line numbers and no
+    /// cap, for `atlas slice --out FILE`. No selection is the whole text.
+    ///
+    /// # Errors
+    ///
+    /// As [`Handles::text`]; [`Error::InvalidArgument`] for `--grep`,
+    /// `--failures`, `--page` or an item that is not there.
+    pub fn extract(&self, id: &str, sel: &Sel) -> Result<String> {
+        let (row, text) = self.text(id)?;
+        let lines: Vec<&str> = text.lines().collect();
+        let n = lines.len();
+        let (a, b) = match sel {
+            Sel::Whole => return Ok(text),
+            Sel::Lines(a, b) => ((*a).max(1), (*b).min(n)),
+            Sel::Head(k) => (1, (*k).min(n)),
+            Sel::Tail(k) => (n.saturating_sub(*k) + 1, n),
+            Sel::Item(name) => {
+                let items = digest::items(Handles::shape_of(&row, &text), &text);
+                match find_items(&items, name).as_slice() {
+                    [one] => (one.first, one.last),
+                    [] => return Err(Error::InvalidArgument(format!("{}: no item {name:?}", row.id))),
+                    _ => return Err(Error::InvalidArgument(format!("{}: more than one item named {name:?}; use --lines", row.id))),
+                }
+            }
+            _ => return Err(Error::InvalidArgument("--out takes --lines, --item, --head, --tail or no selector".into())),
+        };
+        let mut out = String::new();
+        for l in lines.get(a.saturating_sub(1)..b.min(n)).unwrap_or(&[]) {
+            out.push_str(l);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     /// The most recently used handles, newest first.
@@ -634,7 +709,10 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
 
 /// The selector arguments `recall` takes with an `h:` key, each one of
 /// `atlas slice`'s flags without its dashes.
-pub const SLICE_ARGS: &[&str] = &["lines", "item", "failures", "grep", "context", "head", "tail", "page", "digest"];
+pub const SLICE_ARGS: &[&str] = &["lines", "item", "failures", "grep", "context", "head", "tail", "page", "digest", "digest-grep"];
+
+/// How a selector is written, both forms, for a refusal.
+const SELECTOR_FORMS: &str = "a selector is --NAME VALUE or NAME=VALUE (--lines A-B or lines=A-B)";
 
 /// What a `recall h:ID` call asks of a stored output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -650,7 +728,7 @@ fn value_of(k: &str) -> &'static str {
     match k {
         "lines" => "A-B",
         "item" => "NAME",
-        "grep" => "RE",
+        "grep" | "digest-grep" => "RE",
         "page" => "K",
         _ => "N",
     }
@@ -684,7 +762,7 @@ pub fn parse_args(pairs: &[(String, String)]) -> std::result::Result<Ask, String
         if k == "|" {
             return Err("one selector at a time: a hint's `|` separates alternatives, so pick one (key \"h:ID lines=A-B\")".into());
         }
-        if matches!(k, "context" | "lines" | "item" | "grep" | "head" | "tail" | "page") && v.is_empty() {
+        if matches!(k, "context" | "lines" | "item" | "grep" | "head" | "tail" | "page" | "digest-grep") && v.is_empty() {
             return Err(format!("{k} needs a value: {k}={}", value_of(k)));
         }
         match k {
@@ -703,11 +781,11 @@ pub fn parse_args(pairs: &[(String, String)]) -> std::result::Result<Ask, String
                 words.extend(["--context".to_string(), v.to_string()]);
                 continue;
             }
-            "lines" | "item" | "grep" | "head" | "tail" | "page" => {
+            "lines" | "item" | "grep" | "head" | "tail" | "page" | "digest-grep" => {
                 grep |= k == "grep";
                 words.extend([format!("--{k}"), v.to_string()]);
             }
-            _ => return Err(format!("unknown selector {k:?}; use one of {}", SLICE_ARGS.join(", "))),
+            _ => return Err(format!("unknown selector {k:?}: {SELECTOR_FORMS}, NAME one of {}", SLICE_ARGS.join(", "))),
         }
         chosen.push(k);
     }
@@ -779,11 +857,42 @@ pub fn split_key(key: &str) -> std::result::Result<(String, Vec<(String, String)
     }
     let mut it = words.into_iter();
     let id = it.next().unwrap_or_default();
+    Ok((id, word_pairs(it)?))
+}
+
+/// The (name, value) pairs of selector words in either form: the CLI's
+/// flags (`--lines A-B`, `--lines=A-B`, `-l A-B`, `--failures`) or
+/// `recall`'s (`lines=A-B`, `failures`), for [`parse_args`]. A flag that is
+/// not a selector takes no value, so [`parse_args`] names it.
+///
+/// # Errors
+///
+/// A message for a flag without its value.
+fn word_pairs(words: impl IntoIterator<Item = String>) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut it = words.into_iter();
     let mut pairs = Vec::new();
     while let Some(w) = it.next() {
-        if let Some(name) = w.strip_prefix("--") {
+        let short = match w.as_str() {
+            "-l" => Some("lines"),
+            "-i" => Some("item"),
+            "-g" => Some("grep"),
+            "-C" => Some("context"),
+            "-f" => Some("failures"),
+            _ => None,
+        };
+        if let Some(name) = short.or_else(|| w.strip_prefix("--")) {
             let name = if name == "symbol" { "item" } else { name };
-            let v = if matches!(name, "failures" | "digest") { "true".to_string() } else { it.next().ok_or_else(|| format!("{w} needs a value"))? };
+            if let Some((k, v)) = name.split_once('=') {
+                pairs.push((k.to_string(), v.to_string()));
+                continue;
+            }
+            let v = if matches!(name, "failures" | "digest") {
+                "true".to_string()
+            } else if SLICE_ARGS.contains(&name) {
+                it.next().ok_or_else(|| format!("{w} needs a value"))?
+            } else {
+                String::new()
+            };
             pairs.push((name.to_string(), v));
         } else if let Some((k, v)) = w.split_once('=') {
             pairs.push((k.to_string(), v.to_string()));
@@ -793,7 +902,18 @@ pub fn split_key(key: &str) -> std::result::Result<(String, Vec<(String, String)
             pairs.push((w, String::new()));
         }
     }
-    Ok((id, pairs))
+    Ok(pairs)
+}
+
+/// Parses the selector words of `atlas slice` in either form: its flags
+/// (`--lines A-B`) or `recall`'s arguments (`lines=A-B`), as a hint printed
+/// off a terminal writes them. A shell has already removed the quotes.
+///
+/// # Errors
+///
+/// As [`parse_args`]; a flag without its value.
+pub fn parse_words(words: &[String]) -> std::result::Result<Ask, String> {
+    parse_args(&word_pairs(words.iter().cloned())?)
 }
 
 /// Parses the selector words of `atlas slice` (`recall`'s arguments go
@@ -824,7 +944,8 @@ pub fn parse_sel(words: &[String]) -> std::result::Result<Sel, String> {
             "--head" => sel = Some(Sel::Head(val()?.parse().map_err(|_| "--head needs a number".to_string())?)),
             "--tail" => sel = Some(Sel::Tail(val()?.parse().map_err(|_| "--tail needs a number".to_string())?)),
             "--page" => sel = Some(Sel::Page(val()?.parse().map_err(|_| "--page needs a number".to_string())?)),
-            o => return Err(format!("unknown selector {o:?}")),
+            "--digest-grep" => sel = Some(Sel::DigestGrep(val()?)),
+            o => return Err(format!("unknown selector {o:?}: {SELECTOR_FORMS}")),
         }
     }
     Ok(match sel {
@@ -914,7 +1035,24 @@ pub fn to_cli(text: &str) -> String {
 }
 
 /// The usage of `atlas slice`.
-pub const SLICE_USAGE: &str = "usage: atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --page K | --digest]\n       atlas slice --list [N]";
+pub const SLICE_USAGE: &str = "usage: atlas slice h:ID [--lines A-B | --item NAME | --failures | --grep RE [--context N] | --head N | --tail N | --page K | --digest | --digest-grep RE]\n       (each also as recall writes it: lines=A-B, grep=RE, failures, ...)\n       atlas slice h:ID [--lines A-B | --item NAME | --head N | --tail N] --out FILE   the text as stored, uncapped and unnumbered, into FILE\n       atlas slice --list [N]";
+
+/// Writes `text` to `file` for `slice --out` and returns the confirmation
+/// line, which says "replaced" when the file existed. A FILE starting with
+/// `-` is refused: it is a flag that lost its file (`--out --lines 1-5`).
+///
+/// # Errors
+///
+/// The refusal, or the write error naming the file.
+pub fn write_out(id: &str, file: &str, text: &str) -> std::result::Result<String, String> {
+    if file.is_empty() || file.starts_with('-') {
+        return Err(format!("--out needs a file, not {file:?} (a file starting with - is taken for a flag)"));
+    }
+    let existed = std::fs::symlink_metadata(file).is_ok();
+    std::fs::write(file, text.as_bytes()).map_err(|e| format!("--out {file}: {e}"))?;
+    let verb = if existed { "replaced" } else { "wrote" };
+    Ok(format!("{id}: {verb} {file} with {} lines, {} B", crate::digest::line_count(text), text.len()))
+}
 
 /// The `atlas slice` subcommand: one slice of a stored output.
 ///
@@ -942,13 +1080,22 @@ pub fn cli(args: Vec<String>, db: &std::path::Path, lean: Option<&crate::json::V
         println!("{SLICE_USAGE}");
         return Ok(ExitCode::SUCCESS);
     }
-    let rest = &args[1..];
-    let out = if rest.iter().any(|w| w == "--digest") {
-        h.digest(first).map_err(|e| e.to_string())?
-    } else {
-        let sel = parse_sel(rest)?;
-        h.slice(first, &sel).map_err(|e| e.to_string())?
-    };
+    let mut rest = args[1..].to_vec();
+    if let Some(i) = rest.iter().position(|w| w == "--out") {
+        let file = rest.get(i + 1).cloned().ok_or("--out needs a file")?;
+        rest.drain(i..=i + 1);
+        let Ask::Slice(sel) = parse_words(&rest)? else { return Err("--out takes --lines, --item, --head, --tail or no selector".into()) };
+        let text = h.extract(first, &sel).map_err(|e| e.to_string())?;
+        println!("{}", write_out(first, &file, &text)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Either form: `--lines A-B`, or `lines=A-B` as a hint off a terminal
+    // writes it.
+    let out = match parse_words(&rest)? {
+        Ask::Digest => h.digest(first),
+        Ask::Slice(sel) => h.slice(first, &sel),
+    }
+    .map_err(|e| e.to_string())?;
     print!("{}", HintForm::for_stdout().apply(&out));
     Ok(ExitCode::SUCCESS)
 }

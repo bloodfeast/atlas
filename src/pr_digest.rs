@@ -64,7 +64,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::error::Result;
 use crate::handles::{Handles, Meta};

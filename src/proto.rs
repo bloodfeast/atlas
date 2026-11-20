@@ -494,13 +494,13 @@ pub fn mention_rows(
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn indexed_rpcs(conn: &rusqlite::Connection, root: &str, own: bool) -> crate::Result<HashSet<String>> {
+pub fn indexed_rpcs(conn: &crate::db::Connection, root: &str, own: bool) -> crate::Result<HashSet<String>> {
     let sql = format!(
         "SELECT DISTINCT o.name FROM code_occ o JOIN code_files f ON f.id = o.file WHERE o.sect = 0 AND o.kind LIKE 'rpc (%' AND f.root {} ?1",
         if own { "=" } else { "<>" }
     );
     let mut st = conn.prepare(&sql)?;
-    let v = st.query_map([root], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<HashSet<String>>>()?;
+    let v = st.query_map([root], |r| r.get::<_, String>(0))?.collect::<crate::db::Result<HashSet<String>>>()?;
     Ok(v)
 }
 
@@ -849,14 +849,14 @@ pub fn link_rows(rows: &mut crate::code::Rows, rpcs: &[(String, String)], texts:
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn foreign_stubs(conn: &rusqlite::Connection, root: &str, rpcs: &[(String, String)]) -> crate::Result<Vec<(String, String, String)>> {
+pub fn foreign_stubs(conn: &crate::db::Connection, root: &str, rpcs: &[(String, String)]) -> crate::Result<Vec<(String, String, String)>> {
     let mut names: Vec<String> = crate::langs::LANGS.iter().filter_map(|l| l.grpc.as_ref()).flat_map(|g| Names::of(g, rpcs).stubs.into_keys()).collect();
     names.sort();
     names.dedup();
     let mut st = conn.prepare_cached("SELECT o.container, f.path FROM code_occ o JOIN code_files f ON f.id = o.file WHERE o.name = ?1 AND o.sect = 0 AND f.root <> ?2")?;
     let mut out = Vec::new();
     for n in names {
-        let rows = st.query_map(rusqlite::params![n, root], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = st.query_map(crate::db::params![n, root], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for r in rows {
             let (container, path) = r?;
             if crate::langs::is_generated(&path) {
@@ -873,13 +873,13 @@ pub fn foreign_stubs(conn: &rusqlite::Connection, root: &str, rpcs: &[(String, S
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn indexed_rpc_services(conn: &rusqlite::Connection, root: &str) -> crate::Result<Vec<(String, String)>> {
+pub fn indexed_rpc_services(conn: &crate::db::Connection, root: &str) -> crate::Result<Vec<(String, String)>> {
     let mut st = conn.prepare(
         "SELECT DISTINCT o.name, o.container FROM code_occ o JOIN code_files f ON f.id = o.file WHERE o.sect = 0 AND o.kind LIKE 'rpc (%' AND f.root <> ?1",
     )?;
     let v = st
         .query_map([root], |r| Ok((r.get::<_, String>(0)?, service_of(&r.get::<_, String>(1)?))))?
-        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        .collect::<crate::db::Result<Vec<(String, String)>>>()?;
     Ok(v)
 }
 

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use rusqlite::{params, Connection};
+use crate::db::{params, Connection};
 
 use crate::embed::gemm;
 use crate::embed::window::{self, WINDOW_RULES_VERSION};
@@ -388,7 +388,7 @@ impl VecIndex {
             let id: i64 = r.get(0)?;
             let sha: String = r.get(1)?;
             match r.get_ref(2)? {
-                rusqlite::types::ValueRef::Blob(b) if b.len() == dim * 4 => {
+                crate::db::types::ValueRef::Blob(b) if b.len() == dim * 4 => {
                     ix.push(&mut at, id, b);
                 }
                 _ => ix.missing += 1,
@@ -408,7 +408,7 @@ impl VecIndex {
             let sha: String = r.get(0)?;
             let Some(ids) = by_sha.get(&sha) else { continue };
             match r.get_ref(3)? {
-                rusqlite::types::ValueRef::Blob(b) if b.len() == dim * 4 => {
+                crate::db::types::ValueRef::Blob(b) if b.len() == dim * 4 => {
                     for &id in ids {
                         ix.push(&mut at, id, b);
                     }
@@ -526,7 +526,6 @@ impl Embedder {
         let (d, e, f) = (done.clone(), embedded.clone(), failed.clone());
         let run = move || -> Result<()> {
             let mut conn = crate::store::open_raw(&db)?;
-            conn.busy_timeout(Duration::from_secs(30))?;
             loop {
                 let p = embed_pending(&mut conn, &model, 256, threads)?;
                 if p.total() == 0 {

@@ -78,7 +78,7 @@ pub fn is_denied(name: &str) -> bool {
     ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].iter().any(|k| n.starts_with(k))
         || n == "credentials"
         || n.starts_with("credentials.")
-        || matches!(n.as_str(), ".netrc" | "_netrc" | ".npmrc" | ".pypirc")
+        || matches!(n.as_str(), ".netrc" | "_netrc" | ".npmrc" | ".pypirc" | ".git-credentials" | ".pgpass")
         || n.starts_with("secrets.")
         || n == "secretsdata.json"
 }
@@ -416,6 +416,8 @@ mod tests {
             "secretsdata.json",
             "SecretsData.JSON",
             "store.p12",
+            ".git-credentials",
+            ".PGPASS",
         ] {
             assert!(is_denied(n), "{n} should be denied");
         }

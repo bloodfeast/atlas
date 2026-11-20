@@ -1953,8 +1953,8 @@ pub const COMPACT_BEGIN: &str = "<!-- atlas:compact-instructions";
 pub const COMPACT_END: &str = "<!-- /atlas:compact-instructions -->";
 
 /// The instructions for Claude Code's compaction summary: keys and deltas.
-/// The PreCompact hook returns this text as it stands, so it holds no markers
-/// and no heading; [`compact_block`] is the same text for a `CLAUDE.md`.
+/// The PreCompact hook returns this text, then the live agents' line when
+/// there is one, so it holds no markers and no heading; [`compact_block`] is the same text for a `CLAUDE.md`.
 pub const COMPACT_INSTRUCTIONS: &str = "When compacting, write keys and deltas, not restated content. The summary's hard limit is 3,000 characters (about 1,250 tokens), under half of a usual summary; a longer one has failed, so count characters, not words: prose for rulings, decisions, state and next steps; keys for detail.
 - After compaction atlas injects a card that names every part of this segment by a key one recall returns (turn:...-...@hash groups, older segments by compact:...@hash links), plus lanes, open questions, owed steps, rulings and files touched. Do not repeat what it lists, and never restate tool output: its exact text is one recall away.
 - Where a card key or a record key already holds something (a discussion, a plan, a file's content, an earlier step's detail), write that key in place of the content, never both.
@@ -2154,6 +2154,10 @@ fn same_folder(a: &str, b: &str) -> bool {
     crate::project::path_key(Path::new(a)) == crate::project::path_key(Path::new(b))
 }
 
+/// The variable a client that is not Claude Code sets to say whether a user is
+/// there to answer (`1` unattended, `0` attended).
+const UNATTENDED_VAR: &str = "ATLAS_UNATTENDED";
+
 /// Whether a session has no user to answer a question, from what Claude Code
 /// sets for its hooks. `CLAUDE_CODE_SESSION_ATTENDED` is its own word on it, and
 /// `CLAUDE_CODE_ENTRYPOINT` covers a version without that: measured on 2.1.319,
@@ -2161,7 +2165,33 @@ fn same_folder(a: &str, b: &str) -> bool {
 /// pipes, started from another session or not (`sdk-ts` with `0` from the SDK).
 /// The hook's stdin says nothing usable and a terminal test sees the hook's own
 /// pipes. With neither variable, as with a hook run by hand, a user is assumed.
+///
+/// `ATLAS_UNATTENDED` comes first, for a client that is not Claude Code (#266):
+/// `1` is unattended and `0` attended whatever Claude Code's variables say; empty
+/// or unset leaves them to decide, and another value is ignored with one stderr
+/// line naming it. Surrounding spaces are ignored. Every offer reads the one
+/// flag this decides.
 pub fn unattended_session(env: impl Fn(&str) -> Option<String>) -> bool {
+    let (unattended, note) = unattended_decision(env);
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    unattended
+}
+
+/// [`unattended_session`]'s answer, with the stderr line it prints, if any.
+pub fn unattended_decision(env: impl Fn(&str) -> Option<String>) -> (bool, Option<String>) {
+    // Trimmed: cmd's `set ATLAS_UNATTENDED=1 && client` stores "1 ".
+    let note = match env(UNATTENDED_VAR).as_deref().map(str::trim) {
+        Some("1") => return (true, None),
+        Some("0") => return (false, None),
+        None | Some("") => None,
+        Some(other) => Some(format!("atlas: {UNATTENDED_VAR}={other:?} is ignored (only 0 or 1 is read)")),
+    };
+    (claude_code_unattended(&env), note)
+}
+
+fn claude_code_unattended(env: &impl Fn(&str) -> Option<String>) -> bool {
     match env("CLAUDE_CODE_SESSION_ATTENDED").as_deref() {
         Some("1") => false,
         Some("0") => true,

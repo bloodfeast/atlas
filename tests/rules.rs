@@ -903,7 +903,7 @@ fn a_sync_under_unset_writes_no_rules_refs_and_no_new_exports() {
     assert!(store.head("claude-md:r00001").unwrap().is_none(), "the root file is not read");
     assert!(store.linked_to(rules::AMENDS, "intent:r00001").unwrap().is_empty());
     drop(store);
-    let conn = rusqlite::Connection::open(&s.store).unwrap();
+    let conn = atlas::db::Connection::open(&s.store).unwrap();
     let refs: i64 = conn.query_row("SELECT COUNT(*) FROM refs WHERE kind IN (?1, ?2, ?3)", [rules::AMENDS, rules::AMENDED_BY, rules::CHECKED], |r| r.get(0)).unwrap();
     assert_eq!(refs, 0);
     drop(conn);

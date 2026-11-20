@@ -7,7 +7,7 @@ mod common;
 use std::path::Path;
 
 use atlas::digest;
-use atlas::handles::{HandleCfg, Handles, HintForm, Meta, Sel};
+use atlas::handles::{parse_words, Ask, HandleCfg, Handles, HintForm, Meta, Sel};
 use atlas::json;
 use atlas::json::{Map, Value};
 use atlas::tools::Server;
@@ -253,6 +253,19 @@ fn cli_calls(line: &str, item: &str) -> Vec<(String, Sel)> {
     out
 }
 
+/// A hint's recall arguments as the words a shell hands `atlas slice`
+/// (`lines=1-3`, `failures=true`).
+fn recall_words(args: &Value) -> Vec<String> {
+    let m = args.as_object().cloned().unwrap_or_default();
+    m.iter()
+        .filter(|(k, _)| k.as_str() != "key")
+        .map(|(k, v)| match v {
+            Value::String(s) => format!("{k}={s}"),
+            v => format!("{k}={v}"),
+        })
+        .collect()
+}
+
 /// A recall answer that selected something: not a "nothing selected" or
 /// "no item" reply.
 fn selected(t: &str) -> bool {
@@ -309,6 +322,12 @@ fn every_hint_names_recall_and_round_trips() {
             }
             let got: Vec<(String, Sel)> = cli_calls(cline, &item);
             assert_eq!(got, want.iter().map(|(_, k, s)| (k.clone(), s.clone())).collect::<Vec<_>>(), "{line:?} vs {cline:?}");
+            // `atlas slice` takes the recall form too (a hint printed off a
+            // terminal, run from a shell).
+            for (args, key, sel) in &want {
+                let words = recall_words(args);
+                assert_eq!(parse_words(&words), Ok(Ask::Slice(sel.clone())), "atlas slice {key} {words:?}");
+            }
         }
     }
     assert!(calls >= 12, "{calls} hint calls");
@@ -513,4 +532,132 @@ fn the_recall_schema_and_help_name_the_handle_form() {
     assert!(help.contains("`h:ID`") && help.contains("`h:`"), "{help}");
     let grep = atlas::tools::full_tool_list().into_iter().find(|t| t["name"] == "grep").unwrap();
     assert!(!grep["description"].as_str().unwrap().contains("atlas slice"), "{grep}");
+}
+
+/// `atlas slice` takes a selector as `recall` writes it (`lines=1-3`) as
+/// well as its own flag (`--lines 1-3`), to the same selection (issue 307).
+#[test]
+fn slice_takes_the_recall_form() {
+    let w = |s: &[&str]| s.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+    for (recall, cli) in [
+        (w(&["lines=1-3"]), w(&["--lines", "1-3"])),
+        (w(&["grep=Story"]), w(&["--grep", "Story"])),
+        (w(&["grep=a b"]), w(&["--grep", "a b"])),
+        (w(&["grep=\"a b\""]), w(&["--grep", "a b"])),
+        (w(&["item=NAME"]), w(&["--item", "NAME"])),
+        (w(&["failures=true"]), w(&["--failures"])),
+        (w(&["failures"]), w(&["--failures"])),
+        (w(&["grep=RE", "context=2"]), w(&["--grep", "RE", "--context", "2"])),
+        (w(&["head=5"]), w(&["--head", "5"])),
+        (w(&["digest=true"]), w(&["--digest"])),
+        (w(&["digest-grep=PROJ-1"]), w(&["--digest-grep", "PROJ-1"])),
+        (w(&["--lines=1-3"]), w(&["-l", "1-3"])),
+    ] {
+        let a = parse_words(&recall);
+        assert!(a.is_ok(), "{recall:?}: {a:?}");
+        assert_eq!(a, parse_words(&cli), "{recall:?} vs {cli:?}");
+    }
+    assert_eq!(parse_words(&w(&["lines=1-3"])), Ok(Ask::Slice(Sel::Lines(1, 3))));
+    assert_eq!(parse_words(&w(&["grep=a b"])), Ok(Ask::Slice(Sel::Grep { re: "a b".into(), context: 2 })));
+    assert_eq!(parse_words(&w(&["digest-grep=X"])), Ok(Ask::Slice(Sel::DigestGrep("X".into()))));
+    let e = parse_words(&w(&["lines=1-3", "|", "grep=RE"])).unwrap_err();
+    assert!(e.contains("one selector at a time"), "{e}");
+    for bad in [w(&["bogus=1"]), w(&["--bogus"]), w(&["5-9"])] {
+        let e = parse_words(&bad).unwrap_err();
+        assert!(e.contains("--lines A-B") && e.contains("lines=A-B"), "{bad:?}: {e}");
+    }
+}
+
+/// The `atlas slice` command itself takes the recall form.
+#[test]
+fn the_slice_command_takes_the_recall_form() {
+    let (fx, _s, mut h) = setup("recall-slice-cli-form");
+    let id = cargo_test(&mut h);
+    // `--db` is not a leading option of a subcommand: the database comes
+    // from the configuration.
+    let cfg = fx.tmp.path().join("atlas.json");
+    std::fs::write(&cfg, json!({"db": fx.db.display().to_string(), "vaults": []}).to_string()).unwrap();
+    let run = |words: &[&str]| {
+        let o = std::process::Command::new(common::bin())
+            .arg("slice")
+            .arg(&id)
+            .args(words)
+            .env("ATLAS_CONFIG", &cfg)
+            .current_dir(fx.tmp.path())
+            .output()
+            .unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+    let (okay, out, err) = run(&["grep=test result"]);
+    assert!(okay, "{err}");
+    assert_eq!(out, h.slice(&id, &Sel::Grep { re: "test result".into(), context: 2 }).unwrap());
+    let (okay, out, err) = run(&["lines=17-18"]);
+    assert!(okay, "{err}");
+    assert_eq!(out, h.slice(&id, &Sel::Lines(17, 18)).unwrap());
+    let (okay, _, err) = run(&["nope=1"]);
+    assert!(!okay && err.contains("lines=A-B"), "{err}");
+}
+
+/// A record argument with a handle key is refused with where the selector
+/// goes instead.
+#[test]
+fn a_record_argument_on_a_handle_says_where_the_selector_goes() {
+    let (_fx, mut s, mut h) = setup("recall-slice-where");
+    let id = cargo_test(&mut h);
+    for (k, v) in [("query", json!("\\[Story\\]")), ("budget_tokens", json!(300))] {
+        let mut m = Map::new();
+        m.insert("key".into(), json!(format!("{id} grep=FAILED")));
+        m.insert(k.into(), v);
+        let e = err(&mut s, Value::Object(m));
+        assert!(e.contains(&format!("{k} does not apply")) && e.contains("a selector goes in key, as \"h:ID grep=RE\""), "{k}: {e}");
+        assert!(e.contains("lines, grep, item") && !e.contains('\n'), "{k}: {e}");
+    }
+}
+
+/// A JQL search of `n` issues, as a tracker handle keeps it.
+fn jql_search(n: usize) -> String {
+    let issues: Vec<String> = (1..=n)
+        .map(|i| {
+            let ty = if i % 2 == 0 { "Story" } else { "Bug" };
+            format!(
+                r#"{{"key":"PROJ-{i}","fields":{{"summary":"Thing {i}","status":{{"name":"To Do"}},"issuetype":{{"name":"{ty}"}},"updated":"2026-11-0{}T00:00:00.000+0000"}}}}"#,
+                1 + i % 9
+            )
+        })
+        .collect();
+    let v = json::parse(&format!(r#"{{"issues":[{}],"isLast":true}}"#, issues.join(","))).unwrap();
+    format!("{}\n", json::to_string_pretty(&v))
+}
+
+/// `digest-grep=RE` answers the digest rows that match, every issue of a
+/// search and not only the rows the digest had room for, capped as a slice.
+#[test]
+fn digest_grep_returns_the_matching_digest_rows() {
+    let (fx, mut s, mut h) = setup("recall-slice-digest-grep");
+    let m = Meta { kind: "tracker".into(), label: "jira jql search".into(), cmd: "/rest/api/3/search/jql".into(), ..Meta::default() };
+    let id = h.put(jql_search(45).as_bytes(), &m).unwrap().id;
+    let d = h.digest(&id).unwrap();
+    assert!(!d.contains("PROJ-40 "), "past the digest's rows: {d}");
+    // A space inside the quotes, not at its end: a value is trimmed.
+    let one = h.slice(&id, &Sel::DigestGrep("^PROJ-40 To".into())).unwrap();
+    assert_eq!(one, format!("{id}: 1 of 45 digest rows match \"^PROJ-40 To\"\nPROJ-40 To Do [Story] - unassigned 2026-11-05 Thing 40\n"));
+    assert_eq!(ok(&mut s, json!({"key": format!("{id} digest-grep=\"^PROJ-40 To\"")})), one);
+    let stories = h.slice(&id, &Sel::DigestGrep("\\[Story\\]".into())).unwrap();
+    assert!(stories.starts_with(&format!("{id}: 22 of 45 digest rows match")), "{stories}");
+    assert_eq!(stories.lines().filter(|l| l.starts_with("PROJ-") && l.contains("[Story]")).count(), 22, "{stories}");
+    let none = h.slice(&id, &Sel::DigestGrep("NOPE".into())).unwrap();
+    assert_eq!(none, format!("{id}: no digest row matches \"NOPE\" (45 rows)\n"));
+    assert!(h.slice(&id, &Sel::DigestGrep("(".into())).is_err());
+    // The digest names it.
+    assert!(d.trim_end().lines().last().unwrap().contains(" | digest-grep=RE"), "{d}");
+    // Capped like any slice.
+    let small = Handles::open(&fx.db, HandleCfg { slice_bytes: 256, ..HandleCfg::default() }).unwrap();
+    let cut = small.slice(&id, &Sel::DigestGrep("PROJ".into())).unwrap();
+    assert!(cut.len() < 400 && cut.trim_end().lines().last().unwrap().starts_with("truncated, "), "{cut}");
+    // Any other output: the digest's own lines.
+    let run = cargo_test(&mut h);
+    let rows = h.slice(&run, &Sel::DigestGrep("FAILED|failed".into())).unwrap();
+    let digest = h.digest(&run).unwrap();
+    let body: Vec<&str> = rows.lines().skip(1).collect();
+    assert!(!body.is_empty() && body.iter().all(|l| digest.lines().any(|d| d == *l)), "{rows}");
 }

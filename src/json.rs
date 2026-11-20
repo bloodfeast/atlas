@@ -1402,10 +1402,24 @@ mod tests {
         // About the most keys a 4 MiB protocol message holds. Quadratic
         // insertion took minutes here.
         let n = 300_000;
-        let text = format!("{{{}}}", (0..n).map(|i| format!("\"k{i}\":{i}")).collect::<Vec<_>>().join(","));
-        let t = std::time::Instant::now();
-        let v = parse(&text).unwrap();
-        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        let object = |n: usize| format!("{{{}}}", (0..n).map(|i| format!("\"k{i}\":{i}")).collect::<Vec<_>>().join(","));
+        let time = |s: &str| {
+            let t = std::time::Instant::now();
+            let v = parse(s).unwrap();
+            (t.elapsed(), v)
+        };
+        // 30k keys against 3k, the faster of three each, timed in this run so
+        // a load on the machine weighs on both: linear is 10x, quadratic
+        // 100x. Both stay small enough that the cache does not tilt them.
+        let (mid, small) = (object(n / 10), object(n / 100));
+        let best = |s: &str| (0..3).map(|_| time(s).0).min().unwrap();
+        let (a, b) = (best(&mid), best(&small));
+        // The +50 ms absorbs a loaded container (36 ms against 0.55 ms seen);
+        // a scan per insert costs seconds.
+        assert!(a < b * 25 + std::time::Duration::from_millis(50), "{} keys took {a:?}, a tenth {b:?}", n / 10);
+        // The full object: a wall backstop at over 10x the unloaded time.
+        let (took, v) = time(&object(n));
+        assert!(took < std::time::Duration::from_secs(20), "{took:?}");
         assert_eq!(v.as_object().unwrap().len(), n);
         assert_eq!(v["k299999"], 299_999);
         // Duplicates, below and past the index threshold: the last value,

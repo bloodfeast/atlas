@@ -49,7 +49,11 @@ fn command(t: &Temp, cfg: &Path, claude: &Path, off: bool) -> Command {
         .env("HOME", t.path())
         .env("USERPROFILE", t.path())
         .env_remove("ATLAS_CONFIG")
-        .env_remove("ATLAS_PROJECT");
+        .env_remove("ATLAS_PROJECT")
+        // The runner's session kind is never inherited by the hook.
+        .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_UNATTENDED");
     if off {
         c.env("ATLAS_CALIBRATE", "off");
     } else {
@@ -70,13 +74,13 @@ fn serve(t: &Temp, cfg: &Path, claude: &Path, off: bool) -> Child {
 }
 
 fn rows(db: &Path) -> i64 {
-    let conn = rusqlite::Connection::open(db).unwrap();
+    let conn = atlas::db::Connection::open(db).unwrap();
     conn.query_row("SELECT count(*) FROM baseline_log", [], |r| r.get(0)).unwrap_or(0)
 }
 
 /// How many tables named like `pattern` the store has (none without a store).
 fn tables(db: &Path, pattern: &str) -> i64 {
-    let Ok(conn) = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return 0 };
+    let Ok(conn) = atlas::db::Connection::open_with_flags(db, atlas::db::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return 0 };
     conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name LIKE ?1", [pattern], |r| r.get(0)).unwrap_or(0)
 }
 
@@ -101,7 +105,7 @@ fn the_server_calibrates_in_the_background_unless_turned_off() {
     assert_eq!(tables(&db, "calibrate_%"), 0);
 
     // A hook never calibrates.
-    let mut hook = command(&t, &cfg, &claude, false).arg("--hook").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut hook = command(&t, &cfg, &claude, false).arg("--hook").env("ATLAS_HOOK_BUDGET_OFF", "1").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     let ev = json!({"hook_event_name": "SessionStart", "session_id": "s", "source": "startup", "cwd": t.path().to_string_lossy().to_string()});
     hook.stdin.take().unwrap().write_all(ev.to_string().as_bytes()).unwrap();
     hook.wait().unwrap();
@@ -131,8 +135,8 @@ fn the_server_calibrates_in_the_background_unless_turned_off() {
     // The hook above logged the store's first atlas answer: that is the cutoff.
     assert!(text.contains("(the store's first atlas answer)") && text.contains(&format!("lookup rules v{}", atlas::calibrate::RULES_VERSION)), "{text}");
     assert!(!text.contains("stale"), "{text}");
-    // The default is the human layout: the same baseline, in a titled block.
-    let human = command(&t, &cfg, &claude, true).arg("--token-report").output().unwrap();
+    // --verbose is the human layout: the same baseline, in a titled block.
+    let human = command(&t, &cfg, &claude, true).args(["--token-report", "--verbose"]).output().unwrap();
     let human = String::from_utf8_lossy(&human.stdout);
     assert!(
         human.starts_with("Headline\n")
@@ -140,6 +144,17 @@ fn the_server_calibrates_in_the_background_unless_turned_off() {
             && !human.contains('\t'),
         "{human}"
     );
+    // The default is the summary (#339): a short read that names --verbose.
+    let short = command(&t, &cfg, &claude, true).arg("--token-report").output().unwrap();
+    let short = String::from_utf8_lossy(&short.stdout);
+    assert!(
+        short.starts_with("Token report: calibrated ")
+            && short.lines().count() <= 16
+            && short.ends_with("Full report: atlas --token-report --verbose\n"),
+        "{short}"
+    );
+    let bad = command(&t, &cfg, &claude, true).arg("--verbose").output().unwrap();
+    assert!(!bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("--verbose goes after --token-report"));
 
     // By hand: progress and the result, the same numbers from the stored calls.
     let by_hand = command(&t, &cfg, &claude, true).arg("--calibrate").output().unwrap();
@@ -166,7 +181,9 @@ fn too_little_history_gives_the_ledger_ratio_only() {
     assert!(text.contains("measured ratio per answer: none, too little pre-atlas history: 12 pre-atlas lookup episodes in 2 of 2 transcripts"), "{text}");
     assert!(text.contains("needs 30 episodes in 5 transcripts") && text.contains("runs again when the lookup rules or the configured targets change"), "{text}");
     assert!(text.contains("ledger ratio per answer (rule-based, not a bound"), "{text}");
-    assert!(!text.contains("upper bound"), "{text}");
+    // The ratios are never called a bound; only the net's own bound line
+    // (#297) may say what kind of number the net is.
+    assert!(!text.lines().filter(|l| !l.starts_with("bound\t")).any(|l| l.contains("upper bound")), "{text}");
 }
 
 #[test]

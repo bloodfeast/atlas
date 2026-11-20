@@ -93,7 +93,7 @@ fn round_trip_through_the_binary() {
     assert_eq!(out[8]["error"]["code"], json!(-32700));
     assert_eq!(out[8]["id"], Value::Null);
     // The client name from initialize reached the audit log.
-    let conn = rusqlite::Connection::open(&fx.db).unwrap();
+    let conn = atlas::db::Connection::open(&fx.db).unwrap();
     let client: String = conn.query_row("SELECT client FROM writes", [], |r| r.get(0)).unwrap();
     assert_eq!(client, "pipe-test");
 }
@@ -259,8 +259,14 @@ fn no_network_code() {
         // (macOS, hourly; the last background scan, no network) on its own thread. Nothing else spawns. Unsafe code lives only in the platform FFI and the
         // SIMD kernels (scan, embedding GEMM).
         let platform = path.parent().is_some_and(|p| p.ends_with("platform"));
-        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || path.ends_with("pr_supervise.rs") || path.ends_with("worktree_ledger.rs") || path.ends_with("restart.rs") || path.ends_with("restart_warn.rs") || platform;
-        let ffi = platform || path.ends_with("scan.rs") || path.ends_with("gemm.rs");
+        // `atlas track` (command line only, never the server) reads Jira and
+        // Confluence through the system curl: its one spawn.
+        let trackers_http = path.ends_with("trackers/http.rs");
+        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || path.ends_with("card_agents.rs") || path.ends_with("pr_supervise.rs") || path.ends_with("worktree_ledger.rs") || path.ends_with("worktree_gc.rs") || path.ends_with("restart.rs") || path.ends_with("restart_warn.rs") || trackers_http || platform;
+        // The owned SQLite binding (src/db): the C declarations, the one
+        // module that calls them, and the wrapper's `Send` and column reads.
+        let sqlite = path.parent().is_some_and(|p| p.ends_with("db"));
+        let ffi = platform || sqlite || path.ends_with("scan.rs") || path.ends_with("gemm.rs");
         // Only the server's code: not the test modules, not comments.
         let body = src.split("\n#[cfg(test)]\nmod ").next().unwrap_or(&src);
         // A test module the other modules' tests reach (the fake gh).
@@ -284,6 +290,11 @@ fn no_network_code() {
             }
             assert!(!code.contains(bad), "{bad} in {}", path.display());
         }
+        // The card's PR lookup spawns gh once, and nothing else.
+        if path.ends_with("card_agents.rs") {
+            assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
+            assert!(code.contains("Command::new(\"gh\")"), "{}", path.display());
+        }
         // The merge gate's one spawn is gh, and nothing else.
         if path.ends_with("reviews.rs") {
             assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
@@ -294,6 +305,12 @@ fn no_network_code() {
             assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
             assert!(code.contains("Command::new(\"gh\")"), "{}", path.display());
         }
+        // The trackers transport's one spawn is curl (the binary atlas's
+        // model downloads use), and nothing else.
+        if trackers_http {
+            assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
+            assert!(code.contains("Command::new(&self.exe)") && code.contains("default_curl()"), "{}", path.display());
+        }
         // The PR digest's one spawn is git, and nothing else.
         if path.ends_with("pr_digest.rs") {
             assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
@@ -303,6 +320,19 @@ fn no_network_code() {
         if path.ends_with("worktree_ledger.rs") {
             assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
             assert!(code.contains("Command::new(\"git\")"), "{}", path.display());
+        }
+        // Worktree gc spawns git or docker through its one `call`, and atlas
+        // itself (the hook's detached run), and nothing else.
+        if path.ends_with("worktree_gc.rs") || path.ends_with("worktree_gc_docker.rs") {
+            let n = if path.ends_with("worktree_gc.rs") { 2 } else { 0 };
+            assert_eq!(code.matches("Command::new").count(), n, "{}", path.display());
+            if n == 2 {
+                assert!(code.contains("Command::new(program)") && code.contains("Command::new(&exe)"), "{}", path.display());
+            }
+            for (i, _) in code.match_indices("call(\"") {
+                let rest = &code[i + 6..];
+                assert!(rest.starts_with("git\"") || rest.starts_with("docker\""), "{}: {}", path.display(), &rest[..rest.len().min(20)]);
+            }
         }
     }
 }

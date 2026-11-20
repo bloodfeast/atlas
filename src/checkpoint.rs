@@ -16,7 +16,7 @@
 //! files: src/a.rs, src/b.rs
 //! pending: Bash cargo test --no-fail-fast
 //! intent: Next I will run the tests and fix the failing one.
-//! groups (recall a key for its digest and text):
+//! groups (recall a key for its text):
 //! - turn:1a2b:b81200-b90410@... a.rs
 //! chain_depth: 4 chain_index: 4
 //! links (recall a key for that segment's card and digest):
@@ -37,13 +37,14 @@
 //! them from the transcript, which is append-only, so a key stays valid
 //! for the transcript's life.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::compact::{record_ref, HASH_LEN};
 use crate::error::Result;
 use crate::json::Value;
 use crate::memory::{Head, MemoryStore};
+use crate::resume::{goal_event, maybe_goal, Goal, GOAL_CMD};
 
 /// The tool calls a checkpoint lists, newest last.
 pub const TOOLS: usize = 6;
@@ -149,7 +150,9 @@ pub struct Tail {
     /// Whether the last assistant record ends in a tool call (a tool chain
     /// is running), with no person's prompt after it.
     pub mid_task: bool,
-    /// The last assistant text's last line, redacted and cut.
+    /// The task, redacted and cut: the active `/goal` text when the segment
+    /// set one and did not clear it, else the last assistant line that is
+    /// not about the compaction or the handoff itself ([`boilerplate`]).
     pub intent: String,
     /// The newest request's context tokens.
     pub last_ctx: u64,
@@ -586,6 +589,69 @@ struct Scanner {
     ids: HashMap<String, usize>,
     last_msg: String,
     prev_ctx: u64,
+    /// The segment's active goal, read by the parser resume shares
+    /// ([`crate::resume::goal_event`]).
+    goal: Goal,
+}
+
+/// Whether an assistant line is about the compaction or the handoff
+/// itself ("Please run `/compact`.", "a good point to compact", "handoff
+/// written"), not the task: such a line is never the card's intent.
+fn boilerplate(line: &str) -> bool {
+    // Asks for the command or reports the handoff: closing talk anywhere.
+    const ANYWHERE: &[&str] = &[
+        "run /compact",
+        "type /compact",
+        "/compact when you",
+        "/compact when ready",
+        "/compact when convenient",
+        "ready for /compact",
+        "can /compact",
+        "to /compact",
+        "compact now",
+        "good point for compaction",
+        "handoff written",
+        "handoff is written",
+        "handoff saved",
+        "wrote the handoff to",
+    ];
+    // Phrases that can also name a subject ("fix the compaction point
+    // check", "cut the time to compact a segment"): closing talk only in a
+    // closing shape: after a qualifier ("a good time to compact"), or with
+    // nothing after it, sentence punctuation or a dash ("a compaction
+    // point."), or closing words ("a compaction point if you want one").
+    // A joiner ("to", "and", "for", a bare "if") leads on to the subject's
+    // object.
+    const SHAPED: &[&str] = &[
+        "point to compact",
+        "moment to compact",
+        "time to compact",
+        "ready to compact",
+        "safe to compact",
+        "compaction point",
+        "compaction moment",
+        "wrote the handoff",
+    ];
+    const QUALIFIERS: &[&str] = &["good ", "natural ", "clean ", "right ", "safe ", "ideal ", "fine "];
+    const TAILS: &[&str] = &["now", "here", "if you", "if needed", "if helpful", "whenever"];
+    const STOPS: &[char] = &['.', ',', ';', ':', '!', '?', '\u{2014}', '\u{2013}'];
+    let l = line.replace('`', "").to_lowercase();
+    // A phrase starts and a closing word ends at a word boundary: "rewrote
+    // the handoff" is not "wrote the handoff", nor "iffy" "if".
+    let word_ends = |s: &str| !s.starts_with(char::is_alphanumeric);
+    let starts = |i: usize| l[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+    if ANYWHERE.iter().any(|n| l.match_indices(n).any(|(i, _)| starts(i))) {
+        return true;
+    }
+    SHAPED.iter().any(|n| {
+        l.match_indices(n).filter(|&(i, _)| starts(i)).any(|(i, _)| {
+            let rest = l[i + n.len()..].trim_start();
+            QUALIFIERS.iter().any(|q| l[..i].ends_with(q))
+                || rest.is_empty()
+                || rest.starts_with(STOPS)
+                || TAILS.iter().any(|t| rest.strip_prefix(t).is_some_and(word_ends))
+        })
+    })
 }
 
 impl Scanner {
@@ -593,12 +659,16 @@ impl Scanner {
     fn record(&mut self, raw: &[u8], n: u64) {
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         let t = &mut self.t;
-        // A record whose first key is its type names itself at once: one
-        // that is not a user or assistant record (Claude Code writes its
-        // bulky api-request records so, most of a long segment's bytes) is
-        // passed over without a search through it.
+        // A record whose first key is its type names itself at once: a user
+        // or assistant record is read; a system or attachment record only
+        // when its raw bytes can hold a goal record; any other (Claude
+        // Code writes its bulky api-request records so, most of a long
+        // segment's bytes) is passed over without a search through it.
         if let Some(kind) = raw.strip_prefix(b"{\"type\":\"") {
-            if !(kind.starts_with(b"user\"") || kind.starts_with(b"assistant\"")) {
+            let main = kind.starts_with(b"user\"") || kind.starts_with(b"assistant\"");
+            let side = kind.starts_with(b"system\"") || kind.starts_with(b"attachment\"");
+            // Not UTF-8: the lossy read below decides.
+            if !(main || (side && std::str::from_utf8(raw).map_or(true, maybe_goal))) {
                 return;
             }
         }
@@ -608,13 +678,20 @@ impl Scanner {
         }
         // A prefilter only: the text can sit nested in any record (a tool
         // result quoting a transcript), so the parsed type decides.
-        if !(line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")) {
+        let goal = line.contains(GOAL_CMD) || line.contains("\"goal_status\"");
+        if !(goal || line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")) {
             return;
         }
         let Ok(v) = crate::json::parse(&line) else { return };
         let assistant = match v.get("type").and_then(Value::as_str) {
             Some("user") => false,
             Some("assistant") => true,
+            Some("system" | "attachment") => {
+                if let Some(e) = goal_event(&v) {
+                    self.goal.apply(e);
+                }
+                return;
+            }
             _ => return,
         };
         if let Some(ts) = v.get("timestamp").and_then(Value::as_str).filter(|x| !x.is_empty()) {
@@ -660,7 +737,7 @@ impl Scanner {
                     }
                     Some("text") => {
                         let said = b.get("text").and_then(Value::as_str).unwrap_or("");
-                        if let Some(l) = said.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
+                        if let Some(l) = said.lines().rev().map(str::trim).find(|l| !l.is_empty() && !boilerplate(l)) {
                             t.intent = cut(&crate::redact::redact(l), INTENT_CHARS);
                         }
                         t.mid_task = false;
@@ -682,6 +759,9 @@ impl Scanner {
             if !any && v.get("isMeta").and_then(Value::as_bool) != Some(true) {
                 t.mid_task = false;
             }
+            if let Some(e) = goal_event(&v) {
+                self.goal.apply(e);
+            }
         }
     }
 
@@ -689,6 +769,9 @@ impl Scanner {
     /// `line(offset, length)` and hashed for its ref.
     fn finish(mut self, session: &str, line: impl Fn(u64, usize) -> Option<Vec<u8>>) -> Tail {
         let mut t = self.t;
+        if let Some(g) = self.goal.text() {
+            t.intent = cut(&crate::redact::redact(g), INTENT_CHARS);
+        }
         t.files.truncate(FILES);
         let k = self.steps.len().saturating_sub(TOOLS);
         t.steps = self.steps.split_off(k);
@@ -744,12 +827,19 @@ pub struct State {
     pub since: Option<String>,
     /// Active lanes, newest first: (lane, its current step's ref).
     pub lanes: Vec<(String, Option<String>)>,
+    /// The active lanes past [`PER_LINE`], counted (`+N more`).
+    pub more_lanes: usize,
     /// Unanswered questions.
     pub open: Vec<String>,
     /// `next` entries no commit followed.
     pub owed: Vec<String>,
     /// Rule records written or revised in the window.
     pub rulings: Vec<String>,
+    /// The live agents, each with its PR or its parked mark
+    /// ([`crate::card_agents`]); filled by the hook, not by [`state`].
+    pub agents: Vec<String>,
+    /// Why a PR lookup came back empty (gh missing, a timeout), one line.
+    pub agents_note: String,
 }
 
 fn href(h: &Head) -> String {
@@ -768,7 +858,21 @@ fn href(h: &Head) -> String {
 ///
 /// [`crate::Error::Db`].
 pub fn state(store: &MemoryStore, session: &str, since: &str, until: &str, lanes: Lanes) -> Result<State> {
+    state_live(store, session, since, until, lanes, &[])
+}
+
+/// [`state`], its lanes led by `live` (the lanes of the agents running now,
+/// whether or not they wrote in the window, #309 item 4); lanes past
+/// [`PER_LINE`] are counted in [`State::more_lanes`].
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn state_live(store: &MemoryStore, session: &str, since: &str, until: &str, lanes: Lanes, live: &[String]) -> Result<State> {
     let mut s = State::default();
+    let mut all_lanes: Vec<(String, Option<String>)> = Vec::new();
+    let step_of =
+        |heads: &[&Head]| heads.iter().rev().find(|h| matches!(h.sub.as_str(), "next" | "brief") || h.kind == "handoff").map(|h| href(h));
     let bounded;
     let since = if since.is_empty() {
         bounded = hours_before(until, UNKNOWN_START_HOURS);
@@ -787,7 +891,20 @@ pub fn state(store: &MemoryStore, session: &str, since: &str, until: &str, lanes
         None => since.to_string(),
     };
     let in_window = |time: &str| in_window(time) && time >= since.as_str();
+    for l in live {
+        if l.is_empty() || all_lanes.iter().any(|(x, _)| x == l) {
+            continue;
+        }
+        let heads = store.lane(l)?;
+        let heads: Vec<&Head> = heads.iter().filter(|h| until.is_empty() || h.time.as_str() <= until).collect();
+        all_lanes.push((l.clone(), step_of(&heads)));
+    }
+    // The live agents are this session's own, so they are named with no
+    // project too (#306 N5); the store's other lanes are not.
     if lanes == Lanes::Session {
+        s.more_lanes = all_lanes.len().saturating_sub(PER_LINE);
+        all_lanes.truncate(PER_LINE);
+        s.lanes = all_lanes;
         return Ok(s);
     }
     // Open by the store's one test (`memory::OPEN_QUESTION_SQL`).
@@ -802,9 +919,8 @@ pub fn state(store: &MemoryStore, session: &str, since: &str, until: &str, lanes
         if !heads.iter().any(|h| in_window(&h.time)) {
             continue;
         }
-        let step = heads.iter().rev().find(|h| matches!(h.sub.as_str(), "next" | "brief") || h.kind == "handoff").map(|h| href(h));
-        if s.lanes.len() < PER_LINE {
-            s.lanes.push((l.lane.clone(), step));
+        if !all_lanes.iter().any(|(x, _)| *x == l.lane) {
+            all_lanes.push((l.lane.clone(), step_of(&heads)));
         }
         for h in heads.iter().filter(|h| open.contains(h.key.as_str())) {
             if s.open.len() < PER_LINE {
@@ -818,6 +934,9 @@ pub fn state(store: &MemoryStore, session: &str, since: &str, until: &str, lanes
             }
         }
     }
+    s.more_lanes = all_lanes.len().saturating_sub(PER_LINE);
+    all_lanes.truncate(PER_LINE);
+    s.lanes = all_lanes;
     let mut rules: Vec<Head> = store.heads(Some("rule"), None)?.into_iter().filter(|h| h.status == "active" && in_window(&h.time)).collect();
     rules.sort_by(|a, b| b.time.cmp(&a.time));
     s.rulings = rules.iter().take(PER_LINE).map(href).collect();
@@ -832,7 +951,11 @@ pub fn body(s: &State, t: &Tail, budget: usize) -> String {
     if let Some(p) = &s.since {
         lines.push(("since", vec![p.clone()], ", "));
     }
-    let lanes: Vec<String> = s.lanes.iter().map(|(l, st)| st.as_ref().map_or_else(|| l.clone(), |r| format!("{l} (step {r})"))).collect();
+    let mut lanes: Vec<String> =
+        s.lanes.iter().map(|(l, st)| st.as_ref().map_or_else(|| l.clone(), |r| format!("{l} (step {r})"))).collect();
+    if s.more_lanes > 0 {
+        lanes.push(format!("+{} more", s.more_lanes));
+    }
     lines.push(("lanes", lanes, ", "));
     lines.push(("open", s.open.clone(), ", "));
     lines.push(("owed", s.owed.clone(), ", "));
@@ -840,6 +963,12 @@ pub fn body(s: &State, t: &Tail, budget: usize) -> String {
     // The tool calls are listed by the chain card's groups
     // ([`crate::chain::card`]), which the hook appends outside this budget.
     lines.push(("files", t.files.clone(), ", "));
+    // After the lines the card exists for, so a long agents line cannot
+    // push them out of the budget (#331 review S2).
+    lines.push(("agents", s.agents.clone(), ", "));
+    if !s.agents_note.is_empty() {
+        lines.push(("prs", vec![s.agents_note.clone()], ""));
+    }
     if t.mid_task {
         if let Some(p) = t.steps.last().filter(|x| x.result.is_none()) {
             lines.push(("pending", vec![format!("{} {}", p.tool, p.target)], ""));
@@ -940,14 +1069,76 @@ pub fn cleared_at(store: &MemoryStore, dir: &Path, session: &str, now: i64) -> R
     }
 }
 
-/// The model's own newest checkpoint entry in a session's lane written at
-/// or after `since` (the segment's start; empty: any).
+/// The model's own newest checkpoint entry written at or after `since` (the
+/// segment's start; empty: any): in the session's lane, else in any work
+/// lane (#324: an orchestrator journals it to its own lane), but only one
+/// this session wrote: its `transcript` holds the atlas journal call whose
+/// result names the entry's key. Another session's lane is never read, nor
+/// a hook's checkpoint.
 ///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn model_entry(store: &MemoryStore, session: &str, since: &str) -> Result<Option<Head>> {
-    Ok(store.lane(&format!("session:{session}"))?.into_iter().rev().find(|h| h.sub == "checkpoint" && !by_hook(h) && h.time.as_str() >= since))
+pub fn model_entry(store: &MemoryStore, session: &str, since: &str, transcript: &Path) -> Result<Option<Head>> {
+    let own = store.lane(&format!("session:{session}"))?.into_iter().rev().find(|h| h.sub == "checkpoint" && !by_hook(h) && h.time.as_str() >= since);
+    if own.is_some() {
+        return Ok(own);
+    }
+    // Meta and titles only (the query's time test is strict, so `since`
+    // itself is tested here); the full head of the one found.
+    let all = if since.is_empty() { store.active_entries_no_body("checkpoint")? } else { store.active_entries_since_no_body("checkpoint", since)? };
+    let mut work: Vec<Head> = all.into_iter().filter(|h| !h.scope.starts_with("session:") && !by_hook(h) && h.time.as_str() >= since).collect();
+    if work.is_empty() {
+        return Ok(None);
+    }
+    work.sort_by(|a, b| b.time.cmp(&a.time).then(b.rid.cmp(&a.rid)));
+    let written = journaled_keys(transcript);
+    match work.into_iter().find(|h| written.contains(&h.key)) {
+        Some(h) => store.head(&h.key),
+        None => Ok(None),
+    }
+}
+
+/// The keys an atlas `journal` call in a transcript wrote: each such
+/// call's result, read for `journal:LANE:NNNN` keys. Empty when the
+/// transcript cannot be read.
+pub fn journaled_keys(transcript: &Path) -> HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(transcript) else { return HashSet::new() };
+    let mut calls: HashSet<String> = HashSet::new();
+    let mut keys = HashSet::new();
+    for line in text.lines() {
+        // Before any parse: a call names a tool ending in `journal`, and a
+        // result with no `journal:` key cannot add one (#331 r2 S4).
+        let use_line = line.contains("journal\"") && line.contains("\"tool_use\"");
+        if !use_line && !(line.contains("journal:") && line.contains("\"tool_result\"")) {
+            continue;
+        }
+        let Ok(v) = crate::json::parse(line) else { continue };
+        let Some(blocks) = v.get("message").and_then(|m| m.get("content")).and_then(Value::as_array) else { continue };
+        for b in blocks {
+            match b.get("type").and_then(Value::as_str) {
+                Some("tool_use") if b.get("name").and_then(Value::as_str).is_some_and(|n| n.contains("atlas") && n.ends_with("journal")) => {
+                    if let Some(id) = b.get("id").and_then(Value::as_str) {
+                        calls.insert(id.to_string());
+                    }
+                }
+                Some("tool_result") if b.get("tool_use_id").and_then(Value::as_str).is_some_and(|id| calls.contains(id)) => {
+                    let t: Vec<&str> = match b.get("content") {
+                        Some(Value::String(s)) => vec![s.as_str()],
+                        Some(Value::Array(c)) => c.iter().filter_map(|y| y.get("text").and_then(Value::as_str)).collect(),
+                        _ => Vec::new(),
+                    };
+                    for w in t.join("\n").split(|c: char| c.is_whitespace() || "@,;()`'\"".contains(c)) {
+                        if w.starts_with("journal:") && w.matches(':').count() >= 2 {
+                            keys.insert(w.trim_end_matches(['.', ':']).to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    keys
 }
 
 /// The checkpoint line naming the model's entry, or saying it is missing.
@@ -1153,6 +1344,114 @@ mod tests {
         ];
         let t = scan(lines.join("\n").as_bytes(), 0, "s");
         assert_eq!((t.start.as_str(), t.end.as_str()), ("2026-11-01T10:00:00.000Z", "2026-11-01T11:15:00.000Z"));
+    }
+
+    /// The intent is the task: a closing line about the compaction or the
+    /// handoff is skipped (to the line before it, in that text or an
+    /// earlier one), and an active `/goal` wins until `/goal clear` (#309).
+    #[test]
+    fn the_intent_skips_compaction_boilerplate_and_takes_the_goal() {
+        let said = |id: &str, text: &str| rec("assistant", id, &format!(r#"[{{"type":"text","text":{}}}]"#, Value::String(text.into())), 1000);
+        let typed = |text: &str| format!(r#"{{"type":"user","message":{{"role":"user","content":{}}}}}"#, Value::String(text.into()));
+        let goal = |args: &str| typed(&format!("<command-message>goal</command-message>\n<command-name>/goal</command-name>\n<command-args>{args}</command-args>"));
+        let intent = |lines: &[String]| scan(lines.join("\n").as_bytes(), 0, "s").intent;
+        // A plain last line is unchanged.
+        assert_eq!(intent(&[said("m1", "Looking.\nI will fix chain.rs next.")]), "I will fix chain.rs next.");
+        // A closing compaction line: the line before it.
+        assert_eq!(intent(&[said("m1", "Merged #316 and queued #317.\n\nPlease run `/compact`.")]), "Merged #316 and queued #317.");
+        // A text that is all boilerplate: the earlier text's line.
+        let lines = [said("m1", "Tests pass on card-intent."), said("m2", "Handoff written.\nThis is a good point to compact.")];
+        assert_eq!(intent(&lines), "Tests pass on card-intent.");
+        // An active goal wins; a bare `/goal` changes nothing.
+        let active = [goal("ship X"), said("m1", "Working on it."), typed("<command-name>/goal</command-name>\n<command-args></command-args>")];
+        assert_eq!(intent(&active), "ship X");
+        // A `/goal clear` after it falls back to the assistant line.
+        let cleared = [goal("ship X"), said("m1", "Shipped X."), goal("clear")];
+        assert_eq!(intent(&cleared), "Shipped X.");
+        // A goal quoted in a tool result is not a command.
+        let quoted = [said("m1", "Reading."), rec("user", "", r#"[{"type":"tool_result","tool_use_id":"t","content":"<command-name>/goal</command-name><command-args>no</command-args>"}]"#, 0)];
+        assert_eq!(intent(&quoted), "Reading.");
+    }
+
+    /// The goal as Claude Code records it (#317 review): a `/goal` run as a
+    /// `system` `local_command` record counts as a user one does, a met
+    /// `goal_status` ends the goal, an unmet one carries it, a quoted `/goal`
+    /// beside a tool result is no command, and a multi-line goal is one line.
+    #[test]
+    fn the_goal_follows_system_commands_and_goal_status() {
+        let said = |id: &str, text: &str| rec("assistant", id, &format!(r#"[{{"type":"text","text":{}}}]"#, Value::String(text.into())), 1000);
+        let cmd = |args: &str| format!("<command-message>goal</command-message>\n<command-name>/goal</command-name>\n<command-args>{args}</command-args>");
+        let typed = |args: &str| format!(r#"{{"type":"user","message":{{"role":"user","content":{}}}}}"#, Value::String(cmd(args)));
+        let system = |args: &str| format!(r#"{{"parentUuid":"p","type":"system","subtype":"local_command","content":{},"level":"info"}}"#, Value::String(cmd(args)));
+        let status = |met: bool, cond: &str| format!(r#"{{"type":"attachment","attachment":{{"type":"goal_status","met":{met},"sentinel":true,"condition":{}}}}}"#, Value::String(cond.into()));
+        let intent = |lines: &[String]| scan(lines.join("\n").as_bytes(), 0, "s").intent;
+        // S2 (r2): one parser with resume. An unmet check after a clear does
+        // not bring the goal back; a newer `/goal TEXT` sets one again; an
+        // unmet check without `sentinel` changes nothing.
+        assert_eq!(intent(&[typed("ship X"), system("clear"), said("m1", "Idle."), status(false, "ship X")]), "Idle.");
+        assert_eq!(intent(&[system("clear"), typed("ship V"), said("m1", "Idle."), status(false, "ship V2")]), "ship V2");
+        let check = r#"{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":"ship U"}}"#;
+        assert_eq!(intent(&[said("m1", "Idle."), check.to_string()]), "Idle.");
+        // M1: set as a user record, cleared as a system record.
+        assert_eq!(intent(&[typed("ship X"), said("m1", "Shipped X."), system("clear")]), "Shipped X.");
+        // A goal set as a system record is the intent.
+        assert_eq!(intent(&[system("ship Y"), said("m1", "Working.")]), "ship Y");
+        // Another system subtype holding the command text is not a command.
+        let other = format!(r#"{{"type":"system","subtype":"informational","content":{}}}"#, Value::String(cmd("ship Z")));
+        assert_eq!(intent(&[said("m1", "Working."), other]), "Working.");
+        // S1: a met goal stops being the intent.
+        assert_eq!(intent(&[typed("ship X"), said("m1", "Shipped X."), status(true, "ship X")]), "Shipped X.");
+        // An unmet goal_status carries the goal past a compaction.
+        assert_eq!(intent(&[said("m1", "Working."), status(false, "ship W")]), "ship W");
+        // N2: a user record with a tool result and a text block quoting `/goal`.
+        let quoted = rec(
+            "user",
+            "",
+            &format!(r#"[{{"type":"tool_result","tool_use_id":"t","content":"ok"}},{{"type":"text","text":{}}}]"#, Value::String(cmd("no"))),
+            0,
+        );
+        assert_eq!(intent(&[said("m1", "Reading."), quoted]), "Reading.");
+        // N3: a multi-line goal is one line.
+        assert_eq!(intent(&[typed("ship X\nthen Y\r\n  and Z")]), "ship X then Y and Z");
+    }
+
+    /// The closing lines the review found (#317): "type /compact" asks for
+    /// the command; a compaction phrase naming a subject is the task.
+    #[test]
+    fn closing_shapes_are_boilerplate_and_subjects_are_not() {
+        assert!(boilerplate("Type `/compact` when you're ready; I can't run it myself."));
+        assert!(boilerplate("Type `/compact` and the next segment starts clean."));
+        assert!(boilerplate("Ready? /compact when you are."));
+        assert!(boilerplate("This is a good point to compact."));
+        assert!(boilerplate("A natural compaction point."));
+        assert!(boilerplate("I wrote the handoff to atlas."));
+        assert!(boilerplate("This is a compaction point if you want one."));
+        assert!(boilerplate("A compaction point if needed."));
+        assert!(boilerplate("Here is a compaction point if helpful."));
+        assert!(!boilerplate("Next I'll fix the compaction point check in hooks.rs."));
+        assert!(!boilerplate("Cut the time to compact a 500k segment."));
+        assert!(!boilerplate("I wrote the handoff schema change; next the migration."));
+        assert!(!boilerplate("write the handoff for the fluids lane"));
+        // r2: a joiner or a non-sentence mark after the subject is the task;
+        // a dash after a closing phrase still closes.
+        assert!(!boilerplate("Move the compaction point to 250k."));
+        assert!(!boilerplate("Raise the time to compact for 500k segments."));
+        assert!(!boilerplate("Fix the compaction point and the card budget."));
+        assert!(!boilerplate("Fix the compaction point's threshold in hooks.rs."));
+        assert!(!boilerplate("Tune the compaction point (hooks.rs:120)."));
+        assert!(!boilerplate("Fix /compact when the card is empty."));
+        assert!(boilerplate("This is a compaction point \u{2014} want me to stop here?"));
+        assert!(boilerplate("This is a compaction point \u{2013} your call."));
+        // r3 S1: the common ways to ask for the command close.
+        assert!(boilerplate("Good place to stop; `/compact` when ready."));
+        assert!(boilerplate("`/compact` when convenient."));
+        assert!(boilerplate("/compact when convenient"));
+        // r3 N1: a phrase inside a longer word is the task.
+        assert!(!boilerplate("Rewrote the handoff to skip empty lanes."));
+        assert!(!boilerplate("Overwrote the handoff to keep the lanes."));
+        // r3 N3: a bare "if" leads on to a condition; "if you" closes.
+        assert!(!boilerplate("Skip the compaction point if the segment is under 50k."));
+        assert!(boilerplate("A compaction point if you want one."));
     }
 
     /// The streamed read of a file gives what [`scan`] gives over the same
@@ -1384,5 +1683,83 @@ mod tests {
         let rc = Curve { points: vec![100_000, 200_000, 20_000, 120_000], compactions: vec![(2, 200_000, 15_000, "manual".into())] };
         let nr = simulate(&rc, &Arm { threshold: u64::MAX, ..a });
         assert_eq!(nr.raw, 100_000.0 + 200_000.0 + 205_000.0 + 305_000.0);
+    }
+
+    /// A checkpoint entry in `lane` at `time`; `hook` writes the hook's meta.
+    fn ck(s: &mut MemoryStore, lane: &str, time: &str, hook: bool) -> String {
+        let d = crate::memory::Draft {
+            title: format!("checkpoint {lane} {time}"),
+            meta: if hook { "hook_ms: 1.0\n".into() } else { String::new() },
+            body: "step".into(),
+            reason: "t".into(),
+            author: "t".into(),
+            client: "t".into(),
+            time: Some(time.into()),
+            ..Default::default()
+        };
+        let mut w = s.writer().unwrap();
+        let key = w.next_key(&format!("journal:{lane}:"), 4).unwrap();
+        w.create(&key, "journal", "checkpoint", lane, &d, None).unwrap();
+        w.commit().unwrap();
+        key
+    }
+
+    #[test]
+    fn model_entry_finds_a_work_lane_checkpoint_and_prefers_the_session_lane() {
+        let d = std::env::temp_dir().join(format!("atlas-model-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut s = MemoryStore::open(&d.join("memory.sqlite")).unwrap();
+        let since = "2026-11-18T10:00:00.000Z";
+        let key = |h: Option<Head>| h.map(|h| h.key);
+        // Before the segment, a hook's, another session's: none counts.
+        ck(&mut s, "orchestrator", "2026-11-18T09:00:00.000Z", false);
+        ck(&mut s, "orchestrator", "2026-11-18T11:00:00.000Z", true);
+        ck(&mut s, "session:other", "2026-11-18T11:00:00.000Z", false);
+        let tp = d.join("s1.jsonl");
+        std::fs::write(&tp, "").unwrap();
+        assert_eq!(key(model_entry(&s, "s1", since, &tp).unwrap()), None);
+        // The orchestrator's own lane (#324), written by this session: its
+        // transcript holds the journal call naming the key.
+        let work = ck(&mut s, "orchestrator", "2026-11-18T11:30:00.000Z", false);
+        // Another session's newer work-lane checkpoint, which this session
+        // only read (a recall's result names it): never this session's.
+        let other = ck(&mut s, "elsewhere", "2026-11-18T11:40:00.000Z", false);
+        let use_ = |id: &str, name: &str| format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{{}}}}]}}}}"#);
+        let res = |id: &str, text: &str| format!(r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","content":[{{"type":"text","text":"{text}"}}]}}]}}}}"#);
+        let lines = [
+            use_("t1", "mcp__atlas__journal"),
+            res("t1", &format!("{work} journal/checkpoint lane=orchestrator")),
+            use_("t2", "mcp__atlas__recall"),
+            res("t2", &format!("== {other} journal/checkpoint lane=elsewhere")),
+        ];
+        std::fs::write(&tp, lines.join("\n")).unwrap();
+        let found = model_entry(&s, "s1", since, &tp).unwrap().unwrap();
+        assert_eq!(found.key, work);
+        assert!(!found.sha.is_empty(), "the full head, for the card's ref");
+        // Without this session's journal call, no work-lane entry counts.
+        std::fs::write(&tp, lines[2..].join("\n")).unwrap();
+        assert_eq!(key(model_entry(&s, "s1", since, &tp).unwrap()), None);
+        // The session's lane wins over a newer work-lane entry.
+        let own = ck(&mut s, "session:s1", "2026-11-18T11:10:00.000Z", false);
+        assert_eq!(key(model_entry(&s, "s1", since, &tp).unwrap()), Some(own));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #331 review S2: the agents line comes after open, owed, rulings and
+    /// files, so a long one cannot push them out of the budget.
+    #[test]
+    fn the_agents_line_cannot_push_out_the_lines_the_card_is_for() {
+        let s = State {
+            open: vec!["journal:L:0001@aaaaaaaaaaaa".into()],
+            owed: vec!["journal:L:0002@bbbbbbbbbbbb".into()],
+            agents: (0..6).map(|i| format!("ATLAS-RELEASE/card-prs-{i} PR #33{i} @7c06b09 (ready)")).chain(["+3 more".to_string()]).collect(),
+            ..State::default()
+        };
+        let t = Tail { files: vec!["src/card_agents.rs".into()], ..Tail::default() };
+        let b = body(&s, &t, 160);
+        assert!(b.starts_with("open: journal:L:0001@aaaaaaaaaaaa\nowed: journal:L:0002@bbbbbbbbbbbb\nfiles: src/card_agents.rs\nagents: "), "{b}");
+        assert!(b.len() <= 160, "{b}");
     }
 }

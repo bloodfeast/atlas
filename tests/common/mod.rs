@@ -6,8 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use atlas::json::{Value};
 use atlas::json;
+use atlas::json::Value;
 use atlas::paths::Vaults;
 use atlas::store::Store;
 use atlas::tools::Server;

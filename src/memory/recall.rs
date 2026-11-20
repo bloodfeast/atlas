@@ -393,7 +393,7 @@ pub fn gated(store: &MemoryStore, query: &str, budget: usize, g: &Gate, sem: Opt
 ///
 /// [`crate::Error::Db`].
 pub fn lane(store: &MemoryStore, lane: &str, budget: usize) -> Result<String> {
-    Ok(lane_with(store, lane, budget, None, true)?.text)
+    Ok(lane_with(store, lane, budget, None, true, &HashSet::new())?.text)
 }
 
 /// A lane view as [`lane_with`] built it.
@@ -480,10 +480,22 @@ pub fn lane_head(store: &MemoryStore, lane: &str) -> Result<Option<String>> {
 /// from it; the hook's lane brief leaves them out (and out of its count), so
 /// an agent is not handed an earlier agent's launch prompt.
 ///
+/// An entry whose key is in `covered` (the records a subagent's brief
+/// already names, #275) is not shown, and its room goes to the next; the
+/// count line still counts it. When every entry it would show is covered,
+/// the view is empty.
+///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
-pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&str, usize)>, launches: bool) -> Result<LaneView> {
+pub fn lane_with(
+    store: &MemoryStore,
+    lane: &str,
+    budget: usize,
+    trim: Option<(&str, usize)>,
+    launches: bool,
+    covered: &HashSet<String>,
+) -> Result<LaneView> {
     let all: Vec<Head> = store.lane_family(lane)?.into_iter().filter(|h| launches || !(h.kind == "journal" && h.sub == "launch")).collect();
     if all.is_empty() {
         return Ok(LaneView::default());
@@ -505,6 +517,7 @@ pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&
     ];
     let mut out = format!("lane {lane}: {} entries\n", all.len());
     let mut more = 0usize;
+    let mut skipped = 0usize;
     let mut v = LaneView::default();
     for (title, hs) in order {
         if hs.is_empty() {
@@ -514,6 +527,10 @@ pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&
         let mut added = 0;
         let cut = trim.filter(|_| !LANE_STATE.contains(&title));
         for h in hs {
+            if covered.contains(&h.key) {
+                skipped += 1;
+                continue;
+            }
             let mut one = String::new();
             let mut whole = String::new();
             render(&mut whole, h);
@@ -547,6 +564,11 @@ pub fn lane_with(store: &MemoryStore, lane: &str, budget: usize, trim: Option<(&
         if added > 0 {
             out.push_str(&section);
         }
+    }
+    // Every entry it would show is covered: no bare count line, so the
+    // start's pointers still fill the room (#275).
+    if skipped > 0 && v.keys.is_empty() && more == 0 {
+        return Ok(LaneView::default());
     }
     if v.trimmed > 0 {
         out.push_str(&format!("+{} trimmed above, more in each: recall {{key}} reads one whole\n", v.trimmed));
@@ -598,7 +620,7 @@ mod tests {
             w.create(key, "journal", "decision", "L", &dr, None).unwrap();
             w.commit().unwrap();
         }
-        let out = lane_with(&s, "L", 1 << 20, Some(("walrus yak", 200)), false).unwrap().text;
+        let out = lane_with(&s, "L", 1 << 20, Some(("walrus yak", 200)), false, &HashSet::new()).unwrap().text;
         assert!(out.contains("The walrus opens the body."), "{out}");
         let long = out.split("journal:L:0002").nth(1).unwrap_or("");
         assert!(long.contains("yak tail clause") && !long.contains(&headline), "{out}");

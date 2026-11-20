@@ -17,6 +17,10 @@ const SUPPORTED: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 /// The longest message accepted, in bytes (4 MiB).
 pub const MAX_MESSAGE: u64 = 4 << 20;
 
+/// The `atlas-hooks` worker thread's stack: 16 MiB of address space,
+/// committed only as it is used.
+const HOOK_STACK: usize = 16 << 20;
+
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
@@ -78,9 +82,10 @@ pub fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
             match server.answer_call(name, &args, use_id) {
                 Ok(answer) => Some(ok(id, content(answer.into_text(), false))),
                 Err(crate::error::Error::NotFound(m)) if m.starts_with("tool ") => {
-                    Some(error(id, -32602, &format!("unknown tool: {}", &m[5..])))
+                    Some(error(id, -32602, &crate::hidden::scrub(&format!("unknown tool: {}", &m[5..]))))
                 }
-                Err(e) => Some(ok(id, content(e.to_string(), true))),
+                // An error can echo an argument or a path: scrubbed as an answer is.
+                Err(e) => Some(ok(id, content(crate::hidden::scrub(&e.to_string()).into_owned(), true))),
             }
         }
         _ => Some(plain(id, method, &params)),
@@ -109,7 +114,8 @@ fn request(msg: &Value) -> std::result::Result<(Value, String, Value), Option<Va
     Ok((id, method.to_string(), obj.get("params").cloned().unwrap_or(Value::Null)))
 }
 
-/// The `initialize` result, with `instructions`.
+/// The `initialize` result, with `instructions` (vault folder and source
+/// names from the file system, so scrubbed).
 fn initialize(id: Value, params: &Value, instructions: String) -> Value {
     let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
     let version = if SUPPORTED.contains(&asked) { asked } else { PROTOCOL_VERSION };
@@ -119,7 +125,7 @@ fn initialize(id: Value, params: &Value, instructions: String) -> Value {
             "protocolVersion": version,
             "capabilities": {"tools": {"listChanged": false}, "resources": {}},
             "serverInfo": {"name": "atlas", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": instructions
+            "instructions": crate::hidden::scrub(&instructions).into_owned()
         }),
     )
 }
@@ -138,10 +144,11 @@ fn plain(id: Value, method: &str, params: &Value) -> Value {
         "resources/templates/list" => ok(id, json!({"resourceTemplates": []})),
         "resources/read" => match params.get("uri").and_then(Value::as_str) {
             Some(tools::HELP_URI) => ok(id, json!({"contents": [{"uri": tools::HELP_URI, "mimeType": "text/markdown", "text": tools::help()}]})),
-            Some(u) => error(id, -32002, &format!("resource not found: {u}")),
+            Some(u) => error(id, -32002, &crate::hidden::scrub(&format!("resource not found: {u}"))),
             None => error(id, -32602, "resources/read needs params.uri"),
         },
-        _ => error(id, -32601, &format!("method not found: {method}")),
+        // Both echo client input as written: scrubbed.
+        _ => error(id, -32601, &crate::hidden::scrub(&format!("method not found: {method}"))),
     }
 }
 
@@ -157,7 +164,8 @@ fn plain(id: Value, method: &str, params: &Value) -> Value {
 pub fn serve_refused(refusal: &crate::Error, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
     let mut buf = Vec::new();
     let mut notice = crate::hooks::RefusalNotice::default();
-    let text = format!("atlas is off: {refusal}");
+    // The refusal names the store's path, which can hold any character.
+    let text = crate::hidden::scrub(&format!("atlas is off: {refusal}")).into_owned();
     loop {
         let msg = match read_incoming(&mut input, &mut buf).map_err(|e| on("stdin read", e))? {
             Incoming::Eof => return Ok(()),
@@ -357,6 +365,11 @@ pub fn serve_with_hooks_every(
     use std::sync::{mpsc, Arc, Mutex};
     let out = Arc::new(Mutex::new(output));
     let (main_tx, main_rx) = mpsc::channel::<(Incoming, u64)>();
+    // Each hook's answer is due by its budget from when it was read: the
+    // watchdog answers one the worker has not, and the worker's late answer
+    // is dropped (a hook waits behind the one before it).
+    let watch = hooks.as_ref().filter(|_| crate::hook_budget::enforced()).map(|s| Watchdog::start(s.hook_budget, out.clone()));
+    let watch_reader = watch.as_ref().map(|w| (w.pending.clone(), w.limit));
     let (hook_tx, hook_worker) = match hooks {
         Some(settings) => {
             // `None` is the warm-up signal: the main thread sends it once its
@@ -364,9 +377,13 @@ pub fn serve_with_hooks_every(
             // thread is idle (opening both at start measured +8 ms on the first
             // answer from SQLite busy waits; opening on the first hook, 22 ms
             // on that hook).
-            let (tx, rx) = mpsc::channel::<Option<(Value, Value)>>();
+            let (tx, rx) = mpsc::channel::<Option<(Value, Value, std::time::Instant)>>();
             let o = out.clone();
-            let worker = std::thread::Builder::new().name("atlas-hooks".into()).spawn(move || {
+            let pending = watch.as_ref().map(|w| w.pending.clone());
+            // A larger stack than the 2 MiB default, as a backstop: a hook
+            // runs much of atlas on this thread, and an overflow aborts the
+            // whole server with no panic line (public #15).
+            let worker = std::thread::Builder::new().name("atlas-hooks".into()).stack_size(HOOK_STACK).spawn(move || {
                 let mut hooks: Option<crate::hooks::Hooks> = None;
                 let mut index = index;
                 // Why the last open failed: a store too new for this binary is
@@ -376,8 +393,10 @@ pub fn serve_with_hooks_every(
                 let mut notice = crate::hooks::RefusalNotice::default();
                 let mut open = |hooks: &mut Option<crate::hooks::Hooks>, failed: &mut Option<crate::Error>| {
                     if hooks.is_none() {
+                        let t_open = std::time::Instant::now();
                         match crate::hooks::Hooks::open(settings.clone()) {
                             Ok(mut h) => {
+                                let t_setup = std::time::Instant::now();
                                 h.detect_offer_paths();
                                 // A hook over this route may come from anyone's
                                 // tools/call, and the server outlives any one
@@ -391,7 +410,17 @@ pub fn serve_with_hooks_every(
                                 if let Some(w) = h.binding_warning() {
                                     eprintln!("{w}");
                                 }
+                                let t_warm = std::time::Instant::now();
                                 h.warm();
+                                if crate::hook_budget::timings_on() {
+                                    let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+                                    eprintln!(
+                                        "atlas hook timings open: store={:.1} setup={:.1} warm={:.1}",
+                                        ms(t_open, t_setup),
+                                        ms(t_setup, t_warm),
+                                        crate::hook_budget::ms_since(t_warm)
+                                    );
+                                }
                                 *hooks = Some(h);
                                 *failed = None;
                             }
@@ -410,6 +439,7 @@ pub fn serve_with_hooks_every(
                 let mut due = std::time::Instant::now() + every;
                 let refresh = |hooks: &mut Option<crate::hooks::Hooks>, due: &mut std::time::Instant| {
                     if let Some(h) = hooks.as_mut() {
+                        let _wait = crate::hook_budget::Active::until(std::time::Instant::now() + crate::hook_budget::AFTER_WAIT);
                         h.refresh_restart_point();
                     }
                     *due = std::time::Instant::now() + every;
@@ -424,30 +454,55 @@ pub fn serve_with_hooks_every(
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
                     open(&mut hooks, &mut failed);
-                    let Some((id, args)) = msg else { continue };
+                    let Some((id, args, arrived)) = msg else { continue };
                     let ev = crate::hooks::HookEvent::from_value(&args);
+                    // Tests: a hook slower than its budget.
+                    #[cfg(test)]
+                    if ev.tool_name == tests::SLOW_TOOL {
+                        std::thread::sleep(tests::SLOW);
+                    }
                     // A panic in hook code (#253) answers empty and drops the
                     // hook state; `open` reopens it on the next message.
                     let (text, panicked) = match (hooks.as_mut(), &failed) {
-                        (Some(h), _) => crate::hooks::guard(&settings, &ev, || h.handle(&ev).to_json(&ev.event)),
+                        (Some(h), _) => crate::hooks::guard(&settings, &ev, || h.handle_from(&ev, arrived).to_json(&ev.event)),
                         (None, Some(e)) => (notice.answer(e, &ev), false),
                         (None, None) => (String::new(), false),
                     };
                     if panicked {
                         hooks = None;
                     }
-                    let r = ok(id, content(text, false));
-                    if let Ok(mut w) = o.lock() {
-                        let _ = write_line(&mut *w, &r);
+                    // Answered already when the watchdog took it.
+                    if pending.as_ref().is_none_or(|p| Watchdog::claim(p, &id)) {
+                        let r = ok(id, content(text, false));
+                        if let Ok(mut w) = o.lock() {
+                            let _ = write_line(&mut *w, &r);
+                        }
+                    } else if let Some(h) = hooks.as_mut() {
+                        // Refused by the watchdog: what this answer let in is undone.
+                        h.answer_lost(&ev);
+                    }
+                    // Tests: the worker thread dies (unguarded).
+                    #[cfg(test)]
+                    if ev.tool_name == tests::KILL_TOOL {
+                        tests::KILLED.store(true, std::sync::atomic::Ordering::Release);
+                        panic!("test: the hook worker dies");
                     }
                     // Re-indexing an edited file waits until the answer is out.
+                    let t_after = std::time::Instant::now();
                     if let Some(h) = hooks.as_mut() {
+                        // Its store waits are short: the next hook may be queued.
+                        let _wait = crate::hook_budget::Active::until(t_after + crate::hook_budget::AFTER_WAIT);
                         if crate::hooks::guard(&settings, &ev, || h.after()).1 {
                             hooks = None;
                         }
                     }
-                    if std::time::Instant::now() >= due {
+                    let t_refresh = std::time::Instant::now();
+                    if t_refresh >= due {
                         refresh(&mut hooks, &mut due);
+                    }
+                    if crate::hook_budget::timings_on() {
+                        let after_ms = (t_refresh - t_after).as_secs_f64() * 1e3;
+                        eprintln!("atlas hook timings after {}: after={after_ms:.1} refresh={:.1}", ev.event, crate::hook_budget::ms_since(t_refresh));
                     }
                 }
             })?;
@@ -477,9 +532,20 @@ pub fn serve_with_hooks_every(
                         let args = call.1.clone();
                         // Noted once: by the reader when the worker takes
                         // it, else by the main thread as it answers it.
-                        if tx.send(Some(call)).is_ok() {
+                        let arrived = std::time::Instant::now();
+                        // Expected before it is sent: a claim never loses to it.
+                        if let Some((p, limit)) = &watch_reader {
+                            Watchdog::expect(p, &call.0, &call.1, arrived, *limit);
+                        }
+                        let id = call.0.clone();
+                        if tx.send(Some((call.0, call.1, arrived))).is_ok() {
                             announcer.hook(&args);
                             continue;
+                        }
+                        // The worker is gone: the main thread answers it,
+                        // and the watchdog must not (review S3 of #329).
+                        if let Some((p, _)) = &watch_reader {
+                            Watchdog::claim(p, &id);
                         }
                     }
                     if main_tx.send((Incoming::Message(m), announcer.mark())).is_err() {
@@ -525,7 +591,90 @@ pub fn serve_with_hooks_every(
     if let Some(w) = hook_worker {
         let _ = w.join();
     }
+    drop(watch);
     read
+}
+
+/// The hooks read and not yet answered: request id (as JSON) to the id,
+/// the answer the watchdog gives it, and its deadline.
+type Pending = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (Value, String, std::time::Instant)>>>;
+
+/// The answer to a hook whose budget ran out while the worker was busy (see
+/// [`crate::hook_budget`]): a thread that writes [`crate::hooks::overrun_answer`]
+/// for each hook still pending a little after its deadline. Stops when
+/// dropped.
+struct Watchdog {
+    pending: Pending,
+    limit: std::time::Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// After its deadline, the worker has this long to answer before the
+/// watchdog does (the worker answers right after a phase it cut).
+const WATCH_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl Watchdog {
+    fn start<W: Write + Send + 'static>(limit: std::time::Duration, out: std::sync::Arc<std::sync::Mutex<W>>) -> Watchdog {
+        use std::sync::atomic::Ordering;
+        let pending: Pending = Default::default();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (p, s) = (pending.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name("atlas-hook-watch".into())
+            .spawn(move || {
+                while !s.load(Ordering::Acquire) {
+                    let now = std::time::Instant::now();
+                    let mut due = Vec::new();
+                    let mut next = now + std::time::Duration::from_millis(200);
+                    if let Ok(mut m) = p.lock() {
+                        m.retain(|_, (id, event, deadline)| {
+                            if *deadline + WATCH_GRACE <= now {
+                                due.push((id.clone(), std::mem::take(event)));
+                                false
+                            } else {
+                                next = next.min(*deadline + WATCH_GRACE);
+                                true
+                            }
+                        });
+                    }
+                    for (id, answer) in due {
+                        let r = ok(id, content(answer, false));
+                        if let Ok(mut w) = out.lock() {
+                            let _ = write_line(&mut *w, &r);
+                        }
+                    }
+                    std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+                }
+            })
+            .ok();
+        Watchdog { pending, limit, stop, thread }
+    }
+
+    /// Notes a hook just read at `arrived`, due `limit` later, with the
+    /// answer the watchdog gives it then ([`crate::hooks::overrun_answer`]:
+    /// a gate's is its refusal).
+    fn expect(p: &Pending, id: &Value, args: &Value, arrived: std::time::Instant, limit: std::time::Duration) {
+        let answer = crate::hooks::overrun_answer(&crate::hooks::HookEvent::from_value(args), limit);
+        if let Ok(mut m) = p.lock() {
+            m.insert(id.to_string(), (id.clone(), answer, arrived + limit));
+        }
+    }
+
+    /// Takes the hook `id` for the worker to answer: false when the watchdog
+    /// answered it already.
+    fn claim(p: &Pending, id: &Value) -> bool {
+        p.lock().map(|mut m| m.remove(&id.to_string()).is_some()).unwrap_or(true)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -599,7 +748,7 @@ mod tests {
     }
 
     fn panic_misses(db: &std::path::Path) -> i64 {
-        let c = rusqlite::Connection::open(db).unwrap();
+        let c = crate::db::Connection::open(db).unwrap();
         c.query_row("SELECT count(*) FROM misses WHERE query LIKE 'hook panic %' AND client = 'atlas-hook'", [], |r| r.get(0)).unwrap()
     }
 
@@ -639,6 +788,282 @@ mod tests {
         // No answer came from the main thread's fallback (an error here).
         assert!(a.values().all(|x| x == &(String::new(), false)), "{a:?}");
         assert_eq!(panic_misses(&db), 200);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `initialize` instructions (folder and source names) and the
+    /// echoes of a client's method or resource are scrubbed (#299 r3 N3).
+    #[test]
+    fn instructions_and_protocol_echoes_are_scrubbed() {
+        let r = initialize(Value::from(1), &Value::Null, "vault ma\u{3164}in\u{202E}\u{1b}[2J".into());
+        assert_eq!(r["result"]["instructions"], Value::from("vault main\\u{1b}[2J"));
+        let r = plain(Value::from(2), "to\u{3164}ols/li\u{200B}st", &Value::Null);
+        assert_eq!(r["error"]["message"], Value::from("method not found: tools/list"));
+        let r = plain(Value::from(3), "resources/read", &crate::json!({"uri": "atlas://he\u{E0041}lp\u{202E}"}));
+        assert_eq!(r["error"]["message"], Value::from("resource not found: atlas://help"));
+    }
+
+    /// The refused server names the store's path in its `instructions` and
+    /// in every tool error: scrubbed, as the hook's notice is (#299 r3 S2).
+    #[test]
+    fn the_refused_server_scrubs_its_refusal() {
+        let e = crate::Error::StoreTooNew {
+            store: "memory store".into(),
+            path: "C:/st\u{202E}o\u{3164}re\u{1b}[2J.sqlite".into(),
+            found: "9".into(),
+            supported: "8".into(),
+        };
+        let input = concat!(
+            r#"{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}"#,
+            "\n",
+            r#"{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "recall", "arguments": {}}}"#,
+            "\n"
+        );
+        let mut out = Vec::new();
+        serve_refused(&e, input.as_bytes(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let lines: Vec<Value> = out.lines().map(|l| crate::json::parse(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        let texts = [lines[0]["result"]["instructions"].as_str().unwrap(), lines[1]["result"]["content"][0]["text"].as_str().unwrap()];
+        for t in texts {
+            assert!(t.contains("C:/store\\u{1b}[2J.sqlite"), "{t}");
+            assert_eq!(crate::hidden::hidden_count(t), 0, "{t}");
+        }
+    }
+
+    /// A hook the worker takes [`SLOW`] over before handling it.
+    pub(crate) const SLOW_TOOL: &str = "atlas_test_slow_hook";
+    pub(crate) const SLOW: std::time::Duration = std::time::Duration::from_millis(1_000);
+    /// A hook after whose answer the worker thread dies.
+    pub(crate) const KILL_TOOL: &str = "atlas_test_kill_worker";
+    /// Set as the worker dies of [`KILL_TOOL`].
+    pub(crate) static KILLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// A `gh pr merge` hook (the review merge gate's).
+    fn gate_msg(id: &str) -> String {
+        let args = crate::json!({"event": "PreToolUse", "session_id": "S", "tool_name": "Bash", "tool_input": {"command": "gh pr merge 5"}, "tool_use_id": id});
+        crate::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "hook", "arguments": args}}).to_string()
+    }
+
+    /// Input chunks, each read after its pause (once the worker died
+    /// first, when flagged); an empty one is the EOF.
+    struct Paced(std::collections::VecDeque<(bool, std::time::Duration, Vec<u8>)>);
+
+    impl Read for Paced {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let Some((after_kill, pause, mut b)) = self.0.pop_front() else { return Ok(0) };
+            // Not a timing guess: a loaded machine opens the hook state late.
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while after_kill && !KILLED.load(std::sync::atomic::Ordering::Acquire) && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::thread::sleep(pause);
+            let n = out.len().min(b.len());
+            let rest = b.split_off(n);
+            out[..n].copy_from_slice(&b);
+            if !rest.is_empty() {
+                self.0.push_front((false, std::time::Duration::ZERO, rest));
+            }
+            Ok(n)
+        }
+    }
+
+    /// Review S3 of #329: each hook is answered exactly once, whoever
+    /// answers it: the worker in time, the watchdog past the budget, or the
+    /// main thread once the worker is gone.
+    #[test]
+    fn every_hook_is_answered_exactly_once() {
+        if !crate::hook_budget::enforced() {
+            return;
+        }
+        let (dir, mut server, mut settings) = served("hook-once");
+        settings.hook_budget = std::time::Duration::from_millis(300);
+        let ms = std::time::Duration::from_millis;
+        let line = |s: String| (s + "\n").into_bytes();
+        let input = Paced(
+            vec![
+                (false, ms(0), line(hook_msg("fast", "TodoWrite"))),
+                // Past its budget in the worker: the watchdog answers it,
+                // and the one queued behind it.
+                (false, ms(0), line(hook_msg("slow", SLOW_TOOL))),
+                // A gate queued behind it: refused, never passed (review B1).
+                (false, ms(0), line(gate_msg("merge"))),
+                (false, ms(0), line(hook_msg("kill", KILL_TOOL))),
+                // Read once the worker died (its channel dropped as it
+                // unwound): the main thread answers it.
+                (true, ms(300), line(hook_msg("after", "TodoWrite"))),
+                // Every deadline and the watchdog's grace passed.
+                (false, ms(1_200), Vec::new()),
+            ]
+            .into(),
+        );
+        let out = Shared::default();
+        serve_with_hooks(&mut server, Some(settings), None, io::BufReader::new(input), out.clone()).unwrap();
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let mut n: HashMap<String, usize> = HashMap::new();
+        for l in text.lines() {
+            if let Some(id) = crate::json::parse(l).unwrap()["id"].as_str() {
+                *n.entry(id.to_string()).or_default() += 1;
+            }
+        }
+        for id in ["fast", "slow", "merge", "kill", "after"] {
+            assert_eq!(n.get(id), Some(&1), "{id} answered {:?} times: {text}", n.get(id));
+        }
+        let a = answers(&out);
+        assert!(!a["fast"].1 && !a["slow"].1 && !a["kill"].1, "{a:?}");
+        assert!(a["merge"].0.contains("\"permissionDecision\":\"deny\"") && a["merge"].0.contains(crate::hooks::GATE_OVERRUN), "{a:?}");
+        assert!(!a["kill"].0.contains("deny"), "{a:?}");
+        // The main thread's answer (this server has no memory store).
+        assert!(a["after"].1, "{a:?}");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Input chunks, each read once the answer it names is out, then after
+    /// its pause; an empty one is the EOF.
+    struct AfterAnswer {
+        out: Shared,
+        steps: std::collections::VecDeque<(Option<&'static str>, std::time::Duration, Vec<u8>)>,
+    }
+
+    impl Read for AfterAnswer {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let Some((after, pause, mut b)) = self.steps.pop_front() else { return Ok(0) };
+            if let Some(id) = after {
+                let want = format!("\"id\":\"{id}\"");
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !String::from_utf8_lossy(&self.out.0.lock().unwrap()).contains(&want) && std::time::Instant::now() < end {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            std::thread::sleep(pause);
+            let n = out.len().min(b.len());
+            let rest = b.split_off(n);
+            out[..n].copy_from_slice(&b);
+            if !rest.is_empty() {
+                self.steps.push_front((None, std::time::Duration::ZERO, rest));
+            }
+            Ok(n)
+        }
+    }
+
+    /// Review S1 of #329: a launch the watchdog refused (the worker was
+    /// busy past its budget) holds no cap slot, though the worker admitted
+    /// it afterwards: the next launch of its kind at a cap of one is let in.
+    #[test]
+    fn a_launch_refused_past_its_budget_holds_no_cap_slot() {
+        if !crate::hook_budget::enforced() {
+            return;
+        }
+        use crate::orchestrate::{Kind, KindSpec, OrchestrateSpec};
+        let (dir, mut server, mut settings) = served("hook-lost-slot");
+        let budget = std::time::Duration::from_millis(1_000);
+        settings.hook_budget = budget;
+        settings.snapshot_secs = 0;
+        let one = KindSpec { max: Some(1), ..Default::default() };
+        let spec = OrchestrateSpec { enabled: Some(true), kinds: vec![(Kind::Builder, one)], ..Default::default() };
+        settings.orchestrate = crate::orchestrate::resolve(Some(&spec), None, None, |_| None);
+        let transcript = dir.join("proj").join("sess.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        let tp = transcript.to_string_lossy().into_owned();
+        let launch = |id: &str| {
+            let brief = "Kind: builder\nBuild the widget cache.";
+            let input = crate::json!({"description": "d", "subagent_type": "general-purpose", "prompt": brief});
+            let args = crate::json!({"event": "PreToolUse", "session_id": "S", "tool_name": "Agent", "tool_use_id": id, "transcript_path": tp, "tool_prompt": brief, "tool_input": input});
+            (crate::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "hook", "arguments": args}}).to_string() + "\n").into_bytes()
+        };
+        let line = |s: String| (s + "\n").into_bytes();
+        let ms = std::time::Duration::from_millis;
+        let out = Shared::default();
+        let input = AfterAnswer {
+            out: out.clone(),
+            steps: vec![
+                // The hook state is open before the timed part.
+                (None, ms(0), line(hook_msg("warm", "TodoWrite"))),
+                // Two slow hooks keep the worker 2 s past the launch's
+                // arrival: the watchdog refuses the launch at 1.25 s, and
+                // the worker admits it after.
+                (Some("warm"), ms(0), line(hook_msg("slow1", SLOW_TOOL))),
+                (None, ms(0), line(hook_msg("slow2", SLOW_TOOL))),
+                (None, ms(0), launch("first")),
+                // Once the worker is done with the refused launch.
+                (Some("first"), ms(1_500), launch("second")),
+                (Some("second"), ms(0), Vec::new()),
+            ]
+            .into(),
+        };
+        serve_with_hooks(&mut server, Some(settings), None, io::BufReader::new(input), out.clone()).unwrap();
+        let a = answers(&out);
+        assert!(a["first"].0.contains("\"permissionDecision\":\"deny\"") && a["first"].0.contains(crate::hooks::GATE_OVERRUN), "{a:?}");
+        assert!(crate::hooks::GATE_OVERRUN.contains("retry the call"));
+        assert!(!a["second"].0.contains("deny"), "the refused launch held the builder slot: {a:?}");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r3 S1 of #329: a launch the watchdog refused that never
+    /// reached `admit` (a subagent past its hard context limit, denied by
+    /// the cap) frees no other launch: the builder admitted before it is
+    /// still pending, so the next builder at a cap of one is refused.
+    #[test]
+    fn a_lost_launch_denied_before_admit_frees_no_other_launch() {
+        if !crate::hook_budget::enforced() {
+            return;
+        }
+        use crate::orchestrate::{Kind, KindSpec, Mode, OrchestrateSpec};
+        let (dir, mut server, mut settings) = served("hook-lost-other");
+        settings.hook_budget = std::time::Duration::from_millis(1_000);
+        settings.snapshot_secs = 0;
+        let one = KindSpec { max: Some(1), ..Default::default() };
+        let tight = KindSpec { limit: Some(1_000), handoff: Some(500), mode: Some(Mode::Enforced), ..Default::default() };
+        let spec =
+            OrchestrateSpec { enabled: Some(true), kinds: vec![(Kind::Builder, one), (Kind::Research, tight)], ..Default::default() };
+        settings.orchestrate = crate::orchestrate::resolve(Some(&spec), None, None, |_| None);
+        let transcript = dir.join("proj").join("sess.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        let tp = transcript.to_string_lossy().into_owned();
+        // Subagent y1: a researcher far past its hard limit of 1,000 tokens.
+        let sub = crate::hooks::subagent_transcript(&tp, "y1");
+        std::fs::create_dir_all(sub.parent().unwrap()).unwrap();
+        let usage = "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":900000,\"cache_read_input_tokens\":0,\"output_tokens\":5}}}";
+        std::fs::write(&sub, format!("{{\"type\":\"user\",\"message\":{{\"content\":\"Kind: research\\nRead the cache.\"}}}}\n{usage}\n"))
+            .unwrap();
+        let launch = |id: &str, agent: &str| {
+            let brief = "Kind: builder\nBuild the widget cache.";
+            let input = crate::json!({"description": "d", "subagent_type": "general-purpose", "prompt": brief});
+            let args = crate::json!({"event": "PreToolUse", "session_id": "S", "agent_id": agent, "tool_name": "Agent", "tool_use_id": id, "transcript_path": tp, "tool_prompt": brief, "tool_input": input});
+            (crate::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "hook", "arguments": args}}).to_string()
+                + "\n")
+                .into_bytes()
+        };
+        let line = |s: String| (s + "\n").into_bytes();
+        let ms = std::time::Duration::from_millis;
+        let out = Shared::default();
+        let input = AfterAnswer {
+            out: out.clone(),
+            steps: vec![
+                (None, ms(0), line(hook_msg("warm", "TodoWrite"))),
+                // Builder A is admitted and its answer won: it is pending.
+                (Some("warm"), ms(0), launch("a", "")),
+                // y1's launch B waits behind two slow hooks: the watchdog
+                // refuses it, and the worker's cap denies it before admit.
+                (Some("a"), ms(0), line(hook_msg("slow1", SLOW_TOOL))),
+                (None, ms(0), line(hook_msg("slow2", SLOW_TOOL))),
+                (None, ms(0), launch("b", "y1")),
+                // Once the worker is done with B: builder C is over the cap.
+                (Some("b"), ms(1_500), launch("c", "")),
+                (Some("c"), ms(0), Vec::new()),
+            ]
+            .into(),
+        };
+        serve_with_hooks(&mut server, Some(settings), None, io::BufReader::new(input), out.clone()).unwrap();
+        let a = answers(&out);
+        assert!(!a["a"].0.contains("deny"), "{a:?}");
+        assert!(a["b"].0.contains(crate::hooks::GATE_OVERRUN), "{a:?}");
+        assert!(a["c"].0.contains("\"permissionDecision\":\"deny\""), "the lost launch B freed builder A's slot: {a:?}");
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

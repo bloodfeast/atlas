@@ -2206,6 +2206,9 @@ pub(crate) mod tests {
         let mut log = Vec::new();
         read_until(&rx, &mut log, |l, _| l.what == What::Recorded);
         sup.stop();
+        // The sweep runs on its own thread and can log after REPO records;
+        // stop() has joined it, so the rest of its lines are in the channel.
+        log.extend(rx.try_iter());
         drop(s);
         assert!(log.iter().any(|l| l.repo == REPO2 && l.what == What::Found && l.line.contains("does not serve")), "{log:#?}");
         assert_eq!(gh.hook_ids_of(REPO2), [1, 2]);

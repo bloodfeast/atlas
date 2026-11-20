@@ -81,6 +81,29 @@ unrelated release; `rust-toolchain.toml` pins the same version, so the shipped b
 it, change `channel` in `rust-toolchain.toml`, `CLIPPY_TOOLCHAIN` in `xtask/src/release.rs` and every `1.99.0` in
 `.github/workflows/ci.yml` and `.github/workflows/dev-pr.yml`, and clear what the new lints find.
 
+## CI caches
+
+The third-party actions a workflow may use are a short list a test holds, each at one commit, so a bump is a
+deliberate edit in the workflow and the test (`third_party_allowed` in `xtask/src/release_ci.rs`); a tag, another
+commit or any other action fails it. The rule is Brandon's (2026-11-19: "Allow cache, not leak job"): the public
+`ci.yml` may use `Swatinem/rust-cache`, `taiki-e/install-action` (the prebuilt cargo-nextest, its checksum
+checked, never built from source) and `samypr100/setup-dev-drive` (the Windows test job builds and runs on a ReFS
+Dev Drive); `dev-pr.yml` the cache only; `release-pr.yml`, whose leak job holds the denylist, and `release.yml`
+none.
+
+In the public `ci.yml` a push to main saves the caches and every pull request, a fork's too, restores main's and
+saves nothing (`save-if`), so no pull request can plant what main or another pull request builds from. Each holds
+the registry crates only, as below.
+
+`dev-pr`'s `release-check` caches compiled dependencies with `Swatinem/rust-cache` too. It saves the registry crates only (the action removes the
+workspace's own crates before it saves), keyed on the runner, rustc's version, `Cargo.lock`, the `Cargo.toml` files
+and `rust-toolchain.toml`, so a toolchain or lockfile change starts cold; `zstd` is installed in the Debian 11
+container for the archive. The save setting is the action's default: the workflow runs only on pull requests, and
+GitHub scopes a cache a pull request saves to that pull request, so main and other pull requests never read it. The
+cache therefore helps only a pull request's later pushes and re-runs: every pull request's first run is cold (3m47s
+measured, plus a 36 MB save), a re-run warm (2m39s). `release-pr`'s leak build and the release workflow
+(`release.yml`) cache nothing: a published binary, and the one checked against the denylist, are always built cold.
+
 ## Before a pull request
 
 Every pull request passes, on the machine that made it and on its committed head: `cargo fmt` on the files it

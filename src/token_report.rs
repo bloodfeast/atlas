@@ -1,8 +1,10 @@
 //! The text of `atlas --token-report`: pure functions from the report's
 //! structs to a `String`, so the layout is tested without a store.
 //!
-//! [`human`] is the default: titled blocks, each with a one-line
-//! explanation, aligned columns and compact numbers ([`compact`]).
+//! [`summary`] is the default: about 15 lines of the figures [`human`]
+//! prints, computed by the same functions. [`human`] is
+//! `--token-report --verbose`, the full report: titled blocks, each with a
+//! one-line explanation, aligned columns and compact numbers ([`compact`]).
 //! [`tsv`] is `--token-report --tsv`: the tab-separated lines the report
 //! printed before the human layout, byte for byte, for anything that reads
 //! them by machine. Neither computes a figure: both print what
@@ -428,7 +430,8 @@ const PROMPT_HOOKS: [&str; 4] = ["hook:UserPromptSubmit", "hook:PreToolUse", "ho
 
 /// Where the savings live (journal 0069): the net table's rows
 /// ([`crate::token_cost::net_rows`]) by source, so the rows sum to Net's
-/// credit, cost and net exactly, ordered by net, largest saving first.
+/// credit, cost and net exactly (each with its re-read, #294), ordered by
+/// net, largest saving first.
 ///
 /// * lookups: the [`crate::tokens::CAPPED`] tools but `read_note` (and
 ///   `recall`, by key and by query alike: `token_log` does not record
@@ -506,11 +509,14 @@ pub fn where_rows(r: &Inputs, cost: &crate::token_cost::Cost) -> Vec<WhereRow> {
             k if k == RULEBOOK => rulebook,
             k if k == START_HOOK => {
                 // The injections into the agents both tables hold stand in
-                // for the rulebook; the rest is unjudged.
+                // for the rulebook, and their re-read in proportion; the
+                // rest is unjudged.
                 let to_rulebook = start.min(n.cost);
-                rows[rulebook].credit += n.credit;
+                let share = if n.cost > 0.0 { to_rulebook / n.cost } else { 0.0 };
+                let to_rulebook = to_rulebook + n.cost_reread * share;
+                rows[rulebook].credit += n.credit_total();
                 rows[rulebook].cost += to_rulebook;
-                rows[other].cost += n.cost - to_rulebook;
+                rows[other].cost += n.cost_total() - to_rulebook;
                 continue;
             }
             k if PROMPT_HOOKS.contains(&k) => prompts,
@@ -519,8 +525,8 @@ pub fn where_rows(r: &Inputs, cost: &crate::token_cost::Cost) -> Vec<WhereRow> {
             k if crate::tokens::CAPPED.contains(&k) => lookups,
             _ => other,
         };
-        rows[i].credit += n.credit;
-        rows[i].cost += n.cost;
+        rows[i].credit += n.credit_total();
+        rows[i].cost += n.cost_total();
     }
     // A row with no yardstick of its own that carries hit credit (#217)
     // says where the credit comes from.
@@ -552,6 +558,9 @@ fn where_header(cost: &crate::token_cost::Cost) -> String {
     let mut h = String::from(
         "  Credit, cost and net per source, in tokens, largest saving first; each credit against the yardstick named. The rows sum to Net.",
     );
+    if cost.transcripts {
+        h.push_str(" Credit and cost include their re-reads, priced alike on both sides.");
+    }
     match cost.rulebook_net_credit() {
         Some(rest) if rest <= 0.0 => {
             let _ = write!(
@@ -574,6 +583,12 @@ fn where_header(cost: &crate::token_cost::Cost) -> String {
     h
 }
 
+/// The total credit and cost of [`where_rows`]: Net's, and the one sum
+/// both the full report's "total" row and the summary print.
+fn where_totals(rows: &[WhereRow]) -> (f64, f64) {
+    rows.iter().fold((0.0, 0.0), |(a, b), w| (a + w.credit, b + w.cost))
+}
+
 /// The "Where the savings live" block of the human report.
 fn where_block(r: &Inputs, cost: &crate::token_cost::Cost) -> String {
     let rows = where_rows(r, cost);
@@ -586,7 +601,7 @@ fn where_block(r: &Inputs, cost: &crate::token_cost::Cost) -> String {
             vec![w.source.to_string(), credit, compact(w.cost), compact(w.net()), w.against.clone()]
         })
         .collect();
-    let (credit, c) = rows.iter().fold((0.0, 0.0), |(a, b), w| (a + w.credit, b + w.cost));
+    let (credit, c) = where_totals(&rows);
     cells.push(vec!["total".into(), compact(credit), compact(c), compact(credit - c), String::new()]);
     out.push_str(&table(
         &["source", "credit", "cost", "net", "against"],
@@ -736,6 +751,9 @@ fn headline(r: &Inputs) -> String {
     if r.baseline.is_none() {
         items.push(("ledger ratio", ledger_line(r)));
         items.push(("ledger median", ledger_median_line(r)));
+    }
+    if let Some(c) = r.cost {
+        items.push(("net", crate::token_cost::headline_net(c, r.by_tool)));
     }
     items.push(("lookup cap", cap_line(r)));
     items.push(("injection credit", hook_line(r)));
@@ -996,6 +1014,169 @@ pub fn human(r: &Inputs) -> String {
         out.push('\n');
         out.push_str(&crate::token_cost::human(c, r.by_tool, r.bytes_per_token));
     }
+    out
+}
+
+/// A source whose credit and cost are both under this share of the totals
+/// is folded into the summary's "other" row.
+pub const FOLD_SHARE: f64 = 0.01;
+
+/// The days the summary's recent line covers, counted back from the newest
+/// day logged (that day included).
+pub const RECENT_DAYS: i64 = 7;
+
+/// The day number of a `YYYY-MM-DD` key, in days since 1970-01-01, or
+/// `None` when the key is not a date (the civil-from-days inverse).
+fn day_number(key: &str) -> Option<i64> {
+    let mut it = key.get(..10)?.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    Some(era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468)
+}
+
+/// The day table's rows ([`Inputs::by_day_net`], the rows the full
+/// report's "By day" table prints) of the last [`RECENT_DAYS`] days, summed
+/// into one row keyed `FIRST to LAST`; `None` with no dated row.
+pub fn recent_days(days: &[ReportRow]) -> Option<ReportRow> {
+    let newest = days.iter().filter_map(|d| day_number(&d.key)).max()?;
+    let rows: Vec<&ReportRow> = days.iter().filter(|d| day_number(&d.key).is_some_and(|n| newest - n < RECENT_DAYS)).collect();
+    let first = rows.iter().map(|d| d.key.as_str()).min()?;
+    let last = rows.iter().map(|d| d.key.as_str()).max()?;
+    Some(ReportRow {
+        key: format!("{first} to {last}"),
+        answers: rows.iter().map(|d| d.answers).sum(),
+        returned: rows.iter().map(|d| d.returned).sum(),
+        counterfactual: rows.iter().map(|d| d.counterfactual).sum(),
+        returned_comparable: rows.iter().map(|d| d.returned_comparable).sum(),
+    })
+}
+
+/// The summary's source rows: [`where_rows`] with every source under
+/// [`FOLD_SHARE`] of both the total credit and the total cost folded into
+/// one "other" row, last (only when two or more fold: one is shown as it
+/// is). The rows still sum to Net.
+pub fn summary_rows(rows: Vec<WhereRow>) -> Vec<(String, Option<f64>, f64)> {
+    let (credit, cost) = where_totals(&rows);
+    let small = |w: &WhereRow| w.credit.abs() < FOLD_SHARE * credit.abs() && w.cost.abs() < FOLD_SHARE * cost.abs();
+    let folds = rows.iter().filter(|w| small(w)).count() >= 2;
+    let (mut kept, mut other, mut n, mut shown) = (Vec::new(), (0.0, 0.0), 0, false);
+    for w in rows {
+        if folds && small(&w) {
+            other = (other.0 + w.credit, other.1 + w.cost);
+            n += 1;
+            shown |= w.shown();
+        } else {
+            kept.push((short_source(w.source), w.shown().then_some(w.credit), w.cost));
+        }
+    }
+    if n > 0 {
+        kept.push((format!("small sources ({n} under {:.0}%)", FOLD_SHARE * 100.0), shown.then_some(other.0), other.1));
+    }
+    kept
+}
+
+/// The summary's label for a [`where_rows`] source: the long ones cut to
+/// fit a terminal (the full report keeps them whole); any other source
+/// longer than [`SOURCE_WIDTH`] is cut to it, ending in `...`.
+fn short_source(source: &str) -> String {
+    match source {
+        PROMPTS_SOURCE => "prompts and tool calls".into(),
+        RULEBOOK_SOURCE => "rulebook".into(),
+        crate::token_cost::DEFINITIONS => "tool definitions".into(),
+        s if s.chars().count() <= SOURCE_WIDTH => s.into(),
+        s => format!("{}...", s.chars().take(SOURCE_WIDTH - 3).collect::<String>()),
+    }
+}
+
+/// The widest source label the summary prints: with the three number
+/// columns its table rows stay within 80 columns.
+const SOURCE_WIDTH: usize = 40;
+
+/// The default `--token-report`: about 15 lines, every figure one the full
+/// report ([`human`]) prints, computed by the same functions once, every
+/// line at most 80 columns. A title with the calibration date and, when
+/// there is a ratio, the answers it is measured over; the measured ratio (mean and
+/// median); credit, cost and net (the "Where the savings live" totals,
+/// which are Net's) and their caveat; those rows under short labels, small
+/// ones folded ([`summary_rows`]); the 7 days to the newest logged day of
+/// the day table; and a pointer to `--verbose`.
+pub fn summary(r: &Inputs) -> String {
+    let answers = compact(r.side.returned.len() as f64);
+    let ledger = format!("ledger ratio {:.1}x", r.side.ledger());
+    let (title, ratio, stale) = match r.baseline {
+        // No ratio, so the title names no answers it is over (#348).
+        None => ("Token report: not calibrated yet".to_string(), format!("none yet: run atlas --calibrate; {ledger}"), None),
+        Some((when, b)) => {
+            let date = when.get(..16).unwrap_or(when).replacen('T', " ", 1);
+            let (title, ratio) = if b.too_few {
+                (format!("Token report: calibrated {date}"), format!("none: too little pre-atlas history; {ledger}"))
+            } else {
+                let (med, mean) = r.side.measured(b);
+                (format!("Token report: calibrated {date}, ratio over {answers} answers"), format!("{mean:.1}x mean (ratio of sums), {med:.1}x median"))
+            };
+            let stale = staleness(b, r.fingerprint).0.map(|why| format!("{why}; run atlas --calibrate"));
+            (title, ratio, stale)
+        }
+    };
+    let mut items: Vec<(&str, String)> = vec![("measured ratio", ratio)];
+    if let Some(stale) = stale {
+        items.push(("stale", stale));
+    }
+    let rows = r.cost.map(|c| (c, where_rows(r, c)));
+    let mut caveat = None;
+    match &rows {
+        Some((c, rows)) => {
+            let (credit, cost) = where_totals(rows);
+            items.push(("credit / cost / net", format!("{} / {} / {}", compact(credit), compact(cost), compact(credit - cost))));
+            // The full report's caveat, on a line of its own to fit 80 columns.
+            let how = if c.transcripts { "with re-reads on both sides" } else { "once-only, no transcripts" };
+            let floor = if c.floor() { "; the true net is lower (costs atlas cannot see)" } else { "" };
+            caveat = Some(format!("{how}{floor}"));
+        }
+        None => items.push(("credit / cost / net", "not measured".into())),
+    }
+    let mut out = format!("{title}\n");
+    let w = items.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    for (k, v) in &items {
+        let _ = writeln!(out, "  {k:<w$}  {v}");
+    }
+    if let Some(caveat) = caveat {
+        let _ = writeln!(out, "  {caveat}");
+    }
+    if let Some((_, rows)) = rows {
+        out.push_str("Where the savings live\n");
+        let cells: Vec<Vec<String>> = summary_rows(rows)
+            .into_iter()
+            .map(|(source, credit, cost)| {
+                let net = credit.unwrap_or(0.0) - cost;
+                vec![source, credit.map_or_else(|| "--".into(), compact), compact(cost), compact(net)]
+            })
+            .collect();
+        out.push_str(&table(&["source", "credit", "cost", "net"], &[Align::Left, Align::Right, Align::Right, Align::Right], &cells));
+    }
+    match recent_days(r.by_day_net) {
+        Some(d) => {
+            let _ = writeln!(
+                out,
+                "{RECENT_DAYS} days to newest log ({}): {} answers, ledger {}",
+                d.key,
+                compact(d.answers as f64),
+                ratio_cell(&d)
+            );
+        }
+        None => {
+            let _ = writeln!(out, "{RECENT_DAYS} days to newest log: no answers logged");
+        }
+    }
+    out.push_str("Full report: atlas --token-report --verbose\n");
     out
 }
 
@@ -1260,6 +1441,32 @@ mod tests {
         assert!(block_of(&human(&inputs(&g)), "Hook injections").contains("  largest        201k (a subagent)"));
     }
 
+    /// #294: the Headline names its net, with re-reads on both sides and
+    /// the once-only net beside it, and the "Where the savings live" rows
+    /// sum to that net.
+    #[test]
+    fn the_headline_names_its_net_and_the_where_rows_sum_to_it() {
+        let mut f = with_cost(fixture());
+        let c = f.cost.as_mut().unwrap();
+        c.output_reread_priced.insert("recall".into(), 40_000.0);
+        c.credit_reread.insert("recall".into(), 300_000.0);
+        let i = inputs(&f);
+        let cost = f.cost.as_ref().unwrap();
+        let h = human(&i);
+        let head = h.split("\n\n").next().unwrap();
+        let rows = crate::token_cost::net_rows(cost, i.by_tool);
+        let (credit, c, net) = crate::token_cost::totals(&rows);
+        let net1 = crate::token_cost::totals_once(&rows).2;
+        assert!((net - net1 - 260_000.0).abs() < 1e-6, "{net} {net1}");
+        let want = format!("{} with re-reads on both sides ({} once-only)", compact(net), compact(net1));
+        assert!(head.lines().any(|l| l.trim_start().starts_with("net ") && l.contains(&want)), "{want}\n{head}");
+        let w = where_rows(&i, cost);
+        let sum = w.iter().fold((0.0, 0.0), |(a, b), r| (a + r.credit, b + r.cost));
+        assert!((sum.0 - credit).abs() < 1e-6 && (sum.1 - c).abs() < 1e-6, "{sum:?} against {credit} {c}");
+        // Without a cost side, no net line: the headline is as before.
+        assert!(!human(&inputs(&fixture())).split("\n\n").next().unwrap().contains("once-only"));
+    }
+
     /// The note the Lookups block carries with a read_note row (#213).
     const READ_NOTE_NOTE: &str =
         "  read_note is 1x by design: its counterfactual is the whole file it returns. section is the cheaper read for one heading.\n";
@@ -1340,7 +1547,12 @@ mod tests {
         assert_eq!(order.last(), Some(&"total"), "{h}");
         let total = &cells[cells.len() - 1];
         let net_block = block_of(&h, "Net");
-        assert!(net_block.contains(&format!("credit  {}", total[1])) && net_block.contains(&format!("cost    {}", total[2])), "{h}");
+        // The keys are padded to the block's widest ("net once-only").
+        let first_two = |key: &str| {
+            net_block.lines().find(|l| l.trim_start().starts_with(key)).map(|l| l.split_whitespace().take(2).collect::<Vec<_>>())
+        };
+        assert_eq!(first_two("credit "), Some(vec!["credit", total[1].as_str()]), "{h}");
+        assert_eq!(first_two("cost "), Some(vec!["cost", total[2].as_str()]), "{h}");
         // The Net by tool table has the rulebook as its own row.
         assert!(h.lines().any(|l| l.starts_with("  rulebook (measured)") && l.contains("1.88M")), "{h}");
         let t = tsv(&i);
@@ -1809,4 +2021,172 @@ Post-compaction lookups
   changed targets              0
   unstamped                    2 (shell 0)
 ";
+
+    /// #339: the summary's credit, cost and net are the full report's: the
+    /// "Where the savings live" total row and Net's own totals.
+    #[test]
+    fn the_summary_net_is_the_full_reports_net() {
+        let f = with_cost(fixture());
+        let i = inputs(&f);
+        let c = f.cost.as_ref().unwrap();
+        let (credit, cost, net) = crate::token_cost::totals(&crate::token_cost::net_rows(c, &f.tools));
+        let want = format!("{} / {} / {}", compact(credit), compact(cost), compact(net));
+        let s = summary(&i);
+        let line = s.lines().find(|l| l.trim_start().starts_with("credit / cost / net")).unwrap_or_else(|| panic!("{s}"));
+        assert!(line.contains(&want), "{want}\n{s}");
+        let full = human(&i);
+        let total = block_of(&full, "Where the savings live").lines().find(|l| l.trim_start().starts_with("total")).unwrap();
+        let cells: Vec<&str> = total.split_whitespace().collect();
+        assert_eq!(cells[1..4], [compact(credit), compact(cost), compact(net)], "{total}");
+        let head = full.split("\n\n").next().unwrap();
+        assert!(head.lines().any(|l| l.trim_start().starts_with("net ") && l.contains(&compact(net))), "{head}");
+    }
+
+    /// #339: about 15 lines, in order: title (the ratio's sample, #341 r1
+    /// S2), measured ratio, credit / cost / net, its caveat, the source rows,
+    /// the 7 days to the newest log, the pointer to `--verbose`.
+    #[test]
+    fn the_summary_is_short_and_ends_with_verbose() {
+        let f = with_cost(fixture());
+        let s = summary(&inputs(&f));
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(lines.len() <= 16, "{} lines\n{s}", lines.len());
+        assert_eq!(lines[0], "Token report: calibrated 2026-11-14 02:17, ratio over 3 answers", "{s}");
+        assert_eq!(lines[1], "  measured ratio       20.0x mean (ratio of sums), 10.0x median", "{s}");
+        assert!(lines[2].starts_with("  credit / cost / net  "), "{s}");
+        assert_eq!(lines[3], "  with re-reads on both sides", "{s}");
+        assert_eq!(lines[4], "Where the savings live", "{s}");
+        assert_eq!(lines[lines.len() - 2], "7 days to newest log (2026-11-13 to 2026-11-14): 1.01k answers, ledger 59.5x", "{s}");
+        assert_eq!(lines[lines.len() - 1], "Full report: atlas --token-report --verbose", "{s}");
+        assert!(!s.contains('\t'));
+        // Without a cost side: no table, and the net says so.
+        let f = fixture();
+        let s = summary(&inputs(&f));
+        assert!(s.contains("credit / cost / net  not measured") && !s.contains("Where the savings live"), "{s}");
+    }
+
+    /// Small sources fold into one "other" row, which keeps the sums; a lone
+    /// small source is shown as it is.
+    #[test]
+    fn small_sources_fold_into_other() {
+        let w = |source: &'static str, credit: f64, cost: f64| WhereRow { source, credit, measured: true, cost, against: String::new() };
+        let rows = vec![w("lookups", 1000.0, 100.0), w("routing", 500.0, 300.0), w("a", 5.0, 1.0), w("b", 0.0, 2.0)];
+        let got = summary_rows(rows);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[2], ("small sources (2 under 1%)".to_string(), Some(5.0), 3.0));
+        let net: f64 = got.iter().map(|(_, c, k)| c.unwrap_or(0.0) - k).sum();
+        assert_eq!(net, 1505.0 - 403.0);
+        let got = summary_rows(vec![w("lookups", 1000.0, 100.0), w("a", 5.0, 0.5)]);
+        assert_eq!(got[1].0, "a");
+    }
+
+    /// The last 7 days count back from the newest day logged, across a
+    /// month end; non-date keys are skipped.
+    #[test]
+    fn the_last_seven_days_count_back_from_the_newest() {
+        assert_eq!(day_number("1970-01-01"), Some(0));
+        assert_eq!(day_number("2000-03-01"), Some(11_017));
+        assert_eq!(day_number("2026-12-01").zip(day_number("2026-11-30")).map(|(a, b)| a - b), Some(1));
+        assert_eq!(day_number("hook"), None);
+        let days =
+            vec![row("2026-11-23", 9, 9.0, 0.0), row("2026-11-24", 1, 10.0, 100.0), row("2026-11-30", 2, 10.0, 0.0), row("x", 5, 5.0, 0.0)];
+        let d = recent_days(&days).unwrap();
+        assert_eq!((d.key.as_str(), d.answers, d.counterfactual), ("2026-11-24 to 2026-11-30", 3, 100.0));
+        assert_eq!(ratio_cell(&d), "10.0x");
+        assert!(recent_days(&[]).is_none());
+    }
+
+    /// The widest line of `s`, in columns.
+    fn widest(s: &str) -> usize {
+        s.lines().map(|l| l.chars().count()).max().unwrap_or(0)
+    }
+
+    /// #341 r1 S1: every summary line fits an 80-column terminal, on the
+    /// fixture and on one with the largest realistic numbers, with and
+    /// without transcripts, stale and not calibrated; the full report keeps
+    /// its long labels.
+    #[test]
+    fn the_summary_fits_80_columns() {
+        let big = |mut f: Fixture| {
+            for t in f.tools.iter_mut().chain(f.days_net.iter_mut()) {
+                t.answers *= 1000;
+                t.returned *= 1000.0;
+                t.counterfactual *= 1000.0;
+            }
+            f.side.returned = vec![100.0; 999_999];
+            f.baseline.fingerprint = Some("old".into());
+            let mut f = with_cost(f);
+            let c = f.cost.as_mut().unwrap();
+            c.sent.insert("UserPromptSubmit".into(), 900_000_000.0);
+            c.sent.insert("PreToolUse".into(), 900_000_000.0);
+            f
+        };
+        let once = |mut f: Fixture| {
+            let c = f.cost.as_mut().unwrap();
+            c.transcripts = false;
+            f
+        };
+        for f in [with_cost(fixture()), once(with_cost(fixture())), big(fixture()), once(big(fixture()))] {
+            let s = summary(&inputs(&f));
+            assert!(widest(&s) <= 80, "{} columns\n{s}", widest(&s));
+            assert!(s.contains("prompts and tool calls ") && !s.contains(PROMPTS_SOURCE), "{s}");
+            let mut i = inputs(&f);
+            i.baseline = None;
+            let s = summary(&i);
+            assert!(widest(&s) <= 80, "{} columns\n{s}", widest(&s));
+            assert!(human(&inputs(&f)).contains(PROMPTS_SOURCE));
+        }
+        let s = summary(&inputs(&big(fixture())));
+        assert!(s.contains("  stale  ") && s.contains("the configured targets changed"), "{s}");
+    }
+
+    /// #341 r1 N1, N2: a fold of rows with no measured credit prints `--`,
+    /// and its label takes the share from [`FOLD_SHARE`].
+    #[test]
+    fn a_fold_with_no_measured_credit_prints_dashes() {
+        let w = |source: &'static str, credit: f64, cost: f64, measured: bool| WhereRow {
+            source,
+            credit,
+            measured,
+            cost,
+            against: String::new(),
+        };
+        let got = summary_rows(vec![w("lookups", 1000.0, 100.0, true), w("a", 0.0, 0.5, false), w("b", 0.0, 0.5, false)]);
+        assert_eq!(got[1], ("small sources (2 under 1%)".to_string(), None, 1.0));
+    }
+
+    /// #348: the title names the answers a ratio is over only when there is
+    /// a ratio: not when the store is not calibrated, nor when calibration
+    /// found too little history.
+    #[test]
+    fn the_title_names_answers_only_with_a_ratio() {
+        let f = with_cost(fixture());
+        let mut i = inputs(&f);
+        i.baseline = None;
+        let s = summary(&i);
+        assert_eq!(s.lines().next(), Some("Token report: not calibrated yet"), "{s}");
+        let mut f = with_cost(fixture());
+        f.baseline.too_few = true;
+        let s = summary(&inputs(&f));
+        assert_eq!(s.lines().next(), Some("Token report: calibrated 2026-11-14 02:17"), "{s}");
+        assert!(s.contains("none: too little pre-atlas history"), "{s}");
+    }
+
+    /// #348: a source label longer than [`SOURCE_WIDTH`] is cut to it with
+    /// `...`, and its table row still fits 80 columns at the largest
+    /// numbers; one at the width is kept whole.
+    #[test]
+    fn a_long_source_label_is_cut_to_fit() {
+        const LONG: &str = "a source name far longer than any summary table column could hold whole";
+        const FITS: &str = "exactly forty characters of source name.";
+        assert_eq!(FITS.chars().count(), SOURCE_WIDTH);
+        let w = |source: &'static str| WhereRow { source, credit: 999e9, measured: true, cost: 999e9, against: String::new() };
+        let got = summary_rows(vec![w(LONG), w(FITS)]);
+        assert_eq!(got[0].0.chars().count(), SOURCE_WIDTH, "{got:?}");
+        assert!(got[0].0.ends_with("...") && LONG.starts_with(got[0].0.trim_end_matches("...")), "{got:?}");
+        assert_eq!(got[1].0, FITS);
+        let cells: Vec<Vec<String>> = got.into_iter().map(|(s, c, k)| vec![s, compact(c.unwrap_or(0.0)), compact(k), compact(-k * 10.0)]).collect();
+        let t = table(&["source", "credit", "cost", "net"], &[Align::Left, Align::Right, Align::Right, Align::Right], &cells);
+        assert!(widest(&t) <= 80, "{} columns\n{t}", widest(&t));
+    }
 }

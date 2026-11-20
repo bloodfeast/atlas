@@ -321,7 +321,7 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 /// or synced): the only records a sync may supersede or retire.
 fn from_source(store: &MemoryStore, export: &str) -> Result<HashSet<i64>> {
     let mut st = store.conn().prepare_cached("SELECT v.rid FROM versions v WHERE v.seq = 1 AND v.src = ?1")?;
-    let rows = st.query_map([export], |r| r.get(0))?.collect::<rusqlite::Result<HashSet<i64>>>()?;
+    let rows = st.query_map([export], |r| r.get(0))?.collect::<crate::db::Result<HashSet<i64>>>()?;
     Ok(rows)
 }
 

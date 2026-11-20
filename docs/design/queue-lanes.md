@@ -213,7 +213,11 @@ atlas queue: start together: journal:parser:0003 (builder, urgent), journal:docs
 ```
 
 `atlas queue next` prints the same proposal on demand, counting the running agents of the session whose
-transcript it is given (`--transcript PATH`), or none.
+transcript it is given (`--transcript PATH`). Without it, it counts the running agents of every session in
+the store that filed a `launch` entry in the `orchestrate.stale_minutes` window, across every project that
+shares this `ATLAS_HOME`. That is conservative: the admission hook counts only its own session, so
+`queue next` can propose fewer starts than the hook would admit. A session whose agents folder cannot be
+listed is logged to stderr and skipped.
 
 The orchestrator launches the batch. atlas never launches anything itself until unmanned mode.
 

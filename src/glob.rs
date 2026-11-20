@@ -28,6 +28,8 @@ pub fn matches(pattern: &str, path: &str) -> bool {
         next.fill(false);
         let mut any = false;
         for i in 0..n {
+            #[cfg(test)]
+            tests::step();
             if !cur[i] {
                 continue;
             }
@@ -90,6 +92,8 @@ fn roles(p: &[char]) -> Vec<Role> {
 /// (zero folders), and out of a `**` that took something.
 fn close(p: &[char], role: &[Role], s: &mut [bool]) {
     for i in 0..p.len() {
+        #[cfg(test)]
+        tests::step();
         if !s[i] {
             continue;
         }
@@ -109,6 +113,24 @@ fn close(p: &[char], role: &[Role], s: &mut [bool]) {
 #[cfg(test)]
 mod tests {
     use super::matches;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Pattern positions visited by `matches` on this thread.
+        static STEPS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// One pattern position visited (one unit of the matcher's work).
+    pub(super) fn step() {
+        STEPS.with(|s| s.set(s.get() + 1));
+    }
+
+    /// `matches(pattern, text)` and the positions it visited.
+    fn counted(pattern: &str, text: &str) -> (bool, u64) {
+        STEPS.with(|s| s.set(0));
+        let m = matches(pattern, text);
+        (m, STEPS.with(Cell::get))
+    }
 
     #[test]
     fn globs() {
@@ -143,11 +165,24 @@ mod tests {
     #[test]
     fn pathological_patterns_are_linear() {
         let name = "a".repeat(250);
+        let deep = "a/".repeat(100) + &name;
         let t = std::time::Instant::now();
-        assert!(!matches("*a*a*a*a*a*a*a*b", &name));
-        assert!(!matches("*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b", &name));
-        assert!(!matches(&("**a".repeat(20) + "/b"), &("a/".repeat(100) + &name)));
-        assert!(matches(&"*".repeat(100_000), &name));
-        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        // The work is counted, not timed: at most two visits of each pattern
+        // position per text character (the step and its closure), plus the
+        // first closure. A machine under load cannot move the count.
+        for (pattern, text, want) in [
+            ("*a*a*a*a*a*a*a*b".to_string(), name.as_str(), false),
+            ("*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b".to_string(), &name, false),
+            ("**a".repeat(20) + "/b", &deep, false),
+            ("*".repeat(100_000), &name, true),
+        ] {
+            let (got, steps) = counted(&pattern, text);
+            assert_eq!(got, want, "{pattern:.40}");
+            let (p, t) = (pattern.chars().count() as u64, text.chars().count() as u64);
+            assert!(steps <= p * (2 * t + 1), "{pattern:.40} against {t} chars: {steps} steps, over {}", p * (2 * t + 1));
+        }
+        // A backstop for a matcher that stops counting (a backtracking one is
+        // exponential here): over 10x the unloaded time.
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "{:?}", t.elapsed());
     }
 }

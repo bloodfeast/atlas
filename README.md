@@ -1,217 +1,98 @@
 # atlas
 
-atlas makes long Claude Code sessions cheaper without changing how you work. It is a local MCP server and a
-set of Claude Code hooks: large tool output stays on disk under a short handle and the model gets a digest,
-code reads get exact item ranges instead of guessed windows, and memory (rules, decisions, journals,
-handoffs) is recalled by relevance instead of loaded whole. It runs on your machine, has two direct
-dependencies, SQLite (`rusqlite`) and an ed25519 signature check, plus the crates those two pull in (every one
-is in `Cargo.lock`), and makes no network calls at query time.
+atlas makes long Claude Code sessions cheaper without changing how you work. It is a local MCP server and a set
+of Claude Code hooks: large tool output stays on disk behind a short handle and the model gets a digest, code
+reads get exact item ranges instead of guessed windows, and project memory (rules, decisions, journals,
+handoffs) is recalled by relevance instead of loaded whole.
 
-**You do not need Obsidian.** A vault is any folder of Markdown files: atlas reads and writes the files
-itself and never touches Obsidian's `.obsidian` settings folder. Obsidian is optional, as a reader for the
-same folders. The one Obsidian-specific output is that `make_link` writes `obsidian://open` links between
-vaults, which open only in Obsidian (elsewhere they are plain text); links within a vault are standard
-`[[wikilinks]]`.
+It is for anyone who runs long Claude Code sessions, or many agents, on one codebase. It runs on your machine
+and makes no network calls at query time.
 
-**Languages.** Memory, recall and history, search over Markdown notes and sources, discussions, the work
-queue, projects and multi-repo, and the hooks work whatever programming language a project uses, as does `.proto` indexing (rpc call
-sites are found in any language's files). The code index (`symbol`, item ranges on reads, grep annotations)
-covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C#, Python, Java and Kotlin (through scip-go,
-scip-typescript, scip-dotnet, scip-python and scip-java when they are installed, or a prebuilt `index.scip`
-from CI, WSL or Docker, else an owned scanner), and any language with a SCIP indexer from a `.scip` file.
-Build and test digests recognise `cargo test`, `nextest`, `go test` (plain and `-json`), jest, vitest,
-`dotnet test`, pytest, Maven and Gradle output, and other runners get the generic digest.
-Ranked search (`fts`, `sections`, `recall`) splits words on spaces and punctuation, so text written without
-spaces (Chinese, Japanese, Thai) is found with `search` in `substring` mode or `grep` instead.
+**You do not need Obsidian.** A vault is any folder of Markdown files; Obsidian is an optional reader for it.
 
-## What it saves
-
-Every assistant turn re-reads the whole context, so a result that enters at turn 10 of a 300-turn session is
-processed 290 more times. Measured on real sessions:
-
-| | Without atlas | With atlas |
-|---|---|---|
-| The tool list, loaded with every session | 47 tools, 5,930 tokens (v0.1) | 14 tools, 6,118 bytes (about 1,530 tokens at 4 bytes a token, measured at v0.6.1); the full reference is one fetched resource |
-| A lookup (7,067 answers against 96 lookups done before atlas, measured at v0.6.0) | grep, then read the files | 6.4x fewer tokens in all (ratio of sums); 10.9x median per answer |
-| Memory questions (100-question evaluation, at v0.6.0) | the whole rulebook loaded | 100/100 answered when the agent follows a result to its source, 99/100 reading only the first result; median 506 tokens each |
-
-Shell reads are 36% of what a builder session processes and startup context another 35%; those are the
-buckets atlas targets. `atlas --token-report` measures your own store the same way: it takes its baseline from
-your Claude Code transcripts from before atlas, by itself in the background, and nets what atlas puts into
-context (the tool list, hook injections, tool output) against what it saves. How each number was measured, and
-how to measure your own sessions with `cargo xtask attrib`, is on [Token savings and method](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method).
-
-## Beyond the savings
-
-- **Orchestrated mode**, asked at setup and never on by default: an `orchestrate` skill teaches the main session
-  to delegate through lanes and lean briefs, and the hooks cap how many agents of each kind run at once and
-  hand an agent off at its context limit to a fresh one.
-- **`atlas backlog`** lists ruled work that fell out of the queue, aging items first, each with the rulings
-  behind it. It only proposes; the queue's written order never changes.
-- **Pull request reviews.** In a `gh pr diff` file read, context far from a change is one marker line that
-  `recall h:ID lines=A-B` opens, and `atlas pr-events serve` wakes the session that waits on a review.
-- **Long sections are searched whole.** Semantic search embeds a long section as overlapping windows, so a
-  question answered deep inside it finds it.
-- **`atlas worktrees`** keeps an append-only ledger of which lane owns which worktree.
-- **A fresh install teaches Claude atlas.** The server's instructions and a bundled `atlas` skill carry the
-  habits (recall before asking, journal decisions, hand off before stopping), and atlas tells you at session
-  start when an update arrives.
+Memory, search and the hooks work whatever language a project is written in. The code index covers Rust, Go,
+TypeScript, JavaScript, Python, C#, Java, Kotlin, WGSL and Protocol Buffers, and any language with a SCIP
+indexer ([Code index](https://github.com/bloodfeast/atlas/wiki/Code-index)).
 
 ## Install
 
-atlas is a Claude Code plugin with prebuilt binaries for Windows x86_64, Linux x86_64 and aarch64, and macOS
-(Apple Silicon and Intel). In Claude Code:
+Prebuilt for Windows x86_64, Linux x86_64 and aarch64, and macOS (Apple Silicon and Intel). In Claude Code:
 
 ```
 /plugin marketplace add bloodfeast/atlas
 /plugin install atlas@atlas
 ```
 
-Restart Claude Code. On its first start atlas writes a starter configuration, `atlas.json`, in your
-configuration folder (`%APPDATA%\atlas`, `~/Library/Application Support/atlas` or `~/.config/atlas`) and
-downloads the embedding model (about 35 MB) in the background, checked against its pinned SHA-256. Until the
-model is in place, search and recall are lexical. Updates are signed and on by default (`atlas settings off
-update` turns them off). Building from source, uninstalling and the data folders are on
-[Install and setup](https://github.com/bloodfeast/atlas/wiki/Install-and-setup).
+Restart Claude Code and open a session in your project. Claude asks whether to create a vault for it; say yes.
+It also asks whether to run in orchestrated mode, and no is fine. Then work as usual.
 
-## Quickstart (5 minutes)
+- The first start writes `atlas.json` in your configuration folder and fetches the embedding model (about
+  35 MB, checked against a pinned SHA-256). Search and recall are lexical until it lands.
+- Updates are signed and on by default. `atlas settings off update` turns them off.
+- `atlas settings undo` reverts any change atlas made to your setup. It never deletes a note.
 
-1. Install the plugin (above) and restart Claude Code.
-2. Optionally run the setup in the foreground to see each step; Claude can run it for you, since the plugin's
-   `bin` folder is on the Bash tool's `PATH` (not on your own terminal's):
-
-   ```sh
-   atlas --setup
-   ```
-
-   Run by Claude, it has no terminal, so it lists its questions instead of asking them and records nothing;
-   Claude puts them to you at the next session. In auto mode, Claude Code's classifier may block `atlas --setup`
-   and `atlas settings` commands (with "No reason provided") until you tell Claude you allow them.
-
-3. Open a session in your project. Claude asks you about atlas: *create a vault for this project at
-   `<path>`? yes / other folder / no*, and, unless `atlas --setup` asked already, whether to work in orchestrated mode (caps on how many
-   agents run at once; no is fine; on yes the caps and compile slots start from this machine's cores, see the wiki's Orchestration page). It may also offer Claude Code settings. Say yes to the first: its Markdown becomes a searchable source, a folder holding code becomes
-   a code root, and a new vault (an Obsidian-compatible folder) holds the project's notes and discussion threads.
-   `atlas settings undo` reverts it all; it never deletes a note. A question you do not answer comes back at your
-   next new session, until you answer it, and Claude may not always put it. A session with no user (`claude -p`, the
-   SDK) asks nothing and counts as nothing asked, and atlas stays silent if it could not record your answer. `atlas settings add-project .` and
-   `atlas settings orchestrate` do the same from a terminal. The vault question is per folder.
-4. Work as usual. Large Bash, Read and Grep results now arrive as digests with a handle; Claude pulls what it
-   needs with `recall key=h:ID item=NAME` or `failures=true`. Grep and Read results name the enclosing item and
-   its line range.
-5. Ask Claude to remember a decision (`remember`), and start the next session: relevant records are recalled
-   on each prompt, within a 600-token budget (`recall.budget_tokens`). The recall defaults (600 tokens, a 0.53
-   `recall.cos_floor`) were chosen by a sweep that measured off-topic records as well as on-topic recall.
-6. Optionally, `atlas settings offer` proposes the Claude Code settings that cut cost (the 1-hour subagent
-   cache, fewer goal check-ins). Nothing is written without a yes, and `atlas settings undo` reverts (it shows the change and asks first;
-   `--yes` without a terminal).
-   With the compaction features on (the default; `"compact": {"enabled": false}` or `atlas settings off compact`
-   turns them off), `atlas settings compact-md` offers a Compact instructions block for a project's `CLAUDE.md` the same way.
-   For a project with no rules, `atlas --setup` and `atlas settings rules-template` offer a starter `CLAUDE.md` and
-   `.claude/atlas-rules.md` ([the rules template](https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files#the-rules-template)).
-
-## Projects
-
-One install serves several projects, each with its own index and memory store; recall, the hooks and the
-work queue see only the active project. A shared user layer is imported into every project.
-
-**One repository.** Open Claude Code in it and answer yes, or run:
-
-```sh
-atlas settings add-project --vault .      # or --vault-at FOLDER; without either, no vault
-```
-
-**A folder of repositories.** Open Claude Code in the folder that holds them (each one level down). atlas
-offers to make it a project, or run:
-
-```sh
-atlas settings add-project --new .
-```
-
-That writes `atlas.project.json`, listing each repository by path and remote, and creates the project's vault
-beside atlas's configuration (`--vault-at FOLDER` for another folder, `--no-vault` for none); commit the file so the whole team
-gets the same layout. Describe how the repositories relate, and a prompt that names one gets its role and
-neighbours, while recall puts records about the repository you are working in first:
-
-```json
-{
-  "name": "acme",
-  "repos": [
-    {"name": "billing", "path": "billing", "role": "invoices and payments", "talks_to": ["auth", "ledger"]},
-    {"name": "gateway", "path": "gateway", "role": "public API edge", "talks_to": ["billing"]},
-    {"name": "ledger", "remote": "https://git.example/acme/ledger"}
-  ]
-}
-```
-
-On a fresh install, `add-project --new` first moves the current setup into a project of its own (shown, backed
-up, and reversed by the same `atlas settings undo`). In a terminal it asks for that project's name; otherwise the
-name is the folder holding `atlas.json`, made a valid project name (`-2` if the new project takes it). An existing
-setup moves into a project of another name with `atlas settings migrate-projects NAME`. Everything else is on
+Setup questions, several repositories in one project, building from source and uninstalling are on
+[Install and setup](https://github.com/bloodfeast/atlas/wiki/Install-and-setup) and
 [Projects and multi-repo](https://github.com/bloodfeast/atlas/wiki/Projects-and-multi-repo).
 
-## Minimal configuration
+## What it saves
 
-`atlas.json`, with relative paths taken from its folder. Every key is checked, so a misspelt key is an error.
+Every turn re-reads the whole context, so output that enters early is paid for on every later turn. Before
+atlas, shell reads were 36% of what a builder session processed and startup context another 35%; those are
+what atlas cuts. Measured:
 
-```json
-{
-  "vaults": [{"name": "notes", "path": "../Notes"}],
-  "sources": [{"name": "docs", "root": "../my-project", "include": ["**/*.md"], "exclude": ["target/**"]}],
-  "code": {"roots": [{"name": "app", "root": "../my-project"}]}
-}
-```
+| What | Measured | Turned on by | Method |
+|---|---|---|---|
+| Lookups | 6.2x fewer tokens than grep and file reads (ratio of sums over 7,971 answers on one store; 10.6x median), at v0.8.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Memory questions | 100 of 100 answered, median 506 tokens each, on the 100-question memory eval, at v0.8.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| The tool list, in every session | 14 tools in 6,042 bytes (about 1,510 tokens), down from 47 tools and 5,930 tokens; a test holds the budget | always | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Recall on each prompt | 1 of 30 off-topic prompts gets a record; about 50 tokens injected per prompt over a 303-prompt replay, at v0.8.0 | `recall.budget_tokens` 600, `recall.cos_floor` 0.53 and `recall.inject_floor` 0.60, the defaults | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Weak injections | 2,739 low-cosine pointers dropped, about 27k tokens a week over 14 days of one store, memory eval unchanged, at v0.9.0 | `recall.inject_floor` 0.60, the default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Subagent start | about 210 tokens against 649 for the default, informing 18 needs against 1 on 30 real launches, at v0.9.0 | `"recall": {"subagent_context": "binding"}`, off by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
 
-Vaults are folders atlas may add to; sources are folders it only indexes; code roots feed `symbol`. After an
-edit, run `/mcp` and reconnect atlas, or restart Claude Code. Every key is on
-[Configuration reference](https://github.com/bloodfeast/atlas/wiki/Configuration-reference).
+`atlas --token-report` measures your own store the same way, against your Claude Code transcripts from before
+atlas: a summary in about 15 lines, and the full report with `--verbose`.
 
-## Security in brief
+## Safe by construction
 
-- **Local only.** One process over stdio. No HTTP client or DNS in the code or its dependencies, and one socket:
-  `atlas pr-events serve`, run only from the command line, listens on 127.0.0.1 for signed GitHub events and
-  never connects out; the events reach it through `gh webhook forward`, which it starts with `gh`. Nothing
-  reaches the network at query time. The model download at setup and the update
-  check go through the system `curl`, to pinned `https` URLs, and are verified (SHA-256, and an ed25519
-  signature for updates).
-- **Confined.** Every path is checked to stay inside a configured folder, lexically and after resolving links;
-  dot folders are refused.
-- **A fixed deny-list.** `.env*`, keys, keystores and credential files are never read, whatever the
-  configuration says: not in a source, not in a vault (nor written there), not by `atlas digest` or `atlas crop`.
-  A file Claude Code reads with such a name is never kept as a handle, and neither is the output of a shell command,
-  `atlas run` or Grep that names one. That catches named files only, since a shell command can hide a path.
-- **Nothing lost.** No delete or rename tool exists; writes are additive or exact, atomic and audited with a
-  stated reason. The memory store is append-only.
+- **Local only.** One process over stdio, with no HTTP client in the code or its dependencies. The model
+  download and the update check go through the system `curl` to pinned `https` URLs and are verified.
+- **Confined.** Every path stays inside a configured folder. `.env*`, keys and credential files are never read,
+  whatever the configuration says.
+- **Nothing lost.** There is no delete or rename tool; writes are additive, atomic and audited, and the memory
+  store is append-only.
 
-The threat model and every defence are on [Security model](https://github.com/bloodfeast/atlas/wiki/Security-model).
-Report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes.
+The threat model is on [Security model](https://github.com/bloodfeast/atlas/wiki/Security-model). Report
+vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## Documentation
 
-The wiki is the full manual:
+The wiki is the full manual.
 
-- [Overview](https://github.com/bloodfeast/atlas/wiki/Overview): what atlas is and the rules it is built to
-- [Install and setup](https://github.com/bloodfeast/atlas/wiki/Install-and-setup): install, updates, uninstall, build from source
-- [Configuration reference](https://github.com/bloodfeast/atlas/wiki/Configuration-reference): every key of `atlas.json`
-- [Projects and multi-repo](https://github.com/bloodfeast/atlas/wiki/Projects-and-multi-repo): scoped projects and repository graphs
-- [Token savings and method](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method): where the tokens go and how it is measured
-- [Handles and digests](https://github.com/bloodfeast/atlas/wiki/Handles-and-digests): routing, `recall h:ID`, `atlas run`
-- [Tools reference](https://github.com/bloodfeast/atlas/wiki/Tools-reference): every MCP tool and the answer format
-- [Code index](https://github.com/bloodfeast/atlas/wiki/Code-index): `symbol`, item ranges and language coverage
-- [Semantic search](https://github.com/bloodfeast/atlas/wiki/Semantic-search): the owned embedder and hybrid search
-- [Identifiers and freshness](https://github.com/bloodfeast/atlas/wiki/Identifiers-and-freshness): the registry, freshness and misses
-- [Memory store and hooks](https://github.com/bloodfeast/atlas/wiki/Memory-store-and-hooks): the store, exports, sync and the hooks
-- [Memory tree](https://github.com/bloodfeast/atlas/wiki/Memory-tree): the memory index as a tree
-- [Memory and rule files](https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files): experimental, off by default: what atlas does with your rules and memories once you turn it on, and how to turn it off
-- [Orchestration](https://github.com/bloodfeast/atlas/wiki/Orchestration): orchestrated mode: lanes, kinds and caps, starter resources
-- [Discussions](https://github.com/bloodfeast/atlas/wiki/Discussions): reviewer threads and the decision queue
-- [Generated indices](https://github.com/bloodfeast/atlas/wiki/Generated-indices): indices between markers
-- [Cross-vault links](https://github.com/bloodfeast/atlas/wiki/Cross-vault-links): links between vaults
-- [Security model](https://github.com/bloodfeast/atlas/wiki/Security-model): threat model and defences
-- [SQLite store](https://github.com/bloodfeast/atlas/wiki/SQLite-store): the database and the audit log
-- [Testing and coverage](https://github.com/bloodfeast/atlas/wiki/Testing-and-coverage): the suite, adversarial tests, coverage
-- [Releasing](https://github.com/bloodfeast/atlas/wiki/Releasing): the changelog rule, release notes and the wiki
-- [Changelog](https://github.com/bloodfeast/atlas/wiki/Changelog): every release
+- **Getting started:** [Overview](https://github.com/bloodfeast/atlas/wiki/Overview) ·
+  [Install and setup](https://github.com/bloodfeast/atlas/wiki/Install-and-setup) ·
+  [Configuration reference](https://github.com/bloodfeast/atlas/wiki/Configuration-reference) ·
+  [Reference configuration](https://github.com/bloodfeast/atlas/wiki/Reference-configuration) ·
+  [Projects and multi-repo](https://github.com/bloodfeast/atlas/wiki/Projects-and-multi-repo)
+- **What it saves:** [Token savings and method](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method) ·
+  [Handles and digests](https://github.com/bloodfeast/atlas/wiki/Handles-and-digests)
+- **Reference:** [Tools reference](https://github.com/bloodfeast/atlas/wiki/Tools-reference) ·
+  [Code index](https://github.com/bloodfeast/atlas/wiki/Code-index) ·
+  [Semantic search](https://github.com/bloodfeast/atlas/wiki/Semantic-search) ·
+  [Identifiers and freshness](https://github.com/bloodfeast/atlas/wiki/Identifiers-and-freshness) ·
+  [Memory store and hooks](https://github.com/bloodfeast/atlas/wiki/Memory-store-and-hooks) ·
+  [Memory tree](https://github.com/bloodfeast/atlas/wiki/Memory-tree) ·
+  [Memory and rule files](https://github.com/bloodfeast/atlas/wiki/Memory-and-rule-files) ·
+  [Orchestration](https://github.com/bloodfeast/atlas/wiki/Orchestration) ·
+  [Discussions](https://github.com/bloodfeast/atlas/wiki/Discussions) ·
+  [Project tracking](https://github.com/bloodfeast/atlas/wiki/Project-tracking) ·
+  [Generated indices](https://github.com/bloodfeast/atlas/wiki/Generated-indices) ·
+  [Cross-vault links](https://github.com/bloodfeast/atlas/wiki/Cross-vault-links)
+- **Internals:** [Security model](https://github.com/bloodfeast/atlas/wiki/Security-model) ·
+  [SQLite store](https://github.com/bloodfeast/atlas/wiki/SQLite-store) ·
+  [Testing and coverage](https://github.com/bloodfeast/atlas/wiki/Testing-and-coverage) ·
+  [Releasing](https://github.com/bloodfeast/atlas/wiki/Releasing) ·
+  [Changelog](https://github.com/bloodfeast/atlas/wiki/Changelog)
 
 ## License
 

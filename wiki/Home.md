@@ -10,6 +10,7 @@ The README is the front page; this wiki is the whole manual.
 - [[Overview]]: what atlas is, what it is not, and the rules it is built to.
 - [[Install and setup]]: the plugin, first run, updates, uninstalling, building from source.
 - [[Configuration reference]]: every key of `atlas.json`.
+- [[Reference configuration]]: a complete configuration for atlas as Claude's memory, and how to check it.
 - [[Projects and multi-repo]]: one install, scoped projects, repositories by path or remote.
 
 ## What it saves

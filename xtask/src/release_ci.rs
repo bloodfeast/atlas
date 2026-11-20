@@ -1633,6 +1633,119 @@ pub(crate) mod tests {
     /// multi-platform index digest.
     const BULLSEYE: &str = "debian:bullseye@sha256:6f519a81440354a85eb592c5f32109ab80605f6b892455983a6f618bf87fabe9";
 
+    /// The dependency cache, `Swatinem/rust-cache` v2.9.3, at this commit: a
+    /// bump edits the workflows and this line.
+    const RUST_CACHE_SHA: &str = "d1527c8f67ef9af357290475d4af4b0fab8f12e0";
+    const RUST_CACHE: (&str, &str) = ("Swatinem/rust-cache", RUST_CACHE_SHA);
+    /// cargo-nextest's installer, `taiki-e/install-action` v2.90.1 (it
+    /// checks the download's checksum), public CI only.
+    const INSTALL_ACTION: (&str, &str) = ("taiki-e/install-action", "c509219cf42fba86913069efd0ade2458c59337b");
+    /// The Windows test job's Dev Drive, `samypr100/setup-dev-drive` v4.1.0,
+    /// public CI only.
+    const DEV_DRIVE: (&str, &str) = ("samypr100/setup-dev-drive", "562171fe8df7401fdf582d766cd3b6ab80d5b1a0");
+
+    /// The third-party actions each workflow may use, each at its one
+    /// commit. The rule (Brandon, 2026-11-19: "Allow cache, not leak job"):
+    /// the public ci.yml the three above, dev-pr.yml the cache, and none in
+    /// release-pr.yml (its leak job holds the denylist) or release.yml (a
+    /// published binary is built from clean).
+    fn third_party_allowed(file: &str) -> &'static [(&'static str, &'static str)] {
+        match file.rsplit('/').next().unwrap_or(file) {
+            "ci.yml" => &[RUST_CACHE, INSTALL_ACTION, DEV_DRIVE],
+            "dev-pr.yml" => &[RUST_CACHE],
+            _ => &[],
+        }
+    }
+
+    /// Every `uses:` line of `text` names one of GitHub's own actions or
+    /// one of `allowed` at its commit, pinned by a full commit SHA with its
+    /// version named.
+    fn action_policy(file: &str, text: &str, allowed: &[(&str, &str)]) -> Result<(), String> {
+        for l in text.lines().filter(|l| l.trim_start().starts_with("uses:") || l.trim_start().starts_with("- uses:")) {
+            let spec = l.split("uses:").nth(1).unwrap_or_default().trim();
+            let (action, rest) = spec.split_once('@').ok_or_else(|| format!("{file}: not pinned: {l}"))?;
+            let sha = rest.split_whitespace().next().unwrap_or_default();
+            let listed = allowed.iter().any(|&(a, s)| a == action && s == sha);
+            if !(action.starts_with("actions/") || listed) {
+                return Err(format!("{file}: only GitHub's own actions: {l}"));
+            }
+            if !(sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())) {
+                return Err(format!("{file}: not pinned by SHA: {l}"));
+            }
+            if !rest.contains("# v") {
+                return Err(format!("{file}: the pinned version is named: {l}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The public CI (ci.yml, exported) uses GitHub's own actions and
+    /// exactly the three [`third_party_allowed`] names, each at its one
+    /// commit (a tag, another commit or any other action fails); it holds no
+    /// secret, reads the contents only, keeps no credential in a checkout,
+    /// saves a cache from main only, and reports every failing test of a
+    /// run. Brandon, 2026-11-19: "Allow cache, not leak job".
+    #[test]
+    fn the_public_ci_is_pinned_read_only_and_cached_from_main() {
+        let root = repo_root();
+        let ci = read_text(&root.join(".github/workflows/ci.yml")).unwrap();
+        action_policy("ci.yml", &ci, third_party_allowed("ci.yml")).unwrap();
+        assert!(
+            !ci.contains("secrets.") && !ci.contains("secrets[") && !ci.contains("pull_request_target"),
+            "ci.yml: no secret, no pull_request_target"
+        );
+        assert!(ci.contains("permissions:\n  contents: read\n") && !ci.contains(": write"), "ci.yml: a read-only token");
+        let checkouts = ci.matches("uses: actions/checkout@").count();
+        assert!(
+            checkouts > 0 && ci.matches("persist-credentials: false").count() == checkouts,
+            "ci.yml: every checkout drops its credential"
+        );
+        // A pull request (a fork's too) restores main's cache and saves none,
+        // so no pull request can plant what main or another one builds from.
+        let caches = ci.matches(&format!("uses: Swatinem/rust-cache@{RUST_CACHE_SHA} # v2.9.3")).count();
+        assert!(
+            caches >= 2 && ci.matches("save-if: ${{ github.ref == 'refs/heads/main' }}").count() == caches,
+            "ci.yml: every cache saves from main only"
+        );
+        // Every failure in one run, and the doc tests nextest does not run.
+        assert!(
+            ci.contains("cargo nextest run --workspace --cargo-profile ci --locked --no-fail-fast")
+                && ci.contains("cargo test --workspace --profile ci --locked --doc"),
+            "ci.yml: nextest, no fail-fast, doc tests"
+        );
+        assert!(ci.contains("tool: cargo-nextest@") && ci.contains("fallback: none"), "ci.yml: a pinned nextest, never built from source");
+        assert!(!ci.contains("sccache") && !ci.contains("RUSTC_WRAPPER"), "ci.yml: no compiler wrapper");
+        assert!(!ci.contains("actions/cache"), "ci.yml: no cache but rust-cache");
+        // release.yml (exported, so checked here too) builds from clean.
+        let release = read_text(&root.join(".github/workflows/release.yml")).unwrap();
+        for c in ["rust-cache", "actions/cache", "sccache", "RUSTC_WRAPPER"] {
+            assert!(!release.contains(c), "release.yml builds from clean: {c}");
+        }
+
+        let checkout = "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
+        let pin = format!("      - uses: Swatinem/rust-cache@{RUST_CACHE_SHA} # v2.9.3\n");
+        let install = format!("        uses: {}@{} # v2.90.1\n", INSTALL_ACTION.0, INSTALL_ACTION.1);
+        let other = "      - uses: someone/thing@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v1\n";
+        let ci_ok = third_party_allowed("ci.yml");
+        assert!(action_policy("ci.yml", checkout, ci_ok).is_ok());
+        assert!(action_policy("ci.yml", &pin, ci_ok).is_ok() && action_policy("ci.yml", &install, ci_ok).is_ok());
+        assert!(action_policy("ci.yml", "      - uses: Swatinem/rust-cache@v2\n", ci_ok).is_err(), "a tag");
+        assert!(action_policy("ci.yml", &pin.replace("d1527c8f", "00000000"), ci_ok).is_err(), "another commit");
+        assert!(action_policy("ci.yml", other, ci_ok).is_err(), "any unlisted action");
+        assert!(action_policy("ci.yml", &pin.replace(" # v2.9.3", ""), ci_ok).is_err(), "the version unnamed");
+        // dev-pr.yml: the cache only; release-pr.yml and release.yml nothing.
+        assert!(action_policy("dev-pr.yml", &pin, third_party_allowed("dev-pr.yml")).is_ok());
+        assert!(action_policy("dev-pr.yml", &install, third_party_allowed("dev-pr.yml")).is_err());
+        assert!(
+            action_policy(".github/workflows/release-pr.yml", &pin, third_party_allowed(".github/workflows/release-pr.yml")).is_err(),
+            "the leak job builds from clean"
+        );
+        assert!(
+            action_policy(".github/workflows/release.yml", &pin, third_party_allowed(".github/workflows/release.yml")).is_err(),
+            "release.yml builds from clean"
+        );
+    }
+
     /// The release workflows read as the rules say: every action pinned by
     /// a full commit SHA, no `pull_request_target`, no token permission by
     /// default and each job's own, every job gated to its repository (or
@@ -1652,13 +1765,10 @@ pub(crate) mod tests {
             assert!(!text.contains('\t'), "{file}: a tab");
             assert!(!text.contains("pull_request_target"), "{file}: pull_request_target");
             assert!(text.lines().any(|l| l == "permissions: {}"), "{file}: the token's default must be no permission");
-            for l in text.lines().filter(|l| l.trim_start().starts_with("uses:") || l.trim_start().starts_with("- uses:")) {
-                let spec = l.split("uses:").nth(1).unwrap().trim();
-                let (action, rest) = spec.split_once('@').unwrap_or_else(|| panic!("{file}: {l}"));
-                let sha = rest.split_whitespace().next().unwrap();
-                assert!(action.starts_with("actions/"), "{file}: only GitHub's own actions: {l}");
-                assert!(sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "{file}: not pinned by SHA: {l}");
-                assert!(rest.contains("# v"), "{file}: the pinned version is named: {l}");
+            // One exception: the dependency cache in the pull request check;
+            // never in release-pr.yml or release.yml.
+            if let Err(e) = action_policy(file, &text, third_party_allowed(file)) {
+                panic!("{e}");
             }
             // Every container is pinned by digest, the same image everywhere.
             for l in text.lines().filter(|l| l.trim_start().starts_with("container:")) {
@@ -1819,6 +1929,11 @@ pub(crate) mod tests {
         assert!(pr.lines().any(|l| l.trim() == "needs: linux-leak"), "release-pr.yml: the pull request waits on the Linux leak check");
         assert!(leak.contains("container: debian:bullseye") && leak.contains("CARGO_PROFILE_RELEASE_STRIP: symbols") && leak.contains("ATLAS_RELEASE_BUILD: 1"));
         assert!(leak.contains("TARGET: x86_64-unknown-linux-gnu") && !leak.contains("upload-artifact"), "release-pr.yml: the x86_64 build, nothing uploaded");
+        // The job that holds the denylist builds from clean ("Allow cache,
+        // not leak job", Brandon 2026-11-19).
+        for c in ["rust-cache", "actions/cache", "sccache", "RUSTC_WRAPPER"] {
+            assert!(!text.contains(c), "release-pr.yml builds uncached: {c}");
+        }
         // The build step's script is release.yml's, line for line.
         let script = |b: &str| -> String {
             let from = b.find("set -eu").unwrap_or_else(|| panic!("no build script: {b}"));
@@ -1873,6 +1988,15 @@ pub(crate) mod tests {
         assert_eq!(clippy.len(), 2, "ci.yml's clippy runs");
         for c in clippy {
             assert!(check.lines().any(|l| l.trim() == c), "dev-pr.yml lacks ci.yml's {c}");
+        }
+        // Dependencies are cached here and in the public CI, never in the
+        // release pull request's leak build or a real release.
+        let cache = format!("uses: Swatinem/rust-cache@{RUST_CACHE_SHA} # v2.9.3");
+        assert!(check.contains(&cache) && check.contains(" git zstd >/dev/null"), "dev-pr.yml: the cache, and zstd for it in the container");
+        assert!(!check.contains("save-if:") && !check.contains("cache-workspace-crates:"), "dev-pr.yml: the action's defaults");
+        let release = read_text(&root.join(".github/workflows/release.yml")).unwrap();
+        for c in ["rust-cache", "actions/cache", "sccache", "RUSTC_WRAPPER"] {
+            assert!(!release.contains(c), "release.yml builds cold: {c}");
         }
     }
 

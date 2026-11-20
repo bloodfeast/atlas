@@ -381,7 +381,7 @@ fn revise_meta(w: &mut crate::memory::Writer<'_>, key: &str, h: &crate::memory::
 
 fn head_in(w: &crate::memory::Writer<'_>, key: &str) -> Result<crate::memory::Head> {
     w.head(key).map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("idea {key:?}")),
+        e if crate::db::is_no_rows(&e) => Error::NotFound(format!("idea {key:?}")),
         e => e.into(),
     })
 }
@@ -697,7 +697,7 @@ fn drain_with(store: &mut MemoryStore, dir: &Path, max: usize, retries: &mut Ret
 fn quick<T>(store: &mut MemoryStore, f: impl FnOnce(&mut MemoryStore) -> Result<T>) -> Result<T> {
     let _ = store.conn().busy_timeout(QUICK);
     let r = f(store);
-    let _ = store.conn().busy_timeout(crate::memory::BUSY_TIMEOUT);
+    let _ = crate::hook_budget::bound(store.conn());
     r
 }
 

@@ -563,6 +563,11 @@ fn split(n: usize, g: usize) -> Vec<(usize, usize)> {
     (0..g).map(|i| (i * n / g, (i + 1) * n / g)).filter(|(a, b)| a < b).collect()
 }
 
+/// The card's group header. It promises only the text: a group of one
+/// piece replies with that piece and no digest, and a longer group's
+/// digest covers only its later pieces.
+const GROUPS_HEAD: &str = "groups (recall a key for its text):\n";
+
 /// Groups `recs` into the most groups whose listing fits `CARD_CAP`,
 /// then checks each group's reply against [`CAP`] with its own `next:`
 /// line counted ([`group_est`]); where a group's reply would not fit, more
@@ -578,7 +583,7 @@ fn listing_within(s8: &str, recs: &[Rec], card_cap: usize) -> String {
     let cands: Vec<Vec<String>> = recs.iter().map(|r| names(&r.text)).collect();
     let build = |g: usize| {
         let mut groups = Vec::new();
-        let mut text = String::from("groups (recall a key for its digest and text):\n");
+        let mut text = String::from(GROUPS_HEAD);
         for (a, b) in split(ps.len(), g) {
             let key = if b - a == 1 { ps[a].key.clone() } else { range_key(s8, &recs[ps[a].first..=ps[b - 1].last]) };
             let first = ps[a].first;
@@ -1513,6 +1518,36 @@ mod tests {
             let r = resolve_parts(&d, g).unwrap();
             assert!(!r.is_cut() && est(&r.text) <= CAP, "{g}: {} est", est(&r.text));
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The group header promises nothing a recall of its keys lacks: over
+    /// a card of one one-piece group (no digest) and one of multi-piece
+    /// groups (a digest of the later pieces), every key's reply holds its
+    /// first piece's text, and the header names a digest only if every
+    /// reply carries one.
+    #[test]
+    fn the_group_header_claims_only_what_every_reply_holds() {
+        let d = dir("head-claim");
+        let p = d.join("gggggggg-9999.jsonl");
+        std::fs::write(&p, big_session(60).join("\n") + "\n").unwrap();
+        let recs = records(&std::fs::read(&p).unwrap(), 0);
+        let (mut one, mut multi) = (0, 0);
+        for card in [listing("gggggggg", &recs[..1]), listing_within("gggggggg", &recs[..60], 160)] {
+            let head = card.lines().next().unwrap();
+            assert_eq!(format!("{head}\n"), GROUPS_HEAD);
+            for g in card.lines().filter_map(|l| l.strip_prefix("- turn:")).map(|l| format!("turn:{}", l.split(' ').next().unwrap())) {
+                let r = resolve_parts(&d, &g).unwrap();
+                assert!(r.text.contains("record ") && r.text.contains("src/rec_"), "{g}: the text");
+                if r.digest.is_none() {
+                    one += 1;
+                    assert!(!head.contains("digest"), "{head:?} promises a digest {g} lacks");
+                } else {
+                    multi += 1;
+                }
+            }
+        }
+        assert!(one > 0 && multi > 0, "both group shapes: {one} one-piece, {multi} with a digest");
         let _ = std::fs::remove_dir_all(&d);
     }
 

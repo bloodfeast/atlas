@@ -153,7 +153,13 @@ fn indexed(t: &Temp) -> (IndexReport, Server) {
     write(&root.join("py/client.py"), CLIENT_PY);
     let db = t.path().join("state/atlas.sqlite");
     let spec = atlas::config::CodeSpec {
-        roots: vec![atlas::config::CodeRootSpec { name: "shop".into(), root, build_scripts: false, scip: Default::default() }],
+        roots: vec![atlas::config::CodeRootSpec {
+            name: "shop".into(),
+            root,
+            build_scripts: false,
+            scip: Default::default(),
+            exclude: Vec::new(),
+        }],
         debounce_s: Some(0),
         ..Default::default()
     };
@@ -161,7 +167,7 @@ fn indexed(t: &Temp) -> (IndexReport, Server) {
     code.defer_on_cargo = false;
     code.indexers = Indexers::Off("off in tests".into());
     drop(atlas::store::Store::open(&db, vaults(&db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&db).unwrap();
+    let mut conn = atlas::db::Connection::open(&db).unwrap();
     let rep = code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
     let mut s = Server::new(atlas::store::Store::open(&db, vaults(&db)).unwrap());
     s.set_code(CodeState { setup: code, indexer: None });

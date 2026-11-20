@@ -40,8 +40,8 @@ fn cached(s: &Server) -> i64 {
     s_conn(s).query_row("SELECT COUNT(*) FROM vec_cache", [], |r| r.get(0)).unwrap()
 }
 
-fn s_conn(s: &Server) -> rusqlite::Connection {
-    rusqlite::Connection::open(&s.semantic().unwrap().db).unwrap()
+fn s_conn(s: &Server) -> atlas::db::Connection {
+    atlas::db::Connection::open(&s.semantic().unwrap().db).unwrap()
 }
 
 #[test]

@@ -176,7 +176,7 @@ fn answers(sources: &[PathBuf]) -> Vec<(String, String, Option<archive::AsOf>)> 
     let keys = archive::keys(sources).unwrap();
     let mut times: Vec<String> = vec!["0000".into(), "9999".into()];
     for p in sources {
-        let c = rusqlite::Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let c = atlas::db::Connection::open_with_flags(p, atlas::db::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let mut st = c.prepare("SELECT time FROM versions UNION SELECT time FROM supersedes").unwrap();
         for t in st.query_map([], |r| r.get::<_, String>(0)).unwrap() {
             let t = t.unwrap();
@@ -270,7 +270,7 @@ fn a_damaged_snapshot_is_not_folded_or_removed() {
     let a = snapshot(&store, &dir, u64::MAX).unwrap().unwrap();
     let b = snapshot(&store, &dir, u64::MAX).unwrap().unwrap();
     {
-        let c = rusqlite::Connection::open(&a.path).unwrap();
+        let c = atlas::db::Connection::open(&a.path).unwrap();
         c.execute_batch("DROP TRIGGER versions_no_update; UPDATE versions SET body = body || 'x' WHERE vid = 1;").unwrap();
     }
     let e = archive::roll_up(&dir, 0, Some(&b.path)).unwrap_err().to_string();
@@ -350,7 +350,7 @@ fn recall_answers_carry_a_counterfactual_and_writes_do_not() {
     s.answer("journal", &json!({"lane": "L-1", "entry": "note", "text": "a note"})).unwrap();
     // Dropping the server joins the ledger thread, so every row is written.
     drop(s);
-    let conn = rusqlite::Connection::open(&fx.db).unwrap();
+    let conn = atlas::db::Connection::open(&fx.db).unwrap();
     let rows: Vec<(String, Option<i64>, Option<i64>)> = conn
         .prepare("SELECT tool, grep, read FROM token_log ORDER BY id")
         .unwrap()
@@ -629,7 +629,7 @@ fn the_transcript_source_is_off_by_default_and_serves_this_project_only() {
         std::fs::write(p, format!("{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n{rec}\n")).unwrap();
     }
     std::fs::create_dir_all(f.settings.index_db.parent().unwrap()).unwrap();
-    let conn = rusqlite::Connection::open(&f.settings.index_db).unwrap();
+    let conn = atlas::db::Connection::open(&f.settings.index_db).unwrap();
     atlas::transcripts::index(&conn, &mine).unwrap();
     atlas::transcripts::index(&conn, &theirs).unwrap();
     let hash = atlas::transcripts::get(&conn, &here, "abcdef12", 2).unwrap().unwrap().hash;
@@ -1495,5 +1495,29 @@ fn review_meta_shapes_from_issue_232() {
     for meta in ["role: cost\npr: api#930\nhead: 1badb68a\nverdict: merge with follow-ups", "role: cost\npr: api #930\nhead: 1badb68a\nverdict: merge with follow-ups"] {
         let out = s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": meta})).unwrap().into_text();
         assert!(out.starts_with("ok journal:P:") && !out.contains("names no repo"), "{meta:?}: {out}");
+    }
+}
+
+/// #325: a review filed with GitHub's words is stored with the canonical
+/// verdict; an unknown word is refused with the list.
+#[test]
+fn a_review_in_github_s_words_is_filed_canonical() {
+    let f = fixture("mem-review-github-words");
+    drop(import_all(&f));
+    let (mut s, _fx) = server(&f);
+    let cases = [("APPROVED", "verdict: pass"), ("changes_requested", "verdict: request changes")];
+    let mut keys = Vec::new();
+    for (word, _) in cases {
+        let meta = format!("role: cost\npr: api#930\nhead: 1badb68a\nverdict: {word}");
+        let out = s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": meta})).unwrap().into_text();
+        keys.push(out.strip_prefix("ok ").and_then(|o| o.split_whitespace().next()).unwrap_or_else(|| panic!("{out}")).to_string());
+    }
+    let e = s.answer("journal", &json!({"lane": "P", "entry": "review", "text": "t", "meta": "role: cost\npr: api#930\nhead: 1badb68a\nverdict: lgtm"})).unwrap_err().to_string();
+    assert!(e.contains("unknown verdict") && e.contains("request changes"), "{e}");
+    drop(s);
+    let store = MemoryStore::open(&f.settings.store).unwrap();
+    for ((word, canon), key) in cases.iter().zip(&keys) {
+        let h = store.head(key).unwrap().unwrap();
+        assert!(h.meta.contains(canon) && !h.meta.contains(word), "{word}: {}", h.meta);
     }
 }

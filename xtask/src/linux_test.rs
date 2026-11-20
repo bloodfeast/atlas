@@ -2,7 +2,7 @@
 //! inside a Docker Linux container, before a pull request is opened.
 //!
 //! ```text
-//! cargo xtask linux-test [--debug] [--no-clippy] [--image IMAGE] [-- TEST_ARGS...]
+//! cargo xtask linux-test [--debug] [--no-clippy] [--no-cache] [--cpus N] [--image IMAGE] [--no-default-features] [--features LIST] [-- TEST_ARGS...]
 //! cargo xtask linux-test --clean [--all]
 //! ```
 //!
@@ -18,16 +18,21 @@
 //! sha256 checked before it is unpacked):
 //!
 //! 1. the tests as `cargo xtask test-gate` runs them, in release: `cargo
-//!    nextest run --workspace --locked --no-fail-fast --test-threads 16
-//!    --release`, going on past a failing test so one run reports every
-//!    failure (`--debug` drops `--release`; arguments after `--` go to the
-//!    tests in libtest's form, a filter for example);
+//!    nextest run --workspace --locked --no-fail-fast --test-threads T
+//!    --release`, T the CPUs below but at least 16, going on past a failing
+//!    test so one run reports every failure (`--debug` drops `--release`; arguments after
+//!    `--` go to the tests in libtest's form, a filter for example);
 //! 2. `cargo test --workspace --locked --doc --release`, the doc tests,
 //!    which nextest does not run (the same arguments after `--`);
 //! 3. `cargo +<channel> clippy --workspace --locked --all-targets --features
 //!    atlas/dev -- -D warnings` and
 //! 4. `cargo +<channel> clippy --workspace --locked -- -D warnings`, the
 //!    public CI's `clippy` job (`--no-clippy` skips both).
+//!
+//! `--no-default-features` and `--features LIST` (names separated by commas)
+//! go on all four lines, for a feature set the public CI does not build:
+//! the owned SQLite backend is `--no-default-features --features
+//! atlas/owned-sqlite`. The first clippy line keeps its `atlas/dev`.
 //!
 //! The checkout is mounted read-only at `/src`; nothing in it is written
 //! (nextest's store, `target/nextest` under the workspace root whatever
@@ -40,10 +45,27 @@
 //! in a named volume per checkout, `atlas-linux-target-<hash of the checkout
 //! path>`, so a second run is incremental and the host's `target` folder is
 //! never touched; each step's container is named
-//! `atlas-linux-test-<the same hash>`. The container gets 4 CPUs and
-//! `CARGO_BUILD_JOBS=4`. `--clean` removes this checkout's build volume and
-//! any temporary folder a killed run left; `--clean --all` also removes the
-//! shared `CARGO_HOME` volume (the image stays: `docker image rm` it).
+//! `atlas-linux-test-<the same hash>`. The container gets N CPUs,
+//! `CARGO_BUILD_JOBS=N` and max(N, 16) test threads (see [`test_threads`]):
+//! `--cpus N`, else
+//! `ATLAS_LINUX_TEST_CPUS=N`, else 4; a whole number of 1 or more, lowered
+//! with a note to the Docker VM's CPU count when above it. A scheduler that
+//! grants this run cores should pass the same number.
+//!
+//! Every rustc call of the test steps goes through the pinned sccache the
+//! image carries (`RUSTC_WRAPPER=sccache`; the clippy steps run without it,
+//! see [`step_cached`]), its cache on one more named volume shared by
+//! every checkout, `atlas-linux-sccache` (`SCCACHE_DIR`, capped at
+//! [`SCCACHE_CACHE_SIZE`]), so a new checkout's fresh build volume takes the
+//! dependencies another checkout already compiled from the cache instead of
+//! compiling them again. Each step stops its sccache server before its
+//! container goes (so the cache writes land) and the run ends with the
+//! cache's hits and misses. `--no-cache`, or `ATLAS_LINUX_TEST_NO_CACHE` set
+//! to anything but empty or `0`, runs without it.
+//!
+//! `--clean` removes this checkout's build volume and any temporary folder a
+//! killed run left; `--clean --all` also removes the shared `CARGO_HOME`
+//! and sccache volumes (the image stays: `docker image rm` it).
 //!
 //! Every step runs even when an earlier one failed, and a step that could
 //! not be run or read counts as failed; the run ends with one summary line
@@ -59,11 +81,18 @@ use std::time::{Duration, Instant};
 use crate::verify_macos::{test_line, test_totals};
 
 /// Usage line.
-pub const USAGE: &str = "usage: cargo xtask linux-test [--debug] [--no-clippy] [--image IMAGE] [-- TEST_ARGS...]
-       cargo xtask linux-test --clean [--all]";
+pub const USAGE: &str = "usage: cargo xtask linux-test [--debug] [--no-clippy] [--no-cache] [--cpus N] [--image IMAGE] [--no-default-features] [--features LIST] [-- TEST_ARGS...]
+       cargo xtask linux-test --clean [--all]
+--cpus N (or ATLAS_LINUX_TEST_CPUS=N; the flag wins): the container's CPUs and cargo's jobs, default 4
+(nextest runs max(N, 16) test threads); a scheduler that grants this run cores should pass the same number
+--no-cache (or ATLAS_LINUX_TEST_NO_CACHE=1): compile without the shared sccache volume";
 
-/// The CPUs the container may use and the jobs cargo runs in it.
+/// The CPUs the container may use and the jobs cargo runs in it, when
+/// neither `--cpus` nor [`CPUS_ENV`] says otherwise.
 pub const CPUS: u32 = 4;
+
+/// The environment variable that sets the CPUs when `--cpus` is not given.
+pub const CPUS_ENV: &str = "ATLAS_LINUX_TEST_CPUS";
 
 /// The named volume holding `CARGO_HOME`, shared by every checkout.
 pub const CARGO_HOME_VOLUME: &str = "atlas-linux-cargo-home";
@@ -76,6 +105,23 @@ pub const CARGO_HOME: &str = "/cargo-home";
 /// removes it too.
 pub const OLD_REGISTRY_VOLUME: &str = "atlas-linux-cargo";
 
+/// The named volume holding sccache's cache, shared by every checkout.
+pub const SCCACHE_VOLUME: &str = "atlas-linux-sccache";
+
+/// Where that volume is mounted, and `SCCACHE_DIR` in the container.
+pub const SCCACHE_DIR: &str = "/sccache";
+
+/// sccache's cap on that cache (`SCCACHE_CACHE_SIZE`, binary units); past
+/// it the least recently used entries go. About twice what it was seen to
+/// hold: 40 MiB (0.04 GiB) after the release tests and both clippy runs.
+pub const SCCACHE_CACHE_SIZE: &str = "80M";
+
+/// The environment variable that turns the cache off as `--no-cache` does.
+pub const NO_CACHE_ENV: &str = "ATLAS_LINUX_TEST_NO_CACHE";
+
+/// The prefix of the lines a step prints its sccache stats under.
+pub const SCCACHE_STATS_PREFIX: &str = "atlas-sccache: ";
+
 /// How long `docker version` may take to answer.
 const DOCKER_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -86,12 +132,21 @@ pub struct Args {
     pub debug: bool,
     /// Skip both clippy runs.
     pub no_clippy: bool,
+    /// Compile without the shared sccache volume.
+    pub no_cache: bool,
     /// Remove this checkout's build volume and stop.
     pub clean: bool,
     /// With `clean`: the shared `CARGO_HOME` volume too.
     pub all: bool,
     /// The image instead of `rust:<channel>`.
     pub image: Option<String>,
+    /// `--no-default-features` on the test and clippy lines.
+    pub no_default_features: bool,
+    /// `--features` on the test and clippy lines: names separated by
+    /// commas.
+    pub features: Option<String>,
+    /// `--cpus` as given, checked by [`resolve_cpus`].
+    pub cpus: Option<String>,
     /// Arguments for the test binaries.
     pub test_args: Vec<String>,
 }
@@ -105,9 +160,13 @@ impl Args {
             match arg.as_str() {
                 "--debug" => a.debug = true,
                 "--no-clippy" => a.no_clippy = true,
+                "--no-cache" => a.no_cache = true,
                 "--clean" => a.clean = true,
                 "--all" => a.all = true,
                 "--image" => a.image = Some(it.next().ok_or(USAGE)?),
+                "--no-default-features" => a.no_default_features = true,
+                "--features" => a.features = Some(feature_list(&it.next().ok_or(USAGE)?)?),
+                "--cpus" => a.cpus = Some(it.next().ok_or(USAGE)?),
                 "--" => a.test_args.extend(it.by_ref()),
                 _ => return Err(USAGE.into()),
             }
@@ -115,10 +174,79 @@ impl Args {
         if a.all && !a.clean {
             return Err(USAGE.into());
         }
-        if a.clean && (a.debug || a.no_clippy || a.image.is_some() || !a.test_args.is_empty()) {
+        let build = a.debug || a.no_clippy || a.no_cache || a.image.is_some() || a.cpus.is_some() || a.no_default_features || a.features.is_some() || !a.test_args.is_empty();
+        if a.clean && build {
             return Err(USAGE.into());
         }
         Ok(a)
+    }
+
+    /// The feature flags of a cargo line; `dev` adds `atlas/dev` to the
+    /// list unless it is named already.
+    fn feature_flags(&self, dev: bool) -> Vec<String> {
+        let mut names: Vec<&str> = self.features.as_deref().map(|l| l.split(',').collect()).unwrap_or_default();
+        if dev && !names.contains(&"atlas/dev") {
+            names.push("atlas/dev");
+        }
+        let mut flags = Vec::new();
+        if self.no_default_features {
+            flags.push("--no-default-features".to_string());
+        }
+        if !names.is_empty() {
+            flags.push("--features".to_string());
+            flags.push(names.join(","));
+        }
+        flags
+    }
+}
+
+/// A `--features` value goes onto cargo's command line in the container,
+/// so it must be feature names separated by commas and nothing else.
+pub fn feature_list(list: &str) -> Result<String, String> {
+    let name =
+        |n: &str| !n.is_empty() && !n.starts_with('-') && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'/'));
+    if list.split(',').all(name) {
+        Ok(list.to_string())
+    } else {
+        Err(format!("linux-test: {list:?} is not a list of features separated by commas"))
+    }
+}
+
+/// A CPU count as `from` (`--cpus` or [`CPUS_ENV`]) gave it: a whole
+/// number of 1 or more.
+pub fn parse_cpus(v: &str, from: &str) -> Result<u32, String> {
+    match v.parse::<u32>() {
+        Ok(n) if n >= 1 && v.bytes().all(|b| b.is_ascii_digit()) => Ok(n),
+        _ => Err(format!(
+            "linux-test: {from} {v:?} is not a CPU count; give a whole number of 1 or more \
+             (above the Docker VM's CPU count it is lowered to that)"
+        )),
+    }
+}
+
+/// The CPUs asked for and where the number came from: `--cpus` wins over
+/// [`CPUS_ENV`] (trimmed, as `test-gate` trims `CARGO_BUILD_JOBS`; a blank
+/// value counts as unset), and either over [`CPUS`].
+pub fn resolve_cpus(flag: Option<&str>, env: Option<&str>) -> Result<(u32, &'static str), String> {
+    if let Some(f) = flag {
+        return parse_cpus(f, "--cpus").map(|n| (n, "--cpus"));
+    }
+    match env.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => parse_cpus(e, CPUS_ENV).map(|n| (n, CPUS_ENV)),
+        None => Ok((CPUS, "default")),
+    }
+}
+
+/// `n` lowered to the Docker VM's CPU count `ncpu` when it is above it,
+/// with the note to print when it was; an unknown count lowers nothing and
+/// says so.
+pub fn clamp_cpus(n: u32, ncpu: Option<u32>) -> (u32, Option<String>) {
+    match ncpu {
+        Some(max) if max >= 1 && n > max => {
+            (max, Some(format!("linux-test: note: {n} CPUs asked for but the Docker VM has {max}; using {max}")))
+        }
+        Some(max) if max >= 1 => (n, None),
+        _ => (n, Some(format!("linux-test: note: could not read the Docker VM's CPU count; using {n} CPUs unchecked"))),
     }
 }
 
@@ -186,25 +314,101 @@ pub fn clean_volumes(hash: &str, all: bool) -> Vec<String> {
     if all {
         v.push(CARGO_HOME_VOLUME.into());
         v.push(OLD_REGISTRY_VOLUME.into());
+        v.push(SCCACHE_VOLUME.into());
     }
     v
 }
 
-/// One step: its name and the cargo arguments.
-pub fn steps(a: &Args, channel: &str) -> Vec<(&'static str, Vec<String>)> {
+/// Whether the run compiles through sccache: not with `--no-cache`, nor
+/// with [`NO_CACHE_ENV`] set to anything but blank or `0`.
+pub fn cache_on(no_cache: bool, env: Option<&str>) -> bool {
+    !no_cache && env.map(str::trim).is_none_or(|e| e.is_empty() || e == "0")
+}
+
+/// A step's sccache hits and misses, from the stats lines it printed under
+/// [`SCCACHE_STATS_PREFIX`]; `None` when it printed none.
+pub fn sccache_counts(log: &str) -> Option<(u64, u64)> {
+    let (mut hits, mut misses) = (None, None);
+    for l in log.lines().filter_map(|l| l.strip_prefix(SCCACHE_STATS_PREFIX)) {
+        let Some((label, n)) = l.trim_end().rsplit_once(char::is_whitespace) else { continue };
+        let Ok(n) = n.parse::<u64>() else { continue };
+        match label.trim_end() {
+            "Cache hits" => hits = Some(n),
+            "Cache misses" => misses = Some(n),
+            _ => {}
+        }
+    }
+    Some((hits?, misses?))
+}
+
+/// Whether a step compiles through sccache when the cache is on: not the
+/// clippy steps, which would gain about a second, and whose results a cache
+/// could replay stale (clippy.toml is not among the inputs sccache hashes).
+pub fn step_cached(step: &str) -> bool {
+    !step.starts_with("clippy")
+}
+
+/// The run's sccache line: the hits and misses of every step together, the
+/// hit rate, and each step's own.
+pub fn sccache_line(steps: &[(&str, Option<(u64, u64)>)]) -> String {
+    let (h, m) = steps.iter().filter_map(|s| s.1).fold((0, 0), |(h, m), (sh, sm)| (h + sh, m + sm));
+    let rate = if h + m == 0 { "no compiles".to_string() } else { format!("{:.1}% hit rate", h as f64 * 100.0 / (h + m) as f64) };
+    let each: Vec<String> = steps
+        .iter()
+        .map(|(n, c)| match c {
+            Some((h, m)) => format!("{n} {h}/{m}"),
+            None => format!("{n} no stats"),
+        })
+        .collect();
+    format!("linux-test: sccache: {h} hits, {m} misses ({rate}); hits/misses by step: {}", each.join(", "))
+}
+
+/// nextest's test threads in a container of `cpus` CPUs: the CPUs, but
+/// never fewer than `test-gate`'s [`TEST_THREADS`](crate::test_gate::TEST_THREADS).
+/// Many tests wait on processes and servers of their own, so threads above
+/// the CPUs keep the CPUs busy: at 4 CPUs, 16 threads ran the suite in about
+/// 280 s against about 455 s at 4 threads. The CPUs and cargo's jobs stay N.
+pub fn test_threads(cpus: u32) -> u32 {
+    cpus.max(crate::test_gate::TEST_THREADS)
+}
+
+/// One step: its name and the cargo arguments; nextest runs
+/// [`test_threads`] threads.
+pub fn steps(a: &Args, channel: &str, cpus: u32) -> Vec<(&'static str, Vec<String>)> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     let store = ["--tool-config-file".to_string(), format!("atlas-linux-test:{NEXTEST_TOOL_CONFIG}")];
+    let features = a.feature_flags(false);
     let mut out: Vec<(&'static str, Vec<String>)> = crate::test_gate::commands(!a.debug, &store, &a.test_args)
         .into_iter()
-        .map(|(name, cmd)| (if name == "nextest" { "test" } else { name }, cmd))
+        .map(|(name, mut cmd)| {
+            // The feature flags are cargo's: they go before the `--` of the test arguments.
+            let at = cmd.iter().position(|x| x == "--").unwrap_or(cmd.len());
+            cmd.splice(at..at, features.iter().cloned());
+            // Only nextest's own flag, before any `--`: what follows `--` is
+            // the user's, for the test binaries, and the doc tests keep theirs.
+            if name == "nextest" {
+                let end = cmd.iter().position(|x| x == "--").unwrap_or(cmd.len());
+                let own = &mut cmd[..end];
+                if let Some(i) = own.iter().position(|x| x == "--test-threads") {
+                    if let Some(t) = own.get_mut(i + 1) {
+                        *t = test_threads(cpus).to_string();
+                    }
+                }
+            }
+            (if name == "nextest" { "test" } else { name }, cmd)
+        })
         .collect();
     if !a.no_clippy {
         let plus = format!("+{channel}");
-        out.push((
-            "clippy all-targets dev",
-            s(&["cargo", &plus, "clippy", "--workspace", "--locked", "--all-targets", "--features", "atlas/dev", "--", "-D", "warnings"]),
-        ));
-        out.push(("clippy default", s(&["cargo", &plus, "clippy", "--workspace", "--locked", "--", "-D", "warnings"])));
+        let clippy = |targets: &[&str], dev: bool| {
+            let mut line = s(&["cargo", &plus, "clippy", "--workspace", "--locked"]);
+            line.extend(s(targets));
+            line.extend(a.feature_flags(dev));
+            line.extend(s(&["--", "-D", "warnings"]));
+            line
+        };
+        out.push(("clippy all-targets dev", clippy(&["--all-targets"], true)));
+        out.push(("clippy default", clippy(&[], false)));
     }
     out
 }
@@ -232,37 +436,79 @@ pub fn mount(kind: &str, src: &str, dst: &str, readonly: bool) -> String {
     m
 }
 
+/// What every step's container shares.
+pub struct Container<'a> {
+    /// The checkout, mounted read-only at `/src`.
+    pub root: &'a Path,
+    /// The image the steps run in.
+    pub image: &'a str,
+    /// The container's name.
+    pub name: &'a str,
+    /// This checkout's build volume.
+    pub volume: &'a str,
+    /// The CPUs and cargo's jobs.
+    pub cpus: u32,
+    /// The git mounts.
+    pub mounts: &'a [String],
+    /// Compile through sccache on [`SCCACHE_VOLUME`].
+    pub sccache: bool,
+}
+
+/// The shell script a step runs under when the cache is on: the command,
+/// then sccache's stats under [`SCCACHE_STATS_PREFIX`], then the server
+/// stopped so its cache writes land before the container goes; the
+/// command's exit status is the step's.
+pub fn sccache_script() -> String {
+    format!(
+        "\"$@\"; rc=$?; sccache --show-stats 2>&1 | sed 's/^/{SCCACHE_STATS_PREFIX}/'; \
+         sccache --stop-server >/dev/null 2>&1; exit $rc"
+    )
+}
+
 /// The `docker run` arguments for one step.
-fn docker_args(root: &Path, image: &str, name: &str, volume: &str, mounts: &[String], cmd: &[String]) -> Vec<String> {
-    let mut v: Vec<String> = ["run", "--rm", "--init", "--name", name, "--cpus"].iter().map(|s| s.to_string()).collect();
-    v.push(CPUS.to_string());
-    let own = [
-        mount("bind", &root.to_string_lossy(), "/src", true),
+fn docker_args(c: &Container, cmd: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = ["run", "--rm", "--init", "--name", c.name, "--cpus"].iter().map(|s| s.to_string()).collect();
+    v.push(c.cpus.to_string());
+    let mut own = vec![
+        mount("bind", &c.root.to_string_lossy(), "/src", true),
         mount("volume", CARGO_HOME_VOLUME, CARGO_HOME, false),
-        mount("volume", volume, "/target", false),
+        mount("volume", c.volume, "/target", false),
     ];
-    for m in own.iter().chain(mounts) {
+    if c.sccache {
+        own.push(mount("volume", SCCACHE_VOLUME, SCCACHE_DIR, false));
+    }
+    for m in own.iter().chain(c.mounts) {
         v.push("--mount".into());
         v.push(m.clone());
     }
     // The checkout's files belong to another user on a Linux host; git
     // would call the repository dubious and refuse it.
-    let env = [
+    let mut env = vec![
         format!("CARGO_HOME={CARGO_HOME}"),
         "CARGO_TARGET_DIR=/target".to_string(),
-        format!("CARGO_BUILD_JOBS={CPUS}"),
+        format!("CARGO_BUILD_JOBS={}", c.cpus),
         "CARGO_TERM_COLOR=always".into(),
         "GIT_CONFIG_COUNT=1".into(),
         "GIT_CONFIG_KEY_0=safe.directory".into(),
         "GIT_CONFIG_VALUE_0=*".into(),
     ];
+    if c.sccache {
+        env.extend([
+            "RUSTC_WRAPPER=sccache".to_string(),
+            format!("SCCACHE_DIR={SCCACHE_DIR}"),
+            format!("SCCACHE_CACHE_SIZE={SCCACHE_CACHE_SIZE}"),
+        ]);
+    }
     for e in env {
         v.push("-e".into());
         v.push(e);
     }
     v.push("-w".into());
     v.push("/src".into());
-    v.push(image.into());
+    v.push(c.image.into());
+    if c.sccache {
+        v.extend(["sh".to_string(), "-c".to_string(), sccache_script(), "sh".to_string()]);
+    }
     v.extend(cmd.iter().cloned());
     v
 }
@@ -406,8 +652,20 @@ pub const NEXTEST_TOOL_CONFIG: &str = "/usr/local/share/atlas-linux-test/nextest
 
 /// The revision of [`dockerfile`], in the image's tag: an image built
 /// before a change to what the image carries (2: the
-/// [`NEXTEST_TOOL_CONFIG`]) is not reused.
-pub const IMAGE_REVISION: u32 = 2;
+/// [`NEXTEST_TOOL_CONFIG`]; 3: sccache) is not reused.
+pub const IMAGE_REVISION: u32 = 3;
+
+/// The sccache the image installs, pinned.
+pub const SCCACHE_VERSION: &str = "0.19.0";
+
+/// The sha256 of each Linux build of that release's prebuilt archive
+/// (`sccache-v<version>-<arch>-unknown-linux-musl.tar.gz`), as the release
+/// publishes it beside the archive; the image build refuses an archive that
+/// hashes otherwise.
+pub const SCCACHE_SHA256: [(&str, &str); 2] = [
+    ("x86_64", "aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd"),
+    ("aarch64", "3e47fc4a71b1ddd1b4294a0de9d34498922fdf41e3cd0bda5df3954e3d6deb9d"),
+];
 
 /// The local image the steps run in: `base` with the pinned clippy added,
 /// as the public CI's clippy job installs it (the official `rust` images
@@ -424,10 +682,14 @@ pub fn image_tag(base: &str, channel: &str) -> String {
 /// for the image's architecture, checked against [`NEXTEST_SHA256`] before
 /// it is unpacked into `/usr/local/bin` (`CARGO_HOME` is a volume at run
 /// time, so its `bin` would not hold it). The tool config sets nextest's
-/// store to `/target/nextest`, on the build volume.
+/// store to `/target/nextest`, on the build volume. sccache is the
+/// release's prebuilt static binary, checked against [`SCCACHE_SHA256`] the
+/// same way.
 pub fn dockerfile(base: &str, channel: &str) -> String {
     let v = NEXTEST_VERSION;
     let cases: String = NEXTEST_SHA256.iter().map(|(arch, sum)| format!("{arch}) sum={sum} ;; ")).collect();
+    let sv = SCCACHE_VERSION;
+    let scases: String = SCCACHE_SHA256.iter().map(|(arch, sum)| format!("{arch}) sum={sum} ;; ")).collect();
     format!(
         "FROM {base}\n\
          RUN rustup toolchain install {channel} --profile minimal -c clippy\n\
@@ -436,7 +698,12 @@ pub fn dockerfile(base: &str, channel: &str) -> String {
          curl -fsSL -o /tmp/$f https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{v}/$f; \
          echo \"$sum  /tmp/$f\" | sha256sum -c -; tar -xzf /tmp/$f -C /usr/local/bin; rm /tmp/$f; cargo-nextest nextest --version\n\
          RUN mkdir -p {dir} && \
-         printf '[store]\\ndir = \"/target/nextest\"\\n' > {NEXTEST_TOOL_CONFIG}\n",
+         printf '[store]\\ndir = \"/target/nextest\"\\n' > {NEXTEST_TOOL_CONFIG}\n\
+         RUN set -eu; arch=\"$(uname -m)\"; case \"$arch\" in {scases}*) echo \"no sccache build for $arch\" >&2; exit 1 ;; esac; \
+         d=sccache-v{sv}-$arch-unknown-linux-musl; \
+         curl -fsSL -o /tmp/$d.tar.gz https://github.com/mozilla/sccache/releases/download/v{sv}/$d.tar.gz; \
+         echo \"$sum  /tmp/$d.tar.gz\" | sha256sum -c -; tar -xzf /tmp/$d.tar.gz -C /usr/local/bin --strip-components=1 $d/sccache; \
+         rm /tmp/$d.tar.gz; sccache --version\n",
         dir = NEXTEST_TOOL_CONFIG.rsplit_once('/').map_or("/", |(d, _)| d)
     )
 }
@@ -588,6 +855,16 @@ fn output_within(cmd: &mut Command, limit: Duration) -> Result<Output, String> {
     }
 }
 
+/// The Docker VM's CPU count (`docker info`'s `NCPU`), or `None` when it
+/// cannot be read.
+fn docker_ncpu() -> Option<u32> {
+    let o = output_within(Command::new("docker").args(["info", "--format", "{{.NCPU}}"]), DOCKER_VERSION_TIMEOUT).ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+}
+
 fn clean(hash: &str, all: bool) -> Result<(), String> {
     let vols = clean_volumes(hash, all);
     let s = Command::new("docker").args(["volume", "rm", "-f"]).args(&vols).status().map_err(|e| format!("docker: {e}"))?;
@@ -610,6 +887,9 @@ fn clean(hash: &str, all: bool) -> Result<(), String> {
 /// Runs the command.
 pub fn run(args: Vec<String>) -> Result<(), String> {
     let a = Args::parse(args)?;
+    // `--clean` takes no `--cpus` and ignores the variable.
+    let env_cpus = if a.clean { None } else { std::env::var(CPUS_ENV).ok() };
+    let (cpus, cpus_from) = resolve_cpus(a.cpus.as_deref(), env_cpus.as_deref())?;
     let root = root();
     let hash = checkout_hash(&root.to_string_lossy(), cfg!(windows));
     let volume = target_volume(&hash);
@@ -630,14 +910,34 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     let image = ensure_image(&base, &channel)?;
     // Dropped at the end of the run, removing the run's folder.
     let (mounts, _run_dir) = git_mounts(&root, &hash)?;
-    println!("linux-test: {} in {image} (from {base}), {CPUS} CPUs, build volume {volume}", root.display());
+    // `docker info` once per run, after the image is in place.
+    let (cpus, note) = clamp_cpus(cpus, docker_ncpu());
+    if let Some(note) = note {
+        println!("{note}");
+    }
+    let sccache = cache_on(a.no_cache, std::env::var(NO_CACHE_ENV).ok().as_deref());
+    let cache = if sccache {
+        format!("sccache on (volume {SCCACHE_VOLUME}, SCCACHE_CACHE_SIZE={SCCACHE_CACHE_SIZE})")
+    } else {
+        format!("sccache off (--no-cache or {NO_CACHE_ENV})")
+    };
+    println!("linux-test: {} in {image} (from {base}), {cpus} CPUs ({cpus_from}), build volume {volume}, {cache}", root.display());
+    let mut c = Container { root: &root, image: &image, name: &name, volume: &volume, cpus, mounts: &mounts, sccache };
     let start = Instant::now();
     let mut results = Vec::new();
-    for (step, cmd) in steps(&a, &channel) {
+    let mut stats = Vec::new();
+    for (step, cmd) in steps(&a, &channel, cpus) {
         println!("linux-test: == {step}: {}", cmd.join(" "));
         let t = Instant::now();
-        let (ok, log, err) = run_step(&docker_args(&root, &image, &name, &volume, &mounts, &cmd), &name);
+        c.sccache = sccache && step_cached(step);
+        let (ok, log, err) = run_step(&docker_args(&c, &cmd), &name);
+        if c.sccache {
+            stats.push((step, sccache_counts(&log)));
+        }
         results.push(Step { name: step, ok, detail: step_detail(step, &log, err.as_deref()), secs: t.elapsed().as_secs() });
+    }
+    if sccache {
+        println!("{}", sccache_line(&stats));
     }
     let (pass, line) = summary(&results, start.elapsed().as_secs());
     println!("{line}");
@@ -666,10 +966,55 @@ mod tests {
         assert!(Args::parse(v(&["--release"])).is_err(), "release is the default; --debug opts out");
         assert!(Args::parse(v(&["--image"])).is_err());
         assert!(Args::parse(v(&["--clean", "--debug"])).is_err());
+        assert!(Args::parse(v(&["--clean", "--no-cache"])).is_err());
+        assert!(Args::parse(v(&["--no-cache"])).unwrap().no_cache);
         assert!(Args::parse(v(&["--all"])).is_err(), "--all only goes with --clean");
         assert!(Args::parse(v(&["--clean"])).unwrap().clean);
         let a = Args::parse(v(&["--clean", "--all"])).unwrap();
         assert!(a.clean && a.all);
+    }
+
+    #[test]
+    fn the_feature_flags_reach_the_test_line_and_both_clippy_lines() {
+        let a = Args::parse(v(&["--no-default-features", "--features", "atlas/owned-sqlite"])).unwrap();
+        let s = steps(&a, "1.99.0", CPUS);
+        assert_eq!(
+            s[0].1.join(" "),
+            "cargo nextest run --workspace --locked --no-fail-fast --test-threads 16 --release \
+             --tool-config-file atlas-linux-test:/usr/local/share/atlas-linux-test/nextest.toml \
+             --no-default-features --features atlas/owned-sqlite"
+        );
+        assert_eq!(s[1].1.join(" "), "cargo test --workspace --locked --doc --release --no-default-features --features atlas/owned-sqlite");
+        assert_eq!(
+            s[2].1.join(" "),
+            "cargo +1.99.0 clippy --workspace --locked --all-targets --no-default-features --features atlas/owned-sqlite,atlas/dev -- -D warnings"
+        );
+        assert_eq!(
+            s[3].1.join(" "),
+            "cargo +1.99.0 clippy --workspace --locked --no-default-features --features atlas/owned-sqlite -- -D warnings"
+        );
+        // Test arguments still go last, and a list that names atlas/dev
+        // does not get it twice.
+        let a = Args::parse(v(&["--features", "atlas/dev,atlas/rusqlite-backend", "--debug", "--", "x"])).unwrap();
+        let s = steps(&a, "1.99.0", CPUS);
+        assert_eq!(
+            s[0].1.join(" "),
+            "cargo nextest run --workspace --locked --no-fail-fast --test-threads 16 \
+             --tool-config-file atlas-linux-test:/usr/local/share/atlas-linux-test/nextest.toml \
+             --features atlas/dev,atlas/rusqlite-backend -- x"
+        );
+        assert_eq!(s[1].1.join(" "), "cargo test --workspace --locked --doc --features atlas/dev,atlas/rusqlite-backend -- x");
+        assert_eq!(
+            s[2].1.join(" "),
+            "cargo +1.99.0 clippy --workspace --locked --all-targets --features atlas/dev,atlas/rusqlite-backend -- -D warnings"
+        );
+        // A list is feature names: never empty, never another cargo flag.
+        for bad in [&["--features"][..], &["--features", ""], &["--features", "--release"], &["--features", "a b"], &["--features", "a,,b"]]
+        {
+            assert!(Args::parse(v(bad)).is_err(), "{bad:?}");
+        }
+        assert!(Args::parse(v(&["--clean", "--features", "atlas/dev"])).is_err());
+        assert!(Args::parse(v(&["--clean", "--no-default-features"])).is_err());
     }
 
     #[test]
@@ -697,7 +1042,7 @@ mod tests {
         }
         let d = dockerfile("rust:1.99.0", "1.99.0");
         assert!(d.starts_with("FROM rust:1.99.0\nRUN rustup toolchain install 1.99.0 --profile minimal -c clippy\nRUN "), "{d}");
-        assert_eq!(d.lines().count(), 4, "{d}");
+        assert_eq!(d.lines().count(), 5, "{d}");
         assert!(d.ends_with('\n'));
     }
 
@@ -733,7 +1078,7 @@ mod tests {
              printf '[store]\\ndir = \"/target/nextest\"\\n' > /usr/local/share/atlas-linux-test/nextest.toml"
         );
         assert!(NEXTEST_TOOL_CONFIG.starts_with("/usr/local/share/atlas-linux-test/"));
-        let s = steps(&Args::default(), "1.99.0");
+        let s = steps(&Args::default(), "1.99.0", CPUS);
         let i = s[0].1.iter().position(|x| x == "--tool-config-file").unwrap();
         assert_eq!(s[0].1[i + 1], format!("atlas-linux-test:{NEXTEST_TOOL_CONFIG}"));
         // The doc tests and clippy are cargo's, which take no such flag.
@@ -743,7 +1088,7 @@ mod tests {
     #[test]
     fn steps_match_the_public_ci_in_release_and_never_stop_early() {
         let a = Args::default();
-        let s = steps(&a, "1.99.0");
+        let s = steps(&a, "1.99.0", CPUS);
         assert_eq!(s.len(), 4);
         assert_eq!(s.iter().map(|x| x.0).collect::<Vec<_>>(), ["test", "doctest", "clippy all-targets dev", "clippy default"]);
         assert_eq!(
@@ -755,7 +1100,7 @@ mod tests {
         assert_eq!(s[2].1.join(" "), "cargo +1.99.0 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings");
         assert_eq!(s[3].1.join(" "), "cargo +1.99.0 clippy --workspace --locked -- -D warnings");
         let a = Args { debug: true, no_clippy: true, test_args: v(&["x"]), ..Args::default() };
-        let s = steps(&a, "1.99.0");
+        let s = steps(&a, "1.99.0", 8);
         assert_eq!(s.len(), 2);
         assert_eq!(
             s[0].1.join(" "),
@@ -780,13 +1125,16 @@ mod tests {
     #[test]
     fn clean_all_removes_the_shared_cargo_home() {
         assert_eq!(clean_volumes("abc", false), v(&["atlas-linux-target-abc"]));
-        assert_eq!(clean_volumes("abc", true), v(&["atlas-linux-target-abc", "atlas-linux-cargo-home", "atlas-linux-cargo"]));
+        assert_eq!(
+            clean_volumes("abc", true),
+            v(&["atlas-linux-target-abc", "atlas-linux-cargo-home", "atlas-linux-cargo", "atlas-linux-sccache"])
+        );
     }
 
     #[test]
     fn image_tag_is_a_valid_tag_and_names_the_channel() {
-        assert_eq!(image_tag("rust:1.99.0", "1.99.0"), "atlas-linux-test:rust-1.99.0-clippy-1.99.0-nextest-0.9.118-r2");
-        assert_eq!(image_tag("ghcr.io/x/y:1", "nightly"), "atlas-linux-test:ghcr.io-x-y-1-clippy-nightly-nextest-0.9.118-r2");
+        assert_eq!(image_tag("rust:1.99.0", "1.99.0"), "atlas-linux-test:rust-1.99.0-clippy-1.99.0-nextest-0.9.118-r3");
+        assert_eq!(image_tag("ghcr.io/x/y:1", "nightly"), "atlas-linux-test:ghcr.io-x-y-1-clippy-nightly-nextest-0.9.118-r3");
         assert_ne!(image_tag("rust:1", "1.99.0"), image_tag("rust:1", "1.98.0"));
     }
 
@@ -831,29 +1179,41 @@ mod tests {
 
     #[test]
     fn docker_args_mount_read_only_share_cargo_home_and_cap_cpus() {
-        let d = docker_args(
-            Path::new("/w"),
-            "rust:1",
-            "atlas-linux-test-abc",
-            "vol",
-            &v(&["type=bind,src=/g,dst=/git-common,readonly"]),
-            &v(&["cargo", "nextest", "run"]),
-        );
+        let mounts = v(&["type=bind,src=/g,dst=/git-common,readonly"]);
+        let c = Container {
+            root: Path::new("/w"),
+            image: "rust:1",
+            name: "atlas-linux-test-abc",
+            volume: "vol",
+            cpus: 6,
+            mounts: &mounts,
+            sccache: false,
+        };
+        let d = docker_args(&c, &v(&["cargo", "nextest", "run"]));
         let j = d.join(" ");
-        assert!(j.starts_with("run --rm --init --name atlas-linux-test-abc --cpus 4 "), "{j}");
+        assert!(j.starts_with("run --rm --init --name atlas-linux-test-abc --cpus 6 "), "{j}");
         assert!(j.contains("--mount type=bind,src=/w,dst=/src,readonly"));
         assert!(j.contains("--mount type=volume,src=atlas-linux-cargo-home,dst=/cargo-home "));
         assert!(j.contains("-e CARGO_HOME=/cargo-home"));
         assert!(j.contains("--mount type=volume,src=vol,dst=/target "));
         assert!(j.contains("--mount type=bind,src=/g,dst=/git-common,readonly"));
-        assert!(j.contains("-e CARGO_BUILD_JOBS=4"));
+        assert!(j.contains("-e CARGO_BUILD_JOBS=6"));
         assert!(!j.contains(" -v "), "--mount only");
         assert!(j.ends_with("rust:1 cargo nextest run"));
     }
 
     #[test]
     fn docker_args_keep_a_windows_path_with_spaces_in_one_argument() {
-        let d = docker_args(Path::new(r"C:\My Work\atlas"), "rust:1", "n", "vol", &[], &v(&["cargo", "nextest", "run"]));
+        let c = Container {
+            root: Path::new(r"C:\My Work\atlas"),
+            image: "rust:1",
+            name: "n",
+            volume: "vol",
+            cpus: CPUS,
+            mounts: &[],
+            sccache: true,
+        };
+        let d = docker_args(&c, &v(&["cargo", "nextest", "run"]));
         let i = d.iter().position(|x| x.contains("dst=/src")).unwrap();
         assert_eq!(d[i], r"type=bind,src=C:\My Work\atlas,dst=/src,readonly");
         assert_eq!(d[i - 1], "--mount");
@@ -923,5 +1283,166 @@ mod tests {
             (false, "linux-test: FAIL in 1s; test FAILED (0 passed, 0 failed, docker: not found) 0s; clippy default ok 1s".into())
         );
         assert!(!summary(&[], 0).0, "no step is no pass");
+    }
+
+    #[test]
+    fn cpus_come_from_the_flag_then_the_env_then_the_default() {
+        assert_eq!(Args::parse(v(&["--cpus", "8"])).unwrap().cpus.as_deref(), Some("8"));
+        assert!(Args::parse(v(&["--cpus"])).is_err());
+        assert!(Args::parse(v(&["--clean", "--cpus", "8"])).is_err());
+        assert_eq!(resolve_cpus(Some("8"), None), Ok((8, "--cpus")));
+        assert_eq!(resolve_cpus(None, Some("6")), Ok((6, CPUS_ENV)));
+        assert_eq!(resolve_cpus(Some("8"), Some("6")), Ok((8, "--cpus")), "the flag wins");
+        assert_eq!(resolve_cpus(Some("8"), Some("bogus")), Ok((8, "--cpus")), "an env the flag overrides is not read");
+        assert_eq!(resolve_cpus(None, None), Ok((4, "default")));
+        assert_eq!(resolve_cpus(None, Some("")), Ok((4, "default")), "an empty variable is unset");
+    }
+
+    #[test]
+    fn cpus_must_be_a_whole_number_of_one_or_more() {
+        assert_eq!(parse_cpus("1", "--cpus"), Ok(1));
+        assert_eq!(parse_cpus("32", "--cpus"), Ok(32));
+        for bad in ["0", "-1", "+4", "1.5", "", " 4", "four", "99999999999"] {
+            let e = resolve_cpus(Some(bad), None).unwrap_err();
+            assert!(e.contains("--cpus") && e.contains("a whole number of 1 or more"), "{bad:?}: {e}");
+            assert!(!e.contains(&u32::MAX.to_string()), "{bad:?}: {e}");
+            let env = resolve_cpus(None, Some(bad));
+            assert!(bad.trim().is_empty() || bad == " 4" || env.is_err(), "{bad:?} from the env is refused too");
+        }
+        assert!(resolve_cpus(None, Some("0")).unwrap_err().contains(CPUS_ENV));
+    }
+
+    #[test]
+    fn the_env_value_is_trimmed_as_test_gate_trims_its_own() {
+        assert_eq!(resolve_cpus(None, Some("4 ")), Ok((4, CPUS_ENV)));
+        assert_eq!(resolve_cpus(None, Some(" 6\r\n")), Ok((6, CPUS_ENV)));
+        assert_eq!(resolve_cpus(None, Some("  ")), Ok((CPUS, "default")), "a blank variable is unset");
+        assert!(resolve_cpus(Some("4 "), None).is_err(), "the flag is taken as typed");
+    }
+
+    #[test]
+    fn test_threads_are_the_cpus_but_never_below_the_test_gates_sixteen() {
+        assert_eq!(test_threads(1), 16);
+        assert_eq!(test_threads(4), 16);
+        assert_eq!(test_threads(16), 16);
+        assert_eq!(test_threads(17), 17);
+        assert_eq!(test_threads(32), 32);
+        let s = steps(&Args::default(), "1.99.0", 32);
+        assert!(s[0].1.join(" ").contains(" --test-threads 32 "), "{:?}", s[0].1);
+    }
+
+    #[test]
+    fn only_nextests_own_thread_count_is_rewritten() {
+        // A user's `--test-threads 1` after `--` reaches the doc tests unchanged.
+        let a = Args { test_args: v(&["--test-threads", "1"]), ..Args::default() };
+        let s = steps(&a, "1.99.0", 8);
+        assert_eq!(s[1].1.join(" "), "cargo test --workspace --locked --doc --release -- --test-threads 1");
+        assert!(s[0].1.join(" ").starts_with("cargo nextest run --workspace --locked --no-fail-fast --test-threads 16 "));
+        assert!(s[0].1.join(" ").ends_with(" -- --test-threads 1"), "{:?}", s[0].1);
+        // A trailing `--test-threads` with no value is passed on, not a panic.
+        let a = Args { test_args: v(&["--test-threads"]), ..Args::default() };
+        let s = steps(&a, "1.99.0", 8);
+        assert_eq!(s[1].1.last().map(String::as_str), Some("--test-threads"));
+        assert_eq!(s[0].1.last().map(String::as_str), Some("--test-threads"));
+    }
+
+    #[test]
+    fn cpus_above_the_docker_vm_are_clamped_with_one_note() {
+        assert_eq!(clamp_cpus(8, Some(16)), (8, None));
+        assert_eq!(clamp_cpus(16, Some(16)), (16, None));
+        let (n, note) = clamp_cpus(32, Some(16));
+        assert_eq!(n, 16);
+        assert_eq!(note.as_deref(), Some("linux-test: note: 32 CPUs asked for but the Docker VM has 16; using 16"));
+        let unknown = Some("linux-test: note: could not read the Docker VM's CPU count; using 32 CPUs unchecked".to_string());
+        assert_eq!(clamp_cpus(32, None), (32, unknown), "an unknown VM size lowers nothing, with a note");
+        let (n, note) = clamp_cpus(4, Some(0));
+        assert_eq!(n, 4);
+        assert!(note.unwrap().contains("could not read"));
+    }
+
+    fn cached(sccache: bool) -> String {
+        let c = Container { root: Path::new("/w"), image: "img", name: "n", volume: "vol", cpus: 8, mounts: &[], sccache };
+        docker_args(&c, &v(&["cargo", "nextest", "run"])).join(" ")
+    }
+
+    #[test]
+    fn the_cache_is_on_by_default_and_wraps_rustc_on_the_shared_volume() {
+        let j = cached(true);
+        assert!(j.contains("--mount type=volume,src=atlas-linux-sccache,dst=/sccache "), "{j}");
+        assert!(j.contains("-e RUSTC_WRAPPER=sccache "), "{j}");
+        assert!(j.contains("-e SCCACHE_DIR=/sccache "), "{j}");
+        assert!(j.contains("-e SCCACHE_CACHE_SIZE=80M "), "{j}");
+        // The command runs under the script, as its "$@", and keeps its status.
+        assert!(j.contains(&format!(" img sh -c {} sh cargo nextest run", sccache_script())), "{j}");
+        assert!(cache_on(false, None));
+        assert!(cache_on(false, Some("")) && cache_on(false, Some(" 0 ")));
+    }
+
+    #[test]
+    fn no_cache_or_its_env_drops_the_wrapper_volume_and_script() {
+        let j = cached(false);
+        for absent in ["sccache", "SCCACHE", "sh -c"] {
+            assert!(!j.contains(absent), "{absent} in {j}");
+        }
+        assert!(j.ends_with("img cargo nextest run"), "{j}");
+        assert!(!cache_on(true, None));
+        assert!(!cache_on(false, Some("1")) && !cache_on(false, Some("yes")));
+    }
+
+    #[test]
+    fn the_clippy_steps_run_without_the_cache() {
+        let names: Vec<&str> = steps(&Args::default(), "1.99.0", CPUS).into_iter().map(|s| s.0).collect();
+        let cached: Vec<&str> = names.iter().copied().filter(|n| step_cached(n)).collect();
+        assert_eq!(cached, ["test", "doctest"], "{names:?}");
+    }
+
+    #[test]
+    fn the_step_script_prints_stats_stops_the_server_and_exits_with_the_command() {
+        let s = sccache_script();
+        assert!(s.starts_with("\"$@\"; rc=$?; "), "{s}");
+        let (stats, stop, exit) = (s.find("--show-stats").unwrap(), s.find("--stop-server").unwrap(), s.find("exit $rc").unwrap());
+        assert!(stats < stop && stop < exit, "{s}");
+        assert!(s.contains("sed 's/^/atlas-sccache: /'"), "{s}");
+        assert!(s.ends_with("exit $rc"), "{s}");
+    }
+
+    #[test]
+    fn the_image_installs_the_pinned_sccache_and_checks_its_sha256() {
+        let d = dockerfile("rust:1", "1.99.0");
+        let run = d.lines().nth(4).unwrap();
+        assert!(run.starts_with("RUN set -eu; "), "{run}");
+        assert!(run.contains("d=sccache-v0.19.0-$arch-unknown-linux-musl;"), "{run}");
+        assert!(run.contains("https://github.com/mozilla/sccache/releases/download/v0.19.0/$d.tar.gz"), "{run}");
+        for (arch, sum) in SCCACHE_SHA256 {
+            assert_eq!(sum.len(), 64);
+            assert!(run.contains(&format!("{arch}) sum={sum} ;;")), "{run}");
+        }
+        let (check, unpack) = (run.find("sha256sum -c -").unwrap(), run.find("tar -xzf").unwrap());
+        assert!(check < unpack, "{run}");
+        assert!(run.contains("*) echo \"no sccache build for $arch\" >&2; exit 1 ;;"), "{run}");
+        assert!(run.contains("-C /usr/local/bin --strip-components=1 $d/sccache;"), "{run}");
+    }
+
+    #[test]
+    fn sccache_stats_are_read_and_summed() {
+        let log = "test a ... ok\n\
+                   atlas-sccache: Compile requests                    120\n\
+                   atlas-sccache: Cache hits                          100\n\
+                   atlas-sccache: Cache hits (Rust)                   100\n\
+                   atlas-sccache: Cache hits rate                   83.33 %\n\
+                   atlas-sccache: Cache misses                         20\n\
+                   atlas-sccache: Cache misses (Rust)                  20\n\
+                   Cache hits 999\n";
+        assert_eq!(sccache_counts(log), Some((100, 20)));
+        assert_eq!(sccache_counts("Cache hits 5\nCache misses 1\n"), None, "only the prefixed lines count");
+        assert_eq!(sccache_counts("atlas-sccache: Cache hits 5\n"), None, "both or nothing");
+        assert_eq!(
+            sccache_line(&[("test", Some((100, 20))), ("doctest", None), ("clippy default", Some((50, 30)))]),
+            "linux-test: sccache: 150 hits, 50 misses (75.0% hit rate); hits/misses by step: test 100/20, doctest no stats, clippy default 50/30"
+        );
+        assert_eq!(
+            sccache_line(&[("test", None)]),
+            "linux-test: sccache: 0 hits, 0 misses (no compiles); hits/misses by step: test no stats"
+        );
     }
 }

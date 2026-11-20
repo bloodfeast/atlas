@@ -1,18 +1,8 @@
 # cargo-nextest's settings for this workspace (`cargo xtask test-gate` runs
 # nextest at 16 tests at once). See https://nexte.st/docs/configuration/.
 #
-# No test is retried except the one below. A retried pass is shown as
-# FLAKY in nextest's summary and as `N flaky: NAME` on the gate's last line,
-# never as a plain pass.
-
-# admit_at_300_metas_is_cheap times an admit against a 250 ms bar: it takes
-# every test slot, so it runs alone and its median is not another test's
-# load. On a contended machine its p99 can still pass the bar (8 of 9 runs
-# held on the first config), so it is retried once (Brandon, 2026-11-16).
-[[profile.default.overrides]]
-filter = 'test(=admit_at_300_metas_is_cheap)'
-threads-required = 'num-test-threads'
-retries = 1
+# No test is retried. A retried pass is shown as FLAKY in nextest's summary
+# and as `N flaky: NAME` on the gate's last line, never as a plain pass.
 
 # state_changes_from_many_processes_are_never_lost has 8 child processes
 # change the update state 200 times and counts every change. It runs alone (Brandon,

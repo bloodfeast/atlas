@@ -139,6 +139,7 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
                     root: root.to_path_buf(),
                     build_scripts: false,
                     scip: Default::default(),
+                    exclude: Vec::new(),
                 }],
                 dir: Some(scratch.join("run")),
                 timeout_s: Some(1800),
@@ -146,7 +147,7 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
             };
             let mut setup = CodeSetup::from_spec(&spec, &db, false);
             setup.defer_on_cargo = false;
-            let mut conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+            let mut conn = atlas::db::Connection::open(&db).map_err(|e| e.to_string())?;
             let rep = code_index::index_root(&setup, &mut conn, &setup.roots[0], &RustSource::ScanOnly("bench".into()))
                 .map_err(|e| e.to_string())?;
             for (unit, r) in &rep.runs {
@@ -291,6 +292,7 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
                 root: root.to_path_buf(),
                 build_scripts: false,
                 scip: Default::default(),
+                exclude: Vec::new(),
             }],
             dir: Some(scratch.join("code")),
             ..Default::default()
@@ -298,11 +300,17 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
         let mut setup = CodeSetup::from_spec(&spec, &db, false);
         setup.indexers = indexers;
         setup.defer_on_cargo = false;
-        let mut conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+        let mut conn = atlas::db::Connection::open(&db).map_err(|e| e.to_string())?;
         let rep = code_index::index_root(
             &setup,
             &mut conn,
-            &CodeRoot { name: "bench".into(), root: root.to_path_buf(), build_scripts: false, scip: Default::default() },
+            &CodeRoot {
+                name: "bench".into(),
+                root: root.to_path_buf(),
+                build_scripts: false,
+                scip: Default::default(),
+                exclude: Vec::new(),
+            },
             &rust,
         )
         .map_err(|e| e.to_string())?;
@@ -349,7 +357,7 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
 /// scanner filled and how many are missing; in the others, how many come
 /// from the scanner and how many are missing.
 fn truth_split(
-    conn: &rusqlite::Connection,
+    conn: &atlas::db::Connection,
     row: &'static atlas::langs::Lang,
     root: &Path,
     docs: &HashSet<String>,

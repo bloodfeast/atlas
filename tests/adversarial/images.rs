@@ -428,32 +428,47 @@ fn hostile_dimensions_are_refused() {
 /// once the data passes what the header allows.
 #[test]
 fn a_decompression_bomb_is_refused_early() {
-    // Fixed Huffman: literal 0, then (length 258, distance 1) repeated.
-    let mut bits: Vec<u8> = Vec::new();
-    let mut put = |v: u32, n: u32, rev: bool| {
-        for i in 0..n {
-            let b = if rev { (v >> (n - 1 - i)) & 1 } else { (v >> i) & 1 };
-            bits.push(b as u8);
+    // Fixed Huffman: literal 0, then (length 258, distance 1) `reps` times.
+    let bomb = |reps: usize| {
+        let mut bits: Vec<u8> = Vec::new();
+        let mut put = |v: u32, n: u32, rev: bool| {
+            for i in 0..n {
+                let b = if rev { (v >> (n - 1 - i)) & 1 } else { (v >> i) & 1 };
+                bits.push(b as u8);
+            }
+        };
+        put(1, 1, false);
+        put(1, 2, false);
+        put(0x30, 8, true);
+        for _ in 0..reps {
+            put(0b1100_0101, 8, true);
+            put(0, 5, true);
         }
+        put(0, 7, true);
+        let mut d = vec![0x78, 0x01];
+        for c in bits.chunks(8) {
+            d.push(c.iter().enumerate().fold(0u8, |a, (i, &b)| a | (b << i)));
+        }
+        png_with(&ihdr(1, 1, 8, 6), &d)
     };
-    put(1, 1, false);
-    put(1, 2, false);
-    put(0x30, 8, true);
-    for _ in 0..1_000_000 {
-        put(0b1100_0101, 8, true);
-        put(0, 5, true);
-    }
-    put(0, 7, true);
-    let mut d = vec![0x78, 0x01];
-    for c in bits.chunks(8) {
-        d.push(c.iter().enumerate().fold(0u8, |a, (i, &b)| a | (b << i)));
-    }
-    let png = png_with(&ihdr(1, 1, 8, 6), &d);
-    let t = Instant::now();
-    let r = picture::decode(&png);
-    let took = t.elapsed();
-    assert!(r.is_err(), "a bomb decoded");
-    assert!(took < Duration::from_millis(150), "the bomb was inflated in full: {took:?}");
+    let (png, tenth) = (bomb(1_000_000), bomb(100_000));
+    // The faster of three refusals.
+    let time = |png: &[u8]| {
+        (0..3)
+            .map(|_| {
+                let t = Instant::now();
+                assert!(picture::decode(png).is_err(), "a bomb decoded");
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let (took, small) = (time(&png), time(&tenth));
+    // Refused early, the bomb costs what a tenth of it costs; inflated in
+    // full it costs 10x. Both are timed in this run, so a load on the
+    // machine weighs on both. The wall ceiling is a backstop.
+    assert!(took < small * 3 + Duration::from_millis(20), "the bomb was inflated in full: {took:?}, a tenth of it {small:?}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
 }
 
 #[test]

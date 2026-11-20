@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use common::*;
-use rusqlite::Connection;
+use atlas::db::Connection;
 use atlas::json::{Value};
 use atlas::json;
 

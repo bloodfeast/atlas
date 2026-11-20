@@ -218,11 +218,31 @@ fn next_word(s: &str) -> Option<(&str, &str)> {
 /// `time`, `xargs` or `!` is caught, and a quoted word is checked as a
 /// command of its own (`bash -c "git push"`). A quoted value stays one
 /// word, so `-C "a log"` cannot pass for a subcommand.
-fn piece_writes(mut rest: &str) -> bool {
-    while let Some((w, r)) = next_word(rest) {
-        rest = r;
-        if (w.contains(char::is_whitespace) && piece_writes(w)) || (command_word(w).eq_ignore_ascii_case("git") && !git_reads(r)) {
-            return true;
+///
+/// The quoted words wait on a work list, not the call stack, and a word is
+/// taken up only when it is shorter than the text it came from: an
+/// unclosed quote (`c" file`, a piece of `grep "a\|b\|c" file` cut at its
+/// pipes) makes the whole text one word, which the recursive form scanned
+/// again until the hook thread's stack ran out (public #15).
+fn piece_writes(piece: &str) -> bool {
+    let mut todo = vec![piece];
+    while let Some(text) = todo.pop() {
+        let whole = text.trim_start_matches(word_sep).len();
+        let mut rest = text;
+        while let Some((w, r)) = next_word(rest) {
+            rest = r;
+            if command_word(w).eq_ignore_ascii_case("git") && !git_reads(r) {
+                return true;
+            }
+            if w.contains(char::is_whitespace) {
+                if w.len() < whole {
+                    todo.push(w);
+                } else if let Some(q) = w.find(['"', '\'']) {
+                    // The whole text, held by an unclosed quote: what follows
+                    // the quote is still read (`b" -exec git commit`).
+                    todo.push(&w[q + 1..]);
+                }
+            }
         }
     }
     false
@@ -361,7 +381,7 @@ pub struct Router {
     cfg: HandleCfg,
     handles: Option<Handles>,
     /// The connection R7 re-indexing writes through.
-    code_conn: Option<rusqlite::Connection>,
+    code_conn: Option<crate::db::Connection>,
 }
 
 impl std::fmt::Debug for Router {
@@ -663,7 +683,12 @@ impl Router {
         let h = self.handles()?;
         let row = h.put(full.as_bytes(), &meta)?;
         let shape = Handles::shape_of(&row, &full);
-        let digest = crate::digest::digest(&row.id, &row.meta.label, shape, &full, meta.exit_code.map(|c| c as i32), h.cfg.digest_bytes);
+        // The digest ends with its hint line's newline, which Claude Code
+        // trims from the tool result the model reads: it is trimmed here, so
+        // the ledger logs the bytes the session receives (#297, R1).
+        let digest = crate::digest::digest(&row.id, &row.meta.label, shape, &full, meta.exit_code.map(|c| c as i32), h.cfg.digest_bytes)
+            .trim_end()
+            .to_string();
         // A routed Read logs the output it replaced and where it was read, but
         // the ledger credits it nothing (ATLAS-HOOK-VALUE:0012: the follow-up
         // reads made it overstate); the report judges it against the later
@@ -736,13 +761,15 @@ impl Router {
         let m = Meta { kind: kind.into(), label: cmd.lines().next().unwrap_or("").to_string(), cmd: cmd.into(), cwd: ev.cwd.clone(), session: session.to_string(), exit_code: exit, ..Meta::default() };
         let h = self.handles().ok()?;
         let d = crate::pr_digest::route(h, &pc, &w, stdout, &m, small).ok()??;
+        // Trimmed as the generic digest is, for the same reason (#297, R1).
+        let digest = d.digest.trim_end().to_string();
         let _ = crate::tokens::log_row(
             h.conn(),
             "route:gh-pr",
-            d.digest.len(),
+            digest.len(),
             Some(crate::tokens::Counterfactual { grep: 0, read: crate::tokens::shown_bytes(stdout) }),
         );
-        Some(d.digest)
+        Some(digest)
     }
 
     /// Annotations for a result that passes whole (see the module docs):
@@ -867,7 +894,7 @@ impl Router {
     pub fn reindex_code(&mut self, path: &str) -> Result<crate::code::Reindexed> {
         if self.code_conn.is_none() {
             let c = crate::store::open_raw(&self.db)?;
-            c.busy_timeout(std::time::Duration::from_secs(10))?;
+            crate::hook_budget::bound_within::<10>(&c)?;
             self.code_conn = Some(c);
         }
         let c = self.code_conn.as_mut().ok_or_else(|| Error::Db("index connection".into()))?;
@@ -888,7 +915,7 @@ impl Router {
             let _ = crate::store::guarded(c, || {
                 c.execute(
                     "INSERT INTO misses(time, tool, query, returned, found, reason, client) VALUES(?1, 'route', ?2, '', '', ?3, 'atlas-hook')",
-                    rusqlite::params![crate::store::utc(std::time::SystemTime::now()), query, reason],
+                    crate::db::params![crate::store::utc(std::time::SystemTime::now()), query, reason],
                 )?;
                 Ok(())
             });
@@ -905,7 +932,7 @@ impl Router {
             let _ = crate::store::guarded(c, || {
                 c.execute(
                     "INSERT INTO misses(time, tool, query, returned, found, reason, client) VALUES(?1, 'route', ?2, '', '', ?3, 'atlas-hook')",
-                    rusqlite::params![crate::store::utc(std::time::SystemTime::now()), query, e.to_string()],
+                    crate::db::params![crate::store::utc(std::time::SystemTime::now()), query, e.to_string()],
                 )?;
                 Ok(())
             });

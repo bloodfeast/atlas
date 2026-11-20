@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use crate::db::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use crate::json::{Map, Value};
 
 use crate::error::{Error, Result};
@@ -187,13 +187,16 @@ pub(crate) fn begin_shared(conn: &Connection) -> Result<Transaction<'_>> {
 
 /// Opens the index database at `db_path` for a raw use (a report, a log,
 /// a side table) after the same check as [`Store::open`]: a database a newer
-/// atlas made is refused before anything is written.
+/// atlas made is refused before anything is written. It waits on another
+/// writer as the store does ([`crate::hook_budget::bound`], #340); a caller
+/// with a shorter limit sets [`crate::hook_budget::bound_within`] after.
 ///
 /// # Errors
 ///
 /// [`Error::StoreTooNew`], or [`Error::Db`] from SQLite.
 pub fn open_raw(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
+    crate::hook_budget::bound(&conn)?;
     guard(&conn)?;
     Ok(conn)
 }
@@ -204,7 +207,7 @@ pub fn open_raw(db_path: &Path) -> Result<Connection> {
 /// when the file cannot be read (missing, locked or corrupt): this look says
 /// nothing then, and the open that follows reports its own error.
 pub fn index_skew(db_path: &Path) -> Vec<Error> {
-    let Ok(conn) = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX) else {
+    let Ok(conn) = Connection::open_with_flags(db_path, crate::db::OpenFlags::SQLITE_OPEN_READ_ONLY | crate::db::OpenFlags::SQLITE_OPEN_NO_MUTEX) else {
         return Vec::new();
     };
     let mut out: Vec<Error> = read_state(db_path, &conn).err().into_iter().collect();
@@ -603,7 +606,11 @@ impl Store {
 
     fn open_once(db_path: &Path, vaults: &Vaults, atlas: &mut Atlas) -> Result<Connection> {
         let mut conn = Connection::open(db_path)?;
-        conn.busy_timeout(Duration::from_secs(30))?;
+        // 30 s (crate::memory::BUSY_TIMEOUT), polled every 2 ms at most:
+        // SQLite's own handler backs off to 100 ms sleeps, and a waiter that
+        // polls that rarely can lose the lock to newer writers for the whole
+        // timeout under load (#340).
+        crate::hook_budget::bound(&conn)?;
         // A newer binary's derived tables are refused before anything is
         // written, the journal mode included: rebuilding them here would
         // undo that binary's rebuild. Two point reads of `meta`.
@@ -792,7 +799,7 @@ impl Store {
                         }
                     };
                     type DocRow = ((String, String), (i64, i64, String), Option<String>);
-                    let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<DocRow> {
+                    let map = |r: &crate::db::Row<'_>| -> crate::db::Result<DocRow> {
                         Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?, r.get(4)?), r.get::<_, Option<String>>(5)?))
                     };
                     match only {
@@ -997,7 +1004,7 @@ impl Store {
         Ok(out)
     }
 
-    fn link_rows(&self, filter: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<LinkRow>> {
+    fn link_rows(&self, filter: &str, args: &[&dyn crate::db::ToSql]) -> Result<Vec<LinkRow>> {
         let sql = format!(
             "SELECT n.vault, n.path, l.line, l.kind, l.raw, l.target, l.heading, l.to_vault, l.to_path FROM links l JOIN notes n ON n.id = l.note_id WHERE {filter} ORDER BY n.vault, n.path, l.line, l.raw"
         );
@@ -1497,8 +1504,8 @@ fn audit(
 /// What the store-skew tests of the modules that write either store share.
 #[cfg(test)]
 pub(crate) mod skew_support {
-    use rusqlite::types::ValueRef;
-    use rusqlite::Connection;
+    use crate::db::types::ValueRef;
+    use crate::db::Connection;
 
     /// Marks the index database `conn` has open as one a newer atlas
     /// upgraded since it was opened: a `schema` row with a higher table
@@ -1513,7 +1520,7 @@ pub(crate) mod skew_support {
         let tables: Vec<(String, String)> = {
             let mut st = conn.prepare("SELECT name, ifnull(sql, '') FROM sqlite_master ORDER BY type, name").unwrap();
             let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-            rows.collect::<rusqlite::Result<_>>().unwrap()
+            rows.collect::<crate::db::Result<_>>().unwrap()
         };
         let mut out: Vec<String> = tables.iter().map(|(n, s)| format!("{n}: {s}")).collect();
         for (name, sql) in &tables {

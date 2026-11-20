@@ -191,6 +191,9 @@ pub struct Settings {
     pub model: PathBuf,
     /// Encoder threads for embedding records.
     pub embed_threads: usize,
+    /// Every hook event's time budget (`hooks.budget_ms`, see
+    /// [`crate::hook_budget`]).
+    pub hook_budget: std::time::Duration,
     /// Context-cap settings.
     pub cap: CapSettings,
     /// Orchestrator mode: agent caps and per-kind context limits.
@@ -229,6 +232,11 @@ pub struct Settings {
     pub graph: Option<std::sync::Arc<crate::project::Graph>>,
     /// The memory index as a tree (see [`super::tree`]).
     pub tree: Option<super::tree::TreeSpec>,
+    /// `project_tracking.atlassian`, when configured: the queue hint says
+    /// whether `atlas track snapshot` can read a ticket directly.
+    pub trackers: Option<crate::trackers::Settings>,
+    /// Worktree gc (`worktrees`; see [`crate::worktree_gc`]).
+    pub worktrees: crate::worktree_gc::GcSettings,
 }
 
 /// The default relevance floor: the negated bm25 a record needs. Derived by
@@ -371,6 +379,7 @@ impl Settings {
             },
             model: crate::models::semantic_model(c, db),
             embed_threads: c.and_then(|c| c.semantic.as_ref()).and_then(|s| s.threads).unwrap_or(crate::config::DEFAULT_EMBED_THREADS).max(1),
+            hook_budget: crate::hook_budget::limit(c.and_then(|c| c.hooks.as_ref()).and_then(|h| h.budget_ms)),
             cap: CapSettings {
                 warn_tokens: if orchestrate.enabled { orchestrate.other.handoff } else { k.warn_tokens.map_or(V02_WARN, |w| w as u64) },
                 block_tokens: if orchestrate.enabled { orchestrate.other.limit } else { k.block_tokens.map_or(V02_BLOCK, |b| b as u64) },
@@ -406,6 +415,8 @@ impl Settings {
             ideas: m.ideas.clone().unwrap_or_default(),
             graph: None,
             tree: m.tree.clone(),
+            trackers: c.and_then(|c| crate::trackers::Settings::from_config(c.trackers.as_ref()).ok().flatten()),
+            worktrees: crate::worktree_gc::GcSettings::from_spec(c.and_then(|c| c.worktrees.as_ref())),
         })
     }
 

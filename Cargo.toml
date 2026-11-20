@@ -1,6 +1,6 @@
 [package]
 name = "atlas"
-version = "0.7.0"
+version = "0.9.0"
 edition = "2021"
 description = "A local, stdio-only MCP index and memory store for agents over Obsidian vaults and read-only Markdown sources: identifiers, sections, a code index, semantic recall. No network at query time."
 authors = ["Brandon White"]
@@ -25,6 +25,14 @@ name = "atlas"
 path = "src/main.rs"
 
 [features]
+# Which SQLite binding the store runs on; exactly one. `rusqlite-backend` is
+# rusqlite with its bundled SQLite. `owned-sqlite` is atlas's own binding
+# (src/db) over the vendored amalgamation (vendor/sqlite), compiled by
+# build.rs with no build dependency:
+# `--no-default-features --features owned-sqlite`.
+default = ["rusqlite-backend"]
+rusqlite-backend = ["dep:rusqlite"]
+owned-sqlite = []
 # The measuring modes (--bench, --judge, --symbol-bench, --recall-scores and
 # the options only they read). Off by default and in release builds; `cargo
 # xtask` turns it on for the benches and verify-macos.
@@ -42,11 +50,25 @@ test-seams = []
 # - ed25519-compact, default features off (no dependencies of its own): the
 #   signature check on release manifests (src/update.rs). Curve arithmetic
 #   is not hand-written.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 ed25519-compact = { version = "2.6", default-features = false }
 
 [dev-dependencies]
 # atlas itself, with its test seams on: the integration tests build the
 # binary they run with them (resolver 2 turns a dev-dependency's features
-# on only for test builds). Not a new crate.
-atlas = { path = ".", features = ["test-seams"] }
+# on only for test builds). Not a new crate. No default features: they
+# would turn `rusqlite-backend` on in every test build, beside
+# `owned-sqlite` when that backend is the one asked for; the backend
+# comes from the command line alone.
+atlas = { path = ".", default-features = false, features = ["test-seams"] }
+
+# The public CI's tests (.github/workflows/ci.yml): a debug build without
+# debug information, so its ~75 test binaries link and land quickly, with
+# the dependencies (the bundled SQLite above all) optimised, since they
+# change only with Cargo.lock and come from the CI's cache.
+[profile.ci]
+inherits = "dev"
+debug = false
+
+[profile.ci.package."*"]
+opt-level = 3

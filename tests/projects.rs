@@ -744,7 +744,7 @@ fn a_root_of_repos_is_discovered_offered_written_routed_and_indexed() {
     // The .proto index across repos: definitions, type references, rpc call sites.
     let mut server = server_for(&e);
     let code = atlas::code::CodeSetup { defer_on_cargo: false, ..atlas::code::CodeSetup::from_spec(e.code.as_ref().unwrap(), e.db.as_ref().unwrap(), false) };
-    let mut conn = rusqlite::Connection::open(e.db.as_ref().unwrap()).unwrap();
+    let mut conn = atlas::db::Connection::open(e.db.as_ref().unwrap()).unwrap();
     let scan = atlas::code_index::RustSource::ScanOnly("test".into());
     let root = |n: &str| code.roots.iter().find(|x| x.name == n).unwrap().clone();
     let t0 = Instant::now();
@@ -1712,6 +1712,7 @@ fn wide_atlas(x: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>) -> (bool
         .env("LOCALAPPDATA", x.join("AppData").join("Local"))
         .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_UNATTENDED")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env("CLAUDE_CONFIG_DIR", x.join(".claude"))

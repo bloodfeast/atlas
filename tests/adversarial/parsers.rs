@@ -138,20 +138,37 @@ fn json_duplicate_keys_keep_the_last_value_in_the_first_place() {
 #[test]
 fn json_many_keys_parse_in_linear_time() {
     let n = 300_000;
-    let mut s = String::from("{");
-    for i in 0..n {
-        if i > 0 {
-            s.push(',');
+    let object = |n: usize| {
+        let mut s = String::from("{");
+        for i in 0..n {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"k{i}\":0"));
         }
-        s.push_str(&format!("\"k{i}\":0"));
-    }
-    s.push('}');
+        s.push('}');
+        s
+    };
+    let s = object(n);
     assert!(s.len() < (4 << 20));
-    let t = Instant::now();
-    let v = json::parse(&s).unwrap();
-    let took = t.elapsed();
+    let time = |s: &str| {
+        let t = Instant::now();
+        let v = json::parse(s).unwrap();
+        (t.elapsed(), v)
+    };
+    // 30k keys against 3k, the faster of three each, timed in this run so a
+    // load on the machine weighs on both: linear is 10x, quadratic 100x.
+    // Both stay small enough that the cache does not tilt them.
+    let (mid, small) = (object(n / 10), object(n / 100));
+    let best = |s: &str| (0..3).map(|_| time(s).0).min().unwrap();
+    let (a, b) = (best(&mid), best(&small));
+    // The +50 ms absorbs a loaded container (36 ms against 0.55 ms seen in
+    // linux-test); a scan per insert costs seconds.
+    assert!(a < b * 25 + Duration::from_millis(50), "{} keys took {a:?}, a tenth {b:?}", n / 10);
+    // The full object: a wall backstop at over 10x the unloaded time.
+    let (took, v) = time(&s);
     assert_eq!(v.as_object().unwrap().len(), n);
-    assert!(took < Duration::from_secs(3), "{n} keys took {took:?}");
+    assert!(took < Duration::from_secs(20), "{n} keys took {took:?}");
 }
 
 // ------------------------------------------------------------------ regex

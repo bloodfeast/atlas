@@ -47,7 +47,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
 use crate::scip::{self, Index};
@@ -217,6 +217,42 @@ pub struct CodeRoot {
     pub build_scripts: bool,
     /// Its prebuilt SCIP files ([`Prebuilt`]).
     pub scip: Prebuilt,
+    /// See [`crate::config::CodeRootSpec::exclude`].
+    pub exclude: Vec<String>,
+}
+
+impl CodeRoot {
+    /// This root's files and folders, without those its `exclude` globs
+    /// match ([`walk_excluding`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the root cannot be read.
+    pub fn walk(&self) -> Result<Walk> {
+        walk_excluding(&self.root, &self.exclude)
+    }
+}
+
+/// Whether a path below a code root (relative, `/`-separated) is one of
+/// its `exclude` globs ([`crate::glob::matches`]: a glob without `/` is
+/// matched against the last component, so `legacy-plugin` names that folder
+/// wherever it is), or lies in a folder one matches.
+pub fn excluded(exclude: &[String], rel: &str) -> bool {
+    if exclude.is_empty() {
+        return false;
+    }
+    let mut end = 0;
+    loop {
+        let next = rel[end..].find('/').map(|i| end + i);
+        let prefix = &rel[..next.unwrap_or(rel.len())];
+        if exclude.iter().any(|g| crate::glob::matches(g, prefix)) {
+            return true;
+        }
+        match next {
+            Some(i) => end = i + 1,
+            None => return false,
+        }
+    }
 }
 
 /// Where a root's prebuilt SCIP files are (`code.roots[i].scip`): files an
@@ -282,7 +318,59 @@ impl Prebuilt {
 ///
 /// [`Error::Io`] when the root cannot be walked.
 pub fn root_fingerprint(root: &CodeRoot) -> Result<String> {
-    Ok(walk(&root.root)?.fingerprint_with(&root.scip.configured()))
+    Ok(root.walk()?.fingerprint_with(&root.scip.configured()))
+}
+
+/// The `meta` key holding a root's `exclude` globs, one per line, for
+/// [`reindex_file`] (which runs without the configuration).
+fn exclude_key(root: &str) -> String {
+    format!("code_exclude:{root}")
+}
+
+/// Records root `root`'s `exclude` globs where [`reindex_file`] reads them.
+///
+/// # Errors
+///
+/// [`Error::Db`].
+pub fn record_exclude(conn: &Connection, root: &str, exclude: &[String]) -> Result<()> {
+    crate::store::guarded(conn, || {
+        if exclude.is_empty() {
+            conn.execute("DELETE FROM meta WHERE key = ?1", [exclude_key(root)])?;
+        } else {
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)", params![exclude_key(root), exclude.join("\n")])?;
+        }
+        Ok(())
+    })
+}
+
+impl Rows {
+    /// Drops every file `exclude` names ([`excluded`]) and its rows: what
+    /// an indexer that reads a whole workspace (rust-analyzer, a prebuilt
+    /// index) emitted for files the walk left out.
+    pub fn drop_excluded(&mut self, exclude: &[String]) {
+        if exclude.is_empty() || !self.files.iter().any(|(p, _)| excluded(exclude, p)) {
+            return;
+        }
+        let mut map: Vec<Option<u32>> = Vec::with_capacity(self.files.len());
+        let mut kept = Vec::with_capacity(self.files.len());
+        for f in std::mem::take(&mut self.files) {
+            if excluded(exclude, &f.0) {
+                map.push(None);
+            } else {
+                map.push(Some(kept.len() as u32));
+                kept.push(f);
+            }
+        }
+        self.files = kept;
+        self.occ.retain_mut(|o| match map[o.file as usize] {
+            Some(n) => {
+                o.file = n;
+                true
+            }
+            None => false,
+        });
+        self.ends = std::mem::take(&mut self.ends).into_iter().filter_map(|((f, l), e)| map[f as usize].map(|n| ((n, l), e))).collect();
+    }
 }
 
 /// Everything the code index is configured with.
@@ -344,7 +432,13 @@ impl CodeSetup {
             roots: spec
                 .roots
                 .iter()
-                .map(|r| CodeRoot { name: r.name.clone(), root: r.root.clone(), build_scripts: r.build_scripts, scip: r.scip.clone() })
+                .map(|r| CodeRoot {
+                    name: r.name.clone(),
+                    root: r.root.clone(),
+                    build_scripts: r.build_scripts,
+                    scip: r.scip.clone(),
+                    exclude: r.exclude.clone(),
+                })
                 .collect(),
             rust_analyzer: spec.rust_analyzer.clone(),
             timeout: Duration::from_secs(spec.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S) as u64),
@@ -416,7 +510,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
     // One write transaction, taken at its start (a deferred one that reads
     // first cannot wait for another writer).
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::db::Transaction::new_unchecked(conn, crate::db::TransactionBehavior::Immediate)?;
     make_schema(&tx)?;
     tx.commit()?;
     Ok(())
@@ -430,7 +524,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 /// # Errors
 ///
 /// [`Error::StoreTooNew`], else [`Error::Db`] from SQLite.
-fn make_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+fn make_schema(tx: &crate::db::Transaction<'_>) -> Result<()> {
     let have = stored_code_schema(tx);
     if have.as_deref() == Some(CODE_SCHEMA) {
         return Ok(());
@@ -576,6 +670,16 @@ pub fn source_lang(rel: &str) -> Option<&'static crate::langs::Lang> {
 ///
 /// [`Error::Io`] when the root cannot be read.
 pub fn walk(root: &Path) -> Result<Walk> {
+    walk_excluding(root, &[])
+}
+
+/// [`walk`], never entering a folder nor listing a file that `exclude`
+/// names ([`excluded`]): no indexer and no scan sees it.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the root cannot be read.
+pub fn walk_excluding(root: &Path, exclude: &[String]) -> Result<Walk> {
     let mut w = Walk::default();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     let mut first = true;
@@ -590,6 +694,10 @@ pub fn walk(root: &Path) -> Result<Walk> {
             let Ok(ft) = e.file_type() else { continue };
             let name = e.file_name().to_string_lossy().into_owned();
             let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            // The parent folders were checked on the way down.
+            if !exclude.is_empty() && exclude.iter().any(|g| crate::glob::matches(g, &child)) {
+                continue;
+            }
             if ft.is_dir() {
                 if !skipped_dir(&name) {
                     stack.push((e.path(), child));
@@ -2475,6 +2583,10 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
     if !relevant(&rel) || !(wgsl || rel.ends_with(".rs") || lang.is_some()) {
         return Ok(Reindexed::NotCovered);
     }
+    let exclude: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [exclude_key(&root)], |r| r.get(0)).optional()?;
+    if exclude.is_some_and(|x| excluded(&x.lines().map(str::to_string).collect::<Vec<_>>(), &rel)) {
+        return Ok(Reindexed::NotCovered);
+    }
     let text = read_source(Path::new(&dir), &rel);
     let mut rows = Rows::default();
     let mut files: HashMap<String, u32> = HashMap::new();
@@ -2564,7 +2676,7 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
 }
 
 /// Recomputes `code_counts` for these names in one root.
-fn recount(tx: &rusqlite::Transaction<'_>, root: &str, names: &HashSet<String>) -> Result<()> {
+fn recount(tx: &crate::db::Transaction<'_>, root: &str, names: &HashSet<String>) -> Result<()> {
     let mut del = tx.prepare("DELETE FROM code_counts WHERE name = ?1 AND root = ?2")?;
     let mut ins = tx.prepare(
         "INSERT INTO code_counts(name, root, defs, refs, impls)
@@ -2883,7 +2995,7 @@ mod tests {
         let newer = format!("code-{}", code_schema_number(CODE_SCHEMA).unwrap() + 1);
         conn.execute("UPDATE meta SET value = ?1 WHERE key = 'code_schema'", [&newer]).unwrap();
         conn.execute_batch("DROP TABLE code_packages;").unwrap();
-        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = crate::db::Transaction::new_unchecked(&conn, crate::db::TransactionBehavior::Immediate).unwrap();
         let e = make_schema(&tx).unwrap_err();
         assert!(e.is_store_too_new(), "{e}");
         drop(tx);
@@ -2892,7 +3004,7 @@ mod tests {
         assert_eq!(made, 0, "no schema is run");
         // An older one is migrated by the same step.
         conn.execute("UPDATE meta SET value = 'code-6' WHERE key = 'code_schema'", []).unwrap();
-        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = crate::db::Transaction::new_unchecked(&conn, crate::db::TransactionBehavior::Immediate).unwrap();
         make_schema(&tx).unwrap();
         tx.commit().unwrap();
         let schema: String = conn.query_row("SELECT value FROM meta WHERE key = 'code_schema'", [], |r| r.get(0)).unwrap();

@@ -59,7 +59,7 @@ pub fn run(store: &Path, from: &Path) -> Result<Tally, String> {
         let field = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let full = field("text");
         let full = full.trim();
-        let Some(h) = rusqlite::OptionalExtension::optional(w.head(&key)).map_err(|e| format!("{key}: {e}"))? else {
+        let Some(h) = atlas::db::OptionalExtension::optional(w.head(&key)).map_err(|e| format!("{key}: {e}"))? else {
             t.missing.push(key);
             continue;
         };

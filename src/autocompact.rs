@@ -402,7 +402,7 @@ impl MainWatch {
             return None;
         }
         self.segment(path, ctx).asked = false;
-        Some(format!("atlas checkpoint-prompt: this automatic compaction waits once for the session's checkpoint journal entry, asked for on its next tool call ({ctx} context tokens, predicted point {at})"))
+        Some(format!("atlas checkpoint-prompt: this automatic compaction waits once for the session's checkpoint journal entry (lane session:{session}, entry checkpoint), asked for on its next tool call ({ctx} context tokens, predicted point {at})"))
     }
 }
 

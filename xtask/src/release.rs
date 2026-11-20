@@ -531,6 +531,20 @@ pub(crate) fn leak_check(tree: &Path, denylist: &Path) -> R<(usize, usize, Vec<S
     Ok((m.len(), named.len(), m.hits(&named)))
 }
 
+/// The hidden-character gate (`cargo xtask hidden`) over an exported
+/// tree, with the workspace's allowlist; an entry for a file the export
+/// leaves out is not an error here (the tracked-tree gate checks those).
+pub(crate) fn hidden_gate(tree: &Path, root: &Path) -> R<String> {
+    let mut files = Vec::new();
+    files_under(tree, Path::new(""), &mut files)?;
+    files.sort_by_key(|s| collate_key(s));
+    let named: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .map(|f| std::fs::read(tree.join(&f)).map(|b| (f.clone(), b)).map_err(|e| format!("{f}: {e}")))
+        .collect::<R<_>>()?;
+    crate::hidden::gate(&named, &crate::hidden::allowlist(root)?, false, "the exported tree")
+}
+
 /// The public repository when ATLAS_PUBLIC_REPO is not set. The README's
 /// wiki links name it (tests/docs.rs checks they agree).
 pub const DEFAULT_PUBLIC_REPO: &str = "bloodfeast/atlas";
@@ -1081,6 +1095,8 @@ pub fn run(args: Vec<String>) -> R {
     }
     say(&format!("leak check: {n} terms, {nfiles} files, no hits"));
     crate::release_ci::secret_gate(&tree.join("bin"), "the release binaries")?;
+    say("context poisoning guard: hidden text (every exported text file; binaries are skipped)");
+    say(&hidden_gate(&tree, &root)?);
 
     say("notes");
     let binaries = binaries_table(&stage.join("bin"))?;

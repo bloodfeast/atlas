@@ -268,7 +268,7 @@ fn disk_check(store: &MemoryStore, specs: &[ExportSpec], dir: &Path, rep: &mut C
         for (i, bad, empty) in &mut left {
             let spec = &specs[*i];
             // Busy past the store's own timeout: this round says nothing.
-            let Ok(locked) = rusqlite::Transaction::new_unchecked(store.conn(), rusqlite::TransactionBehavior::Immediate) else { continue };
+            let Ok(locked) = crate::db::Transaction::new_unchecked(store.conn(), crate::db::TransactionBehavior::Immediate) else { continue };
             let now: HashMap<PathBuf, String> = export::render(store, spec)?.into_iter().collect();
             let mut still = Vec::new();
             for rel in bad.iter() {
@@ -368,7 +368,7 @@ fn snapshot_once(store: &MemoryStore, dir: &Path) -> Result<Option<(PathBuf, i64
         n += 1;
     }
     let target = path.to_string_lossy().into_owned();
-    let version = |c: &rusqlite::Connection| c.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0));
+    let version = |c: &crate::db::Connection| c.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0));
     let before = version(store.conn())?;
     let records: i64 = store.conn().query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
     if let Err(e) = store.conn().execute("VACUUM INTO ?1", [&target]) {
@@ -377,7 +377,7 @@ fn snapshot_once(store: &MemoryStore, dir: &Path) -> Result<Option<(PathBuf, i64
     }
     let raced = version(store.conn())? != before;
     let verdict = (|| -> Result<(String, i64)> {
-        let copy = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let copy = crate::db::Connection::open_with_flags(&path, crate::db::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let ic: String = copy.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         let copied: i64 = copy.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
         Ok((ic, copied))

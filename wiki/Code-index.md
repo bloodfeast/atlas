@@ -1,3 +1,19 @@
+## What needs a language and what does not
+
+Memory, recall and history, search over Markdown notes and sources, discussions, the work queue, projects and
+multi-repo, and the hooks work whatever programming language a project uses, as does `.proto` indexing (rpc
+call sites are found in any language's files). The code index (`symbol`, item ranges on reads, grep
+annotations) covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C#, Python, Java and Kotlin (through
+scip-go, scip-typescript, scip-dotnet, scip-python and scip-java when they are installed, or a prebuilt
+`index.scip` from CI, WSL or Docker, else an owned scanner), and any language with a SCIP indexer from a
+`.scip` file. Build and test digests recognise `cargo test`, `nextest`, `go test` (plain and `-json`), jest,
+vitest, `dotnet test`, pytest, Maven and Gradle output, and other runners get the generic digest (see
+[[Handles and digests]]). Ranked search (`fts`, `sections`, `recall`) splits words on spaces and punctuation,
+so text written without spaces (Chinese, Japanese, Thai) is found with `search` in `substring` mode or `grep`
+instead.
+
+## The `symbol` tool
+
 `symbol` answers what a grep and several file reads would, from one pre-sorted table. Code roots are set
 under `code` on [[Configuration reference]].
 
@@ -184,6 +200,12 @@ app:src/lib.rs:8-10	Open for Store
 - `code.indexers` in the configuration turns the language indexers off (`false`) or names each one's binary,
   as `code.rust_analyzer` does for rust-analyzer, and `code.roots[].scip` names prebuilt indexes (see
   [[Configuration reference]]).
+- `code.roots[].exclude` leaves folders and files out of a root: globs relative to it (`["OctoPrint-Slow",
+  "tools/gen"]`). The walk never enters a match, so a package there is not a unit of its own: its indexer never
+  runs and nothing in it is scanned, which skips a package whose indexer hangs until `code.timeout_s` on every
+  reindex. An indexer whose unit or workspace holds the folder still reads it (rust-analyzer reads the whole
+  Cargo workspace; scip-python indexes a unit's whole folder when its project file sits above the excluded
+  one), but rows for excluded files are dropped, and an edit to one re-indexes nothing.
 - Each root records its **units** in `code_units`: the Rust side (`scip` or `scan only: why`), each unit of the
   language table (`TOOL VERSION` from its indexer, `prebuilt TOOL VERSION` from a prebuilt index, or `scan
   only: why`) and each language of a `--scip` file from another indexer (`prebuilt TOOL VERSION`), with the
