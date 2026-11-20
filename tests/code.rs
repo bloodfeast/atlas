@@ -949,6 +949,53 @@ mod worktrees {
         let empty = Db::open(f.root.parent().unwrap().join("empty.sqlite")).unwrap();
         assert_eq!(labels(&empty, &wt.join("src/lib.rs")), None);
     }
+
+    /// Two roots that are checkouts of one repository, here two worktrees of
+    /// a bare one. A file with no row in either root's own checkout stays
+    /// unannotated, though the other root would map it. A third worktree's
+    /// file maps.
+    #[test]
+    fn a_file_in_any_roots_own_checkout_is_never_mapped() {
+        let t = Temp::new("code-wt-two-roots");
+        let bare = t.path().join(".bare");
+        let (a, b, c) = (t.path().join("a"), t.path().join("b"), t.path().join("c"));
+        for (top, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+            link_worktree(&bare, top, name);
+            write(&top.join("src/lib.rs"), LIB);
+        }
+        let db = t.path().join("state/atlas.sqlite");
+        let root = |name: &str, dir: &Path| atlas::config::CodeRootSpec { name: name.into(), root: dir.to_path_buf(), build_scripts: false, scip: Default::default(), exclude: Vec::new() };
+        let spec = atlas::config::CodeSpec { roots: vec![root("a", &a), root("b", &b)], debounce_s: Some(0), ..Default::default() };
+        let code = CodeSetup::from_spec(&spec, &db, false);
+        drop(atlas::store::Store::open(&db, vaults(&db)).unwrap());
+        let mut conn = Db::open(&db).unwrap();
+        for r in &code.roots {
+            code_index::index_root(&code, &mut conn, r, &RustSource::ScanOnly("test".into())).unwrap();
+        }
+        write(&b.join("src/new.rs"), "pub fn new_here() {}\n");
+        assert_eq!(labels(&conn, &b.join("src/new.rs")), None, "b's own checkout");
+        assert!(labels(&conn, &c.join("src/lib.rs")).is_some(), "a third worktree maps");
+    }
+
+    /// The bytes scanned are the given path's, the file the tool read, even
+    /// when the canonical-path cache still names a link's old target.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_moved_since_it_was_cached_scans_the_file_it_names_now() {
+        let (f, conn) = repo("code-wt-link-moved");
+        let t = f.root.parent().unwrap();
+        let (one, two) = (t.join("one"), t.join("two"));
+        link_worktree(&f.root.join(".git"), &one, "one");
+        link_worktree(&f.root.join(".git"), &two, "two");
+        write(&one.join("src/moved.rs"), "pub fn moved() {}\n");
+        write(&two.join("src/moved.rs"), "\n\npub fn moved() {}\n");
+        let link = t.join("link");
+        std::os::unix::fs::symlink(&one, &link).unwrap();
+        assert_eq!(labels(&conn, &link.join("src/moved.rs")), some(&["fn moved 1-1"]));
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&two, &link).unwrap();
+        assert_eq!(labels(&conn, &link.join("src/moved.rs")), some(&["fn moved 3-3"]));
+    }
 }
 
 /// The line of `text` (1-based) that is exactly `want` after trimming its

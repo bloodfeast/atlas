@@ -2530,12 +2530,13 @@ fn root_in(roots: &[(String, String, String)], path: &str) -> Option<(String, St
 /// the index holds no row for. They are scanned from the file's own bytes, as
 /// [`reindex_file`] scans them, and nothing is written.
 ///
-/// The file maps to a root whose repository has the same common git folder
-/// and whose checkout is another one, when the file's path below its own
-/// checkout's top starts with the root folder's path below the root's; the
-/// deepest such folder wins. Git's own files decide it
-/// ([`crate::project::checkout`]). The mapped path then meets the root's walk
-/// rules ([`relevant`]) and its size limit ([`read_source`]).
+/// The file maps to a root whose repository has the same common git folder,
+/// when the file's path below its own checkout's top starts with the root
+/// folder's path below the root's; the deepest such folder wins. A file in any
+/// root's own checkout is never mapped: the index's rows are the answer there.
+/// Git's own files decide it ([`crate::project::checkout`]). The mapped path
+/// then meets the root's walk rules ([`relevant`]) and its size limit
+/// ([`read_source`]).
 fn worktree_items(roots: &[(String, String, String)], path: &str) -> Option<Vec<Item>> {
     // Only a file the scan reads is worth the walk up to its `.git`.
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
@@ -2544,16 +2545,25 @@ fn worktree_items(roots: &[(String, String, String)], path: &str) -> Option<Vec<
     }
     let file = crate::paths::canonical(Path::new(path));
     let here = crate::project::checkout(file.parent()?)?;
+    let here_top = crate::project::path_key(&here.top);
     let rel = below(&file, &here.top)?;
-    // (the file's folder for the root, its path below that, the prefix's length)
-    let mut best: Option<(PathBuf, String, usize)> = None;
+    // Every root's checkout first: the file may be in one of them.
+    let mut theirs: Vec<(PathBuf, crate::project::Checkout)> = Vec::new();
     for (_, dir, _) in roots {
         let dir = crate::paths::canonical(Path::new(dir));
         let Some(there) = crate::project::checkout(&dir) else { continue };
-        if there.common != here.common || crate::project::path_key(&there.top) == crate::project::path_key(&here.top) {
+        if crate::project::path_key(&there.top) == here_top {
+            return None;
+        }
+        theirs.push((dir, there));
+    }
+    // (its path below the root, the prefix's length)
+    let mut best: Option<(String, usize)> = None;
+    for (dir, there) in &theirs {
+        if there.common != here.common {
             continue;
         }
-        let Some(prefix) = below(&dir, &there.top) else { continue };
+        let Some(prefix) = below(dir, &there.top) else { continue };
         let mapped = if prefix.is_empty() {
             rel.clone()
         } else if rel.len() > prefix.len() + 1 && rel.is_char_boundary(prefix.len()) && same_path(&rel[..prefix.len()], &prefix) && rel.as_bytes()[prefix.len()] == b'/' {
@@ -2561,15 +2571,20 @@ fn worktree_items(roots: &[(String, String, String)], path: &str) -> Option<Vec<
         } else {
             continue;
         };
-        if best.as_ref().is_none_or(|b| prefix.len() > b.2) {
-            best = Some((here.top.join(&prefix), mapped, prefix.len()));
+        if best.as_ref().is_none_or(|b| prefix.len() > b.1) {
+            best = Some((mapped, prefix.len()));
         }
     }
-    let (base, rel, _) = best?;
+    let (rel, _) = best?;
     if !scannable(&rel) {
         return None;
     }
-    let text = read_source(&base, &rel)?;
+    // The bytes of the path as given, the file the tool read, through the
+    // size limit: a stale entry in the canonical-path cache (a link moved
+    // since it was cached) can change only which root a file maps to, never
+    // whose bytes are scanned.
+    let given = Path::new(path);
+    let text = read_source(given.parent()?, &given.file_name()?.to_string_lossy())?;
     let rows = scan_file(&rel, &text);
     let lines: Vec<&str> = text.lines().collect();
     let items = rows
