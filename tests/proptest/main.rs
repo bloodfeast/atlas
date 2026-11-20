@@ -5,12 +5,15 @@
 //! case prints its minimal input; proptest also saves it under
 //! `tests/proptest/proptest-regressions/` so the next run tries it first.
 
+mod checkout;
 mod denylist;
+mod fingerprint;
 mod grep;
 mod hashes;
 mod items;
 mod json;
 mod literals;
 mod paths;
+mod parity;
 mod protobuf;
 mod stamps;
