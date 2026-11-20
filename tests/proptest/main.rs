@@ -10,6 +10,7 @@ mod denylist;
 mod fingerprint;
 mod grep;
 mod hashes;
+mod indexer_model;
 mod items;
 mod json;
 mod literals;
