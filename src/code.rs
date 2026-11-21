@@ -3246,6 +3246,32 @@ mod tests {
         assert!(!relevant(".git/HEAD"));
         assert!(!relevant("README.md"));
     }
+
+    /// The root holding a path is the deepest one whose folder is a whole
+    /// prefix of it, with something below. A sibling whose name has the same
+    /// length, a folder that only starts like a root's, the root's own folder
+    /// and a path shorter than every root are no file of any root. Through
+    /// `file_items` a wrong root mostly reads as no row and falls back to the
+    /// worktree scan, so the rule is checked here.
+    #[test]
+    fn root_in_takes_the_deepest_root_whose_folder_holds_the_path() {
+        let r = |name: &str, dir: &str| (name.to_string(), dir.to_string(), format!("{name} stamp"));
+        let forward = [r("a", "/t/aa"), r("b", "/t/bb/"), r("long", "/t/bbbbb"), r("outer", "/t/o"), r("inner", "/t/o/in")];
+        let reverse: Vec<_> = forward.iter().rev().cloned().collect();
+        let hit = |root: &str, dir: &str, rel: &str| Some((root.to_string(), format!("{root} stamp"), dir.to_string(), rel.to_string()));
+        for roots in [&forward[..], &reverse[..]] {
+            assert_eq!(root_in(roots, "/t/aa/x.rs"), hit("a", "/t/aa", "x.rs"));
+            assert_eq!(root_in(roots, "/t/bb/x.rs"), hit("b", "/t/bb", "x.rs"));
+            assert_eq!(root_in(roots, "\\t\\bb\\x.rs"), hit("b", "/t/bb", "x.rs"));
+            // The byte after "/t/bbbbb"'s length is a slash here too.
+            assert_eq!(root_in(roots, "/t/aa/cc/x.rs"), hit("a", "/t/aa", "cc/x.rs"));
+            assert_eq!(root_in(roots, "/t/o/in/x.rs"), hit("inner", "/t/o/in", "x.rs"));
+            assert_eq!(root_in(roots, "/t/o/x.rs"), hit("outer", "/t/o", "x.rs"));
+            for none in ["/t/aax/y.rs", "/t/aa", "/t/aa/", "/t", "/u/aa/x.rs"] {
+                assert_eq!(root_in(roots, none), None, "{none}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
