@@ -674,7 +674,7 @@ mod worktrees {
     use super::*;
 
     /// The index database's connection.
-    type Db = rusqlite::Connection;
+    type Db = atlas::db::Connection;
 
     fn db(f: &Fixture) -> Db {
         Db::open(&f.db).unwrap()
