@@ -460,6 +460,91 @@ fn two_indexers_that_disagree_on_a_fingerprint_settle() {
     assert_eq!((ia.reports().len(), runs), (1, 1), "the two indexers took turns");
 }
 
+/// The same two servers, watching as servers do: each walks only when asked
+/// (here a poke, in a server the safety-net walk), so each one's walk comes
+/// after the other's write. An indexer that forgot the fingerprint its own
+/// run stored would read the other's write as a change, and the two would
+/// take turns again at every walk. The test above walks every 20 ms, so each
+/// indexer's own next walk comes first and hides that.
+#[test]
+fn two_watching_indexers_that_disagree_on_a_fingerprint_settle() {
+    let f = fixture("code-two-fp-watch");
+    let mut a = setup(&f);
+    a.watch = true;
+    a.rescan_interval = Duration::from_secs(60);
+    let mut b = a.clone();
+    b.roots[0].scip = code::Prebuilt::Files(vec![(String::new(), Some(f.scip.clone()))]);
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let ia = Indexer::start(a, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
+    assert!(ia.wait_reports(1, Duration::from_secs(30)), "{:?}", ia.status());
+    let ib = Indexer::start(b, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
+    assert!(ib.wait_reports(1, Duration::from_secs(30)), "{:?}", ib.status());
+    for _ in 0..3 {
+        ia.check();
+        std::thread::sleep(Duration::from_millis(300));
+        ib.check();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let runs = settled_count(2, || ia.reports().len() + ib.reports().len());
+    assert_eq!((ia.reports().len(), ib.reports().len()), (1, 1), "the two indexers took turns: {runs} runs");
+}
+
+/// A lease left by a holder that is gone (a server that crashed in a run) is
+/// free once its time is up, and a holder takes its own lease again before
+/// then. Without the first, one crash would stop every server's indexing for
+/// good.
+#[test]
+fn an_expired_lease_is_free_and_a_holder_takes_its_own_again() {
+    let f = fixture("code-lease-expiry");
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let ttl = Duration::from_secs(600);
+    assert!(code_index::take_lease(&mut conn, "crashed", ttl).unwrap());
+    assert!(!code_index::take_lease(&mut conn, "next", ttl).unwrap(), "held");
+    assert!(code_index::take_lease(&mut conn, "crashed", ttl).unwrap(), "its own lease, again");
+    conn.execute("UPDATE code_lease SET until = until - 1200 WHERE id = 1", []).unwrap();
+    assert!(code_index::take_lease(&mut conn, "next", ttl).unwrap(), "an expired lease is free");
+    assert!(!code_index::take_lease(&mut conn, "crashed", ttl).unwrap(), "and the next holder has it");
+}
+
+/// A watching indexer still walks at its safety-net interval when nothing in
+/// the root moves. That walk is how it finds a mark another root's run left
+/// (a stored fingerprint of ''), which no file event announces.
+#[test]
+fn a_watching_indexer_finds_a_mark_at_its_safety_net_walk() {
+    let f = fixture("code-net-walk");
+    let mut code = setup(&f);
+    code.watch = true;
+    code.rescan_interval = Duration::from_millis(300);
+    index(&f, &code);
+    let ix = Indexer::start(code, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(ix.reports().len(), 0, "the stored index is current");
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute("UPDATE code_roots SET fingerprint = ''", []).unwrap();
+    assert!(ix.wait_reports(1, Duration::from_secs(10)), "the mark was never found: {:?}", ix.status());
+}
+
+/// A poke makes a watching indexer walk at once, as a watcher that lost
+/// events (a queue overflow) asks it to: here it finds a mark long before its
+/// safety-net walk.
+#[test]
+fn a_poke_makes_a_watching_indexer_walk_at_once() {
+    let f = fixture("code-poke");
+    let mut code = setup(&f);
+    code.watch = true;
+    code.rescan_interval = Duration::from_secs(60);
+    index(&f, &code);
+    let ix = Indexer::start(code, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
+    std::thread::sleep(Duration::from_millis(200));
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute("UPDATE code_roots SET fingerprint = ''", []).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(ix.reports().len(), 0, "nothing walked before the poke");
+    ix.check();
+    assert!(ix.wait_reports(1, Duration::from_secs(10)), "the poke found nothing: {:?}", ix.status());
+}
+
 /// Two servers that see one change run it once: the second, given the lease
 /// after the first's run, finds the stored fingerprint current and stands
 /// down. Both watch the root, as servers do, and the safety-net walk is far

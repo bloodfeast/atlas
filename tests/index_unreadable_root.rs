@@ -64,3 +64,17 @@ fn a_marked_root_whose_folder_is_removed_shows_failed() {
     ix.check();
     assert!(shows_failed(&ix), "{:?}", ix.status());
 }
+
+/// A root whose folder comes back after a failed walk is indexed again: a
+/// failure holds only while the root stays as it was when it failed.
+#[test]
+fn a_root_whose_folder_comes_back_is_indexed_again() {
+    let t = Temp::new("ix-back-root");
+    let root = t.path().join("app");
+    let db = t.path().join("state/atlas.sqlite");
+    open_store(&db);
+    let ix = Indexer::start(setup(&root, &db), db.clone(), Some(RustSource::ScanOnly("test".into())));
+    assert!(shows_failed(&ix), "{:?}", ix.status());
+    write(&root.join("src/lib.rs"), "pub fn back() {}\n");
+    assert!(ix.wait_reports(1, Duration::from_secs(30)), "the root was not indexed again: {:?}", ix.status());
+}
