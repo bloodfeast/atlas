@@ -7,7 +7,7 @@ mod common;
 
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use atlas::code::CodeSetup;
 use atlas::code_index::{Indexer, RootState, RustSource};
@@ -34,19 +34,6 @@ fn first_walk_fails(ix: &Indexer) -> bool {
     ix.wait_idle(Duration::from_secs(10)) && matches!(ix.status().get("app"), Some(RootState::Failed(_)))
 }
 
-/// Whether the root shows `Failed` within ten seconds. A walk that a poke
-/// asks for gives no signal when it ends (the root goes from `Idle` straight
-/// to `Failed`), so this polls.
-fn shows_failed(ix: &Indexer) -> bool {
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(10) {
-        if matches!(ix.status().get("app"), Some(RootState::Failed(_))) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    false
-}
 
 #[test]
 fn a_root_whose_folder_is_missing_shows_failed() {
@@ -69,8 +56,9 @@ fn a_marked_root_whose_folder_is_removed_shows_failed() {
     fs::remove_dir_all(&root).unwrap();
     let conn = atlas::db::Connection::open(&db).unwrap();
     conn.execute("UPDATE code_roots SET fingerprint = '' WHERE root = 'app'", []).unwrap();
-    ix.check();
-    assert!(shows_failed(&ix), "{:?}", ix.status());
+    let t = ix.check();
+    assert!(ix.wait_checked(t, Duration::from_secs(10)), "the check was never served: {:?}", ix.status());
+    assert!(matches!(ix.status().get("app"), Some(RootState::Failed(_))), "{:?}", ix.status());
 }
 
 /// A root whose folder comes back after a failed walk is indexed again: a

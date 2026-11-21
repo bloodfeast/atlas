@@ -428,15 +428,12 @@ fn a_file_modified_after_the_walk_began_is_not_served_from_that_run() {
     assert!(code::file_items(&conn, &f.root.join("src/lib.rs").to_string_lossy()).unwrap().is_some(), "an untouched file is served");
 }
 
-/// Waits until `count()` reaches `n` (at most 30 s), then fifty rescan
-/// intervals more, and gives the final count.
-fn settled_count(n: usize, count: impl Fn() -> usize) -> usize {
-    let t = std::time::Instant::now();
-    while count() < n && t.elapsed() < Duration::from_secs(30) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::thread::sleep(Duration::from_secs(1));
-    count()
+/// Asks the indexer to compare every root now, and waits until it has: the
+/// comparison, and any run it started, have ended
+/// ([`Indexer::wait_checked`]).
+fn checked(ix: &Indexer) {
+    let t = ix.check();
+    assert!(ix.wait_checked(t, Duration::from_secs(30)), "the check was never served: {:?}", ix.status());
 }
 
 /// Every server shares one index database, and two servers can compute
@@ -456,8 +453,13 @@ fn two_indexers_that_disagree_on_a_fingerprint_settle() {
     let ia = Indexer::start(a, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
     assert!(ia.wait_reports(1, Duration::from_secs(30)), "{:?}", ia.status());
     let ib = Indexer::start(b, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
-    let runs = settled_count(1, || ib.reports().len());
-    assert_eq!((ia.reports().len(), runs), (1, 1), "the two indexers took turns");
+    assert!(ib.wait_reports(1, Duration::from_secs(30)), "{:?}", ib.status());
+    // Each compares the root twice more, with the other's write stored.
+    for _ in 0..2 {
+        checked(&ia);
+        checked(&ib);
+    }
+    assert_eq!((ia.reports().len(), ib.reports().len()), (1, 1), "the two indexers took turns");
 }
 
 /// The same two servers, watching as servers do: each walks only when asked
@@ -480,13 +482,10 @@ fn two_watching_indexers_that_disagree_on_a_fingerprint_settle() {
     let ib = Indexer::start(b, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
     assert!(ib.wait_reports(1, Duration::from_secs(30)), "{:?}", ib.status());
     for _ in 0..3 {
-        ia.check();
-        std::thread::sleep(Duration::from_millis(300));
-        ib.check();
-        std::thread::sleep(Duration::from_millis(300));
+        checked(&ia);
+        checked(&ib);
     }
-    let runs = settled_count(2, || ia.reports().len() + ib.reports().len());
-    assert_eq!((ia.reports().len(), ib.reports().len()), (1, 1), "the two indexers took turns: {runs} runs");
+    assert_eq!((ia.reports().len(), ib.reports().len()), (1, 1), "the two indexers took turns");
 }
 
 /// A lease left by a holder that is gone (a server that crashed in a run) is
@@ -539,16 +538,18 @@ fn a_poke_makes_a_watching_indexer_walk_at_once() {
     assert!(ix.wait_idle(Duration::from_secs(10)), "the first walk never ended: {:?}", ix.status());
     let conn = atlas::db::Connection::open(&f.db).unwrap();
     conn.execute("UPDATE code_roots SET fingerprint = ''", []).unwrap();
-    assert_eq!(ix.reports().len(), 0, "nothing walked before the poke");
-    ix.check();
-    assert!(ix.wait_reports(1, Duration::from_secs(10)), "the poke found nothing: {:?}", ix.status());
+    assert_eq!(ix.reports().len(), 0, "nothing ran before the poke");
+    checked(&ix);
+    assert_eq!(ix.reports().len(), 1, "the poke's walk did not run the marked root: {:?}", ix.status());
 }
 
 /// Two servers that see one change run it once: the second, given the lease
 /// after the first's run, finds the stored fingerprint current and stands
-/// down. Both watch the root, as servers do, and the safety-net walk is far
-/// off, so nothing but that recheck stops the second run. A stand-in
-/// rust-analyzer keeps the first run long enough for the second to be waiting.
+/// down. The test holds the lease while both see the change, so both wait
+/// for it. Neither walks again after that (both watch the root, as servers
+/// do, the safety-net walk is far off, and nothing pokes them), so nothing
+/// but that recheck stops the second run. A stand-in rust-analyzer keeps the
+/// first run long enough for two holders that shared a name to overlap.
 #[cfg(unix)]
 #[test]
 fn two_indexers_index_one_change_once() {
@@ -571,9 +572,20 @@ fn two_indexers_index_one_change_once() {
     // file was a second change (2 runs in 4 of 40 tries with every core busy).
     let half = f.root.join("src/.later.rs.part");
     fs::write(&half, "pub fn later() {}\n").unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
+    assert!(code_index::take_lease(&mut conn, "the test", Duration::from_secs(600)).unwrap());
     fs::rename(&half, f.root.join("src/later.rs")).unwrap();
-    let runs = settled_count(1, || ia.reports().len() + ib.reports().len());
-    assert_eq!(runs, 1, "one change was indexed more than once");
+    // Both compare the root after the change, and wait for the lease.
+    checked(&ia);
+    checked(&ib);
+    let pending = |ix: &Indexer| matches!(ix.status().get("app"), Some(code_index::RootState::Pending));
+    assert!(pending(&ia) && pending(&ib), "{:?} {:?}", ia.status(), ib.status());
+    // Given back: one runs the change, and the other, once it has the lease,
+    // has stood down, or run, by the time both are idle.
+    code_index::release_lease(&conn, "the test").unwrap();
+    let settled = ia.wait_idle(Duration::from_secs(30)) && ib.wait_idle(Duration::from_secs(30));
+    assert!(settled, "{:?} {:?}", ia.status(), ib.status());
+    assert_eq!(ia.reports().len() + ib.reports().len(), 1, "one change was indexed more than once");
 }
 
 /// A running indexer indexes a file edited during its run again, once. The
@@ -595,7 +607,10 @@ fn a_running_indexer_indexes_a_mid_run_edit_again_once() {
     code.rescan_interval = Duration::from_millis(20);
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
     let ix = Indexer::start(code, f.db.clone(), Some(RustSource::Analyzer(ra)));
-    assert_eq!(settled_count(2, || ix.reports().len()), 2, "{:?}", ix.status());
+    assert!(ix.wait_reports(2, Duration::from_secs(30)), "{:?}", ix.status());
+    checked(&ix);
+    checked(&ix);
+    assert_eq!(ix.reports().len(), 2, "{:?}", ix.status());
     let conn = atlas::db::Connection::open(&f.db).unwrap();
     let items = code::file_items(&conn, &f.root.join("src/mid.rs").to_string_lossy()).unwrap().expect("current");
     assert!(items.iter().any(|i| i.name == "during"), "{items:?}");

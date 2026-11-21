@@ -219,8 +219,11 @@ fn a_running_indexer_reindexes_a_marked_root_once_and_settles() {
     let ix = code_index::Indexer::start(code.clone(), db.clone(), Some(RustSource::ScanOnly("test".into())));
     let roots = |ix: &code_index::Indexer| ix.reports().iter().map(|r| r.root.clone()).collect::<Vec<_>>();
     assert!(ix.wait_reports(3, Duration::from_secs(30)), "the marked service was not indexed again: {:?}", roots(&ix));
-    // Fifty rescan intervals later, nothing more has run.
-    std::thread::sleep(Duration::from_secs(1));
+    // Two more comparisons of every root later, nothing more has run.
+    for _ in 0..2 {
+        let t = ix.check();
+        assert!(ix.wait_checked(t, Duration::from_secs(30)), "the check was never served: {:?}", roots(&ix));
+    }
     assert_eq!(roots(&ix), ["svc", "lib", "svc"]);
     assert_ne!(fingerprint(&db, "svc"), "");
     assert_eq!(ix.reports()[2].rows.xroot_refs, 3, "{:?}", ix.reports()[2].rows);
