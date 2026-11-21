@@ -28,7 +28,15 @@ fn open_store(db: &Path) {
     drop(atlas::store::Store::open(db, atlas::paths::Vaults::new(&[("notes".to_string(), notes)]).unwrap()).unwrap());
 }
 
-/// Whether the root shows `Failed` within ten seconds.
+/// Whether the root's first walk ends with it `Failed`. A root stays
+/// `Starting` until that walk ends, so this waits on the indexer's state.
+fn first_walk_fails(ix: &Indexer) -> bool {
+    ix.wait_idle(Duration::from_secs(10)) && matches!(ix.status().get("app"), Some(RootState::Failed(_)))
+}
+
+/// Whether the root shows `Failed` within ten seconds. A walk that a poke
+/// asks for gives no signal when it ends (the root goes from `Idle` straight
+/// to `Failed`), so this polls.
 fn shows_failed(ix: &Indexer) -> bool {
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(10) {
@@ -46,7 +54,7 @@ fn a_root_whose_folder_is_missing_shows_failed() {
     let db = t.path().join("state/atlas.sqlite");
     open_store(&db);
     let ix = Indexer::start(setup(&t.path().join("gone"), &db), db.clone(), Some(RustSource::ScanOnly("test".into())));
-    assert!(shows_failed(&ix), "{:?}", ix.status());
+    assert!(first_walk_fails(&ix), "{:?}", ix.status());
 }
 
 #[test]
@@ -74,7 +82,7 @@ fn a_root_whose_folder_comes_back_is_indexed_again() {
     let db = t.path().join("state/atlas.sqlite");
     open_store(&db);
     let ix = Indexer::start(setup(&root, &db), db.clone(), Some(RustSource::ScanOnly("test".into())));
-    assert!(shows_failed(&ix), "{:?}", ix.status());
+    assert!(first_walk_fails(&ix), "{:?}", ix.status());
     write(&root.join("src/lib.rs"), "pub fn back() {}\n");
     assert!(ix.wait_reports(1, Duration::from_secs(30)), "the root was not indexed again: {:?}", ix.status());
 }

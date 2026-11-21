@@ -518,7 +518,7 @@ fn a_watching_indexer_finds_a_mark_at_its_safety_net_walk() {
     code.rescan_interval = Duration::from_millis(300);
     index(&f, &code);
     let ix = Indexer::start(code, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
-    std::thread::sleep(Duration::from_millis(200));
+    assert!(ix.wait_idle(Duration::from_secs(10)), "the first walk never ended: {:?}", ix.status());
     assert_eq!(ix.reports().len(), 0, "the stored index is current");
     let conn = rusqlite::Connection::open(&f.db).unwrap();
     conn.execute("UPDATE code_roots SET fingerprint = ''", []).unwrap();
@@ -536,10 +536,9 @@ fn a_poke_makes_a_watching_indexer_walk_at_once() {
     code.rescan_interval = Duration::from_secs(60);
     index(&f, &code);
     let ix = Indexer::start(code, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
-    std::thread::sleep(Duration::from_millis(200));
+    assert!(ix.wait_idle(Duration::from_secs(10)), "the first walk never ended: {:?}", ix.status());
     let conn = rusqlite::Connection::open(&f.db).unwrap();
     conn.execute("UPDATE code_roots SET fingerprint = ''", []).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(ix.reports().len(), 0, "nothing walked before the poke");
     ix.check();
     assert!(ix.wait_reports(1, Duration::from_secs(10)), "the poke found nothing: {:?}", ix.status());
@@ -564,7 +563,8 @@ fn two_indexers_index_one_change_once() {
     index(&f, &code);
     let ia = Indexer::start(code.clone(), f.db.clone(), Some(RustSource::Analyzer(ra.clone())));
     let ib = Indexer::start(code.clone(), f.db.clone(), Some(RustSource::Analyzer(ra)));
-    std::thread::sleep(Duration::from_millis(200));
+    let first_walks = ia.wait_idle(Duration::from_secs(10)) && ib.wait_idle(Duration::from_secs(10));
+    assert!(first_walks, "a first walk never ended: {:?} {:?}", ia.status(), ib.status());
     assert_eq!(ia.reports().len() + ib.reports().len(), 0, "the stored index is current");
     // One change, renamed into place: with a debounce of 0, a walk between
     // `fs::write`'s create and its write stored the empty file, and the full
