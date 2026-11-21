@@ -1962,6 +1962,8 @@ fn precompact_replies(dir: &Path, cfg: &Path, tp: &Path, trigger: &str) -> (Stri
             .args(a)
             // Not a budget test: a loaded first open is not cut (review S3 of #329).
             .env("ATLAS_HOOK_BUDGET_OFF", "1")
+            // Not the developer's own Claude settings: an autoCompactWindow there moves the compact point.
+            .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
             .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .env_remove("ATLAS_UNATTENDED")
