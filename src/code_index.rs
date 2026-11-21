@@ -1118,7 +1118,21 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
             let snap = watcher.snapshot(i);
             let must_walk = walk_all || !snap.healthy || snap.full;
             if must_walk {
-                let fp = code::root_fingerprint(r).unwrap_or_default();
+                let fp = match code::root_fingerprint(r) {
+                    Ok(fp) => fp,
+                    Err(e) => {
+                        // The root cannot be walked (its folder is gone or
+                        // unreadable): a failure to show, never a current
+                        // index. Read as '', the error would equal a mark.
+                        changed[i] = None;
+                        failed[i] = Some((String::new(), e.to_string()));
+                        seen_fp[i] = String::new();
+                        watcher.clear(i, snap.seq);
+                        set(shared, &r.name, RootState::Failed(e.to_string()));
+                        settled[i] = true;
+                        continue;
+                    }
+                };
                 let indexed = stored.get(&r.name).map(|x| x.fingerprint.as_str());
                 if indexed == Some(fp.as_str()) || failed[i].as_ref().is_some_and(|f| f.0 == fp) {
                     changed[i] = None;
@@ -1179,15 +1193,17 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                 continue;
             }
             // Another server may have indexed it since it was scheduled
-            // here: then there is nothing to do.
-            let fp = code::root_fingerprint(r).unwrap_or_default();
-            if code::root_records(&conn)?.get(&r.name).is_some_and(|x| x.fingerprint == fp) {
-                let _ = release_lease(&conn, &holder);
-                changed[i] = None;
-                seen_fp[i] = fp;
-                set(shared, &r.name, RootState::Idle);
-                settled[i] = true;
-                continue;
+            // here: then there is nothing to do. A root that cannot be walked
+            // goes on to the run, which fails and says why.
+            if let Ok(fp) = code::root_fingerprint(r) {
+                if code::root_records(&conn)?.get(&r.name).is_some_and(|x| x.fingerprint == fp) {
+                    let _ = release_lease(&conn, &holder);
+                    changed[i] = None;
+                    seen_fp[i] = fp;
+                    set(shared, &r.name, RootState::Idle);
+                    settled[i] = true;
+                    continue;
+                }
             }
             set(shared, &r.name, if settled[i] { RootState::Running } else { RootState::Starting });
             log_line(&setup.dir, &format!("{} indexing", r.name));

@@ -48,6 +48,8 @@
 9 sleep tests/hooks.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 6 elapsed tests/ideas.rs -- a wall-time bound on work (perf claim); to become a count of work done
 2 sleep tests/ideas.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
+1 elapsed tests/index_unreadable_root.rs -- a give-up bound on a poll for an event (outcome fixed unless it hangs); to become a readiness signal
+1 sleep tests/index_unreadable_root.rs -- a sleep or poll used to order threads or processes: a poll for the state a walk leaves; the walk gives no signal when it ends; to become a readiness signal
 1 elapsed tests/orchestrate.rs -- a time printed for the reader; asserts nothing (the admit cost is counted, #373)
 35 sleep tests/orchestrate.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 elapsed tests/pr_digest.rs -- a time printed for the reader; asserts nothing
