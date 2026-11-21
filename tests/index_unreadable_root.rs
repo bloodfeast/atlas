@@ -67,7 +67,7 @@ fn a_marked_root_whose_folder_is_removed_shows_failed() {
     let ix = Indexer::start(setup(&root, &db), db.clone(), Some(RustSource::ScanOnly("test".into())));
     assert!(ix.wait_reports(1, Duration::from_secs(30)), "{:?}", ix.status());
     fs::remove_dir_all(&root).unwrap();
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = atlas::db::Connection::open(&db).unwrap();
     conn.execute("UPDATE code_roots SET fingerprint = '' WHERE root = 'app'", []).unwrap();
     ix.check();
     assert!(shows_failed(&ix), "{:?}", ix.status());

@@ -420,7 +420,7 @@ fn a_file_modified_after_the_walk_began_is_not_served_from_that_run() {
     fs::set_permissions(&ra, fs::Permissions::from_mode(0o755)).unwrap();
     let code = setup(&f);
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     let rep = code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::Analyzer(ra)).unwrap();
     assert!(rep.rust.contains("exited with"), "the stand-in ran: {}", rep.rust);
     assert!(fs::read_to_string(f.root.join("src/mid.rs")).unwrap().contains("during"), "the stand-in edited the file");
@@ -497,7 +497,7 @@ fn two_watching_indexers_that_disagree_on_a_fingerprint_settle() {
 fn an_expired_lease_is_free_and_a_holder_takes_its_own_again() {
     let f = fixture("code-lease-expiry");
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
-    let mut conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut conn = atlas::db::Connection::open(&f.db).unwrap();
     let ttl = Duration::from_secs(600);
     assert!(code_index::take_lease(&mut conn, "crashed", ttl).unwrap());
     assert!(!code_index::take_lease(&mut conn, "next", ttl).unwrap(), "held");
@@ -520,7 +520,7 @@ fn a_watching_indexer_finds_a_mark_at_its_safety_net_walk() {
     let ix = Indexer::start(code, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
     assert!(ix.wait_idle(Duration::from_secs(10)), "the first walk never ended: {:?}", ix.status());
     assert_eq!(ix.reports().len(), 0, "the stored index is current");
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     conn.execute("UPDATE code_roots SET fingerprint = ''", []).unwrap();
     assert!(ix.wait_reports(1, Duration::from_secs(10)), "the mark was never found: {:?}", ix.status());
 }
@@ -537,7 +537,7 @@ fn a_poke_makes_a_watching_indexer_walk_at_once() {
     index(&f, &code);
     let ix = Indexer::start(code, f.db.clone(), Some(RustSource::ScanOnly("test".into())));
     assert!(ix.wait_idle(Duration::from_secs(10)), "the first walk never ended: {:?}", ix.status());
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     conn.execute("UPDATE code_roots SET fingerprint = ''", []).unwrap();
     assert_eq!(ix.reports().len(), 0, "nothing walked before the poke");
     ix.check();
@@ -596,7 +596,7 @@ fn a_running_indexer_indexes_a_mid_run_edit_again_once() {
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
     let ix = Indexer::start(code, f.db.clone(), Some(RustSource::Analyzer(ra)));
     assert_eq!(settled_count(2, || ix.reports().len()), 2, "{:?}", ix.status());
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     let items = code::file_items(&conn, &f.root.join("src/mid.rs").to_string_lossy()).unwrap().expect("current");
     assert!(items.iter().any(|i| i.name == "during"), "{items:?}");
 }
@@ -616,7 +616,7 @@ fn a_stale_but_stable_root_is_indexed_again() {
     drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
     let ix = Indexer::start(code.clone(), f.db.clone(), Some(RustSource::File(f.scip.clone())));
     assert!(ix.wait_reports(1, Duration::from_secs(60)), "{:?}", ix.status());
-    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
     conn.execute("UPDATE code_roots SET fingerprint = '' WHERE root = 'app'", []).unwrap();
     ix.check();
     assert!(ix.wait_reports(2, Duration::from_secs(20)), "the stale root was not indexed again: {:?}", ix.status());
