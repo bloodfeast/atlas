@@ -122,6 +122,13 @@ impl Poker {
     pub fn roots(&self) -> usize {
         self.roots
     }
+
+    /// Wakes anyone in [`Watcher::wait_past`] without marking a root: an
+    /// event of its own, so a waiter that counted every earlier one wakes.
+    pub fn wake(&self) {
+        self.shared.lock().seq += 1;
+        self.shared.changed.notify_all();
+    }
 }
 
 /// Watches a set of roots for changes.

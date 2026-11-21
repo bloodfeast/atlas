@@ -32,7 +32,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -955,10 +955,16 @@ pub type Status = HashMap<String, RootState>;
 
 struct Shared {
     status: Mutex<Status>,
-    /// Signalled whenever a root's state changes.
+    /// Signalled whenever a root's state changes, and when a pass serves a
+    /// check.
     moved: Condvar,
     stop: AtomicBool,
     reports: Mutex<Vec<IndexReport>>,
+    /// The tickets [`Indexer::check`] has handed out.
+    asked: AtomicU64,
+    /// The newest ticket a finished pass took when it began. It changes
+    /// under `status`, and `moved` is notified after.
+    served: AtomicU64,
 }
 
 /// The background indexer: one thread that watches the code roots and
@@ -991,7 +997,14 @@ impl Indexer {
         let watcher = if setup.watch { Watcher::start(&roots) } else { Watcher::disabled(&roots) };
         let poker = watcher.poker();
         let status: Status = setup.roots.iter().map(|r| (r.name.clone(), RootState::Starting)).collect();
-        let shared = Arc::new(Shared { status: Mutex::new(status), moved: Condvar::new(), stop: AtomicBool::new(false), reports: Mutex::new(Vec::new()) });
+        let shared = Arc::new(Shared {
+            status: Mutex::new(status),
+            moved: Condvar::new(),
+            stop: AtomicBool::new(false),
+            reports: Mutex::new(Vec::new()),
+            asked: AtomicU64::new(0),
+            served: AtomicU64::new(0),
+        });
         let s2 = shared.clone();
         std::thread::Builder::new()
             .name("atlas-code-index".into())
@@ -1014,10 +1027,38 @@ impl Indexer {
     }
 
     /// Asks the thread to compare every root with its fingerprint now.
-    pub fn check(&self) {
+    ///
+    /// # Returns
+    ///
+    /// A ticket for [`Indexer::wait_checked`].
+    pub fn check(&self) -> u64 {
         for i in 0..self.poker.roots() {
             self.poker.poke(i);
         }
+        // After the pokes, so a pass that takes this ticket sees them.
+        let ticket = self.shared.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        // The pokes may have woken the loop already, and that pass may have
+        // ended before the ticket existed: wake it once more, after.
+        self.poker.wake();
+        ticket
+    }
+
+    /// Blocks until `ticket` (from [`Indexer::check`]) is served, or the
+    /// timeout passes (a condition-variable wait). Served means that every
+    /// root was compared with its fingerprint after the check, by the pass
+    /// that took the ticket or by the one running when it was asked, and
+    /// that every run those comparisons started has ended. A root they left
+    /// pending (its lease held elsewhere, a quiet time above zero, a
+    /// deferral) is not resolved yet: [`Indexer::wait_idle`] waits for that.
+    ///
+    /// # Returns
+    ///
+    /// True when the ticket was served.
+    pub fn wait_checked(&self, ticket: u64, timeout: Duration) -> bool {
+        let st = self.shared.status.lock().unwrap_or_else(|p| p.into_inner());
+        let served = &self.shared.served;
+        let (_st, _) = self.shared.moved.wait_timeout_while(st, timeout, |_| served.load(Ordering::SeqCst) < ticket).unwrap_or_else(|p| p.into_inner());
+        served.load(Ordering::SeqCst) >= ticket
     }
 
     /// The reports of every indexing this indexer ran, oldest first.
@@ -1073,6 +1114,15 @@ fn log_line(dir: &Path, line: &str) {
     }
 }
 
+/// Marks the checks up to `ticket` served ([`Indexer::wait_checked`]).
+fn serve(shared: &Shared, ticket: u64) {
+    let _st = shared.status.lock().unwrap_or_else(|p| p.into_inner());
+    if shared.served.load(Ordering::SeqCst) < ticket {
+        shared.served.store(ticket, Ordering::SeqCst);
+        shared.moved.notify_all();
+    }
+}
+
 fn set(shared: &Shared, name: &str, s: RootState) {
     let mut st = shared.status.lock().unwrap_or_else(|p| p.into_inner());
     if st.get(name) != Some(&s) {
@@ -1113,6 +1163,9 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
         if shared.stop.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // The newest check this pass serves. It was asked before the pass
+        // began, so its pokes are in the snapshots below.
+        let ticket = shared.asked.load(Ordering::SeqCst);
         let stored = code::root_records(&conn)?;
         for (i, r) in setup.roots.iter().enumerate() {
             let snap = watcher.snapshot(i);
@@ -1229,12 +1282,23 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                 }
             }
         }
+        // Every decision of this pass, and every run it started, has
+        // landed: the checks asked before it began are served.
+        serve(shared, ticket);
+        // Counted before the ticket is looked at: a check whose ticket comes
+        // after the look wakes the loop after this count (`check`'s wake).
+        let seen = watcher.events();
+        // A check asked during the pass may have had its pokes taken in by
+        // this pass's snapshots, or counted in `seen`. Either way no wake-up
+        // would come for it, so the pass that serves it starts now.
+        if shared.asked.load(Ordering::SeqCst) > ticket {
+            continue;
+        }
         // Sleep until the next root is due, a change arrives, or the safety
         // net walk is due.
         let next_due = changed.iter().flatten().map(|at| (*at + setup.debounce).saturating_duration_since(Instant::now())).min();
         let net = setup.rescan_interval.saturating_sub(last_walk.elapsed());
         let wait = next_due.map_or(net, |d| d.min(net)).max(Duration::from_millis(10));
-        let seen = watcher.events();
         if !watcher.wait_past(seen, wait) && last_walk.elapsed() >= setup.rescan_interval {
             walk_all = true;
         }
