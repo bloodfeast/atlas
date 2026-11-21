@@ -1337,8 +1337,10 @@ pub(crate) struct ManifestNotes {
     pub(crate) plugin_changed_in: Option<String>,
 }
 
-/// The paths whose files only Claude Code's `/plugin` update installs.
-pub(crate) const PLUGIN_PATHS: &[&str] = &[".claude-plugin", ".mcp.json", "hooks", "skills"];
+/// The paths whose files only Claude Code's `/plugin` update installs. The
+/// MCP server's entry is inline in `.claude-plugin/plugin.json`: a root
+/// `.mcp.json` would also be read as a project server in this repository.
+pub(crate) const PLUGIN_PATHS: &[&str] = &[".claude-plugin", "hooks", "skills"];
 
 /// The manifest's `highlights`: the items of the section's Highlights (see
 /// `notes_parts`), one line each, at most `atlas::update::HIGHLIGHTS_MAX`

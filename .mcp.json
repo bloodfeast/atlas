@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "atlas": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/atlas",
-      "args": []
-    }
-  }
-}

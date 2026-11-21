@@ -8,6 +8,11 @@
   "repository": "https://github.com/bloodfeast/atlas",
   "license": "Apache-2.0",
   "keywords": ["memory", "index", "search", "mcp", "recall"],
-  "mcpServers": "./.mcp.json",
+  "mcpServers": {
+    "atlas": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/atlas",
+      "args": []
+    }
+  },
   "hooks": "./hooks/hooks.json"
 }

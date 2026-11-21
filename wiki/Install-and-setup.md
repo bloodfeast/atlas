@@ -294,7 +294,7 @@ Two file tools, `atlas digest` and `atlas crop`, need no configuration; see [[Ha
 ### As a Claude Code plugin
 
 `.claude-plugin/plugin.json` names the plugin, `.claude-plugin/marketplace.json` makes the repository its own
-marketplace, and `.mcp.json` launches `${CLAUDE_PLUGIN_ROOT}/bin/atlas` with no arguments, so it finds its
+marketplace, and the `mcpServers` entry in `plugin.json` launches `${CLAUDE_PLUGIN_ROOT}/bin/atlas` with no arguments, so it finds its
 configuration through `ATLAS_CONFIG`, `atlas.json` at the plugin root (gitignored), or the user's configuration
 folder. In a release, `bin/` holds `atlas.exe` (Windows resolves `bin/atlas` to it) and, for macOS and Linux, a
 small `sh` launcher named `atlas` that starts `atlas-<arch>-<os>` beside it. `cargo xtask release` builds them

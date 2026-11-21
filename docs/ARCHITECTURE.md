@@ -4,7 +4,7 @@ One Rust binary, one dependency (SQLite, bundled), no network at query time.
 
 ## Processes
 
-- **The MCP server** (`atlas`, started by Claude Code from `.mcp.json`). It serves the tools over
+- **The MCP server** (`atlas`, started by Claude Code from `plugin.json`'s `mcpServers`). It serves the tools over
   stdio. It answers `hook` calls on their own worker thread, so a hook never waits behind a slow tool call.
   It keeps its own log, `atlas-server.log` in the folder of the database it opened (`src/serve_log.rs`),
   meant to be attached to a bug report. It is safe to attach to a public GitHub issue, and its first line

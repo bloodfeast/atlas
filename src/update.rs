@@ -210,7 +210,7 @@ pub struct Manifest {
     /// the field.
     pub highlights: Vec<String>,
     /// The release that last changed the plugin's own files (hooks,
-    /// `.mcp.json`, skills), which only Claude Code's `/plugin` update
+    /// `plugin.json`, skills), which only Claude Code's `/plugin` update
     /// installs: an installed plugin older than it needs `/plugin`. `None`
     /// in a manifest without the field (or with a value that is not
     /// `MAJOR.MINOR.PATCH`).
