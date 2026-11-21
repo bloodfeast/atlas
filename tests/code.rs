@@ -616,6 +616,32 @@ fn a_running_indexer_indexes_a_mid_run_edit_again_once() {
     assert!(items.iter().any(|i| i.name == "during"), "{items:?}");
 }
 
+/// An edit made during a watching indexer's run is indexed as soon as the
+/// run ends: its event, counted while the run was under way, wakes the next
+/// pass. The safety-net walk is ten minutes off, so only that wake-up finds
+/// the edit in time. A stand-in rust-analyzer makes the edit early in the
+/// first run, then keeps the run going.
+#[cfg(unix)]
+#[test]
+fn a_watching_indexer_indexes_an_edit_made_during_its_run_at_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture("code-edit-in-run");
+    write(&f.root.join("src/mid.rs"), "pub fn before() {}\n");
+    let ra = f.root.parent().unwrap().join("edit-early-ra.sh");
+    let script = "#!/bin/sh\nif [ ! -e \"$2/../edited\" ]; then\n  touch \"$2/../edited\"\n  printf 'pub fn during() {}\\n' >> \"$2/src/mid.rs\"\n  sleep 0.5\nfi\nexit 1\n";
+    fs::write(&ra, script).unwrap();
+    fs::set_permissions(&ra, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut code = setup(&f);
+    code.watch = true;
+    code.rescan_interval = Duration::from_secs(600);
+    drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+    let ix = Indexer::start(code, f.db.clone(), Some(RustSource::Analyzer(ra)));
+    assert!(ix.wait_reports(2, Duration::from_secs(30)), "the edit waited for the safety-net walk: {:?}", ix.status());
+    let conn = atlas::db::Connection::open(&f.db).unwrap();
+    let items = code::file_items(&conn, &f.root.join("src/mid.rs").to_string_lossy()).unwrap().expect("current");
+    assert!(items.iter().any(|i| i.name == "during"), "{items:?}");
+}
+
 /// A root whose stored fingerprint no longer matches its files, while the
 /// files stay as they are, is indexed again by the running indexer. A file
 /// edited during a run leaves this state (the stored fingerprint is the

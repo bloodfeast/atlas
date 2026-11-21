@@ -1166,6 +1166,11 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
         // The newest check this pass serves. It was asked before the pass
         // began, so its pokes are in the snapshots below.
         let ticket = shared.asked.load(Ordering::SeqCst);
+        // The events counted before the pass looks at anything. One that
+        // lands during the pass (an edit during a run) then wakes the next
+        // pass at once; counted at the end, it waited for the next event or
+        // the safety-net walk.
+        let seen = watcher.events();
         let stored = code::root_records(&conn)?;
         for (i, r) in setup.roots.iter().enumerate() {
             let snap = watcher.snapshot(i);
@@ -1285,12 +1290,11 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
         // Every decision of this pass, and every run it started, has
         // landed: the checks asked before it began are served.
         serve(shared, ticket);
-        // Counted before the ticket is looked at: a check whose ticket comes
-        // after the look wakes the loop after this count (`check`'s wake).
-        let seen = watcher.events();
         // A check asked during the pass may have had its pokes taken in by
         // this pass's snapshots, or counted in `seen`. Either way no wake-up
-        // would come for it, so the pass that serves it starts now.
+        // would come for it, so the pass that serves it starts now. A check
+        // whose ticket comes after this look wakes the loop after `seen` was
+        // counted (`check`'s wake).
         if shared.asked.load(Ordering::SeqCst) > ticket {
             continue;
         }
