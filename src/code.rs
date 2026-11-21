@@ -327,6 +327,12 @@ fn exclude_key(root: &str) -> String {
     format!("code_exclude:{root}")
 }
 
+/// Root `root`'s `exclude` globs, as [`record_exclude`] stored them.
+fn root_excludes(conn: &Connection, root: &str) -> Result<Vec<String>> {
+    let x: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [exclude_key(root)], |r| r.get(0)).optional()?;
+    Ok(x.map(|x| x.lines().map(str::to_string).collect()).unwrap_or_default())
+}
+
 /// Records root `root`'s `exclude` globs where [`reindex_file`] reads them.
 ///
 /// # Errors
@@ -2535,9 +2541,10 @@ fn root_in(roots: &[(String, String, String)], path: &str) -> Option<(String, St
 /// folder's path below the root's; the deepest such folder wins. A file in any
 /// root's own checkout is never mapped: the index's rows are the answer there.
 /// Git's own files decide it ([`crate::project::checkout`]). The mapped path
-/// then meets the root's walk rules ([`relevant`]) and its size limit
-/// ([`read_source`]).
-fn worktree_items(roots: &[(String, String, String)], path: &str) -> Option<Vec<Item>> {
+/// then meets the root's walk rules ([`relevant`]), its `exclude` globs
+/// ([`excluded`], from `excludes`; a root whose globs cannot be read maps
+/// nothing) and its size limit ([`read_source`]).
+fn worktree_items(roots: &[(String, String, String)], path: &str, excludes: impl Fn(&str) -> Option<Vec<String>>) -> Option<Vec<Item>> {
     // Only a file the scan reads is worth the walk up to its `.git`.
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     if !(name.ends_with(".rs") || name.ends_with(".wgsl") || crate::langs::of_path(name).is_some()) {
@@ -2548,18 +2555,18 @@ fn worktree_items(roots: &[(String, String, String)], path: &str) -> Option<Vec<
     let here_top = crate::project::path_key(&here.top);
     let rel = below(&file, &here.top)?;
     // Every root's checkout first: the file may be in one of them.
-    let mut theirs: Vec<(PathBuf, crate::project::Checkout)> = Vec::new();
-    for (_, dir, _) in roots {
+    let mut theirs: Vec<(&str, PathBuf, crate::project::Checkout)> = Vec::new();
+    for (root, dir, _) in roots {
         let dir = crate::paths::canonical(Path::new(dir));
         let Some(there) = crate::project::checkout(&dir) else { continue };
         if crate::project::path_key(&there.top) == here_top {
             return None;
         }
-        theirs.push((dir, there));
+        theirs.push((root, dir, there));
     }
-    // (its path below the root, the prefix's length)
-    let mut best: Option<(String, usize)> = None;
-    for (dir, there) in &theirs {
+    // (the root, its path below the root, the prefix's length)
+    let mut best: Option<(&str, String, usize)> = None;
+    for (root, dir, there) in &theirs {
         if there.common != here.common {
             continue;
         }
@@ -2571,12 +2578,12 @@ fn worktree_items(roots: &[(String, String, String)], path: &str) -> Option<Vec<
         } else {
             continue;
         };
-        if best.as_ref().is_none_or(|b| prefix.len() > b.1) {
-            best = Some((mapped, prefix.len()));
+        if best.as_ref().is_none_or(|b| prefix.len() > b.2) {
+            best = Some((root, mapped, prefix.len()));
         }
     }
-    let (rel, _) = best?;
-    if !scannable(&rel) {
+    let (root, rel, _) = best?;
+    if !scannable(&rel) || excluded(&excludes(root)?, &rel) {
         return None;
     }
     // The bytes of the path as given, the file the tool read, through the
@@ -2652,7 +2659,8 @@ fn file_row(conn: &Connection, root: &str, rel: &str) -> Result<Option<(i64, Str
 /// `None`).
 pub fn file_items(conn: &Connection, path: &str) -> Result<Option<Vec<Item>>> {
     let roots = code_roots(conn)?;
-    let Some((root, _, _, rel)) = root_in(&roots, path) else { return Ok(worktree_items(&roots, path)) };
+    let excludes = |root: &str| root_excludes(conn, root).ok();
+    let Some((root, _, _, rel)) = root_in(&roots, path) else { return Ok(worktree_items(&roots, path, excludes)) };
     // One statement, so one snapshot: a full write committing between two
     // reads could give this file's id to another file, whose rows would then
     // be read as this file's. A covered file with no item still yields one
@@ -2681,7 +2689,7 @@ pub fn file_items(conn: &Connection, path: &str) -> Result<Option<Vec<Item>>> {
     }
     // No row: the file may be a worktree's copy (the root's walk never
     // enters `.claude/worktrees/`). A stale row is never mapped.
-    let Some(indexed) = indexed else { return Ok(worktree_items(&roots, path)) };
+    let Some(indexed) = indexed else { return Ok(worktree_items(&roots, path, excludes)) };
     // A file written after the indexing may have moved its lines.
     let modified = fs::metadata(path).and_then(|m| m.modified()).map(crate::store::utc).unwrap_or_default();
     if modified.is_empty() || modified > indexed {

@@ -935,6 +935,26 @@ mod worktrees {
         assert_eq!(labels(&conn, &wt.join("src/small.rs")), some(&["fn small 1-1"]));
     }
 
+    /// A root's `exclude` globs hold in its worktrees too: a worktree file they
+    /// cover gets no items, as the checkout's own copy gets none.
+    #[test]
+    fn a_worktree_file_the_roots_excludes_cover_gets_no_items() {
+        let f = fixture("code-wt-exclude");
+        fs::create_dir_all(f.root.join(".git")).unwrap();
+        write(&f.root.join("src/gen/made.rs"), "pub fn made() {}\n");
+        let mut code = setup(&f);
+        code.roots[0].exclude = vec!["gen".into()];
+        scan_index(&f, &code);
+        let conn = db(&f);
+        assert_eq!(labels(&conn, &f.root.join("src/gen/made.rs")), None, "excluded in the checkout");
+        let wt = f.root.join(".claude/worktrees/w");
+        link_worktree(&f.root.join(".git"), &wt, "w");
+        write(&wt.join("src/gen/made.rs"), "pub fn made() {}\n");
+        assert_eq!(labels(&conn, &wt.join("src/gen/made.rs")), None, "excluded in the worktree");
+        write(&wt.join("src/kept.rs"), "pub fn kept() {}\n");
+        assert_eq!(labels(&conn, &wt.join("src/kept.rs")), some(&["fn kept 1-1"]));
+    }
+
     /// The checkout's own files are never mapped: a file the index holds no
     /// row for stays unannotated, as before worktrees were covered. A database
     /// without the code tables answers nothing.
