@@ -665,6 +665,22 @@ fn the_live_check_runs_when_the_last_check_expires() {
     assert!(update::next_check_in(&dir, hour, hour) <= hour + Duration::from_secs(1));
 }
 
+/// Copies the atlas binary over the file `to`. On Unix `cp` writes the copy,
+/// in a process of its own, as a new file with the binary's mode. Written
+/// here, the copy could be open at the moment a test beside this one starts
+/// a process; that child then holds the copy's write handle until it runs
+/// its own program, and Linux will not run a file open for writing ("Text
+/// file busy").
+fn copy_atlas_over(to: &Path) {
+    #[cfg(unix)]
+    {
+        fs::remove_file(to).unwrap();
+        assert!(Command::new("cp").arg(env!("CARGO_BIN_EXE_atlas")).arg(to).status().unwrap().success(), "cp to {}", to.display());
+    }
+    #[cfg(not(unix))]
+    fs::copy(env!("CARGO_BIN_EXE_atlas"), to).unwrap();
+}
+
 #[test]
 fn a_live_server_stages_the_new_binary_and_is_told_to_reconnect() {
     let t = Temp::new("upd-live");
@@ -673,7 +689,7 @@ fn a_live_server_stages_the_new_binary_and_is_told_to_reconnect() {
     let u = Updater { live: true, check_every: Duration::ZERO, ..setup(&t, &base) };
     // A running process started from the installed binary (a real
     // executable, blocked reading its stdin) stands for the live server.
-    fs::copy(env!("CARGO_BIN_EXE_atlas"), &u.exe).unwrap();
+    copy_atlas_over(&u.exe);
     let mut running = Command::new(&u.exe)
         .arg("--hook")
         .env("ATLAS_HOOK_BUDGET_OFF", "1")
