@@ -2771,8 +2771,7 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
     if !scannable(&rel) {
         return Ok(Reindexed::NotCovered);
     }
-    let exclude: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [exclude_key(&root)], |r| r.get(0)).optional()?;
-    if exclude.is_some_and(|x| excluded(&x.lines().map(str::to_string).collect::<Vec<_>>(), &rel)) {
+    if excluded(&root_excludes(conn, &root)?, &rel) {
         return Ok(Reindexed::NotCovered);
     }
     let wgsl = rel.ends_with(".wgsl");
