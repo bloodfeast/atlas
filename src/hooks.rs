@@ -1214,7 +1214,8 @@ impl Hooks {
             log_thread,
             router,
             // Claude Code's live folder only when the caller asks
-            // ([`Hooks::detect_offer_paths`]): a test never reads it.
+            // ([`Hooks::detect_offer_paths`]): a test that reaches it sets its
+            // own `CLAUDE_CONFIG_DIR`.
             offer: None,
             records: None,
             edited: Vec::new(),
