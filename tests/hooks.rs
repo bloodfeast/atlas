@@ -1931,6 +1931,8 @@ fn command_hook_rows_reach_the_token_log_before_the_process_exits() {
             .arg("--hook")
             // Not a budget test: a loaded machine does not cut its answer.
             .env("ATLAS_HOOK_BUDGET_OFF", "1")
+            // Not the developer's own Claude settings: SessionStart points their status line at this binary.
+            .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
             .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .env_remove("ATLAS_UNATTENDED")

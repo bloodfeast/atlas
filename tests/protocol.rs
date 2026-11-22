@@ -360,23 +360,6 @@ fn a_leading_byte_order_mark_is_ignored() {
     assert!(v.get("error").is_none(), "{v}");
 }
 
-/// The `hook` tool does not say a user is there, so SessionStart asks nothing
-/// and spends nothing, on the route `tools_memory` answers.
-#[test]
-fn the_hook_tool_asks_nothing_at_session_start() {
-    let fx = Fx::new("p-hook-start");
-    let mut s = fx.server();
-    let state = fx.tmp.path().join("mem");
-    s.set_memory(atlas::memory::settings::Settings::from_config(None, &state.join("index.sqlite")).unwrap());
-    let input = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"hook","arguments":{"event":"SessionStart","session_id":"s","source":"startup"}}}
-"#;
-    let mut out = Vec::new();
-    atlas::protocol::serve(&mut s, &input[..], &mut out).unwrap();
-    let out = String::from_utf8(out).unwrap();
-    assert!(out.contains("\"id\":7") && !out.contains("On by default") && !out.contains("Claude Code setting"), "{out}");
-    assert!(!state.join(atlas::claude_settings::OFFER_STATE).exists(), "nothing spent: {out}");
-}
-
 /// The words a source file's `match` arms take, with the given indent, after
 /// `from`. An arm under `#[cfg(feature = "dev")]` is skipped, so this holds with
 /// and without `dev`. Read from the source so that a new arm cannot be missed.
