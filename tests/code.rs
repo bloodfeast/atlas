@@ -1016,6 +1016,28 @@ mod worktrees {
         std::os::unix::fs::symlink(&two, &link).unwrap();
         assert_eq!(labels(&conn, &link.join("src/moved.rs")), some(&["fn moved 3-3"]));
     }
+
+    /// Which repository a file is in comes from the path as it resolves now,
+    /// not from the canonical-path cache: a link moved to another
+    /// repository's checkout maps to no root, rather than annotating that
+    /// repository's bytes under the root its old target mapped to.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_moved_to_another_repository_maps_to_no_root() {
+        let (f, conn) = repo("code-wt-link-repo");
+        let t = f.root.parent().unwrap();
+        let (one, other) = (t.join("one"), t.join("other"));
+        link_worktree(&f.root.join(".git"), &one, "one");
+        fs::create_dir_all(other.join(".git")).unwrap();
+        write(&one.join("src/moved.rs"), "pub fn moved() {}\n");
+        write(&other.join("src/moved.rs"), "pub fn elsewhere() {}\n");
+        let link = t.join("link");
+        std::os::unix::fs::symlink(&one, &link).unwrap();
+        assert_eq!(labels(&conn, &link.join("src/moved.rs")), some(&["fn moved 1-1"]));
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(labels(&conn, &link.join("src/moved.rs")), None, "another repository's file");
+    }
 }
 
 /// The line of `text` (1-based) that is exactly `want` after trimming its

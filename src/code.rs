@@ -2550,7 +2550,9 @@ fn worktree_items(roots: &[(String, String, String)], path: &str, excludes: impl
     if !(name.ends_with(".rs") || name.ends_with(".wgsl") || crate::langs::of_path(name).is_some()) {
         return None;
     }
-    let file = crate::paths::canonical(Path::new(path));
+    // Resolved now: a link moved since the cache saw it may name another
+    // repository, whose file must not map to this one's roots.
+    let file = crate::paths::canonical_fresh(Path::new(path));
     let here = crate::project::checkout(file.parent()?)?;
     let here_top = crate::project::path_key(&here.top);
     let rel = below(&file, &here.top)?;
@@ -2587,9 +2589,8 @@ fn worktree_items(roots: &[(String, String, String)], path: &str, excludes: impl
         return None;
     }
     // The bytes of the path as given, the file the tool read, through the
-    // size limit: a stale entry in the canonical-path cache (a link moved
-    // since it was cached) can change only which root a file maps to, never
-    // whose bytes are scanned.
+    // size limit. Its identity above is resolved fresh, so these are the
+    // bytes of the file that mapped.
     let given = Path::new(path);
     let text = read_source(given.parent()?, &given.file_name()?.to_string_lossy())?;
     let rows = scan_file(&rel, &text);
