@@ -14,7 +14,17 @@ use atlas::code_index::{Indexer, RootState, RustSource};
 use common::*;
 
 fn setup(root: &Path, db: &Path) -> CodeSetup {
-    let spec = atlas::config::CodeSpec { roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: root.to_path_buf(), build_scripts: false, scip: Default::default(), exclude: Vec::new() }], debounce_s: Some(0), ..Default::default() };
+    let spec = atlas::config::CodeSpec {
+        roots: vec![atlas::config::CodeRootSpec {
+            name: "app".into(),
+            root: root.to_path_buf(),
+            build_scripts: false,
+            scip: Default::default(),
+            exclude: Vec::new(),
+        }],
+        debounce_s: Some(0),
+        ..Default::default()
+    };
     let mut code = CodeSetup::from_spec(&spec, db, false);
     code.defer_on_cargo = false;
     code.watch = false;
@@ -33,7 +43,6 @@ fn open_store(db: &Path) {
 fn first_walk_fails(ix: &Indexer) -> bool {
     ix.wait_idle(Duration::from_secs(10)) && matches!(ix.status().get("app"), Some(RootState::Failed(_)))
 }
-
 
 #[test]
 fn a_root_whose_folder_is_missing_shows_failed() {
@@ -73,4 +82,28 @@ fn a_root_whose_folder_comes_back_is_indexed_again() {
     assert!(first_walk_fails(&ix), "{:?}", ix.status());
     write(&root.join("src/lib.rs"), "pub fn back() {}\n");
     assert!(ix.wait_reports(1, Duration::from_secs(30)), "the root was not indexed again: {:?}", ix.status());
+}
+
+/// A root whose folder is briefly unreadable and comes back unchanged is
+/// current again: the walk that finds the stored fingerprint clears the
+/// failure, with no run.
+#[test]
+fn a_root_whose_folder_comes_back_unchanged_is_idle_again() {
+    let t = Temp::new("ix-back-unchanged");
+    let root = t.path().join("app");
+    let aside = t.path().join("app-aside");
+    write(&root.join("src/lib.rs"), "pub fn a() {}\n");
+    let db = t.path().join("state/atlas.sqlite");
+    open_store(&db);
+    let ix = Indexer::start(setup(&root, &db), db.clone(), Some(RustSource::ScanOnly("test".into())));
+    assert!(ix.wait_reports(1, Duration::from_secs(30)), "{:?}", ix.status());
+    fs::rename(&root, &aside).unwrap();
+    let c = ix.check();
+    assert!(ix.wait_checked(c, Duration::from_secs(10)), "the check was never served: {:?}", ix.status());
+    assert!(matches!(ix.status().get("app"), Some(RootState::Failed(_))), "{:?}", ix.status());
+    fs::rename(&aside, &root).unwrap();
+    let c = ix.check();
+    assert!(ix.wait_checked(c, Duration::from_secs(10)), "the check was never served: {:?}", ix.status());
+    assert_eq!(ix.status().get("app"), Some(&RootState::Idle), "the unchanged root stays failed");
+    assert_eq!(ix.reports().len(), 1, "an unchanged root needs no run");
 }

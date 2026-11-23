@@ -440,7 +440,9 @@ fn checked(ix: &Indexer) {
 /// different fingerprints for one root: one started before a configuration
 /// change (here a configured prebuilt SCIP file) and one after. Each settles on
 /// the other's write. A stale root goes at once only for a mark (a stored
-/// fingerprint of ''), so the two never take turns re-indexing it.
+/// fingerprint of ''), so the two never take turns re-indexing it. This test
+/// guards that mark-only rule: the code before the rule never took turns, so it
+/// passes there too, and fails once any stale fingerprint goes at once.
 #[test]
 fn two_indexers_that_disagree_on_a_fingerprint_settle() {
     let f = fixture("code-two-fp");
@@ -467,7 +469,9 @@ fn two_indexers_that_disagree_on_a_fingerprint_settle() {
 /// after the other's write. An indexer that forgot the fingerprint its own
 /// run stored would read the other's write as a change, and the two would
 /// take turns again at every walk. The test above walks every 20 ms, so each
-/// indexer's own next walk comes first and hides that.
+/// indexer's own next walk comes first and hides that. Like the test above,
+/// it guards a rule (the remembered fingerprint) rather than failing on the
+/// code before it.
 #[test]
 fn two_watching_indexers_that_disagree_on_a_fingerprint_settle() {
     let f = fixture("code-two-fp-watch");
@@ -599,7 +603,15 @@ fn a_running_indexer_indexes_a_mid_run_edit_again_once() {
     let f = fixture("code-mid-run-ix");
     write(&f.root.join("src/mid.rs"), "pub fn before() {}\n");
     let ra = f.root.parent().unwrap().join("edit-once-ra.sh");
-    let script = "#!/bin/sh\nif [ ! -e \"$2/../edited\" ]; then\n  touch \"$2/../edited\"\n  sleep 0.05\n  printf 'pub fn during() {}\\n' >> \"$2/src/mid.rs\"\nfi\nexit 1\n";
+    let script = concat!(
+        "#!/bin/sh\n",
+        "if [ ! -e \"$2/../edited\" ]; then\n",
+        "  touch \"$2/../edited\"\n",
+        "  sleep 0.05\n",
+        "  printf 'pub fn during() {}\\n' >> \"$2/src/mid.rs\"\n",
+        "fi\n",
+        "exit 1\n",
+    );
     fs::write(&ra, script).unwrap();
     fs::set_permissions(&ra, fs::Permissions::from_mode(0o755)).unwrap();
     let mut code = setup(&f);
@@ -628,7 +640,15 @@ fn a_watching_indexer_indexes_an_edit_made_during_its_run_at_once() {
     let f = fixture("code-edit-in-run");
     write(&f.root.join("src/mid.rs"), "pub fn before() {}\n");
     let ra = f.root.parent().unwrap().join("edit-early-ra.sh");
-    let script = "#!/bin/sh\nif [ ! -e \"$2/../edited\" ]; then\n  touch \"$2/../edited\"\n  printf 'pub fn during() {}\\n' >> \"$2/src/mid.rs\"\n  sleep 0.5\nfi\nexit 1\n";
+    let script = concat!(
+        "#!/bin/sh\n",
+        "if [ ! -e \"$2/../edited\" ]; then\n",
+        "  touch \"$2/../edited\"\n",
+        "  printf 'pub fn during() {}\\n' >> \"$2/src/mid.rs\"\n",
+        "  sleep 0.5\n",
+        "fi\n",
+        "exit 1\n",
+    );
     fs::write(&ra, script).unwrap();
     fs::set_permissions(&ra, fs::Permissions::from_mode(0o755)).unwrap();
     let mut code = setup(&f);

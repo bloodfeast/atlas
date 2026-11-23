@@ -1057,7 +1057,11 @@ impl Indexer {
     pub fn wait_checked(&self, ticket: u64, timeout: Duration) -> bool {
         let st = self.shared.status.lock().unwrap_or_else(|p| p.into_inner());
         let served = &self.shared.served;
-        let (_st, _) = self.shared.moved.wait_timeout_while(st, timeout, |_| served.load(Ordering::SeqCst) < ticket).unwrap_or_else(|p| p.into_inner());
+        let (_st, _) = self
+            .shared
+            .moved
+            .wait_timeout_while(st, timeout, |_| served.load(Ordering::SeqCst) < ticket)
+            .unwrap_or_else(|p| p.into_inner());
         served.load(Ordering::SeqCst) >= ticket
     }
 
@@ -1192,7 +1196,12 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                     }
                 };
                 let indexed = stored.get(&r.name).map(|x| x.fingerprint.as_str());
-                if indexed == Some(fp.as_str()) || failed[i].as_ref().is_some_and(|f| f.0 == fp) {
+                if indexed == Some(fp.as_str()) {
+                    // Current: a failure from an earlier walk (the folder
+                    // briefly unreadable, now back unchanged) no longer holds.
+                    changed[i] = None;
+                    failed[i] = None;
+                } else if failed[i].as_ref().is_some_and(|f| f.0 == fp) {
                     changed[i] = None;
                 } else if fp != seen_fp[i] {
                     // Still changing (or first sight): restart the quiet time,
@@ -1252,9 +1261,12 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
             }
             // Another server may have indexed it since it was scheduled
             // here: then there is nothing to do. A root that cannot be walked
-            // goes on to the run, which fails and says why.
+            // goes on to the run, which fails and says why. So does a store
+            // that cannot be read here: the lease is held, so an error must
+            // not leave this loop before the release below.
             if let Ok(fp) = code::root_fingerprint(r) {
-                if code::root_records(&conn)?.get(&r.name).is_some_and(|x| x.fingerprint == fp) {
+                let current = code::root_records(&conn).is_ok_and(|m| m.get(&r.name).is_some_and(|x| x.fingerprint == fp));
+                if current {
                     let _ = release_lease(&conn, &holder);
                     changed[i] = None;
                     seen_fp[i] = fp;

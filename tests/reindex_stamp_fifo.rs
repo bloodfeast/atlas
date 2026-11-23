@@ -26,9 +26,20 @@ fn a_file_written_during_the_reindex_read_is_not_taken_as_indexed() {
     let notes = t.path().join("state/notes");
     fs::create_dir_all(&notes).unwrap();
     drop(atlas::store::Store::open(&db, atlas::paths::Vaults::new(&[("notes".to_string(), notes)]).unwrap()).unwrap());
-    let spec = atlas::config::CodeSpec { roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: root.clone(), build_scripts: false, scip: Default::default(), exclude: Vec::new() }], debounce_s: Some(0), ..Default::default() };
+    let spec = atlas::config::CodeSpec {
+        roots: vec![atlas::config::CodeRootSpec {
+            name: "app".into(),
+            root: root.clone(),
+            build_scripts: false,
+            scip: Default::default(),
+            exclude: Vec::new(),
+        }],
+        debounce_s: Some(0),
+        ..Default::default()
+    };
     let code = CodeSetup::from_spec(&spec, &db, false);
-    code_index::index_root(&code, &mut atlas::db::Connection::open(&db).unwrap(), &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
+    code_index::index_root(&code, &mut atlas::db::Connection::open(&db).unwrap(), &code.roots[0], &RustSource::ScanOnly("test".into()))
+        .unwrap();
     let pipe = root.join("src/pipe.rs");
     assert!(Command::new("mkfifo").arg(&pipe).status().unwrap().success());
     let (db2, pipe2) = (db.clone(), pipe.to_string_lossy().into_owned());
