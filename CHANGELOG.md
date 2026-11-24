@@ -14,6 +14,136 @@ Sections are not written here by hand. Each pull request adds a fragment, `chang
 and section, and `cargo xtask version` folds the pending fragments into one section for the next release, in
 the order above, and sets the version by replaying them in merge order (`changes/README.md`).
 
+## v0.11.0
+
+### Highlights
+
+- **Open questions close themselves.** A decision or answer that names a lane's open question now closes it,
+  `recall op=status` shows each question's age and flags the stale ones, `recall op=sweep` lists those that look
+  settled with their evidence, and a question can be deferred to a date or the next session.
+- **A slow hook queue no longer stalls a subagent.** When a gate check overruns its budget, only launches,
+  resumes and merges are still refused; every other call goes ahead with a one-line note, and the refusal names
+  the slow phase.
+- **The task judge has an enforced mode.** With `orchestrate.judge.mode: "enforced"`, the launch hook scores each
+  builder brief itself, denies a launch off the pick, keeps the explore counter and logs every launch.
+- **`pr_events.autostart` keeps the PR listener running**, started with each session and held to one by a lock,
+  and `pr_events.repos` picks which repositories it serves.
+
+### Upgrade notes
+
+- **Restart running Claude Code sessions after this update.** The plugin's MCP server entry moved into
+  `plugin.json`. A session started before the update, on a plugin folder updated in place, loses atlas's tools
+  at its next `/clear`; a new session connects as before.
+  Thanks to @serkankose (#24).
+
+### Features
+
+- **`pr_events.repos` picks the repositories `atlas pr-events serve` serves.** An optional list of `OWNER/NAME`
+  (github.com) or `HOST/OWNER/NAME` entries; the listener forwards and files events for those only, so a project
+  with many repositories no longer has to drop `remote` from the ones it does not want served. Empty by default,
+  which serves every repository with a remote, as before. An entry that names no repository of the project is
+  reported at start.
+- **`pr_events.autostart` starts the listener with the session.** With it on, each session's start runs
+  `atlas pr-events serve` in the background when no listener runs for the memory store, so the listener no longer
+  dies with the shell it was started from. No OS service is installed. A lock beside the store, held by the
+  listener for its life, keeps it to one, even when two sessions start at once, and a listener that exits is
+  started again by the next session. The listener gets none of the session hook's own stdio, so the hook's
+  output ends when the hook does. When the last listener ended on an error, the next start line quotes it. Off
+  by default; it needs `pr_events.port`.
+- **Context limits can differ by model within an agent kind.** `orchestrate.kinds.<kind>.models` maps a model id
+  or family alias (`haiku`, `sonnet`, `opus`, `fable`) to its own `limit`, `handoff`, `handoff_pct` and `window`,
+  so a Haiku builder can hand off near 90,000 tokens while an Opus builder keeps 285,000. The model and the
+  matching are those of `compact.model_windows` (an exact id beats an alias); unset keys fall back to the kind's
+  values, and a model with no entry behaves as before. The handoff and hard-limit messages name the entry that
+  applied, for example `haiku builder: 90,000 (orchestrate.kinds.builder.models.haiku)`.
+- **Haiku 5.5's built-in window is now the inferred one (1,000,000), not 200,000.** Claude Code runs Haiku 5.5
+  subagents past 200,000 context tokens, so the compaction guard no longer treats them as 200,000-token models.
+  Haiku 4.5 and older keep 200,000; `compact.model_windows` still overrides either.
+- **Open questions keep up with themselves.** A `decision` or `answered` journal entry that answers an open
+  question of its lane (or a numbered sub-lane) now closes it: a line or bullet leading with its Q-id such as
+  `Q-RIVER-3`, `answers <key>`, or a ref to its key. A passing mention ("Q-X-1 settled; Q-X-2 still open") closes
+  only the leading one, and a question's own Q-id is the one leading its title, so a follow-up titled
+  "Q-X-2: follow-up to Q-X-1" stays open. atlas adds the `answers` ref, says so in the reply, and lists the
+  lane's questions still open with their age and how to close one. No writer has to remember the ref.
+- **A wrong close has an undo.** `journal entry=reopen` with `refs: ["reopens:<key>"]` opens the question again;
+  a later answer closes it as before.
+- **Stale questions show their age.** `recall op=status` lists each open question with its age in days, flagging
+  those past `memory.question_stale_days` (default 3) as `stale`; the resume card marks a stale one as
+  `KEY (5d, stale)`. A card with nothing stale is byte for byte as before.
+- **`recall op=sweep` finds questions that look settled.** Each comes with its evidence: a later decision, answered
+  entry or ruling naming it or sharing its key terms, a merged PR recorded in the lane after it, or the lane idle
+  past the stale age. It closes nothing on its own and prints the one `journal entry=answered` call that closes
+  the ones you choose. The resume card says `N questions look settled: recall op=sweep` when there are any.
+- **Questions can be deferred.** `journal entry=defer` with `refs: ["defers:<key>"]` and `until: <time>` or
+  `until: next-session` (the owner's next session start, never a subagent's), plus an optional
+  `proceeding_with: <option>`, parks a question: it stays open but leaves the stale flag and the sweep's idle
+  signal. When it comes due, the resume card lists the due ones together with their `A) ... B) ...` options and
+  the option work went ahead on, ready to ask as multiple choice; `recall op=deferred` lists them all. An answer,
+  or a decision naming it, still closes it.
+- **An enforced mode for the task judge's dogfood phase (#412).** With `orchestrate.judge.mode: "enforced"`, the
+  launch hook scores each builder brief with the work classifier itself, the same scoring `note op=judge` does
+  (the two share a score cache, so a brief judged first is not embedded again). It denies a builder launch whose
+  `model` or `effort` is off the pick, or that passes no `effort`, and names the pick in the denial. A
+  `Judge: brandon-named <model>/<effort>` line allows the named pair. The hook keeps the every-5th explore
+  counter beside the memory store, seeded from the log: while the explore launch is due, only a launch one rung
+  below the pick with a `Judge: explore` line is allowed. Each admitted builder launch appends one row to
+  `orchestrate.judge.log` with `outcome` null, and the agent id is filled in when the agent starts. A row whose
+  outcome is still null shows as an owed step on the compaction card. `enabled: true` alone keeps meaning
+  advisory.
+
+### Fixes
+
+- **Opening the atlas repository in Claude Code no longer warns about `CLAUDE_PLUGIN_ROOT`.** The plugin's MCP
+  server entry now lives in `plugin.json`, so the repository's root no longer holds a `.mcp.json` that Claude
+  Code also reads as a project server.
+  Thanks to @serkankose (#24).
+- **A subagent that compacts keeps its atlas continuity.** Its compaction writes a checkpoint on the agent's own
+  lane (`agent:<id>`), the summary gets atlas's compaction instructions, and the checkpoint card is given on the
+  agent's next tool call, also when Claude Code ran no PreCompact for it (seen from the transcript). Chain keys
+  of a subagent's transcript now resolve.
+- **PreCompact, SessionStart and SessionEnd have a longer hook budget.** At least 8 s, so a slow first store
+  open no longer loses the compaction instructions or the session card. Other hooks keep `hooks.budget_ms`.
+- **The review merge gate sees more merges.** `gh api -X PUT .../pulls/N/merge`, a merge inside a shell's `-c`
+  or `-Command` string, and a merge split over a line continuation are checked like `gh pr merge`.
+- **Work after a hook's answer no longer drops or stalls.** An edit's re-index refused by another writer's lock
+  is retried later, and opening the index store stops at the hook's deadline.
+- **The card's live-agent line reads merge notes more exactly**, and a launch the watchdog refused leaves no
+  open worktree ledger row.
+- **The server log keeps a line written while two rotations pass.** An appender paused between opening
+  `atlas-server.log` and writing its line, while other servers rotated the log twice, lost the line with the
+  replaced file; it now checks the file it wrote to is still the log or `.1`, and writes the line again if not.
+- **The agent cap names the right Claude Code process as an agent's owner.** A `node` or `npx` shim between
+  Claude Code and the server is no longer taken for it, and a parent process id reused by an unrelated
+  process (it started after its child) is not climbed to, so live agents are no longer listed as released
+  when a shim exits.
+- **A rejected agent launch leaves `atlas queue list` and `recall op=status` at once.** A launch the harness
+  refused and that was never relaunched showed as `[launched, not started]` for up to two minutes; the
+  listing now reads the session transcript for its refusal.
+- **`code.roots[].exclude` leaves excluded files out of the index report too.** A whole-workspace index's
+  excluded documents no longer count in the stats line, as packages the root defines, or as a language unit.
+- **`atlas slice` takes a selector value as the shell gave it.** `--grep ' '` searches for a space and
+  `--grep '"x"'` for the quotes; `recall`'s arguments still drop one pair of quotes and outer spaces.
+- **What 0.8.0 changed in `atlas slice` errors, now noted.** Since 0.8.0 an unknown flag no longer takes the next
+  word as its value (it is named in the error), two selectors at once are refused, and an error names a
+  selector without its leading `--`.
+- **The gh user's login is matched on its own host only.** When the listener serves repositories on github.com
+  and on a GitHub Enterprise host, a comment by someone on one host who shares the gh user's login on the other
+  is now heard instead of dropped: the host is read from each delivery's repository URL. The listener also asks
+  every host for its gh user at once, so an unreachable host delays the start by one timeout, not one per host.
+- **A slow hook queue no longer refuses every call of a subagent.** When a gate check runs past its budget,
+  only a launch, a resume (`SendMessage`) or a merge is still refused. A subagent's other calls go ahead, with
+  one line saying the check was skipped, and the next call is checked again. A refusal's reason now names the
+  slow phase and its milliseconds, or the queue wait and the hook ahead of it. A call the watchdog already
+  answered is not worked, so a backed-up queue clears instead of refusing every retry.
+- **`atlas --hook-report` shows gate timing.** Per event (a subagent's listed apart): p50, p95 and max time
+  from arrival, the queue's p95, refusals, overruns, and the slowest phase.
+
+### Security hardening
+
+- **Registry logins are on the deny-list.** podman's `containers/auth.json` and Docker's
+  `.docker/config.json` hold registry credentials; atlas now refuses to read them or keep their output
+  as a handle, judged by the folder that holds them, since their names alone are too common to deny.
+
 ## v0.10.0
 
 ### Highlights

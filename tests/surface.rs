@@ -9,7 +9,10 @@ use atlas::json;
 /// one-heading read to `section` (#213: 6,057 to 6,118 bytes, 1,529.5 tokens).
 /// Lowered to 1511 when `lookup` and `symbol` lost their always-loaded mark
 /// (journal:ATLAS-EFFICIENCY:0004: 6,118 to 6,042 bytes, 1,510.5 tokens).
-const BUDGET_TOKENS: f64 = 1511.0;
+/// Raised to 1518 for #406's three enum values (`recall` ops `sweep` and
+/// `deferred`, `journal` entry `defer`): about 1,517 tokens. Raised to 1520
+/// for the `journal` entry `reopen` (#413 review: a false close needs an undo).
+const BUDGET_TOKENS: f64 = 1520.0;
 
 #[test]
 fn tools_list_fits_its_budget() {

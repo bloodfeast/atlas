@@ -51,22 +51,44 @@ pub fn guard<T: Default>(settings: &Settings, ev: &HookEvent, f: impl FnOnce() -
 pub const TEST_PANIC_TOOL: &str = "atlas_test_panic";
 
 /// The answer to `event` when its time budget `limit` ran out before the
-/// hook's work ended (see [`crate::hook_budget`]): a gate ([`gated`])
-/// refuses the call, failing closed ([`GATE_OVERRUN`]); an event that takes
-/// context gets one line saying so; any other answer is empty (the call
-/// passes through).
-pub fn overrun_answer(ev: &HookEvent, limit: std::time::Duration) -> String {
+/// hook's work ended (see [`crate::hook_budget`]); `why` names the slow
+/// phase and its time ([`crate::hook_gate::why`]). A launch or a shell
+/// merge ([`overrun_denies`]) is refused, failing closed ([`GATE_OVERRUN`]);
+/// any other gated call ([`gated`]) fails open (#416): it goes ahead with
+/// one context line saying its check was skipped, and the next call is
+/// checked again (a refusal loop would strand a subagent with no way to
+/// write its handoff). An event that takes context gets one line saying
+/// so; any other answer is empty (the call passes through).
+pub fn overrun_answer(ev: &HookEvent, limit: std::time::Duration, why: &str) -> String {
     let mut a = HookAnswer::default();
-    if gated(ev) {
-        a.deny = Some(GATE_OVERRUN.into());
+    let ms = limit.as_millis();
+    if overrun_denies(ev) {
+        a.deny = Some(format!("{GATE_OVERRUN} ({ms} ms; slow: {why}); refused, retry the call"));
+    } else if gated(ev) {
+        a.context = format!("{GATE_SKIPPED} ({ms} ms; slow: {why}); this call went ahead unchecked, and the next one is checked again");
     } else if matches!(ev.event.as_str(), "UserPromptSubmit" | "SessionStart" | "SubagentStart") {
-        a.context = format!("atlas: hook time budget ({} ms) spent; skipped: the whole answer", limit.as_millis());
+        a.context = format!("atlas: hook time budget ({ms} ms) spent; skipped: the whole answer");
     }
     a.to_json(&ev.event)
 }
 
-/// The refusal of a gated call whose check ran past the hook's budget.
-pub const GATE_OVERRUN: &str = "atlas: gate check did not finish within its budget; refused, retry the call";
+/// The refusal of a launch or merge whose check ran past the hook's budget.
+pub const GATE_OVERRUN: &str = "atlas: gate check did not finish within its budget";
+
+/// The context line of a gated call let through past the budget (#416).
+pub const GATE_SKIPPED: &str = "atlas: gate check skipped, its budget spent";
+
+/// Whether a gated call is still refused when its check runs past the
+/// budget (#416): an `Agent`/`Task` launch (the caps, queue and judge), a
+/// `SendMessage` (the resume gate), and a shell command with a
+/// `gh pr merge` (the review merge gate). Every other gated call fails open.
+pub fn overrun_denies(ev: &HookEvent) -> bool {
+    ev.event == "PreToolUse" && (matches!(ev.tool_name.as_str(), "Agent" | "Task" | "SendMessage") || shell_merge(ev))
+}
+
+fn shell_merge(ev: &HookEvent) -> bool {
+    matches!(ev.tool_name.as_str(), "Bash" | "PowerShell") && ev.tool_input.get("command").and_then(Value::as_str).is_some_and(|c| !crate::reviews::merges(c).is_empty())
+}
 
 impl Hooks {
     /// The watchdog answered `ev` before the worker did (its budget ran out),
@@ -77,9 +99,37 @@ impl Hooks {
     /// (the context cap) would free another session's pending launch (r3 S1).
     /// An empty id would match every pending launch without one.
     pub fn answer_lost(&mut self, ev: &HookEvent) {
+        // A subagent's post-compaction card went out on the dropped answer
+        // (#295, review S2 of #391): owed again to its next tool call. Its
+        // checkpoint is written already and is not written twice.
+        if ev.event == "PreToolUse" && !ev.agent_id.is_empty() {
+            if let Some(c) = self.agent_compact.get_mut(&ev.agent_id) {
+                if let Some((_, before)) = c.lost.take_if(|(id, _)| *id == ev.tool_use_id) {
+                    c.given = before;
+                    c.due = true;
+                }
+            }
+        }
         if ev.event == "PreToolUse" && matches!(ev.tool_name.as_str(), "Agent" | "Task") && !ev.tool_use_id.is_empty() {
             self.orch.forget_launch(&ev.tool_use_id);
             self.sync_pending();
+            // Its worktree ledger row too (#333, review N2 of #329).
+            if let Err(e) = crate::worktree_ledger::forget_launch(self.store.conn(), self.store.path(), &ev.tool_use_id) {
+                eprintln!("atlas worktrees: lost launch {}: {e}", ev.tool_use_id);
+            }
+        }
+    }
+
+    /// The phases of the event answered last and their times.
+    pub fn budget_phases(&self) -> &[(&'static str, std::time::Duration)] {
+        self.budget.phases()
+    }
+
+    /// Logs one event's gate timing (`hook_gate`, #416) on the log
+    /// thread, never on the hook's path; dropped without one.
+    pub fn log_gate(&self, row: crate::hook_gate::GateRow) {
+        if let Some(l) = &self.log {
+            let _ = l.send(LogRow { tool: String::new(), returned: 0, keys: Vec::new(), brief: None, session: String::new(), agent: String::new(), transcript: String::new(), miss: None, gate: Some(row) });
         }
     }
 
@@ -96,7 +146,8 @@ impl Hooks {
 }
 
 /// Whether `ev`'s answer can refuse it, so that an answer cut at the budget
-/// refuses it too (fails closed): a PreToolUse of a subagent's tool other
+/// says what it skipped ([`overrun_answer`]: only [`overrun_denies`] calls
+/// are refused then, #416): a PreToolUse of a subagent's tool other
 /// than the handoff (the context cap, and the report backstop of its
 /// hand-back), of an `Agent`/`Task` launch (the agent caps, queue, judge and
 /// classifier), of a `SendMessage` (the resume gate), and of a shell
@@ -105,9 +156,7 @@ pub fn gated(ev: &HookEvent) -> bool {
     if ev.event != "PreToolUse" {
         return false;
     }
-    let tool = ev.tool_name.as_str();
-    let shell_merge = matches!(tool, "Bash" | "PowerShell") && ev.tool_input.get("command").and_then(Value::as_str).is_some_and(|c| !crate::reviews::merges(c).is_empty());
-    (!ev.agent_id.is_empty() && !passes_cap(tool)) || matches!(tool, "Agent" | "Task" | "SendMessage") || shell_merge
+    (!ev.agent_id.is_empty() && !passes_cap(&ev.tool_name)) || overrun_denies(ev)
 }
 
 /// One hook event, from either transport.
@@ -469,6 +518,53 @@ pub fn first_user_text(path: &Path) -> Option<String> {
         return Some(s.chars().take(65_536).collect());
     }
     None
+}
+
+/// One subagent's compactions (#295): `SessionStart:compact` never fires in
+/// a subagent, so its card is given on its next tool call after one.
+#[derive(Debug, Clone, Default)]
+struct AgentCompact {
+    /// How far its transcript was read for `compact_boundary` records.
+    read: u64,
+    /// The boundaries seen past where atlas first read it.
+    seen: usize,
+    /// The cards given.
+    given: usize,
+    /// A PreCompact wrote its checkpoint; the card is owed.
+    due: bool,
+    /// The tool call the last card went to and `given` before it: undone
+    /// by [`Hooks::answer_lost`] when the watchdog answered that call.
+    lost: Option<(String, usize)>,
+}
+
+/// The marker of a compaction in a transcript (`"subtype":"compact_boundary"`).
+const COMPACT_BOUNDARY: &[u8] = b"\"compact_boundary\"";
+
+/// The `compact_boundary` records in `path` from byte `from` to its end,
+/// complete lines only, and where the read stopped.
+fn boundaries_from(path: &Path, from: u64) -> (usize, u64) {
+    let Ok(mut f) = std::fs::File::open(path) else { return (0, from) };
+    let len = f.metadata().map_or(0, |m| m.len());
+    // A transcript rewritten shorter is read again from its start.
+    let from = if len < from { 0 } else { from };
+    if len == from || f.seek(SeekFrom::Start(from)).is_err() {
+        return (0, from);
+    }
+    let mut buf = Vec::new();
+    if f.take(len - from).read_to_end(&mut buf).is_err() {
+        return (0, from);
+    }
+    let end = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    // A boundary record only, as the checkpoint reads one: not the word in a
+    // tool call's input (a Grep for it), and sidechain records count in a
+    // subagent's own transcript (review S1 of #391).
+    let own = crate::checkpoint::own_sidechain(path);
+    let n = buf[..end]
+        .split(|b| *b == b'\n')
+        .filter(|l| l.windows(COMPACT_BOUNDARY.len()).any(|w| w == COMPACT_BOUNDARY))
+        .filter(|l| crate::checkpoint::is_boundary(&String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)), own))
+        .count();
+    (n, from + end as u64)
 }
 
 /// One subagent's run, as the hooks saw it.
@@ -891,8 +987,10 @@ struct LogRow {
     /// atlas" row beside the answer's own.
     brief: Option<(String, String)>,
     /// A live post-compaction lookup row for `compact_miss`. A row with an
-    /// empty `tool` carries only this.
+    /// empty `tool` carries only this (or `gate`).
     miss: Option<crate::compact::MissRow>,
+    /// A hook event's gate timing for `hook_gate` (#416).
+    gate: Option<crate::hook_gate::GateRow>,
 }
 
 /// The semantic side of the recall gate: the model, the record vectors,
@@ -931,6 +1029,8 @@ pub struct Hooks {
     report_sent_back: HashSet<String>,
     warned: HashMap<PathBuf, u64>,
     usage_cache: HashMap<PathBuf, (u64, Option<(String, u64)>)>,
+    /// A subagent's model as its transcript names it, once it does (#403).
+    agent_model: HashMap<String, String>,
     log: Option<mpsc::Sender<LogRow>>,
     /// The token-log thread, joined on drop so its rows reach the database
     /// before a command hook's process exits.
@@ -945,6 +1045,8 @@ pub struct Hooks {
     records: Option<((i64, u64), i64)>,
     /// Files an Edit or Write changed, re-indexed by [Hooks::after].
     edited: Vec<String>,
+    /// Per subagent: its compactions and the cards given for them (#295).
+    agent_compact: HashMap<String, AgentCompact>,
     /// Transcripts to index into the opt-in transcript source by [Hooks::after].
     transcripts: Vec<PathBuf>,
     /// Opens the index store over the vaults and sources (R7: an edited
@@ -1107,6 +1209,7 @@ impl Hooks {
             report_sent_back: HashSet::new(),
             warned: HashMap::new(),
             usage_cache: HashMap::new(),
+            agent_model: HashMap::new(),
             log,
             log_thread,
             router,
@@ -1115,6 +1218,7 @@ impl Hooks {
             offer: None,
             records: None,
             edited: Vec::new(),
+            agent_compact: HashMap::new(),
             transcripts: Vec::new(),
             index_opener: None,
             index: None,
@@ -1423,12 +1527,30 @@ impl Hooks {
         }
         self.file_ideas();
         self.index_transcripts();
-        for path in std::mem::take(&mut self.edited) {
-            if let Err(e) = self.reindex(&path) {
-                eprintln!("atlas reindex {path}: {e}");
-                self.router.miss_text(&format!("reindex {path}"), &e);
+        let mut edited = std::mem::take(&mut self.edited).into_iter();
+        while let Some(path) = edited.next() {
+            match self.reindex(&path) {
+                Ok(()) => {}
+                // Another writer's lock (#333 item 1): the re-index stays owed
+                // and is tried after the next answer, the rest untried (one
+                // short wait per answer, however many are owed).
+                Err(e) if e.is_busy() => {
+                    self.edited.push(path);
+                    self.edited.extend(edited);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("atlas reindex {path}: {e}");
+                    self.router.miss_text(&format!("reindex {path}"), &e);
+                }
             }
         }
+    }
+
+    /// Files whose re-index is still owed (tests).
+    #[doc(hidden)]
+    pub fn reindex_owed(&self) -> usize {
+        self.edited.len()
     }
 
     /// Files the captures this event spooled; a command hook calls it after
@@ -1621,7 +1743,7 @@ impl Hooks {
     /// [`Hooks::handle`] for an event that arrived at `arrived` (a server's
     /// hook may wait behind another): its time budget counts from then.
     pub fn handle_from(&mut self, ev: &HookEvent, arrived: std::time::Instant) -> HookAnswer {
-        self.budget = crate::hook_budget::Budget::from_env(arrived, self.settings.hook_budget);
+        self.budget = crate::hook_budget::Budget::from_env(arrived, crate::hook_budget::for_event(self.settings.hook_budget, &ev.event));
         // Every store wait on this thread ends at the deadline.
         let active = crate::hook_budget::Active::set(&self.budget);
         let mut a = self.handle_timed(ev);
@@ -1879,6 +2001,12 @@ impl Hooks {
                     }
                 };
                 let launch = launch_id.as_deref().or(brief.as_ref().map(|b| b.tool_use_id.as_str()));
+                // The enforced judge's log row gets the agent id (#412).
+                if let (Some(t), Some(log)) = (launch, self.settings.orchestrate.judge.log.as_deref()) {
+                    if let Err(e) = crate::judge_enforce::fill_agent(log, t, &ev.agent_id) {
+                        eprintln!("atlas judge log {}: {e}", log.display());
+                    }
+                }
                 let sub_lane = launch.and_then(|t| self.orch.sub_lane(t)).map(str::to_string);
                 let sub_line = self.sub_lane_line(&ev.agent_id, launch);
                 let told_sub = sub_line.is_some();
@@ -1927,11 +2055,30 @@ impl Hooks {
                 if !sub && self.settings.compact.enabled {
                     self.note_lookup(ev);
                 }
+                // Timed phases (never skipped): an overrun's answer and the
+                // gate report name the slow one (#416).
                 if sub {
                     let path = subagent_transcript(&ev.transcript_path, &ev.agent_id);
+                    self.budget.mark("cap");
                     self.cap(ev, &path, &mut a);
+                    self.budget.mark("card");
+                    if let Err(e) = self.subagent_card(ev, &path, &mut a) {
+                        eprintln!("atlas checkpoint: agent {}: {e}", ev.agent_id);
+                    }
                 } else {
+                    self.budget.mark("main_context");
                     self.main_context(ev, &mut a);
+                }
+                self.budget.mark("gates");
+                // The enforced judge decides before admission, so a denied
+                // launch takes no slot and writes no row (#412).
+                let mut judged = None;
+                if a.deny.is_none() && (ev.tool_name == "Agent" || ev.tool_name == "Task") && self.settings.orchestrate.judge.mode == crate::taskjudge::JudgeMode::Enforced {
+                    let brief = if ev.tool_prompt.is_empty() { ev.tool_input.get("prompt").and_then(Value::as_str).unwrap_or("") } else { &ev.tool_prompt };
+                    match self.enforce_judge(ev, brief) {
+                        Ok(j) => judged = j,
+                        Err(t) => a.deny = Some(t),
+                    }
                 }
                 if a.deny.is_none() && (ev.tool_name == "Agent" || ev.tool_name == "Task") {
                     let brief = if ev.tool_prompt.is_empty() {
@@ -1959,6 +2106,9 @@ impl Hooks {
                     }
                     if a.deny.is_none() && self.settings.orchestrate.judge.classifier.enabled {
                         self.classify_launch(ev, brief, &mut a);
+                    }
+                    if let Some(j) = judged.take().filter(|_| a.deny.is_none()) {
+                        self.judge_admitted(ev, brief, &j, &mut a);
                     }
                     if a.deny.is_none() {
                         crate::worktree_ledger::hook(&self.store, &self.settings, ev, brief);
@@ -2016,6 +2166,7 @@ impl Hooks {
                     // checks a guess or answers an ambiguous start.
                     if sub {
                         if let Some(u) = self.unsettled.remove(&ev.agent_id) {
+                            self.budget.mark("first_call");
                             let (t, k) = self.first_call(ev, u, a.context.chars().count())?;
                             if !t.is_empty() {
                                 if !a.context.is_empty() {
@@ -2029,6 +2180,7 @@ impl Hooks {
                 }
                 if a.deny.is_none() {
                     // Routing fails open: an error leaves the call as it is.
+                    self.budget.mark("route");
                     match self.router.pre_tool_use(ev) {
                         Ok(u) => a.updated_input = u,
                         Err(e) => self.router.miss(ev, &e),
@@ -2064,6 +2216,7 @@ impl Hooks {
                 let waiting = ev.background_tasks.as_array().is_some_and(|t| !t.is_empty());
                 if a.block.is_none() && !waiting {
                     self.file_finish(&ev.agent_id);
+                    self.agent_compact.remove(&ev.agent_id);
                 }
             }
             "PostToolUse" if ev.tool_name == "AskUserQuestion" => {
@@ -2156,6 +2309,14 @@ impl Hooks {
                     }
                     a.context.push_str(&line);
                 }
+                // #386: the pr-events listener, started when none runs.
+                let started = if ev.tool_use { None } else { crate::pr_autostart::session_start(&self.settings) };
+                if let Some(line) = started {
+                    if !a.context.is_empty() {
+                        a.context.push('\n');
+                    }
+                    a.context.push_str(&line);
+                }
                 let fresh = ev.source == "startup" || ev.source == "clear";
                 // Hook drift, once a session, when no prompt will tell it: a
                 // recalling event routed to a command hook, and no mcp_tool
@@ -2191,7 +2352,15 @@ impl Hooks {
                 let fresh = fresh && self.phase("resume_card");
                 let mut ideas_line = if fresh { self.ideas.as_ref().and_then(|i| i.resume_line(&self.store)) } else { None };
                 if fresh && self.settings.resume_card {
-                    match crate::resume::card_with(&self.store, &self.settings.orchestrate, &ev.transcript_path, &crate::memory::now(), ev.source == "clear", ideas_line.as_deref()) {
+                    match crate::resume::card_stale_after(
+                        &self.store,
+                        &self.settings.orchestrate,
+                        &ev.transcript_path,
+                        &crate::memory::now(),
+                        ev.source == "clear",
+                        ideas_line.as_deref(),
+                        self.settings.question_stale_days,
+                    ) {
                         Ok(Some(card)) => {
                             // A full card may have cut it: then it stays a line of its own.
                             if ideas_line.as_deref().is_some_and(|l| card.contains(l)) {
@@ -2269,7 +2438,25 @@ impl Hooks {
                 // the checkpoint, the deferral and the backstop below are the
                 // main session's (its `session:<id>` lane).
                 if !ev.agent_id.is_empty() {
+                    // A trace of every subagent PreCompact (#295 step 3): the
+                    // hook log shows the call arrived, whatever it answers.
+                    if let Some(l) = &self.log {
+                        let _ = l.send(LogRow { tool: "compact:subagent".into(), returned: 0, keys: Vec::new(), brief: None, session: ev.session_id.clone(), agent: ev.agent_id.clone(), transcript: String::new(), miss: None, gate: None });
+                    }
                     a.block = self.subagent_compaction_block(ev);
+                    if a.block.is_some() || !self.settings.compact.enabled {
+                        return Ok(a);
+                    }
+                    // Not blocked (#295): the agent's own checkpoint and the
+                    // summary's instructions, as the main session gets; its
+                    // card is given on its next tool call.
+                    let trigger = if ev.trigger.is_empty() { "unknown" } else { ev.trigger.as_str() };
+                    if let Some((_, chain, live)) = self.subagent_checkpoint(ev, trigger, false)? {
+                        if chain {
+                            a.instructions = crate::claude_settings::COMPACT_INSTRUCTIONS;
+                            a.instructions_tail = live;
+                        }
+                    }
                     return Ok(a);
                 }
                 // The rest is the compaction work, on unless `compact.enabled`
@@ -2295,7 +2482,7 @@ impl Hooks {
                     let w = crate::checkpoint::window(self.settings.compact.window, &t);
                     if let Some(reason) = crate::checkpoint::defer(&ev.trigger, &t, w) {
                         if let Some(l) = &self.log {
-                            let _ = l.send(LogRow { tool: "compact:defer".into(), returned: 0, keys: Vec::new(), brief: None, session: ev.session_id.clone(), agent: String::new(), transcript: String::new(), miss: None });
+                            let _ = l.send(LogRow { tool: "compact:defer".into(), returned: 0, keys: Vec::new(), brief: None, session: ev.session_id.clone(), agent: String::new(), transcript: String::new(), miss: None, gate: None });
                         }
                         a.block = Some(reason);
                         return Ok(a);
@@ -2313,7 +2500,8 @@ impl Hooks {
                 }
                 self.misses.compact(&ev.session_id);
                 let trigger = if ev.trigger.is_empty() { "unknown" } else { ev.trigger.as_str() };
-                let (_, chain, live) = self.write_checkpoint(&ev.session_id, &ev.transcript_path, trigger, &t, &from, model.as_ref(), t_pre)?;
+                let lane = format!("session:{}", ev.session_id);
+                let (_, chain, live) = self.write_checkpoint(&lane, &ev.session_id, &ev.transcript_path, trigger, &t, &from, None, model.as_ref(), t_pre)?;
                 if chain {
                     // Only with a card: the text tells the summarizer to leave
                     // out what the card lists. A later error answers nothing.
@@ -2351,6 +2539,7 @@ impl Hooks {
                     agent: ev.agent_id.clone(),
                     transcript,
                     miss: None,
+                    gate: None,
                 });
             }
         }
@@ -2387,7 +2576,7 @@ impl Hooks {
         if let Some(l) = &self.log {
             // An empty tool writes no token-log row: only the legacy repeat has one.
             let tool = if row.legacy { "compact:miss" } else { "" };
-            let _ = l.send(LogRow { tool: tool.into(), returned: 0, keys: Vec::new(), brief: None, session: s.clone(), agent: String::new(), transcript: String::new(), miss: Some(row) });
+            let _ = l.send(LogRow { tool: tool.into(), returned: 0, keys: Vec::new(), brief: None, session: s.clone(), agent: String::new(), transcript: String::new(), miss: Some(row), gate: None });
         }
     }
 
@@ -3345,6 +3534,56 @@ impl Hooks {
         }
     }
 
+    /// The enforced judge on a launch (#412): `Ok(None)` for a launch that
+    /// is not a builder's, `Ok(Some)` with the row facts for an allowed
+    /// builder launch, `Err` with the denial text. Scores with
+    /// [`crate::taskjudge::classify_with`], the function `note op=judge`
+    /// uses, through the same score cache; the encoder loads only on a miss.
+    fn enforce_judge(&mut self, ev: &HookEvent, brief: &str) -> std::result::Result<Option<crate::judge_enforce::Admit>, String> {
+        let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
+        if crate::orchestrate::classify(&self.settings.orchestrate, brief, f("subagent_type"), f("isolation")) != crate::orchestrate::Kind::Builder {
+            return Ok(None);
+        }
+        let s = self.settings.orchestrate.judge.classifier.clone();
+        let cache = crate::taskjudge::score_cache(&self.settings.store);
+        if s.source == crate::taskjudge::ScoreSource::Head {
+            self.load_model();
+        }
+        let mut sem = self.sem.as_mut();
+        let pick = crate::taskjudge::classify_with(&s, brief, "builder", cache.as_deref(), &mut |text| {
+            let sem = sem.as_deref_mut()?;
+            let m = sem.model.clone();
+            (m.id == crate::taskjudge::CLASSIFIER_MODEL && m.dim == crate::taskjudge::CLASSIFIER_DIM)
+                .then(|| crate::taskjudge::input_vector(&m, text, &mut sem.scratch))
+        });
+        let counter = crate::judge_enforce::Counter::open(&self.settings.store, self.settings.orchestrate.judge.log.as_deref());
+        let ask = crate::judge_enforce::ask(brief);
+        crate::judge_enforce::decide(pick, &s.map, &ask, f("model"), f("effort"), counter.since).map(Some)
+    }
+
+    /// An admitted enforced-judge launch: its context line, one dogfood log
+    /// row, and the explore counter moved. A write error is reported and
+    /// changes no decision.
+    fn judge_admitted(&mut self, ev: &HookEvent, brief: &str, j: &crate::judge_enforce::Admit, a: &mut HookAnswer) {
+        let log = self.settings.orchestrate.judge.log.clone();
+        let mut counter = crate::judge_enforce::Counter::open(&self.settings.store, log.as_deref());
+        counter.count(j);
+        if !a.context.is_empty() {
+            a.context.push('\n');
+        }
+        a.context.push_str(&j.line);
+        let Some(log) = log else {
+            eprintln!("atlas judge: enforced with no orchestrate.judge.log; no row written");
+            return;
+        };
+        let lane = brief_lane(brief, &[]).unwrap_or_default();
+        let named = crate::taskjudge::brief_path(&crate::taskjudge::strip_judge(brief)).map(|p| p.display().to_string()).unwrap_or_default();
+        let row = crate::judge_enforce::row(&crate::memory::now(), &lane, &named, j, &ev.tool_use_id);
+        if let Err(e) = crate::taskjudge::append_line(&log, &row) {
+            eprintln!("atlas judge log {}: {e}", log.display());
+        }
+    }
+
     /// An admitted writer launch into a declared lane that a running writer
     /// holds, when the lane has no `brief` journal entry of its own, runs as
     /// the first free sub-lane (`NAME/2`, `NAME/3`, ...;
@@ -3617,15 +3856,22 @@ bytes: {}", report.len()),
     /// and the store, as PreCompact does: the key, whether the chain card
     /// was added, and the live agents' text for the summary's instructions.
     /// `model` is the model's own checkpoint entry, named in the body (or
-    /// said missing) while `compact.checkpoint_prompt` is on.
+    /// said missing) while `compact.checkpoint_prompt` is on. Written on
+    /// `lane`: the session's `session:<id>`, or a subagent's `agent:<id>`
+    /// (#295), whose card names no live agents (those are the session's).
+    /// `until` bounds the chain card to the transcript's bytes before it: a
+    /// checkpoint written after its compaction's boundary (#295's fallback)
+    /// lists the segment that boundary closed, not the stub after it.
     #[allow(clippy::too_many_arguments)]
     fn write_checkpoint(
         &mut self,
+        lane: &str,
         session: &str,
         transcript: &str,
         trigger: &str,
         t: &crate::checkpoint::Tail,
         from: &crate::checkpoint::TailFrom,
+        until: Option<u64>,
         model: Option<&crate::memory::Head>,
         t_pre: std::time::Instant,
     ) -> Result<(String, bool, String)> {
@@ -3635,16 +3881,21 @@ bytes: {}", report.len()),
             TailFrom::Parent(_) => t.last_ctx,
             TailFrom::Unread => 0,
         };
-        let lane = format!("session:{session}");
         let scope = crate::checkpoint::Lanes::for_project(self.settings.graph.as_deref());
         // Bounded by the transcript's own newest record: never a record the
         // session could not have seen.
         // The lanes of the agents running now lead the card's `lanes:`,
         // whether or not they wrote in the segment (#309 item 4): the same
         // running set the restart point reads.
-        let agents = self.card_agents(session, transcript);
+        let agents = if lane.starts_with("agent:") { Vec::new() } else { self.card_agents(session, transcript) };
         let live: Vec<String> = agents.iter().map(|a| a.lane.clone()).filter(|l| !l.is_empty()).collect();
         let mut state = crate::checkpoint::state_live(&self.store, session, &t.start, &t.end, scope, &live)?;
+        // Dogfood rows whose outcome is still null are owed steps (#412),
+        // the newest few.
+        if let Some(text) = self.settings.orchestrate.judge.log.as_deref().and_then(|l| std::fs::read_to_string(l).ok()) {
+            let rows = crate::judge_enforce::owed(&text);
+            state.owed.extend(rows.iter().skip(rows.len().saturating_sub(crate::checkpoint::PER_LINE)).cloned());
+        }
         // Each live agent with its PR, or parked (#327).
         // gh's fixed bound, cut at the hook's own deadline (#329).
         let deadline = crate::card_agents::gh_deadline(std::time::Instant::now(), self.budget.deadline());
@@ -3662,7 +3913,10 @@ bytes: {}", report.len()),
             TailFrom::Parent(p) => p.clone(),
             _ => PathBuf::from(transcript),
         };
-        let chain = crate::chain::card(&read);
+        let chain = match until {
+            Some(u) => crate::chain::card_upto(&read, u).map(|(c, _)| c),
+            None => crate::chain::card(&read),
+        };
         if let Some(c) = &chain {
             body.push_str(c);
         }
@@ -3692,7 +3946,7 @@ bytes: {}", report.len()),
         };
         let mut w = self.store.writer()?;
         let key = w.next_key(&format!("journal:{lane}:"), 4)?;
-        w.create(&key, "journal", "checkpoint", &lane, &d, None)?;
+        w.create(&key, "journal", "checkpoint", lane, &d, None)?;
         w.commit()?;
         let tail = if state.agents.is_empty() {
             String::new()
@@ -3769,7 +4023,8 @@ bytes: {}", report.len()),
             return Ok(());
         }
         let model = crate::checkpoint::model_entry(&self.store, &ev.session_id, &t.start, path)?;
-        self.write_checkpoint(&ev.session_id, &ev.transcript_path, "clear", &t, &crate::checkpoint::TailFrom::Own, model.as_ref(), t_pre)?;
+        let lane = format!("session:{}", ev.session_id);
+        self.write_checkpoint(&lane, &ev.session_id, &ev.transcript_path, "clear", &t, &crate::checkpoint::TailFrom::Own, None, model.as_ref(), t_pre)?;
         Ok(())
     }
 
@@ -3822,17 +4077,42 @@ bytes: {}", report.len()),
     /// mode. A subagent in orchestrated mode has its kind's; any other (and
     /// every agent with orchestrated mode off) has the plain cap, enforced
     /// unless orchestrated mode says otherwise.
-    fn limits_of(&mut self, ev: &HookEvent) -> (crate::orchestrate::Kind, u64, u64, crate::orchestrate::Mode) {
-        use crate::orchestrate::{Kind, Mode};
+    fn limits_of(&mut self, ev: &HookEvent) -> (crate::orchestrate::Kind, crate::orchestrate::Applied, crate::orchestrate::Mode) {
+        use crate::orchestrate::{Applied, Kind, Mode};
         let sub = !ev.agent_id.is_empty();
         let orchestrated = self.settings.orchestrate.enabled;
         if sub && orchestrated {
             let dir = crate::orchestrate::subagents_dir(&ev.transcript_path);
             let kind = self.orch.kind_of(&self.settings.orchestrate, &dir, &ev.agent_id, &ev.agent_type);
-            let lim = self.settings.orchestrate.limits(kind);
-            return (kind, lim.handoff, lim.limit, lim.mode);
+            let (applied, mode) = self.applied(&dir, &ev.agent_id, kind);
+            return (kind, applied, mode);
         }
-        (Kind::None, self.settings.cap.warn_tokens, self.settings.cap.block_tokens, if orchestrated { self.settings.orchestrate.other.mode } else { Mode::Enforced })
+        let plain = Applied { handoff: self.settings.cap.warn_tokens, limit: self.settings.cap.block_tokens, model: None };
+        (Kind::None, plain, if orchestrated { self.settings.orchestrate.other.mode } else { Mode::Enforced })
+    }
+
+    /// Subagent `id`'s points as its kind and model give them, and its
+    /// kind's mode. The model is read only when the kind has model entries
+    /// (#403): the transcript's last real model (cached once seen), else
+    /// the meta file's `model` alias, as the compaction path reads it.
+    fn applied(&mut self, dir: &Path, id: &str, kind: crate::orchestrate::Kind) -> (crate::orchestrate::Applied, crate::orchestrate::Mode) {
+        let lim = self.settings.orchestrate.limits(kind);
+        if lim.models.is_empty() {
+            return (lim.for_model(None), lim.mode);
+        }
+        let id = id.strip_prefix("agent-").unwrap_or(id);
+        let model = match self.agent_model.get(id) {
+            Some(m) => Some(m.clone()),
+            None => match last_model(&dir.join(format!("agent-{id}.jsonl"))).ok().flatten() {
+                Some(m) => {
+                    self.agent_model.insert(id.to_string(), m.clone());
+                    Some(m)
+                }
+                None => crate::orchestrate::model_alias_of(dir, id),
+            },
+        };
+        let lim = self.settings.orchestrate.limits(kind);
+        (lim.for_model(model.as_deref()), lim.mode)
     }
 
     /// Review S4 of #192 (ATLAS-CLEAR 0008): whether a subagent's automatic
@@ -3849,7 +4129,8 @@ bytes: {}", report.len()),
         if ev.agent_id.is_empty() || ev.trigger != "auto" {
             return None;
         }
-        let (_, handoff, limit, mode) = self.limits_of(ev);
+        let (_, applied, mode) = self.limits_of(ev);
+        let (handoff, limit) = (applied.handoff, applied.limit);
         if mode != crate::orchestrate::Mode::Enforced {
             return None;
         }
@@ -3873,6 +4154,74 @@ bytes: {}", report.len()),
         ))
     }
 
+    /// A subagent's checkpoint at its compaction (#295), on its own lane
+    /// `agent:<id>` (one per agent; its launch entry is on its brief's
+    /// `Lane:` instead), from its own transcript, as PreCompact writes the
+    /// main session's: the key, whether the chain card was added, and the
+    /// instructions' tail. Its card is owed to its next tool call. `None`
+    /// with no transcript to read.
+    ///
+    /// `closed`: written after the compaction (no PreCompact came), from
+    /// the segment its newest boundary closed, at once (the records before
+    /// a boundary are written: no settle wait on the tool call's budget).
+    fn subagent_checkpoint(&mut self, ev: &HookEvent, trigger: &str, closed: bool) -> Result<Option<(String, bool, String)>> {
+        if ev.transcript_path.is_empty() || ev.agent_id.is_empty() {
+            return Ok(None);
+        }
+        let t_pre = std::time::Instant::now();
+        let path = subagent_transcript(&ev.transcript_path, &ev.agent_id);
+        let (t, from, until) = if closed {
+            let (t, at) = crate::checkpoint::closed(&path, &ev.session_id);
+            (t, crate::checkpoint::TailFrom::Own, Some(at))
+        } else {
+            let (t, from) = crate::checkpoint::tail_settled(&path, &ev.session_id, crate::checkpoint::SETTLE_WAIT);
+            (t, from, None)
+        };
+        let lane = format!("agent:{}", ev.agent_id);
+        let tp = path.to_string_lossy().into_owned();
+        let out = self.write_checkpoint(&lane, &ev.session_id, &tp, trigger, &t, &from, until, None, t_pre)?;
+        self.agent_compact.entry(ev.agent_id.clone()).or_insert_with(|| AgentCompact { read: std::fs::metadata(&path).map_or(0, |m| m.len()), ..AgentCompact::default() }).due = true;
+        Ok(Some(out))
+    }
+
+    /// The post-compaction card of the calling subagent (#295), on its first
+    /// tool call after a compaction: owed by its PreCompact, or seen as a new
+    /// `compact_boundary` in its transcript when no PreCompact came (the
+    /// checkpoint is then written here). Appended to the context.
+    fn subagent_card(&mut self, ev: &HookEvent, path: &Path, a: &mut HookAnswer) -> Result<()> {
+        if !self.settings.compact.enabled {
+            return Ok(());
+        }
+        // First sight: read from where the transcript is now.
+        let c = self.agent_compact.entry(ev.agent_id.clone()).or_insert_with(|| AgentCompact { read: std::fs::metadata(path).map_or(0, |m| m.len()), ..AgentCompact::default() });
+        let (n, read) = boundaries_from(path, c.read);
+        c.read = read;
+        c.seen += n;
+        let (due, unseen) = (c.due, c.seen > c.given);
+        if !due && !unseen {
+            return Ok(());
+        }
+        if !due {
+            // No PreCompact for this compaction: its checkpoint now, of the
+            // segment the boundary closed.
+            self.subagent_checkpoint(ev, "boundary", true)?;
+        }
+        if let Some(c) = self.agent_compact.get_mut(&ev.agent_id) {
+            // Kept until the answer is out: a watchdog that answers first
+            // drops this card, and `answer_lost` owes it again.
+            c.lost = Some((ev.tool_use_id.clone(), c.given));
+            c.due = false;
+            c.given = (c.given + 1).max(c.seen);
+        }
+        if let Some(h) = crate::checkpoint::newest_on(&self.store, &format!("agent:{}", ev.agent_id))? {
+            if !a.context.is_empty() {
+                a.context.push('\n');
+            }
+            a.context.push_str(&crate::checkpoint::card(&h));
+        }
+        Ok(())
+    }
+
     /// The context limit of the calling subagent (the main session has
     /// [`Hooks::main_context`] instead, advice only): past
     /// the handoff point it is told to wrap up, past the hard limit every
@@ -3885,7 +4234,8 @@ bytes: {}", report.len()),
         let Some(ctx) = self.context_of(path) else { return };
         let sub = !ev.agent_id.is_empty();
         let orchestrated = self.settings.orchestrate.enabled;
-        let (kind, handoff, limit, mode) = self.limits_of(ev);
+        let (kind, applied, mode) = self.limits_of(ev);
+        let (handoff, limit) = (applied.handoff, applied.limit);
         if mode == Mode::Off || ctx < handoff {
             return;
         }
@@ -3894,11 +4244,13 @@ bytes: {}", report.len()),
         if sub && orchestrated {
             self.orch.passed(&ev.agent_id, &lane, kind);
         }
-        let what = match (sub, orchestrated) {
+        // The point that applied and where it came from (#403).
+        let what_at = |point: u64| match (sub, orchestrated) {
             (false, _) => "main session".to_string(),
-            (true, true) => format!("{} limits", kind.name()),
+            (true, true) => applied.source(kind, point),
             (true, false) => "cap".to_string(),
         };
+        let what = what_at(if ctx >= limit { limit } else { handoff });
         if ctx >= limit && mode == Mode::Enforced {
             if !passes_cap(&ev.tool_name) {
                 a.deny = Some(format!(
@@ -3975,16 +4327,16 @@ bytes: {}", report.len()),
         }
         let Some(ctx) = self.context_of(&path) else { return };
         let kind = self.orch.kind_of(&self.settings.orchestrate, &dir, &id, "");
-        let lim = self.settings.orchestrate.limits(kind).clone();
-        if lim.mode == Mode::Off || ctx < lim.handoff {
+        let (lim, mode) = self.applied(&dir, &id, kind);
+        if mode == Mode::Off || ctx < lim.handoff {
             return;
         }
         let lane = self.lane_of(&id);
-        if ctx >= lim.limit && lim.mode == Mode::Enforced {
+        if ctx >= lim.limit && mode == Mode::Enforced {
             a.deny = Some(format!(
-                "atlas context cap: agent {id} is at {ctx} context tokens, past its hard limit {} ({} limits). Do not resume it: start a fresh agent from its handoff and the lane {lane} journal.",
+                "atlas context cap: agent {id} is at {ctx} context tokens, past its hard limit {} ({}). Do not resume it: start a fresh agent from its handoff and the lane {lane} journal.",
                 lim.limit,
-                kind.name()
+                lim.source(kind, lim.limit)
             ));
         } else {
             a.context = format!(
@@ -4055,6 +4407,9 @@ fn start_log(s: &Settings) -> Option<(mpsc::Sender<LogRow>, std::thread::JoinHan
                 if let Some(m) = &r.miss {
                     let _ = crate::compact::log_miss(&conn, m);
                 }
+                if let Some(g) = &r.gate {
+                    let _ = crate::hook_gate::log(&conn, g);
+                }
                 if r.tool.is_empty() {
                     continue;
                 }
@@ -4086,7 +4441,7 @@ fn make_token_table(conn: &crate::db::Connection, refused: &mut bool) -> bool {
     if *refused {
         let _ = crate::hook_budget::bound_within::<1>(conn);
     }
-    let made = match conn.execute_batch(crate::tokens::TOKEN_TABLE) {
+    let made = match conn.execute_batch(crate::tokens::TOKEN_TABLE).and_then(|()| conn.execute_batch(crate::hook_gate::GATE_TABLE)) {
         Ok(()) => true,
         Err(e) => {
             eprintln!("atlas token log: {e}");

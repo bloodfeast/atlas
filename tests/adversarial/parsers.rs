@@ -568,6 +568,10 @@ fn others_never_panic(n: usize) {
         let _ = atlas::memory::import::front_value(t, s);
         let words: Vec<String> = t.split(' ').map(str::to_string).collect();
         let _ = atlas::handles::parse_sel(&words);
+        // The CLI's word parser in both forms (#323 N3), and recall's.
+        let _ = atlas::handles::parse_words(&words);
+        let pairs: Vec<(String, String)> = words.chunks(2).map(|c| (c[0].clone(), c.get(1).cloned().unwrap_or_default())).collect();
+        let _ = atlas::handles::parse_args(&pairs);
         let _ = atlas::update::parse_version(t);
         let _ = atlas::update::parse_manifest(t.as_bytes());
         let _ = atlas::update::key_from_hex(t);

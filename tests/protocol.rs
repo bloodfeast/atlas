@@ -262,7 +262,10 @@ fn no_network_code() {
         // `atlas track` (command line only, never the server) reads Jira and
         // Confluence through the system curl: its one spawn.
         let trackers_http = path.ends_with("trackers/http.rs");
-        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || path.ends_with("card_agents.rs") || path.ends_with("pr_supervise.rs") || path.ends_with("worktree_ledger.rs") || path.ends_with("worktree_gc.rs") || path.ends_with("restart.rs") || path.ends_with("restart_warn.rs") || trackers_http || platform;
+        // The pr-events auto-start (`pr_events.autostart`, off by default)
+        // starts one process at SessionStart: atlas itself, `pr-events serve`.
+        let autostart = path.ends_with("pr_autostart.rs");
+        let spawns = path.ends_with("bench.rs") || path.ends_with("code_index.rs") || path.ends_with("models.rs") || path.ends_with("update.rs") || path.ends_with("run.rs") || path.ends_with("claude_settings.rs") || path.ends_with("reviews.rs") || path.ends_with("pr_digest.rs") || path.ends_with("card_agents.rs") || path.ends_with("pr_supervise.rs") || path.ends_with("worktree_ledger.rs") || path.ends_with("worktree_gc.rs") || path.ends_with("restart.rs") || path.ends_with("restart_warn.rs") || trackers_http || autostart || platform;
         // The owned SQLite binding (src/db): the C declarations, the one
         // module that calls them, and the wrapper's `Send` and column reads.
         let sqlite = path.parent().is_some_and(|p| p.ends_with("db"));
@@ -276,6 +279,10 @@ fn no_network_code() {
         // is the one socket: TCP, bound to 127.0.0.1 and nothing else, and it
         // never connects out (journal:ATLAS-USES:0009).
         let listens = path.ends_with("pr_listen.rs");
+        if autostart {
+            assert_eq!(code.matches("Command::new").count(), 1, "{}", path.display());
+            assert!(code.contains("Command::new(exe)") && code.contains("std::env::current_exe()"), "{}", path.display());
+        }
         if listens {
             assert_eq!(code.matches("::bind(").count(), 1, "{}", path.display());
             assert!(code.contains("TcpListener::bind((Ipv4Addr::LOCALHOST, port))"), "{}", path.display());

@@ -13,8 +13,9 @@ adds one file per section: `changes/<pr>-<slug>.md`, the slug in lowercase lette
 An outside pull request merged on the public repository comes in through `cargo xtask release import`, which
 renames its `changes/<n>.md` to `changes/public-<n>.md` (`changes/public-<n>-<slug>.md` for a slug), `<n>` its
 public number, and adds `author: <login>`, its author's GitHub login, to the front matter. Only such a fragment
-takes, and must have, `author`; the fold ends each of its list items with `Thanks to @<login> (#<n>).`. The
-import's own pull request needs no other fragment.
+takes, and must have, `author`; the fold ends each of its list items with `Thanks to @<login> (#<n>).`. A
+marker, `changes/<n>.none`, becomes `changes/public-<n>.none`. The import's own pull request needs no other
+fragment or marker.
 
 ```markdown
 ---

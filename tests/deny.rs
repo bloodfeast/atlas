@@ -134,7 +134,7 @@ fn cli_file_tools_refuse_denied_files() {
 fn a_denied_file_claude_code_read_is_never_kept_as_a_handle() {
     let t = Temp::new("deny-read");
     let db = t.path().join("index.sqlite");
-    let mut r = Router::with_db(&db, None);
+    let mut r = Router::with_db(&db, Some(json!({"route_read": "all"})));
     let env = t.path().join(".env");
     let body: String = (0..1000).map(|i| format!("KEY_{i}={SECRET}\n")).collect();
     write(&env, &body);
@@ -147,8 +147,29 @@ fn a_denied_file_claude_code_read_is_never_kept_as_a_handle() {
         ..HookEvent::default()
     };
     assert_eq!(r.post_tool_use(&read).unwrap(), None);
-    let listed = Command::new(bin()).arg("--db").arg(&db).arg("slice").arg("--list").output().unwrap();
-    assert!(!String::from_utf8_lossy(&listed.stdout).contains(".env"), "{}", String::from_utf8_lossy(&listed.stdout));
+    // A control read of an allowed file of the same size is kept, so the
+    // listing below is known to name what was kept (#323).
+    let notes = t.path().join("notes.txt");
+    write(&notes, &body);
+    let n = notes.to_string_lossy().into_owned();
+    let control = HookEvent {
+        tool_input: json!({"file_path": n}),
+        tool_response: json!({"type": "text", "file": {"filePath": n, "content": body, "numLines": 1000, "startLine": 1, "totalLines": 1000}}),
+        ..read.clone()
+    };
+    r.post_tool_use(&control).unwrap();
+    drop(r);
+    // The database comes from the configuration: `--db` is no option of a
+    // subcommand (#323).
+    let cfg = t.path().join("atlas.json");
+    write(&cfg, &json!({"db": db.display().to_string(), "vaults": []}).to_string());
+    let listed = Command::new(bin()).arg("slice").arg("--list").env("ATLAS_CONFIG", &cfg).current_dir(t.path()).output().unwrap();
+    let out = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    // One row, the control's: a kept .env would be a second (a label is cut
+    // at 80 characters, so a long temp path may hide its name).
+    assert_eq!(out.lines().count(), 1, "only the control is listed:\n{out}");
+    assert!(!out.contains(".env"), "{out}");
 }
 
 const CANARY: &str = "marigoldquartz7731";

@@ -745,6 +745,13 @@ fn value_of(k: &str) -> &'static str {
 /// A message naming the argument that is unknown, repeated, malformed or
 /// without its value.
 pub fn parse_args(pairs: &[(String, String)]) -> std::result::Result<Ask, String> {
+    parse_pairs(pairs, true)
+}
+
+/// [`parse_args`]; `unquote` false takes each value as given, untrimmed and
+/// with its quotes: a shell has already removed the quotes a CLI value had,
+/// so `--grep ' '` is a space and `--grep '"x"'` matches the quotes (#323).
+fn parse_pairs(pairs: &[(String, String)], unquote: bool) -> std::result::Result<Ask, String> {
     let flag = |k: &str, v: &str| match v {
         "true" | "" => Ok(true),
         "false" => Ok(false),
@@ -757,8 +764,12 @@ pub fn parse_args(pairs: &[(String, String)]) -> std::result::Result<Ask, String
     let mut context = false;
     for (k, v) in pairs {
         let k = k.as_str();
-        let v = v.trim();
-        let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v);
+        let v = if unquote {
+            let v = v.trim();
+            v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v)
+        } else {
+            v.as_str()
+        };
         if k == "|" {
             return Err("one selector at a time: a hint's `|` separates alternatives, so pick one (key \"h:ID lines=A-B\")".into());
         }
@@ -895,7 +906,10 @@ fn word_pairs(words: impl IntoIterator<Item = String>) -> std::result::Result<Ve
             };
             pairs.push((name.to_string(), v));
         } else if let Some((k, v)) = w.split_once('=') {
-            pairs.push((k.to_string(), v.to_string()));
+            // `recall`'s form, as a hint printed off a terminal writes it:
+            // trimmed and one pair of quotes dropped, as `recall` does.
+            let v = v.trim();
+            pairs.push((k.to_string(), v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v).to_string()));
         } else if matches!(w.as_str(), "failures" | "digest") {
             pairs.push((w, "true".to_string()));
         } else {
@@ -907,13 +921,15 @@ fn word_pairs(words: impl IntoIterator<Item = String>) -> std::result::Result<Ve
 
 /// Parses the selector words of `atlas slice` in either form: its flags
 /// (`--lines A-B`) or `recall`'s arguments (`lines=A-B`), as a hint printed
-/// off a terminal writes them. A shell has already removed the quotes.
+/// off a terminal writes them. A flag's value is taken as the shell gave
+/// it, not trimmed and its quotes kept (#323); a `NAME=VALUE` word is
+/// read as `recall` reads its argument.
 ///
 /// # Errors
 ///
 /// As [`parse_args`]; a flag without its value.
 pub fn parse_words(words: &[String]) -> std::result::Result<Ask, String> {
-    parse_args(&word_pairs(words.iter().cloned())?)
+    parse_pairs(&word_pairs(words.iter().cloned())?, false)
 }
 
 /// Parses the selector words of `atlas slice` (`recall`'s arguments go

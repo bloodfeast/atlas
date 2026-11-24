@@ -308,7 +308,7 @@ pub const ORD_STEP: i64 = 1 << 16;
 pub const KINDS: &[&str] = &["memory", "rule", "section", "block", "handoff", "journal", "decision"];
 
 /// Journal entry kinds (`records.sub` for kind `journal`).
-pub const ENTRIES: &[&str] = &["brief", "decision", "measurement", "commit", "question", "answered", "next", "note", "cap", "checkpoint", "queued", "review", "idea"];
+pub const ENTRIES: &[&str] = &["brief", "decision", "measurement", "commit", "question", "answered", "next", "note", "cap", "checkpoint", "queued", "review", "idea", "defer", "reopen"];
 
 /// Where an imported text came from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -805,10 +805,13 @@ impl LaneStatus {
 }
 
 /// The open-question test, in SQL over `records r`: an active question no
-/// `answers` ref closes. `lanes()`, `open_questions()` and the checkpoint
-/// card (`checkpoint::state`) all count by it.
+/// `answers` ref closes, an `answers` ref older than the newest `reopens`
+/// ref to it aside (#406: a false close has an undo). `lanes()`,
+/// `open_questions()` and the checkpoint card (`checkpoint::state`) all
+/// count by it.
 pub const OPEN_QUESTION_SQL: &str = "(r.kind = 'journal' AND r.sub = 'question' AND r.status = 'active'
-    AND r.key NOT IN (SELECT f.target FROM refs f WHERE f.kind = 'answers'))";
+    AND NOT EXISTS (SELECT 1 FROM refs f WHERE f.kind = 'answers' AND f.target = r.key
+        AND f.rid > (SELECT COALESCE(MAX(o.rid), 0) FROM refs o WHERE o.kind = 'reopens' AND o.target = r.key)))";
 
 /// The work-record test, in SQL over `records r` and its head `versions v`:
 /// an active journal entry or handoff that is not a `queued` entry and that

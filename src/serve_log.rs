@@ -401,10 +401,10 @@ fn temp_for(path: &Path, nanos: u128) -> PathBuf {
     sibling(path, &format!(".{}.{nanos}.{}.new", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
 }
 
-/// [`create_with_header`] through the temporary `tmp`, calling `linked`
+/// [`create_with_header`] through the temporary `tmp`, calling `after_link`
 /// once it is linked as the log and before it is removed: the test seam
 /// for an appender paused there.
-fn create_with_header_via(path: &Path, tmp: &Path, linked: impl FnOnce()) -> io::Result<()> {
+fn create_with_header_via(path: &Path, tmp: &Path, after_link: impl FnOnce()) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir)?;
     }
@@ -417,7 +417,7 @@ fn create_with_header_via(path: &Path, tmp: &Path, linked: impl FnOnce()) -> io:
         Ok(mut f) => {
             let written = f.write_all(head.as_bytes());
             drop(f);
-            let linked = written.and_then(|()| fs::hard_link(tmp, path)).inspect(|()| linked());
+            let linked = written.and_then(|()| fs::hard_link(tmp, path)).inspect(|()| after_link());
             let _ = fs::remove_file(tmp);
             linked
         }
@@ -429,6 +429,10 @@ fn create_with_header_via(path: &Path, tmp: &Path, linked: impl FnOnce()) -> io:
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         // No hard links here (FAT, some network shares): create it and
         // write the header, unless another appender created it first.
+        // Known limit (#350 review): an appender that opens the new empty
+        // log before this header is written gives it the header itself, so
+        // the log can start with two headers. Format only: no line is lost,
+        // and only where hard links are missing.
         Err(_) => match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut f) => f.write_all(head.as_bytes()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
@@ -438,20 +442,50 @@ fn create_with_header_via(path: &Path, tmp: &Path, linked: impl FnOnce()) -> io:
 }
 
 fn try_append(path: &Path, event: &str) -> io::Result<()> {
-    rotate_if_full(path);
+    try_append_via(path, event, |_| ())
+}
+
+/// How often [`try_append`] writes a line again whose file rotations
+/// replaced while it was being written.
+const APPEND_TRIES: u32 = 3;
+
+/// [`try_append`], calling `opened` with the attempt number once the log
+/// is open and before the line is written: the test seam for an appender
+/// paused there while other appenders rotate.
+///
+/// After the write the handle's file must still be the log or `.1`
+/// ([`kept`]): a paused appender that two rotations passed holds a file
+/// the second one replaced, and its line went with it (issue #350). The
+/// line is then written again, to the log as it is now.
+fn try_append_via(path: &Path, event: &str, mut opened: impl FnMut(u32)) -> io::Result<()> {
     let line = format!("{} pid={} v={} {event}\n", crate::store::utc(SystemTime::now()), std::process::id(), env!("CARGO_PKG_VERSION"));
     let open = || OpenOptions::new().append(true).open(path);
-    let mut file = match open() {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            create_with_header(path)?;
-            open()?
+    for attempt in 0..APPEND_TRIES {
+        rotate_if_full(path);
+        let mut file = match open() {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                create_with_header(path)?;
+                open()?
+            }
+            r => r?,
+        };
+        opened(attempt);
+        // An empty file (made by something other than this module) gets
+        // the header, decided from the open handle.
+        let text = if file.metadata()?.len() == 0 { format!("{HEADER}\n{line}") } else { line.clone() };
+        file.write_all(text.as_bytes())?;
+        if kept(&file, path) {
+            return Ok(());
         }
-        r => r?,
-    };
-    // An empty file (made by something other than this module) gets the
-    // header, decided from the open handle.
-    let text = if file.metadata()?.len() == 0 { format!("{HEADER}\n{line}") } else { line };
-    file.write_all(text.as_bytes())
+    }
+    Err(io::Error::other("a line was lost to rotations past it"))
+}
+
+/// Whether the open log `file` is still the log at `path` or its `.1`, by
+/// file identity. Where identity cannot be read it is taken as kept.
+fn kept(file: &fs::File, path: &Path) -> bool {
+    let Some(id) = crate::platform::file_id::of(file) else { return true };
+    [path.to_path_buf(), sibling(path, ".1")].iter().any(|p| fs::File::open(p).ok().and_then(|f| crate::platform::file_id::of(&f)) == Some(id))
 }
 
 #[cfg(test)]
@@ -549,9 +583,8 @@ mod tests {
     /// stays, under one header.
     #[test]
     fn a_header_temporary_of_the_same_name_does_not_truncate_a_linked_log() {
-        let dir = std::env::temp_dir().join(format!("atlas-serve-log-tmpname-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let path = dir.join(FILE);
+        let dir = TempDir::new("tmpname");
+        let path = dir.0.join(FILE);
         let tmp = sibling(&path, ".1.2.new");
         create_with_header_via(&path, &tmp, || {
             append(&path, "exit reason=eof uptime=0.0s responses=0");
@@ -563,7 +596,53 @@ mod tests {
         assert_eq!(ls.len(), 2, "{text}");
         assert_eq!(ls[0], HEADER);
         assert!(ls[1].ends_with(" exit reason=eof uptime=0.0s responses=0"), "{text}");
-        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A test folder removed on drop, also when the test fails.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("atlas-serve-log-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Fills the log at `path` to [`ROTATE_AT`] and rotates it.
+    fn fill_and_rotate(path: &Path) {
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        let len = f.metadata().unwrap().len();
+        f.write_all(&vec![b'x'; (ROTATE_AT - len.min(ROTATE_AT)) as usize]).unwrap();
+        drop(f);
+        rotate_if_full(path);
+    }
+
+    /// Issue #350: an appender has opened the log and not yet written its
+    /// line; two full rotations pass, so the file it holds is renamed to
+    /// `.1` and then replaced. Its line still lands, in the log or `.1`.
+    #[test]
+    fn a_line_survives_two_rotations_past_a_paused_appender() {
+        let dir = TempDir::new("two-rotations");
+        let path = dir.0.join(FILE);
+        append(&path, "start");
+        try_append_via(&path, "exit reason=paused", |attempt| {
+            if attempt == 0 {
+                fill_and_rotate(&path);
+                append(&path, "other");
+                fill_and_rotate(&path);
+            }
+        })
+        .unwrap();
+        let read = |p: &Path| fs::read_to_string(p).unwrap_or_default();
+        let both = format!("{}{}", read(&path), read(&sibling(&path, ".1")));
+        assert_eq!(both.matches(" exit reason=paused").count(), 1, "the paused line landed once");
     }
 
     /// Two temporaries asked for at one clock reading are named apart.

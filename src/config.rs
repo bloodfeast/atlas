@@ -293,6 +293,9 @@ pub struct MemorySpec {
     /// The resume card at a new or cleared session (default true; see
     /// `crate::resume`).
     pub resume_card: Option<bool>,
+    /// Days after which an open question is flagged stale (default 3; see
+    /// `crate::questions`).
+    pub question_stale_days: Option<usize>,
     /// Experimental, off by default: whether atlas manages the memory folder and rule files (see
     /// `crate::memory::rules::Mode`): unset or `false` keeps what is configured by
     /// hand, `true` is `Live`, `"off"` is `Off`.
@@ -720,9 +723,11 @@ fn parse_orchestrate(v: &Value, base: &Path) -> Result<crate::orchestrate::Orche
         }
     }
     if let Some(jv) = f.get("judge") {
-        let g = Fields::new("orchestrate.judge", jv, &["enabled", "cells", "classifier"])?;
+        let g = Fields::new("orchestrate.judge", jv, &["enabled", "cells", "classifier", "mode", "log"])?;
         o.judge_enabled = g.boolean("enabled")?;
         o.judge_cells = g.string("cells")?.map(PathBuf::from);
+        o.judge_mode = named(&g, "mode", crate::taskjudge::JudgeMode::parse, "off, advisory or enforced")?;
+        o.judge_log = g.string("log")?.map(PathBuf::from);
         if let Some(cv) = g.get("classifier") {
             o.judge_classifier = parse_classifier(cv)?;
         }
@@ -745,20 +750,21 @@ fn parse_orchestrate(v: &Value, base: &Path) -> Result<crate::orchestrate::Orche
             let Some(x) = kf.get(kind.name()) else { continue };
             // Each label is written out, so the docs test reads every key.
             let g = match kind {
-                Kind::Builder => Fields::new("orchestrate.kinds.builder", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
-                Kind::Reviewer => Fields::new("orchestrate.kinds.reviewer", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
+                Kind::Builder => Fields::new("orchestrate.kinds.builder", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh", "models"])?,
+                Kind::Reviewer => Fields::new("orchestrate.kinds.reviewer", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh", "models"])?,
                 Kind::BriefWriter => Fields::new(
                     "orchestrate.kinds.brief-writer",
                     x,
-                    &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"],
+                    &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh", "models"],
                 )?,
-                _ => Fields::new("orchestrate.kinds.research", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh"])?,
+                _ => Fields::new("orchestrate.kinds.research", x, &["max", "window", "limit", "handoff", "handoff_pct", "mode", "fresh", "models"])?,
             };
             let pct = g.uint("handoff_pct")?;
             if pct.is_some_and(|p| p == 0 || p > 100) {
                 return Err(g.bad("handoff_pct", "1 to 100"));
             }
             let spec = KindSpec {
+                models: kind_models(kind, &g)?,
                 max: g.uint("max")?,
                 window: g.uint("window")?,
                 limit: g.uint("limit")?,
@@ -771,6 +777,40 @@ fn parse_orchestrate(v: &Value, base: &Path) -> Result<crate::orchestrate::Orche
         }
     }
     Ok(o)
+}
+
+/// `orchestrate.kinds.<kind>.models` (#403): an object of non-empty model
+/// ids or family aliases to `{window, limit, handoff, handoff_pct}`, each
+/// entry's handoff at most its limit.
+fn kind_models(kind: crate::orchestrate::Kind, g: &Fields) -> Result<Vec<(String, crate::orchestrate::ModelSpec)>> {
+    use crate::orchestrate::Kind;
+    let Some(v) = g.get("models") else { return Ok(Vec::new()) };
+    let map = v.as_object().ok_or_else(|| g.bad("models", "an object of model ids or family aliases to limits"))?;
+    let mut out = Vec::new();
+    for (m, ev) in map {
+        if m.trim().is_empty() {
+            return Err(g.bad("models", "an object whose keys are non-empty model ids or family aliases"));
+        }
+        // Each label is written out, so the docs test reads every key.
+        let e = match kind {
+            Kind::Builder => Fields::new(&format!("orchestrate.kinds.builder.models[{m:?}]"), ev, &["window", "limit", "handoff", "handoff_pct"])?,
+            Kind::Reviewer => Fields::new(&format!("orchestrate.kinds.reviewer.models[{m:?}]"), ev, &["window", "limit", "handoff", "handoff_pct"])?,
+            Kind::BriefWriter => Fields::new(&format!("orchestrate.kinds.brief-writer.models[{m:?}]"), ev, &["window", "limit", "handoff", "handoff_pct"])?,
+            _ => Fields::new(&format!("orchestrate.kinds.research.models[{m:?}]"), ev, &["window", "limit", "handoff", "handoff_pct"])?,
+        };
+        let pct = e.uint("handoff_pct")?;
+        if pct.is_some_and(|p| p == 0 || p > 100) {
+            return Err(e.bad("handoff_pct", "1 to 100"));
+        }
+        let spec = crate::orchestrate::ModelSpec { window: e.uint("window")?, limit: e.uint("limit")?, handoff: e.uint("handoff")?, handoff_pct: pct };
+        if let (Some(h), Some(l)) = (spec.handoff, spec.limit) {
+            if h > l {
+                return Err(e.bad("handoff", &format!("at most its limit ({l}); it is {h}")));
+            }
+        }
+        out.push((m.clone(), spec));
+    }
+    Ok(out)
 }
 
 /// Reads a code root's `exclude`: globs relative to the root, with `/`
@@ -1090,7 +1130,7 @@ impl Config {
             c.calibrate = Some(CalibrateSpec { auto: f.boolean("auto")?, skip: f.strings("skip")?, handoff });
         }
         if let Some(mv) = top.get("memory") {
-            let f = Fields::new("memory", mv, &["store", "export_dir", "exports", "snapshot_hours", "snapshot_dir", "snapshot_cap_mb", "brief_reference", "tree", "transcripts", "resume_card", "ideas", "rules"])?;
+            let f = Fields::new("memory", mv, &["store", "export_dir", "exports", "snapshot_hours", "snapshot_dir", "snapshot_cap_mb", "brief_reference", "tree", "transcripts", "resume_card", "question_stale_days", "ideas", "rules"])?;
             let mut m = MemorySpec {
                 store: f.string("store")?.map(|p| absolute(base, Path::new(&p))),
                 export_dir: f.string("export_dir")?.map(|p| absolute(base, Path::new(&p))),
@@ -1100,6 +1140,10 @@ impl Config {
                 brief_reference: f.string("brief_reference")?.map(|p| absolute(base, Path::new(&p))),
                 transcripts: f.boolean("transcripts")?,
                 resume_card: f.boolean("resume_card")?,
+                question_stale_days: match f.uint("question_stale_days")? {
+                    Some(0) => return Err(f.bad("question_stale_days", "a whole number of days, at least 1")),
+                    d => d,
+                },
                 rules: match f.get("rules") {
                     None => None,
                     Some(Value::Bool(true)) => Some(crate::memory::rules::Mode::Live),
@@ -1470,5 +1514,43 @@ mod tests {
         assert_eq!(setup("true"), crate::code::Indexers::Search);
         assert!(matches!(setup("false"), crate::code::Indexers::Off(_)));
         assert_eq!(setup(r#"{"scip-go": false}"#), crate::code::Indexers::Chosen(vec![("scip-go".into(), None)]));
+    }
+
+    /// #403: `orchestrate.kinds.<kind>.models` parses per kind and is
+    /// checked: an object of non-empty keys, known fields only, a 1 to 100
+    /// handoff_pct, and each entry's handoff at most its limit.
+    #[test]
+    fn parses_and_checks_per_model_kind_limits() {
+        use crate::orchestrate::{Kind, ModelSpec};
+        let c = Config::parse(
+            r#"{"orchestrate": {"kinds": {"builder": {"handoff": 285000, "models": {"haiku": {"limit": 180000, "handoff": 90000}, "claude-opus-5-5": {"handoff_pct": 50, "window": 200000}}}, "brief-writer": {"models": {"sonnet": {"limit": 300000}}}}}}"#,
+            Path::new("."),
+        )
+        .unwrap();
+        let o = c.orchestrate.unwrap();
+        let of = |k: Kind| o.kinds.iter().find(|(x, _)| *x == k).map(|(_, s)| s.models.clone()).unwrap();
+        assert_eq!(
+            of(Kind::Builder),
+            vec![
+                ("haiku".to_string(), ModelSpec { limit: Some(180_000), handoff: Some(90_000), ..Default::default() }),
+                ("claude-opus-5-5".to_string(), ModelSpec { window: Some(200_000), handoff_pct: Some(50), ..Default::default() }),
+            ]
+        );
+        assert_eq!(of(Kind::BriefWriter), vec![("sonnet".to_string(), ModelSpec { limit: Some(300_000), ..Default::default() })]);
+        let err = |j: &str| Config::parse(j, Path::new(".")).err().map(|e| e.to_string()).unwrap_or_default();
+        let e = err(r#"{"orchestrate": {"kinds": {"builder": {"models": {"haiku": {"limit": 90000, "handoff": 100000}}}}}}"#);
+        assert!(e.contains(r#"orchestrate.kinds.builder.models["haiku"].handoff must be at most its limit (90000)"#), "{e}");
+        let e = err(r#"{"orchestrate": {"kinds": {"reviewer": {"models": {"haiku": {"max": 1}}}}}}"#);
+        assert!(e.contains(r#"orchestrate.kinds.reviewer.models["haiku"]: unknown field "max""#), "{e}");
+        let e = err(r#"{"orchestrate": {"kinds": {"research": {"models": {"haiku": {"handoff_pct": 0}}}}}}"#);
+        assert!(e.contains(r#"orchestrate.kinds.research.models["haiku"].handoff_pct must be 1 to 100"#), "{e}");
+        for bad in [
+            r#"{"orchestrate": {"kinds": {"builder": {"models": {" ": {"limit": 1}}}}}}"#,
+            r#"{"orchestrate": {"kinds": {"builder": {"models": ["haiku"]}}}}"#,
+            r#"{"orchestrate": {"kinds": {"builder": {"models": {"haiku": 90000}}}}}"#,
+            r#"{"orchestrate": {"kinds": {"builder": {"models": {"haiku": {"limit": "big"}}}}}}"#,
+        ] {
+            assert!(Config::parse(bad, Path::new(".")).is_err(), "accepted {bad}");
+        }
     }
 }

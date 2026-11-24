@@ -183,6 +183,71 @@ pub struct KindSpec {
     pub mode: Option<Mode>,
     /// What follows a handoff.
     pub fresh: Option<Fresh>,
+    /// Per-model limits (`orchestrate.kinds.<kind>.models`): a model id or
+    /// family alias to its points, in configured order (#403).
+    pub models: Vec<(String, ModelSpec)>,
+}
+
+/// One model's limits within a kind (`orchestrate.kinds.<kind>.models.<model>`).
+/// An unset key falls back to the kind's, then to the globals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// The context window its limits scale to.
+    pub window: Option<usize>,
+    /// The hard limit, in tokens.
+    pub limit: Option<usize>,
+    /// The handoff point, in tokens.
+    pub handoff: Option<usize>,
+    /// The handoff point as a percentage of the limit.
+    pub handoff_pct: Option<usize>,
+}
+
+/// One model's resolved points within a kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelLimits {
+    /// The key as configured (a model id or a family alias).
+    pub key: String,
+    /// The window the limits were scaled to.
+    pub window: u64,
+    /// The hard limit, in context tokens.
+    pub limit: u64,
+    /// The handoff (soft) point, at most `limit`.
+    pub handoff: u64,
+}
+
+/// The points that apply to one agent: its kind's, or a model entry's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// The handoff point.
+    pub handoff: u64,
+    /// The hard limit.
+    pub limit: u64,
+    /// The model entry's key, when one matched.
+    pub model: Option<String>,
+}
+
+impl Applied {
+    /// Where a point came from, for the hook text: `builder limits` for the
+    /// kind's own, else `haiku builder: 90,000 (orchestrate.kinds.builder.models.haiku)`.
+    pub fn source(&self, kind: Kind, point: u64) -> String {
+        match &self.model {
+            None => format!("{} limits", kind.name()),
+            Some(m) => format!("{m} {}: {} (orchestrate.kinds.{}.models.{m})", kind.name(), thousands(point), kind.name()),
+        }
+    }
+}
+
+/// `90000` -> `90,000`.
+pub fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The `orchestrate` section as configured.
@@ -223,6 +288,10 @@ pub struct OrchestrateSpec {
     pub judge_enabled: Option<bool>,
     /// The task judge's cells file (`orchestrate.judge.cells`).
     pub judge_cells: Option<std::path::PathBuf>,
+    /// The task judge's mode (`orchestrate.judge.mode`).
+    pub judge_mode: Option<crate::taskjudge::JudgeMode>,
+    /// The dogfood log (`orchestrate.judge.log`).
+    pub judge_log: Option<std::path::PathBuf>,
     /// The work classifier (`orchestrate.judge.classifier`).
     pub judge_classifier: crate::taskjudge::ClassifierSettings,
     /// The folders a `worktree:NAME` resolves under (`orchestrate.worktree_roots`;
@@ -249,6 +318,22 @@ pub struct KindLimits {
     pub mode: Mode,
     /// What follows a handoff.
     pub fresh: Fresh,
+    /// Per-model points, in configured order.
+    pub models: Vec<ModelLimits>,
+}
+
+impl KindLimits {
+    /// The points for an agent of this kind running `model` (an id or an
+    /// alias; `None` when unknown). A model entry is matched as
+    /// `compact.model_windows` is ([`crate::autocompact::match_model`]: an
+    /// exact id beats a family alias); with none, the kind's own.
+    pub fn for_model(&self, model: Option<&str>) -> Applied {
+        let hit = model.and_then(|m| crate::autocompact::match_model(m, self.models.iter().map(|e| e.key.as_str()))).and_then(|k| self.models.iter().find(|e| e.key == k));
+        match hit {
+            Some(e) => Applied { handoff: e.handoff, limit: e.limit, model: Some(e.key.clone()) },
+            None => Applied { handoff: self.handoff, limit: self.limit, model: None },
+        }
+    }
 }
 
 /// The resolved orchestrator settings.
@@ -351,16 +436,34 @@ pub fn resolve(
     let resolve_kind = |k: Kind, default_max: usize| {
         let ks = o.kinds.iter().find(|(x, _)| *x == k).map_or(&none, |(_, s)| s);
         let window = ks.window.filter(|w| *w > 0).map_or(base_window, |w| w as u64);
-        let scaled = |t: u64| ((t as u128 * window as u128) / REFERENCE_WINDOW as u128) as u64;
-        let limit = ks.limit.or(cap_block).map_or_else(|| scaled(DEFAULT_LIMIT), |l| l as u64).max(1);
-        let handoff = ks
-            .handoff
-            .map(|h| h as u64)
-            .or_else(|| ks.handoff_pct.map(|p| limit * p.min(100) as u64 / 100))
-            .or(cap_warn.map(|w| w as u64))
-            .unwrap_or_else(|| scaled(DEFAULT_HANDOFF))
-            .min(limit);
+        // The limit and handoff on a window from configured values, with the
+        // globals and the scaled defaults behind them.
+        let points = |window: u64, limit: Option<usize>, handoff: Option<usize>, pct: Option<usize>| {
+            let scaled = |t: u64| ((t as u128 * window as u128) / REFERENCE_WINDOW as u128) as u64;
+            let limit = limit.or(cap_block).map_or_else(|| scaled(DEFAULT_LIMIT), |l| l as u64).max(1);
+            let handoff = handoff
+                .map(|h| h as u64)
+                .or_else(|| pct.map(|p| limit * p.min(100) as u64 / 100))
+                .or(cap_warn.map(|w| w as u64))
+                .unwrap_or_else(|| scaled(DEFAULT_HANDOFF))
+                .min(limit);
+            (limit, handoff)
+        };
+        let (limit, handoff) = points(window, ks.limit, ks.handoff, ks.handoff_pct);
+        // A model entry's unset keys fall back to the kind's; its handoff
+        // (or handoff_pct) replaces the kind's pair as a whole.
+        let models = ks
+            .models
+            .iter()
+            .map(|(key, e)| {
+                let window = e.window.filter(|w| *w > 0).map_or(window, |w| w as u64);
+                let (h, p) = if e.handoff.is_some() || e.handoff_pct.is_some() { (e.handoff, e.handoff_pct) } else { (ks.handoff, ks.handoff_pct) };
+                let (limit, handoff) = points(window, e.limit.or(ks.limit), h, p);
+                ModelLimits { key: key.clone(), window, limit, handoff }
+            })
+            .collect();
         KindLimits {
+            models,
             max: ks.max.unwrap_or(default_max).min(claude_limit),
             window,
             limit,
@@ -407,9 +510,13 @@ pub fn resolve(
             mode: o.review_mode.unwrap_or(Mode::Advisory),
         },
         judge: crate::taskjudge::JudgeSettings {
-            enabled: o.judge_enabled.unwrap_or(false),
+            // A stated mode wins; `enabled: true` alone is advisory. The
+            // advisory line runs in enforced mode too.
+            enabled: o.judge_mode.map_or(o.judge_enabled.unwrap_or(false), |m| m != crate::taskjudge::JudgeMode::Off),
             cells: o.judge_cells.clone(),
             classifier: o.judge_classifier.clone(),
+            mode: o.judge_mode.unwrap_or(if o.judge_enabled.unwrap_or(false) { crate::taskjudge::JudgeMode::Advisory } else { crate::taskjudge::JudgeMode::Off }),
+            log: o.judge_log.clone(),
         },
         worktree_roots: o.worktree_roots.clone(),
         runq_root: o.runq_root.clone(),
@@ -1056,8 +1163,29 @@ struct Pending {
 /// holding them last wrote them (public #16): `atlas queue list` and
 /// `recall op=status` run elsewhere and list them as held slots. `time` is
 /// the admission in nanoseconds since the Unix epoch; a row older than
-/// [`PENDING_TTL`] holds nothing.
-pub const PENDING_TABLE: &str = "CREATE TABLE IF NOT EXISTS agent_pending(tool_use_id TEXT NOT NULL, transcript TEXT NOT NULL, kind TEXT NOT NULL, lane TEXT NOT NULL, description TEXT NOT NULL, time INTEGER NOT NULL);";
+/// [`PENDING_TTL`] holds nothing. `scan_from` is the session transcript's
+/// length at the admission (#370): a listing reads the transcript from
+/// there for the launch's refusal, so a launch the harness rejected stops
+/// showing at once, not only when the next admission sweeps it. A table
+/// made before the column gets it from [`pending_columns`]; a row without
+/// it reads from the start.
+pub const PENDING_TABLE: &str = "CREATE TABLE IF NOT EXISTS agent_pending(tool_use_id TEXT NOT NULL, transcript TEXT NOT NULL, kind TEXT NOT NULL, lane TEXT NOT NULL, description TEXT NOT NULL, time INTEGER NOT NULL, scan_from INTEGER NOT NULL DEFAULT 0);";
+
+/// Whether `agent_pending` has its `scan_from` column (a table made by an
+/// older build has not).
+fn has_scan_from(conn: &crate::db::Connection) -> crate::Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_pending') WHERE name = 'scan_from')", [], |r| r.get(0))?)
+}
+
+/// Creates [`PENDING_TABLE`], adding `scan_from` to a table an older build
+/// made. Inside the caller's write.
+fn pending_columns(conn: &crate::db::Connection) -> crate::Result<()> {
+    conn.execute_batch(PENDING_TABLE)?;
+    if !has_scan_from(conn)? {
+        conn.execute_batch("ALTER TABLE agent_pending ADD COLUMN scan_from INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(())
+}
 
 /// How much later than an agent's last write the machine must have booted
 /// for that agent to count as dead in the reboot: a boot time read as now
@@ -1149,12 +1277,15 @@ pub fn pending_slots(store: &crate::memory::MemoryStore, now: SystemTime) -> Vec
         if !table_exists(conn, "agent_pending")? {
             return Ok(Vec::new());
         }
-        let mut st = conn.prepare("SELECT tool_use_id, kind, lane, description, time FROM agent_pending WHERE time >= ?1 ORDER BY time")?;
+        let from = if has_scan_from(conn)? { "scan_from" } else { "0" };
+        let mut st = conn.prepare(&format!("SELECT tool_use_id, kind, lane, description, time, transcript, {from} FROM agent_pending WHERE time >= ?1 ORDER BY time"))?;
         let rows = st.query_map([floor], |r| {
             let (id, kind, lane, description, t): (String, String, String, String, i64) =
                 (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+            let (transcript, scan): (String, i64) = (r.get(5)?, r.get(6)?);
             let since = UNIX_EPOCH + Duration::from_nanos(u64::try_from(t).unwrap_or(0));
             Ok((
+                (transcript, u64::try_from(scan).unwrap_or(0)),
                 id,
                 HeldSlot {
                     kind: Kind::parse(&kind).unwrap_or(Kind::None),
@@ -1168,7 +1299,21 @@ pub fn pending_slots(store: &crate::memory::MemoryStore, now: SystemTime) -> Vec
                 },
             ))
         })?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let rows: Vec<((String, u64), String, HeldSlot)> = rows.collect::<std::result::Result<_, _>>()?;
+        // A launch its session transcript records as refused since its
+        // admission holds nothing (#370): swept here, not only on the next
+        // admission. One read per transcript, from its earliest row.
+        let mut refused: HashSet<String> = HashSet::new();
+        let mut transcripts: Vec<&str> = rows.iter().map(|r| r.0 .0.as_str()).collect();
+        transcripts.sort_unstable();
+        transcripts.dedup();
+        for t in transcripts {
+            let mine: Vec<&((String, u64), String, HeldSlot)> = rows.iter().filter(|r| r.0 .0 == t).collect();
+            let from = mine.iter().map(|r| r.0 .1).min().unwrap_or(0);
+            let ids: Vec<&str> = mine.iter().map(|r| r.1.as_str()).collect();
+            refused.extend(refused_launches(Path::new(t), from, &ids).0);
+        }
+        Ok(rows.into_iter().filter(|r| !refused.contains(&r.1)).map(|(_, id, h)| (id, h)).collect())
     };
     read().unwrap_or_else(|e| {
         eprintln!("atlas agent cap: pending launches: {e}");
@@ -1248,7 +1393,7 @@ impl Agents {
         let conn = store.conn();
         let floor = release_nanos(SystemTime::now().checked_sub(PENDING_TTL).unwrap_or(UNIX_EPOCH));
         crate::memory::guarded(conn, store.path(), || {
-            conn.execute_batch(PENDING_TABLE)?;
+            pending_columns(conn)?;
             for gone in self.synced.iter().filter(|t| !now.iter().any(|p| &p.tool_use_id == *t)) {
                 conn.execute("DELETE FROM agent_pending WHERE tool_use_id = ?1", [gone.as_str()])?;
             }
@@ -1256,8 +1401,16 @@ impl Agents {
                 // The sub-lane it runs as, once the queue check gave it one.
                 let lane = p.class.as_ref().and_then(|c| c.lane.as_deref()).unwrap_or(&p.lane);
                 conn.execute(
-                    "INSERT INTO agent_pending(tool_use_id, transcript, kind, lane, description, time) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                    crate::db::params![p.tool_use_id, p.transcript, p.kind.name(), lane, p.description, release_nanos(p.wall)],
+                    "INSERT INTO agent_pending(tool_use_id, transcript, kind, lane, description, time, scan_from) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    crate::db::params![
+                        p.tool_use_id,
+                        p.transcript,
+                        p.kind.name(),
+                        lane,
+                        p.description,
+                        release_nanos(p.wall),
+                        i64::try_from(p.offset).unwrap_or(i64::MAX)
+                    ],
                 )?;
             }
             conn.execute("DELETE FROM agent_pending WHERE time < ?1", [floor])?;
@@ -1965,5 +2118,69 @@ mod tests {
         assert_eq!(Mode::parse("Advisory"), Some(Mode::Advisory));
         assert_eq!(Fresh::parse("ask"), Some(Fresh::Ask));
         assert_eq!(Kind::parse("wizard"), None);
+    }
+
+    /// #403: a model entry's points apply to an agent of that model,
+    /// matched as `compact.model_windows` is; unset keys fall back to the
+    /// kind's, then the globals; a model with no entry keeps the kind's.
+    #[test]
+    fn per_model_points_match_like_model_windows_and_fall_back_to_the_kind() {
+        let m = |limit: Option<usize>, handoff: Option<usize>, pct: Option<usize>, window: Option<usize>| ModelSpec { limit, handoff, handoff_pct: pct, window };
+        let o = OrchestrateSpec {
+            kinds: vec![(
+                Kind::Builder,
+                KindSpec {
+                    limit: Some(500_000),
+                    handoff_pct: Some(60),
+                    models: vec![
+                        ("Haiku".into(), m(Some(180_000), Some(90_000), None, None)),
+                        ("claude-haiku-5-5[1m]".into(), m(None, Some(60_000), None, None)),
+                        ("sonnet".into(), m(Some(400_000), None, None, None)),
+                        ("fable".into(), m(None, None, Some(10), None)),
+                        ("opus".into(), m(None, None, None, Some(200_000))),
+                    ],
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        let s = resolve(Some(&o), Some(100_000), None, |_| None);
+        let b = &s.builder;
+        let at = |model: Option<&str>| {
+            let a = b.for_model(model);
+            (a.handoff, a.limit, a.model)
+        };
+        // A family alias matches any id of the family, case folded.
+        assert_eq!(at(Some("claude-haiku-4-5")), (90_000, 180_000, Some("Haiku".into())));
+        assert_eq!(at(Some("haiku")), (90_000, 180_000, Some("Haiku".into())), "the meta file's alias");
+        // An exact id beats the alias ([1m] ignored on both sides); its unset limit is the kind's.
+        assert_eq!(at(Some("CLAUDE-HAIKU-5-5")), (60_000, 500_000, Some("claude-haiku-5-5[1m]".into())));
+        // An entry with only a limit keeps the kind's handoff_pct of it.
+        assert_eq!(at(Some("claude-sonnet-4-6")), (240_000, 400_000, Some("sonnet".into())));
+        // Its own handoff_pct replaces the kind's.
+        assert_eq!(at(Some("claude-fable-5-2")), (50_000, 500_000, Some("fable".into())));
+        // A window only: the kind's limit and handoff_pct stand.
+        assert_eq!(at(Some("claude-opus-5-5")), (300_000, 500_000, Some("opus".into())));
+        assert_eq!(b.models.iter().find(|e| e.key == "opus").map(|e| e.window), Some(200_000));
+        // No entry, or no model known: the kind's own, unchanged.
+        assert_eq!(at(Some("gpt-x")), (300_000, 500_000, None));
+        assert_eq!(at(None), (300_000, 500_000, None));
+        // Another kind is untouched by the builder's entries.
+        assert!(s.reviewer.models.is_empty());
+        assert_eq!(s.reviewer.for_model(Some("claude-haiku-4-5")).model, None);
+        // The globals sit behind an entry with nothing of the kind's: scaled defaults on its window.
+        let g = OrchestrateSpec { kinds: vec![(Kind::Research, KindSpec { models: vec![("haiku".into(), m(None, None, None, Some(200_000)))], ..Default::default() })], ..Default::default() };
+        let r = resolve(Some(&g), None, None, |_| None).research.for_model(Some("claude-haiku-4-5"));
+        assert_eq!((r.handoff, r.limit), (57_000, 90_000));
+    }
+
+    #[test]
+    fn an_applied_point_names_its_source() {
+        let kind = Applied { handoff: 285_000, limit: 450_000, model: None };
+        assert_eq!(kind.source(Kind::Builder, 285_000), "builder limits");
+        let haiku = Applied { handoff: 90_000, limit: 180_000, model: Some("haiku".into()) };
+        assert_eq!(haiku.source(Kind::Builder, 90_000), "haiku builder: 90,000 (orchestrate.kinds.builder.models.haiku)");
+        assert_eq!(haiku.source(Kind::BriefWriter, 1_180_000), "haiku brief-writer: 1,180,000 (orchestrate.kinds.brief-writer.models.haiku)");
+        assert_eq!(thousands(999), "999");
     }
 }

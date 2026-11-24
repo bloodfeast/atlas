@@ -33,6 +33,36 @@ pub struct JudgeSettings {
     pub cells: Option<PathBuf>,
     /// The work classifier (`orchestrate.judge.classifier`, default off).
     pub classifier: ClassifierSettings,
+    /// `orchestrate.judge.mode`: enforced denies a builder launch off the
+    /// classifier's pick (default off; `enabled: true` alone is advisory).
+    pub mode: JudgeMode,
+    /// `orchestrate.judge.log`: the dogfood log (JSONL), one row per
+    /// admitted builder launch in enforced mode (default none).
+    pub log: Option<PathBuf>,
+}
+
+/// How the judge acts at a launch (`orchestrate.judge.mode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JudgeMode {
+    /// Nothing.
+    #[default]
+    Off,
+    /// One context line, never a deny.
+    Advisory,
+    /// A builder launch off the classifier's pick is denied.
+    Enforced,
+}
+
+impl JudgeMode {
+    /// The mode for a config word.
+    pub fn parse(s: &str) -> Option<JudgeMode> {
+        match s {
+            "off" => Some(JudgeMode::Off),
+            "advisory" => Some(JudgeMode::Advisory),
+            "enforced" => Some(JudgeMode::Enforced),
+            _ => None,
+        }
+    }
 }
 
 /// One cell: a key (absent parts match anything) and its classes.
@@ -516,6 +546,24 @@ pub fn classify(
     model: Option<&crate::embed::Model>,
     scratch: &mut crate::embed::bert::Scratch,
 ) -> Option<ClassPick> {
+    classify_with(s, prompt, kind, None, &mut |text| {
+        let model = model.filter(|m| m.id == CLASSIFIER_MODEL && m.dim == CLASSIFIER_DIM)?;
+        Some(input_vector(model, text, scratch))
+    })
+}
+
+/// The one scoring function `note op=judge` and the launch hook share:
+/// [`classify`], with the brief's input vector from `embed` (called only
+/// on a cache miss) and, when `cache` is given, a JSONL score cache keyed
+/// by the weights, the kind and the brief text, so a launch the
+/// orchestrator judged first is scored again without an embed.
+pub fn classify_with(
+    s: &ClassifierSettings,
+    prompt: &str,
+    kind: &str,
+    cache: Option<&Path>,
+    embed: &mut dyn FnMut(&str) -> Option<Vec<f32>>,
+) -> Option<ClassPick> {
     if !s.enabled {
         return None;
     }
@@ -523,14 +571,66 @@ pub fn classify(
     let (score, source) = match s.source {
         ScoreSource::Kind => (kind_score(kind), "kind"),
         ScoreSource::Head => {
-            let head = Head::load(s.weights.as_deref()?, s.weights_sha256.as_deref())?;
-            let model = model.filter(|m| m.id == CLASSIFIER_MODEL && m.dim == CLASSIFIER_DIM)?;
+            let bytes = std::fs::read(s.weights.as_deref()?).ok()?;
+            let head = Head::parse(&bytes, s.weights_sha256.as_deref())?;
             let text = std::fs::read_to_string(&path).ok()?;
-            (head.score(&input_vector(model, &text, scratch), kind), "head")
+            let key = score_key(&bytes, kind, &text);
+            match cache.and_then(|c| cached_score(c, &key)) {
+                Some(n) => (n, "head"),
+                None => {
+                    let n = head.score(&embed(&text)?, kind);
+                    if let Some(c) = cache {
+                        store_score(c, &key, n);
+                    }
+                    (n, "head")
+                }
+            }
         }
     };
     let (m, e) = rules(score, kind, &s.map);
     Some(ClassPick { score, source, model: m, effort: e })
+}
+
+/// The score cache's key: the sha256 of the weights, the kind and the brief.
+fn score_key(weights: &[u8], kind: &str, text: &str) -> String {
+    let mut b = Vec::with_capacity(weights.len() + kind.len() + text.len() + 2);
+    b.extend_from_slice(weights);
+    b.push(0);
+    b.extend_from_slice(kind.as_bytes());
+    b.push(0);
+    b.extend_from_slice(text.as_bytes());
+    crate::sha256::hex(&b)
+}
+
+/// The cached score for `key`, the newest row's; `None` when the cache is
+/// missing or holds no row for it.
+pub fn cached_score(cache: &Path, key: &str) -> Option<usize> {
+    let text = std::fs::read_to_string(cache).ok()?;
+    text.lines().rev().filter_map(|l| json::parse(l).ok()).find(|v| v["key"].as_str() == Some(key)).and_then(|v| v["score"].as_u64()).map(|n| n as usize)
+}
+
+/// Appends a score to the cache; a write error is reported and changes no pick.
+fn store_score(cache: &Path, key: &str, score: usize) {
+    let row = json::object(96, |w| {
+        w.field("key", key).field("score", &score);
+    });
+    if let Err(e) = append_line(cache, &row) {
+        eprintln!("atlas judge score cache {}: {e}", cache.display());
+    }
+}
+
+/// Appends one line to a file, creating it (and its folder).
+pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut fh = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    std::io::Write::write_all(&mut fh, format!("{line}\n").as_bytes())
+}
+
+/// The score cache beside a memory store.
+pub fn score_cache(store: &Path) -> Option<PathBuf> {
+    store.parent().map(|d| d.join("judge-scores.jsonl"))
 }
 
 /// The advisory line for a classifier pick.

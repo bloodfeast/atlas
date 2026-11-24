@@ -293,6 +293,11 @@ fn an_error_answer_is_scrubbed() {
     let text = tool_error(&mut s, 2, "recall", atlas::json!({"key": "h:abc --gr\u{202E}e\u{3164}p"}));
     assert!(text.contains("unknown selector"), "{text}");
     assert_eq!(hidden::hidden_count(&text), 0, "{text}");
+    // A tool error that echoes its argument as plain text (Display, no
+    // escaping): a regex's bad repetition quotes its body raw (#323 N2).
+    let text = tool_error(&mut s, 4, "search", atlas::json!({"query": "x{1\u{202E},\u{3164}}", "mode": "regex"}));
+    assert!(text.contains("bad repetition {1,}"), "{text}");
+    assert_eq!(hidden::hidden_count(&text), 0, "{text}");
     // An unknown tool's name comes back in the protocol error as written.
     let msg = atlas::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "re\u{3164}ad\u{202E}\u{1b}[2J", "arguments": {}}});
     let r = atlas::protocol::handle(&mut s, &msg).unwrap();

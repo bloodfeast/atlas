@@ -19,6 +19,8 @@ Everything atlas takes, generated from the code the server answers from. The hab
 - `queued`
 - `review`
 - `idea`
+- `defer`
+- `reopen`
 
 ## Queue commands
 
@@ -113,6 +115,7 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `memory.ideas.band_below`
 - `memory.ideas.enabled`
 - `memory.ideas.weights`
+- `memory.question_stale_days`
 - `memory.resume_card`
 - `memory.rules`
 - `memory.snapshot_cap_mb`
@@ -176,8 +179,14 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `orchestrate.judge.classifier.weights`
 - `orchestrate.judge.classifier.weights_sha256`
 - `orchestrate.judge.enabled`
+- `orchestrate.judge.log`
+- `orchestrate.judge.mode`
 - `orchestrate.kinds`
 - `orchestrate.kinds.brief-writer`
+- `orchestrate.kinds.brief-writer.models[].handoff`
+- `orchestrate.kinds.brief-writer.models[].handoff_pct`
+- `orchestrate.kinds.brief-writer.models[].limit`
+- `orchestrate.kinds.brief-writer.models[].window`
 - `orchestrate.kinds.builder`
 - `orchestrate.kinds.builder.fresh`
 - `orchestrate.kinds.builder.handoff`
@@ -185,6 +194,11 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `orchestrate.kinds.builder.limit`
 - `orchestrate.kinds.builder.max`
 - `orchestrate.kinds.builder.mode`
+- `orchestrate.kinds.builder.models`
+- `orchestrate.kinds.builder.models[].handoff`
+- `orchestrate.kinds.builder.models[].handoff_pct`
+- `orchestrate.kinds.builder.models[].limit`
+- `orchestrate.kinds.builder.models[].window`
 - `orchestrate.kinds.builder.window`
 - `orchestrate.kinds.research`
 - `orchestrate.kinds.research.fresh`
@@ -193,6 +207,11 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `orchestrate.kinds.research.limit`
 - `orchestrate.kinds.research.max`
 - `orchestrate.kinds.research.mode`
+- `orchestrate.kinds.research.models`
+- `orchestrate.kinds.research.models[].handoff`
+- `orchestrate.kinds.research.models[].handoff_pct`
+- `orchestrate.kinds.research.models[].limit`
+- `orchestrate.kinds.research.models[].window`
 - `orchestrate.kinds.research.window`
 - `orchestrate.kinds.reviewer`
 - `orchestrate.kinds.reviewer.fresh`
@@ -201,6 +220,11 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `orchestrate.kinds.reviewer.limit`
 - `orchestrate.kinds.reviewer.max`
 - `orchestrate.kinds.reviewer.mode`
+- `orchestrate.kinds.reviewer.models`
+- `orchestrate.kinds.reviewer.models[].handoff`
+- `orchestrate.kinds.reviewer.models[].handoff_pct`
+- `orchestrate.kinds.reviewer.models[].limit`
+- `orchestrate.kinds.reviewer.models[].window`
 - `orchestrate.kinds.reviewer.window`
 - `orchestrate.mode`
 - `orchestrate.resources`
@@ -213,9 +237,11 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `orchestrate.window`
 - `orchestrate.worktree_roots`
 - `pr_events`
+- `pr_events.autostart`
 - `pr_events.ignore_logins`
 - `pr_events.lane`
 - `pr_events.port`
+- `pr_events.repos`
 - `project_tracking`
 - `project_tracking.atlassian`
 - `projects`
@@ -319,6 +345,8 @@ Answers are plain text; `format: "json"` gives JSON. A repeated read answers `un
 - `recall`: Memory by key (or h:ID), query or lane; op status: lanes, op log: versions.
   - op `status` runs `journal_status`
   - op `log` runs `memory_log`
+  - op `sweep` runs `question_sweep`
+  - op `deferred` runs `deferred_questions`
   - `key` `h:ID` (a digest's handle) reads that stored output: its first page, or one of `lines` (A-B), `item`, `failures`, `grep` (with `context`), `head`, `tail`, `page`, `digest`; a hint line `recall h:ID lines=A-B` is those arguments, and they may also follow the id in `key`; `key` `h:` lists the newest
 - `remember`: Store a memory, rule or decision; revising needs expected_sha; old: supersede.
   - with `old` runs `supersede`
@@ -802,10 +830,10 @@ Replace records with a new one; the old stay, marked superseded. The way to reco
 Append a lane journal entry: brief, decision, measurement (with conditions), commit, question, answered, next, note. amend KEY with expected_sha rewrites one's text. (writes)
 
 - `lane` string, required
-- `entry` string (brief, decision, measurement, commit, question, answered, next, note, cap, checkpoint, queued, review, idea), required
+- `entry` string (brief, decision, measurement, commit, question, answered, next, note, cap, checkpoint, queued, review, idea, defer, reopen), required
 - `text` string, required: First line is the headline.
 - `meta` string: key: value lines (branch, worktree, conditions).
-- `refs` array: answers:<key> for an answered question.
+- `refs` array: answers:<key> for an answered question (a decision or answered entry gets it itself for an open question of its lane whose Q-id leads one of its lines, or that it names as answers <key>); reopens:<key> with entry reopen undoes a wrong close; defers:<key> with entry defer, meta until: <UTC time>|next-session and optional proceeding_with: <option>.
 - `amend` string: A journal key: rewrite its title and body as a new version (meta and refs kept).
 - `expected_sha` string: With amend: the head's sha (recall shows it).
 
@@ -835,6 +863,16 @@ Memory versions, newest first.
 - `since` string: UTC time prefix.
 - `author` string
 - `limit` integer: Default 20.
+
+#### question_sweep
+
+Open questions that look settled, each with its evidence keys (a later decision, answered entry or ruling naming its key or Q-id or sharing its key terms; a merged PR in the lane after it; the lane idle past the stale age). Closes nothing: it prints the one journal entry=answered call with an answers ref per candidate.
+
+
+#### deferred_questions
+
+Deferred questions (journal entry=defer): the due ones first, each with its options and proceeding_with, to ask as multiple choice; then those still waiting, with their until.
+
 
 #### hook
 

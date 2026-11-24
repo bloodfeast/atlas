@@ -199,6 +199,27 @@ fn a_launch_by_another_owner_closes_the_span_and_opens_one() {
     assert_eq!(open[0].lane, "L2");
 }
 
+/// #333 (review N2 of #329): a launch whose answer was lost (the watchdog
+/// refused it) leaves no open ledger row; the span it closed is open again.
+#[test]
+fn a_lost_launch_answer_undoes_its_ledger_rows() {
+    let f = Fixture::new("wl-lost");
+    f.add("x");
+    f.add("y");
+    let o = OrchestrateSpec { enabled: Some(true), ..Default::default() };
+    let mut h = Hooks::open(hook_settings(&f, &o)).unwrap();
+    launch_at(&f, h.store(), Kind::Builder, &brief("builder", Some("L1"), "worktree:x"), "tu1");
+    launch_at(&f, h.store(), Kind::Builder, &brief("builder", Some("L2"), "worktree:x"), "tu2");
+    launch_at(&f, h.store(), Kind::Builder, &brief("builder", Some("L3"), "worktree:y"), "tu3");
+    let lost = |id: &str| HookEvent { event: "PreToolUse".into(), session_id: "s1".into(), tool_name: "Agent".into(), tool_use_id: id.into(), ..HookEvent::default() };
+    h.answer_lost(&lost("tu2"));
+    h.answer_lost(&lost("tu3"));
+    let open = wl::open_rows(h.store().conn()).unwrap();
+    assert_eq!(open.iter().map(|r| (r.lane.as_str(), r.tool_use_id.as_str())).collect::<Vec<_>>(), [("L1", "tu1")]);
+    // A ledger: the lost spans are closed, L1's span is a new row.
+    assert_eq!(all_rows(h.store()).len(), 4);
+}
+
 /// The hook's settings: orchestrate on, the fixture's repository as the
 /// project graph.
 fn hook_settings(f: &Fixture, o: &OrchestrateSpec) -> Settings {

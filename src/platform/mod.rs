@@ -53,6 +53,7 @@ mod none {
 pub(crate) use none::Backend;
 
 pub(crate) mod boot;
+pub(crate) mod file_id;
 pub(crate) mod registry;
 pub(crate) mod shutdown;
 
@@ -106,6 +107,53 @@ pub(crate) mod process {
 
         /// EPERM is 1 on Linux and macOS.
         const EPERM: c_int = 1;
+
+        /// `struct proc_bsdinfo` of `<sys/proc_info.h>`: 136 bytes, the
+        /// start time at offset 120.
+        #[cfg(target_os = "macos")]
+        #[repr(C)]
+        struct ProcBsdInfo {
+            _ids: [u32; 12],
+            _comm: [u8; 16],
+            _name: [u8; 32],
+            _counts: [u32; 5],
+            _nice: i32,
+            start_tvsec: u64,
+            start_tvusec: u64,
+        }
+
+        #[cfg(target_os = "macos")]
+        const _: () = assert!(std::mem::size_of::<ProcBsdInfo>() == 136);
+
+        #[cfg(target_os = "macos")]
+        extern "C" {
+            // libproc, in libSystem.
+            fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *mut std::ffi::c_void, size: c_int) -> c_int;
+        }
+
+        #[cfg(target_os = "macos")]
+        const PROC_PIDTBSDINFO: c_int = 3;
+
+        /// When process `pid` started (microseconds since the epoch), from
+        /// `proc_pidinfo(PROC_PIDTBSDINFO)`; `None` when it cannot be read
+        /// (gone, or another user's).
+        #[cfg(target_os = "macos")]
+        pub(crate) fn started(pid: u32) -> Option<u64> {
+            let p = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
+            let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+            let size = std::mem::size_of::<ProcBsdInfo>() as c_int;
+            // SAFETY: the buffer is a zeroed ProcBsdInfo of `size` bytes that
+            // lives across the call; proc_pidinfo writes at most `size` bytes
+            // into it and answers how many it wrote. All its fields are plain
+            // integers, so any bytes are a valid value.
+            let n = unsafe { proc_pidinfo(p, PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+            if n != size {
+                return None;
+            }
+            // SAFETY: zeroed, then filled in full (n == size) above.
+            let info = unsafe { info.assume_init() };
+            Some(info.start_tvsec.saturating_mul(1_000_000).saturating_add(info.start_tvusec))
+        }
 
         /// Kills the process group `pid` led (L5): the leader may be gone
         /// and reaped, but the group id stays taken while a member lives.
@@ -252,6 +300,69 @@ pub(crate) mod process {
         }
 
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(which: u32) -> *mut c_void;
+            fn GetHandleInformation(h: *mut c_void, flags: *mut u32) -> i32;
+            fn SetHandleInformation(h: *mut c_void, mask: u32, flags: u32) -> i32;
+        }
+
+        const HANDLE_FLAG_INHERIT: u32 = 0x1;
+        // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE: (DWORD)-10, -11, -12.
+        const STD_HANDLES: [u32; 3] = [0xFFFF_FFF6, 0xFFFF_FFF5, 0xFFFF_FFF4];
+
+        /// Runs `f` with this process's stdin, stdout and stderr handles not
+        /// inheritable, then sets their inherit flags back. std's spawn
+        /// passes bInheritHandles=TRUE, so a child gets every inheritable
+        /// handle of this process; a child's own stdio is duplicated for it
+        /// apart from these, `Stdio::inherit` included.
+        ///
+        /// One caller at a time (a static lock), so two at once cannot save
+        /// each other's cleared flag and set it back; the flags are set back
+        /// by a guard, so a panic in `f` does not leave them cleared.
+        pub(crate) fn without_std_inheritance<R>(f: impl FnOnce() -> R) -> R {
+            static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+            /// The handles and the inherit flags they had, set back on drop.
+            struct Restore(Vec<(*mut c_void, u32)>);
+
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    // SAFETY: the handles GetStdHandle answered below, which
+                    // this process keeps owning; only their inherit flag is
+                    // set back.
+                    unsafe {
+                        for (h, flags) in &self.0 {
+                            SetHandleInformation(*h, HANDLE_FLAG_INHERIT, *flags);
+                        }
+                    }
+                }
+            }
+
+            let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut was = Restore(Vec::new());
+            // SAFETY: GetStdHandle returns this process's handle (or null or
+            // INVALID_HANDLE_VALUE, skipped), which it keeps owning; the
+            // information calls only read or set the inherit flag of that
+            // handle and write one u32 that lives across the call.
+            unsafe {
+                for which in STD_HANDLES {
+                    let h = GetStdHandle(which);
+                    if h.is_null() || h as isize == -1 || was.0.iter().any(|(k, _)| *k == h) {
+                        continue;
+                    }
+                    let mut flags = 0u32;
+                    if GetHandleInformation(h, &mut flags) != 0 {
+                        was.0.push((h, flags & HANDLE_FLAG_INHERIT));
+                    }
+                }
+                for (h, _) in &was.0 {
+                    SetHandleInformation(*h, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+            f()
+        }
 
         /// When process `pid` was created (100 ns ticks), if it can be read.
         pub(crate) fn created(pid: u32) -> Option<u64> {
@@ -573,6 +684,62 @@ pub(crate) mod process {
         let _ = cmd;
     }
 
+    /// Sets `cmd` to start apart from atlas, to outlive it (#386, the
+    /// auto-started pr-events listener), unlike [`own_group`]: on Unix a
+    /// session of its own (`setsid`), so no hangup reaches it when the
+    /// terminal closes, and no parent-death signal; on Windows a process
+    /// group of its own with no console, and with `breakaway` out of atlas's
+    /// job (a job that does not allow it refuses the spawn: try again
+    /// without).
+    pub(crate) fn detach(cmd: &mut std::process::Command, breakaway: bool) {
+        #[cfg(unix)]
+        {
+            use std::os::raw::c_int;
+            use std::os::unix::process::CommandExt;
+            extern "C" {
+                fn setsid() -> c_int;
+            }
+            let _ = breakaway;
+            // SAFETY: the closure runs in the child between fork and exec
+            // and calls only setsid, which is async-signal-safe and takes
+            // nothing.
+            unsafe {
+                cmd.pre_exec(|| {
+                    setsid();
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+            let away = if breakaway { CREATE_BREAKAWAY_FROM_JOB } else { 0 };
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | away);
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = (cmd, breakaway);
+    }
+
+    /// Runs `f`, a spawn of a process meant to outlive this one, so the child
+    /// gets none of this process's own stdio (#402): on Windows std passes
+    /// every inheritable handle to the child, and a hook's stdout is a pipe
+    /// its reader waits on to its end, so the child would keep the hook's
+    /// output open for its whole life. On Unix std sets the child's 0, 1
+    /// and 2 itself and opens every other file close-on-exec: nothing to do.
+    pub(crate) fn without_std_inheritance<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(windows)]
+        {
+            sys::without_std_inheritance(f)
+        }
+        #[cfg(not(windows))]
+        {
+            f()
+        }
+    }
+
     /// Ends a child started with [`own_group`] and everything it started (a
     /// `gh` extension runs as gh's own child, which a kill of gh alone would
     /// leave running): the process group on Unix, the process tree on
@@ -602,11 +769,16 @@ pub(crate) mod process {
     }
 
     /// When process `pid` started, where that is cheap to read: Windows, its
-    /// creation time; Linux, field 22 of `/proc/PID/stat`. Else `None`.
+    /// creation time; Linux, field 22 of `/proc/PID/stat`; macOS, the BSD
+    /// info's start time (microseconds). Else `None`.
     pub(crate) fn start_time(pid: u32) -> Option<u64> {
         #[cfg(windows)]
         {
             sys::created(pid)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            sys::started(pid)
         }
         #[cfg(target_os = "linux")]
         {
@@ -614,7 +786,7 @@ pub(crate) mod process {
             // Fields after the `(comm)` start at field 3, so 22 is the 20th.
             s[s.rfind(')')? + 1..].split_whitespace().nth(19)?.parse().ok()
         }
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         {
             let _ = pid;
             None

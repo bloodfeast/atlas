@@ -661,3 +661,47 @@ fn digest_grep_returns_the_matching_digest_rows() {
     let body: Vec<&str> = rows.lines().skip(1).collect();
     assert!(!body.is_empty() && body.iter().all(|l| digest.lines().any(|d| d == *l)), "{rows}");
 }
+
+/// A CQL search response of `n` hits, every third with an excerpt.
+fn cql_search(n: usize) -> String {
+    let hits: Vec<String> = (1..=n)
+        .map(|i| {
+            let ex = if i % 3 == 0 { format!(r#","excerpt":"the @@@hl@@@walrus@@@endhl@@@ note {i}""#) } else { String::new() };
+            format!(r#"{{"content":{{"id":"{}","type":"page"}},"title":"Page {i}","resultGlobalContainer":{{"title":"ENG"}},"lastModified":"2026-11-0{}T00:00:00.000Z"{ex}}}"#, 1000 + i, 1 + i % 9)
+        })
+        .collect();
+    let v = json::parse(&format!(r#"{{"results":[{}],"totalSize":{n},"cqlQuery":"text ~ walrus"}}"#, hits.join(","))).unwrap();
+    format!("{}\n", json::to_string_pretty(&v))
+}
+
+/// #323 N4: `digest-grep` over a CQL search: a hit with an excerpt is one
+/// row of two lines, matched by either line and answered whole, and the
+/// count is of hits, not lines.
+#[test]
+fn digest_grep_over_a_cql_search_answers_a_hit_with_its_excerpt() {
+    let (_fx, _s, mut h) = setup("recall-slice-digest-grep-cql");
+    let m = Meta { kind: "tracker".into(), label: "confluence cql search".into(), cmd: "/wiki/rest/api/search".into(), ..Meta::default() };
+    let id = h.put(cql_search(40).as_bytes(), &m).unwrap().id;
+    let one = h.slice(&id, &Sel::DigestGrep("walrus note 39$".into())).unwrap();
+    assert_eq!(one, format!("{id}: 1 of 40 digest rows match \"walrus note 39$\"\n1039 page ENG Page 39 2026-11-04\n  the walrus note 39\n"));
+    let by_title = h.slice(&id, &Sel::DigestGrep("^1039 page".into())).unwrap();
+    assert_eq!(by_title, one.replace("walrus note 39$", "^1039 page"));
+    let excerpts = h.slice(&id, &Sel::DigestGrep("walrus".into())).unwrap();
+    assert!(excerpts.starts_with(&format!("{id}: 13 of 40 digest rows match")), "{excerpts}");
+    assert_eq!(excerpts.lines().filter(|l| l.starts_with("  the walrus note ")).count(), 13, "{excerpts}");
+}
+
+/// #323 N1: a CLI flag's value reaches the selector as the shell left it:
+/// not trimmed and with its quotes. A `NAME=VALUE` word is `recall`'s form
+/// and is read as `recall` reads it.
+#[test]
+fn the_cli_takes_a_selector_value_as_given() {
+    let w = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(parse_words(&w(&["--grep", " "])), Ok(Ask::Slice(Sel::Grep { re: " ".into(), context: 2 })));
+    assert_eq!(parse_words(&w(&["--grep", "\"x\""])), Ok(Ask::Slice(Sel::Grep { re: "\"x\"".into(), context: 2 })));
+    assert_eq!(parse_words(&w(&["--grep= a"])), Ok(Ask::Slice(Sel::Grep { re: " a".into(), context: 2 })));
+    assert_eq!(parse_words(&w(&["grep= \"x\""])), Ok(Ask::Slice(Sel::Grep { re: "x".into(), context: 2 })));
+    // recall's arguments still drop one pair of quotes and the spaces.
+    let pairs = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    assert_eq!(atlas::handles::parse_args(&pairs(&[("grep", " \"x\" ")])), Ok(Ask::Slice(Sel::Grep { re: "x".into(), context: 2 })));
+}

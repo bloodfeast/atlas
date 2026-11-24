@@ -145,3 +145,58 @@ fn dropping_excluded_rows_renumbers_the_files_after_them() {
     ends.sort();
     assert_eq!(ends, [((0, 1), 3), ((1, 1), 5)]);
 }
+
+/// A copy of the `ts` SCIP fixture in `t` (its project and `index.scip`,
+/// kept apart), so its whole-root index can be given with an exclude.
+fn ts_fixture(t: &Temp) -> (std::path::PathBuf, std::path::PathBuf) {
+    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/scip/ts");
+    let root = t.path().join("ts");
+    for f in ["package.json", "tsconfig.json", "src/main.ts", "src/shapes.ts"] {
+        write(&root.join(f), &std::fs::read_to_string(from.join(f)).unwrap());
+    }
+    let scip = t.path().join("index.scip");
+    std::fs::copy(from.join("index.scip"), &scip).unwrap();
+    (root, scip)
+}
+
+/// #371: a whole-root SCIP index's excluded documents count nowhere: not in
+/// the stats line, not as a package the root defines, not as a language
+/// unit. Excluding one file lowers the counts; excluding every file leaves
+/// none, no defined package and no prebuilt unit.
+#[test]
+fn excluded_documents_count_in_no_stats_packages_or_units() {
+    let t = Temp::new("code-exclude-371");
+    let (root, scip) = ts_fixture(&t);
+    let db = t.path().join("state/atlas.sqlite");
+    drop(atlas::store::Store::open(&db, vaults(&db)).unwrap());
+    let mut conn = atlas::db::Connection::open(&db).unwrap();
+    let run = |conn: &mut atlas::db::Connection, exclude: &[&str]| {
+        let code = setup(&root, &db, exclude);
+        let rep = code_index::index_root(&code, conn, &code.roots[0], &RustSource::File(scip.clone())).unwrap();
+        let packages = code::defined_packages(conn, "plugins", true).unwrap();
+        (rep, packages)
+    };
+    let (full, full_pkgs) = run(&mut conn, &[]);
+    assert!(full.rows.scip_defs > 0 && full.rows.scip_refs > 0 && !full_pkgs.is_empty(), "{:?} {full_pkgs:?}", full.rows);
+    assert!(full.units.iter().any(|u| u.source.starts_with("prebuilt")), "{:?}", full.units);
+    let (one, _) = run(&mut conn, &["src/shapes.ts"]);
+    assert!(one.rows.scip_defs < full.rows.scip_defs && one.rows.scip_defs > 0, "{:?} vs {:?}", one.rows, full.rows);
+    let (none, none_pkgs) = run(&mut conn, &["src"]);
+    assert_eq!((none.rows.scip_defs, none.rows.scip_refs, none.rows.external_refs, none.rows.impls), (0, 0, 0, 0), "{:?}", none.rows);
+    assert!(none_pkgs.is_empty(), "{none_pkgs:?}");
+    assert!(none.units.iter().all(|u| !u.source.starts_with("prebuilt")), "{:?}", none.units);
+}
+
+/// #371: the watcher wakes a root's re-index for a changed file the code
+/// index reads, unless an `exclude` glob names it.
+#[test]
+fn the_watcher_ignores_changes_in_excluded_folders() {
+    let ex = |g: &[&str]| g.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let paths = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert!(code_index::change_wakes(&paths(&["tools/keep.rs"]), &ex(&["tools/gen"])));
+    assert!(!code_index::change_wakes(&paths(&["tools/gen/skip.rs"]), &ex(&["tools/gen"])));
+    assert!(!code_index::change_wakes(&paths(&["a/OctoPrint-Slow/x.py", "tools/gen/a/b.rs"]), &ex(&["OctoPrint-Slow", "tools/gen"])));
+    assert!(code_index::change_wakes(&paths(&["tools/gen/skip.rs", "src/lib.rs"]), &ex(&["tools/gen"])));
+    assert!(code_index::change_wakes(&paths(&["tools/gen/skip.rs"]), &[]));
+    assert!(!code_index::change_wakes(&paths(&["notes.md"]), &[]));
+}

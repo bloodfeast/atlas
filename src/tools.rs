@@ -469,7 +469,7 @@ const TOOLS: &[ToolDef] = &[
         read_only: false,
         schema: || {
             obj(
-                json!({"lane": s(""), "entry": e(crate::memory::ENTRIES), "text": s("First line is the headline."), "meta": s("key: value lines (branch, worktree, conditions)."), "refs": strs("answers:<key> for an answered question."), "amend": s("A journal key: rewrite its title and body as a new version (meta and refs kept)."), "expected_sha": s("With amend: the head's sha (recall shows it).")}),
+                json!({"lane": s(""), "entry": e(crate::memory::ENTRIES), "text": s("First line is the headline."), "meta": s("key: value lines (branch, worktree, conditions)."), "refs": strs("answers:<key> for an answered question (a decision or answered entry gets it itself for an open question of its lane whose Q-id leads one of its lines, or that it names as answers <key>); reopens:<key> with entry reopen undoes a wrong close; defers:<key> with entry defer, meta until: <UTC time>|next-session and optional proceeding_with: <option>."), "amend": s("A journal key: rewrite its title and body as a new version (meta and refs kept)."), "expected_sha": s("With amend: the head's sha (recall shows it).")}),
                 &["lane", "entry", "text"],
             )
         },
@@ -491,6 +491,18 @@ const TOOLS: &[ToolDef] = &[
         description: "Memory versions, newest first.",
         read_only: true,
         schema: || obj(json!({"key": s(""), "kind": s(""), "scope": s(""), "since": s("UTC time prefix."), "author": s(""), "limit": n("Default 20.")}), &[]),
+    },
+    ToolDef {
+        name: "question_sweep",
+        description: "Open questions that look settled, each with its evidence keys (a later decision, answered entry or ruling naming its key or Q-id or sharing its key terms; a merged PR in the lane after it; the lane idle past the stale age). Closes nothing: it prints the one journal entry=answered call with an answers ref per candidate.",
+        read_only: true,
+        schema: || obj(json!({}), &[]),
+    },
+    ToolDef {
+        name: "deferred_questions",
+        description: "Deferred questions (journal entry=defer): the due ones first, each with its options and proceeding_with, to ask as multiple choice; then those still waiting, with their until.",
+        read_only: true,
+        schema: || obj(json!({}), &[]),
     },
     ToolDef {
         name: "hook",
@@ -704,12 +716,16 @@ impl Server {
         // The work classifier, when on: its score and pick ride along; off,
         // the answer is unchanged.
         if s.classifier.enabled {
-            let model = if s.classifier.source == crate::taskjudge::ScoreSource::Head {
-                self.memory.as_ref().and_then(|m| crate::embed::Model::load(&m.settings.model).ok())
-            } else {
-                None
-            };
-            let c = crate::taskjudge::classify(&s.classifier, prompt, kind, model.as_ref(), &mut crate::embed::bert::Scratch::default());
+            // The launch hook's scoring (same function, same cache): the
+            // encoder loads only on a cache miss.
+            let (model_path, store) = self.memory.as_ref().map(|m| (m.settings.model.clone(), m.settings.store.clone())).unzip();
+            let cache = store.as_deref().and_then(crate::taskjudge::score_cache);
+            let mut scratch = crate::embed::bert::Scratch::default();
+            let c = crate::taskjudge::classify_with(&s.classifier, prompt, kind, cache.as_deref(), &mut |text| {
+                let m = crate::embed::Model::load(model_path.as_deref()?).ok()?;
+                (m.id == crate::taskjudge::CLASSIFIER_MODEL && m.dim == crate::taskjudge::CLASSIFIER_DIM)
+                    .then(|| crate::taskjudge::input_vector(&m, text, &mut scratch))
+            });
             if let (Some(c), Some(o)) = (c, out.as_object_mut()) {
                 let line = crate::taskjudge::class_line(&c);
                 o.insert("classifier".into(), json!({"line": line, "score": c.score, "source": c.source, "model": c.model, "effort": c.effort}));

@@ -137,13 +137,79 @@ fn the_owner_is_claude_code_past_wrappers_or_unknown() {
     let p = |rows: &[(u32, u32, &str)]| rows.iter().map(|(a, b, n)| (*a, *b, (*n).to_string())).collect::<Vec<_>>();
     // Claude Code started the server directly, or through cmd /c, bash -c
     // or the MSYS stub.
-    assert_eq!(owner_pid(&p(&[(1, 0, "init"), (50, 1, "claude"), (60, 50, "atlas")]), 60), Some(50));
-    assert_eq!(owner_pid(&p(&[(50, 4, "node.exe"), (55, 50, "cmd.exe"), (60, 55, "atlas.exe")]), 60), Some(50));
-    assert_eq!(owner_pid(&p(&[(50, 4, "Claude.EXE"), (52, 50, "bash.exe"), (55, 52, "bash.exe"), (60, 55, "atlas.exe")]), 60), Some(50));
+    assert_eq!(owner_pid(&p(&[(1, 0, "init"), (50, 1, "claude"), (60, 50, "atlas")]), 60, |_| None), Some(50));
+    assert_eq!(owner_pid(&p(&[(50, 4, "node.exe"), (55, 50, "cmd.exe"), (60, 55, "atlas.exe")]), 60, |_| None), Some(50));
+    assert_eq!(owner_pid(&p(&[(50, 4, "Claude.EXE"), (52, 50, "bash.exe"), (55, 52, "bash.exe"), (60, 55, "atlas.exe")]), 60, |_| None), Some(50));
     // Unknown parent, init, a parent gone from the table, a loop: unknown.
-    assert_eq!(owner_pid(&p(&[(50, 4, "cargo"), (60, 50, "atlas")]), 60), None);
-    assert_eq!(owner_pid(&p(&[(55, 1, "sh"), (60, 55, "atlas")]), 60), None);
-    assert_eq!(owner_pid(&p(&[(60, 55, "atlas")]), 60), None);
-    assert_eq!(owner_pid(&p(&[(55, 56, "sh"), (56, 55, "bash"), (60, 55, "atlas")]), 60), None);
-    assert_eq!(owner_pid(&[], 60), None);
+    assert_eq!(owner_pid(&p(&[(50, 4, "cargo"), (60, 50, "atlas")]), 60, |_| None), None);
+    assert_eq!(owner_pid(&p(&[(55, 1, "sh"), (60, 55, "atlas")]), 60, |_| None), None);
+    assert_eq!(owner_pid(&p(&[(60, 55, "atlas")]), 60, |_| None), None);
+    assert_eq!(owner_pid(&p(&[(55, 56, "sh"), (56, 55, "bash"), (60, 55, "atlas")]), 60, |_| None), None);
+    assert_eq!(owner_pid(&[], 60, |_| None), None);
+}
+
+/// #395: a `node` or `npx` shim between Claude Code and the server is not
+/// the owner (the topmost Claude Code-named ancestor is), and a parent pid
+/// that started after its child was reused, so the walk stops below it.
+#[test]
+fn the_owner_skips_a_shim_and_a_reused_parent_pid() {
+    use atlas::restart::owner_pid;
+    let p = |rows: &[(u32, u32, &str)]| rows.iter().map(|(a, b, n)| (*a, *b, (*n).to_string())).collect::<Vec<_>>();
+    let at = |starts: &'static [(u32, u64)]| move |pid: u32| starts.iter().find(|s| s.0 == pid).map(|s| s.1);
+    // Claude Code (50) -> npx shim (55, node) -> atlas (60), with and
+    // without a cmd /c between, and with start times unread.
+    let shim = p(&[(9, 1, "sshd"), (50, 9, "node"), (55, 50, "node"), (60, 55, "atlas")]);
+    assert_eq!(owner_pid(&shim, 60, at(&[(9, 1), (50, 10), (55, 20), (60, 30)])), Some(50));
+    assert_eq!(owner_pid(&shim, 60, |_| None), Some(50));
+    let cmd = p(&[(50, 4, "claude.exe"), (52, 50, "cmd.exe"), (55, 52, "node.exe"), (60, 55, "atlas.exe")]);
+    assert_eq!(owner_pid(&cmd, 60, at(&[(50, 10), (52, 15), (55, 20), (60, 30)])), Some(50));
+    // The wrapper (55) exited and an unrelated node.exe took its pid: it
+    // started after the server, so it is not the owner.
+    let reused = p(&[(50, 4, "explorer.exe"), (55, 50, "node.exe"), (60, 55, "atlas.exe")]);
+    assert_eq!(owner_pid(&reused, 60, at(&[(50, 1), (55, 40), (60, 30)])), None);
+    // Above a real owner, a reused pid named node is not climbed to.
+    let above = p(&[(45, 4, "node.exe"), (50, 45, "claude.exe"), (60, 50, "atlas.exe")]);
+    assert_eq!(owner_pid(&above, 60, at(&[(45, 50), (50, 10), (60, 30)])), Some(50));
+    // A parent dated the same tick as its child is accepted.
+    assert_eq!(owner_pid(&p(&[(50, 4, "claude"), (60, 50, "atlas")]), 60, at(&[(50, 30), (60, 30)])), Some(50));
+}
+
+/// #395 review: the next launch's slot is one past the highest number filed
+/// within two stale windows, gaps and all: slots 1 and 5 filed inside the
+/// window give 6 (not a count plus one), and a 9 filed just outside it is
+/// not counted (a window of one or three stale periods gives 1 or 10).
+#[test]
+fn the_next_slot_follows_the_highest_in_the_window_past_gaps() {
+    use std::time::{Duration, SystemTime};
+    let t = Temp::new("orch-395-slot-window");
+    let s = Session::new(t.path());
+    let set = settings(t.path(), &builders(4), &[]);
+    let window = set.orchestrate.stale * 2;
+    let ten = Duration::from_secs(600);
+    let now = SystemTime::now();
+    let mut store = atlas::memory::MemoryStore::open(&set.store).unwrap();
+    for (n, (slot, at)) in [(1, now - window + ten), (5, now - window + ten), (9, now - window - ten)].into_iter().enumerate() {
+        let d = atlas::memory::Draft {
+            title: format!("launch: old {n}"),
+            meta: format!("agent: old{n}\ntype: general-purpose\nsession: s0\nslot: {slot}\n"),
+            body: "Kind: builder\nLane: OLD\n\nOld.".into(),
+            reason: "test".into(),
+            author: "hook".into(),
+            client: "atlas-hook".into(),
+            time: Some(atlas::store::utc(at)),
+            ..atlas::memory::Draft::default()
+        };
+        let mut w = store.writer().unwrap();
+        w.create(&format!("journal:OLD:{:04}", n + 1), "journal", atlas::hooks::LAUNCH_ENTRY, "OLD", &d, None).unwrap();
+        w.commit().unwrap();
+    }
+    drop(store);
+    let mut h = Hooks::open(settings(t.path(), &builders(4), &[])).unwrap();
+    h.enable_restart_point();
+    let brief = "Kind: builder\nLane: WALRUS\n\nBuild the walrus parser.";
+    assert!(launch_with(&mut h, &s, "t1", brief).deny.is_none());
+    s.agent("b1", "general-purpose", "t1", brief, 1000, false);
+    let _ = start(&mut h, &s, "b1");
+    let entry = entries(&h, "WALRUS", "launch")[0].clone();
+    assert!(entry.meta.contains("\nslot: 6\n"), "{}", entry.meta);
 }

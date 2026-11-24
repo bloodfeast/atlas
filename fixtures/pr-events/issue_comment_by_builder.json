@@ -11,6 +11,6 @@
     "user": { "login": "octo-builder", "id": 2004, "type": "User" },
     "body": "Fixed in 6e828cc: the parser keeps the last line."
   },
-  "repository": { "id": 3001, "name": "widgets", "full_name": "octo-org/widgets" },
+  "repository": { "id": 3001, "name": "widgets", "html_url": "https://github.com/octo-org/widgets", "full_name": "octo-org/widgets" },
   "sender": { "login": "octo-builder", "id": 2004, "type": "User" }
 }

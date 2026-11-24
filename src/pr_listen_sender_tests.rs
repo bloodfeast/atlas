@@ -67,7 +67,7 @@ fn a_bot_s_review_comment_and_pr_comment_surface_no_notice() {
 #[test]
 fn the_gh_user_s_own_comments_surface_no_notice() {
     let (_d, mut s) = store("ownuser");
-    let c = Ctx { ignore: Ignore::new(&["Octo-Builder".into()], &[]), ..ctx() };
+    let c = Ctx { ignore: Ignore::new(&[(None, "Octo-Builder".into())], &[]), ..ctx() };
     plan(&mut s, "L", "review pr#12");
     let comment = fixture("issue_comment_by_builder.json");
     let o = deliver(&mut s, &c, "issue_comment", &comment);
@@ -85,7 +85,7 @@ fn the_gh_user_s_own_review_still_meets_the_wait_and_their_comment_does_not() {
     // The gh user is also the person: their review on a PR an item waits on
     // is the review the wait is for.
     let (_d, mut s) = store("ownreview");
-    let c = Ctx { ignore: Ignore::new(&["Octo-Builder".into(), "jdoe_acme".into()], &[]), ..ctx() };
+    let c = Ctx { ignore: Ignore::new(&[(None, "Octo-Builder".into()), (None, "jdoe_acme".into())], &[]), ..ctx() };
     let waits = plan(&mut s, "L", "review pr#12");
     let comment = String::from_utf8(fixture("issue_comment_by_builder.json")).unwrap();
     for who in ["octo-builder", "JDOE_acme"] {

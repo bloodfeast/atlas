@@ -78,7 +78,7 @@ pub fn server_tag() -> String {
 /// ancestor is provably Claude Code; the line is then left out, and no
 /// slot is ever released on owner evidence.
 pub fn owner_tag() -> Option<String> {
-    let pid = owner_pid(&crate::platform::process::table(), std::process::id())?;
+    let pid = owner_pid(&crate::platform::process::table(), std::process::id(), crate::platform::process::start_time)?;
     Some(match crate::platform::process::start_time(pid) {
         Some(t) => format!("{pid} {t}"),
         None => format!("{pid} -"),
@@ -95,34 +95,44 @@ const WRAPPERS: &[&str] = &["atlas", "bash", "cmd", "dash", "env", "fish", "ksh"
 const CLAUDE_CODE: &[&str] = &["bun", "claude", "node"];
 
 /// The Claude Code process above `me` in `procs` ((pid, parent pid,
-/// executable name), [`owner_tag`], #389 review S2): the first ancestor
-/// that is not a known shell or launcher ([`WRAPPERS`]), and only when its
-/// name is Claude Code's ([`CLAUDE_CODE`]). `None` for anything else (an
-/// unknown parent, init, a pid namespace's edge, a loop, an unread table):
-/// a slot is released on owner evidence only when the owner is known.
-pub fn owner_pid(procs: &[(u32, u32, String)], me: u32) -> Option<u32> {
+/// executable name), [`owner_tag`], #389 review S2): walking up past known
+/// shells and launchers ([`WRAPPERS`]), the topmost ancestor named as
+/// Claude Code is ([`CLAUDE_CODE`]), so a `node` or `npx` shim between
+/// Claude Code and the server is not taken for it (#395). The walk stops
+/// at a parent that `started` (a process's start time, `None` when
+/// unread) dates after its child: that pid was reused after the real
+/// parent exited (#395). `None` when no such ancestor is found (an unknown
+/// parent, init, a pid namespace's edge, a loop, an unread table): a slot
+/// is released on owner evidence only when the owner is known. A
+/// longer-lived process above Claude Code that is also named as it (a
+/// `node` editor server above a shell) is taken instead: the safe side,
+/// since it only keeps slots held longer.
+pub fn owner_pid(procs: &[(u32, u32, String)], me: u32, started: impl Fn(u32) -> Option<u64>) -> Option<u32> {
     let name = |n: &str| {
         let n = n.rsplit(['/', '\\']).next().unwrap_or(n);
         let n = if n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(".exe") { &n[..n.len() - 4] } else { n };
         n.to_ascii_lowercase()
     };
-    let parent_of = |pid: u32| procs.iter().find(|p| p.0 == pid).map(|p| p.1);
-    let mut pid = parent_of(me)?;
+    let row = |pid: u32| procs.iter().find(|p| p.0 == pid);
+    let (mut child, mut pid) = (me, row(me)?.1);
+    let mut found = None;
     // A short walk: a wrapper chain is a few deep; a loop is cut off.
     for _ in 0..8 {
-        if pid <= 1 {
-            return None;
+        let Some(r) = row(pid).filter(|_| pid > 1) else { break };
+        if let (Some(p), Some(c)) = (started(pid), started(child)) {
+            if p > c {
+                break;
+            }
         }
-        let n = name(&procs.iter().find(|p| p.0 == pid)?.2);
+        let n = name(&r.2);
         if CLAUDE_CODE.contains(&n.as_str()) {
-            return Some(pid);
+            found = Some(pid);
+        } else if !WRAPPERS.contains(&n.as_str()) {
+            break;
         }
-        if !WRAPPERS.contains(&n.as_str()) {
-            return None;
-        }
-        pid = parent_of(pid)?;
+        (child, pid) = (pid, r.1);
     }
-    None
+    found
 }
 
 /// Whether the server `tag` ([`server_tag`]) names still runs: its pid is

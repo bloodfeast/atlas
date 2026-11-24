@@ -81,6 +81,8 @@ const OPS: &[Op] = &[
     op("miss", "resolve", "resolve_miss"),
     op("recall", "status", "journal_status"),
     op("recall", "log", "memory_log"),
+    op("recall", "sweep", "question_sweep"),
+    op("recall", "deferred", "deferred_questions"),
 ];
 
 /// The op a merged tool runs when the call names none.

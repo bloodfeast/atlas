@@ -594,3 +594,49 @@ fn a_spent_budget_says_gh_was_skipped() {
     let (items, note) = super::items(&s, &[agent("a1", "L", "w", &wt, true)], &spent, Instant::now()).unwrap();
     assert_eq!((items, note), (vec!["L".to_string()], "gh skipped: hook budget spent".to_string()));
 }
+
+/// #333 (#331 r5 item 4): a budget of a few ms is never said as `0.0 s`.
+#[test]
+fn a_budget_of_a_few_ms_is_not_said_as_zero_seconds() {
+    let d = fresh_dir("fewms");
+    let s = store(&d);
+    let wt = worktree(&d, "w", "b", SHA);
+    let spent: Arc<GhList> = Arc::new(|_: &Path, _: &str, _| Err(GhFail::Timeout));
+    let (_, note) = super::items(&s, &[agent("a1", "L", "w", &wt, true)], &spent, Instant::now() + Duration::from_millis(3)).unwrap();
+    assert!(note == "gh skipped: hook budget spent" || (note.starts_with("gh over ") && note.ends_with(" ms")), "{note}");
+    // The lookup above may find the budget already spent, so the note's own
+    // wording is pinned here too.
+    assert_eq!(GhFail::Timeout.note(Duration::from_millis(3)), "gh over 3 ms");
+    assert_eq!(GhFail::Timeout.note(Duration::from_millis(1500)), "gh over 1.5 s");
+    assert_eq!(GhFail::Timeout.note(Duration::ZERO), "gh skipped: hook budget spent");
+}
+
+/// #333 (#331 r5 items 1-3): merge notes the card read wrong. (text, meta)
+#[test]
+fn merge_notes_name_their_own_pr_a_sha_or_an_aside() {
+    let a = [agent("a1", "L", "", Path::new(""), true)];
+    let open = ("pr:o/atlas#331 head:5f24582 -- hand-back", "");
+    for (i, (text, meta)) in [
+        ("pr:o/atlas#331 head:abc1234 -- merged 3c1d2e0", ""),
+        ("pr:o/atlas#331 head:abc1234 -- merged (squash abc)", ""),
+        ("done", "pr: o/atlas#331 head: abc1234 merged"),
+        ("pr:331 -- merged #331 into main", ""),
+        ("pr:331 -- merged and released", ""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut s = store(&fresh_dir(&format!("r5close{i}")));
+        put(&mut s, "journal", "note", "L", "2026-11-18T11:00:00.000Z", open.0, open.1);
+        put(&mut s, "journal", "note", "L", "2026-11-18T12:00:00.000Z", text, meta);
+        assert_eq!(super::items(&s, &a, &no_gh(), dl()).unwrap().0, ["L"], "{text} | {meta}");
+    }
+    for (i, text) in ["pr:o/atlas#331 head:5f24582 -- merged #329 into the branch", "pr:o/atlas#331 head:5f24582 -- merged in origin/main", "pr:331 head:5f24582 -- merged with main"]
+        .iter()
+        .enumerate()
+    {
+        let mut s = store(&fresh_dir(&format!("r5keep{i}")));
+        put(&mut s, "journal", "note", "L", "2026-11-18T11:00:00.000Z", text, "");
+        assert_eq!(super::items(&s, &a, &no_gh(), dl()).unwrap().0, ["L PR #331 @5f24582"], "{text}");
+    }
+}

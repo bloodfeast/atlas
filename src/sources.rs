@@ -62,7 +62,9 @@ pub const MAX_FILES: usize = 20_000;
 /// `.env` rules apply to every name, and a caller checks the name a path
 /// resolves to as well as the name given ([`path_denied`]), so a note that
 /// is a link to a denied file is still refused. Folder names are checked
-/// by [`is_denied_folder`].
+/// by [`is_denied_folder`], and the registry logins denied only in their
+/// own folder (`containers/auth.json`, `.docker/config.json`) by
+/// [`is_denied_in`].
 ///
 /// # Arguments
 ///
@@ -97,11 +99,36 @@ pub fn is_denied_folder(name: &str) -> bool {
     n == ".env" || n.starts_with(".env.") || matches!(ext, "env" | "pem" | "key" | "p12" | "pfx" | "jks" | "keystore" | "kdbx" | "asc" | "gpg" | "credentials" | "secret")
 }
 
+/// Credential files whose names are too common to deny alone, so each is
+/// denied only in the folder that holds it (issue #284): podman's registry
+/// login `containers/auth.json` (under `$XDG_RUNTIME_DIR` or
+/// `~/.config`) and Docker's `.docker/config.json`, whose `auths` hold
+/// registry credentials. Compared case-insensitively.
+const DENIED_IN_FOLDER: &[(&str, &str)] = &[("containers", "auth.json"), (".docker", "config.json")];
+
+/// [`is_denied`] for the file `name` in a folder named `folder` (one path
+/// component, empty when unknown): also true for the files of
+/// [`DENIED_IN_FOLDER`].
+pub fn is_denied_in(folder: &str, name: &str) -> bool {
+    is_denied(name) || DENIED_IN_FOLDER.iter().any(|(d, n)| folder.eq_ignore_ascii_case(d) && name.eq_ignore_ascii_case(n))
+}
+
+/// [`is_denied_in`] for a path written as text, split at both `/` and `\`
+/// on every OS: its last component in the folder before it.
+pub fn text_path_denied(text: &str) -> bool {
+    let mut parts = text.trim_end_matches(['/', '\\']).rsplit(['/', '\\']);
+    let name = parts.next().unwrap_or("");
+    !name.is_empty() && is_denied_in(parts.next().unwrap_or(""), name)
+}
+
 /// Whether a file atlas is asked to read by path (a CLI file tool, a file
 /// Claude Code read) is on the deny-list: its name as given, or the name it
-/// resolves to through links, is [`is_denied`].
+/// resolves to through links, is [`is_denied_in`] its folder.
 pub fn path_denied(p: &Path) -> bool {
-    let named = |q: &Path| q.file_name().and_then(|n| n.to_str()).is_some_and(is_denied);
+    let named = |q: &Path| {
+        let folder = q.parent().and_then(|f| f.file_name()).and_then(|f| f.to_str()).unwrap_or("");
+        q.file_name().and_then(|n| n.to_str()).is_some_and(|n| is_denied_in(folder, n))
+    };
     named(p) || std::fs::canonicalize(p).is_ok_and(|c| named(&c))
 }
 
@@ -121,10 +148,7 @@ const COMMAND_BREAKS: &str = "|;&()<>$=,:@{}[]";
 /// `/` and `\` on every OS, since `Path::file_name` does not split `\` on Unix.
 pub fn command_names_denied(cmd: &str) -> bool {
     let names = |text: &str, quotes: bool| {
-        text.split(|c: char| c.is_whitespace() || COMMAND_BREAKS.contains(c) || (quotes && matches!(c, '\'' | '"'))).any(|f| {
-            let name = f.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("");
-            !name.is_empty() && is_denied(name)
-        })
+        text.split(|c: char| c.is_whitespace() || COMMAND_BREAKS.contains(c) || (quotes && matches!(c, '\'' | '"'))).any(text_path_denied)
     };
     if names(cmd, true) {
         return true;
@@ -435,5 +459,27 @@ mod tests {
         for n in [".env", "keys.gpg", "prod.env"] {
             assert!(is_denied_folder(n), "folder {n} should be denied");
         }
+    }
+
+    /// Issue #284: podman's and Docker's registry logins are denied by the
+    /// folder that holds them; the same names elsewhere are read.
+    #[test]
+    fn registry_logins_are_denied_by_their_folder() {
+        for (d, n) in [("containers", "auth.json"), ("Containers", "AUTH.json"), (".docker", "config.json")] {
+            assert!(is_denied_in(d, n), "{d}/{n} should be denied");
+        }
+        for (d, n) in [("", "auth.json"), ("src", "auth.json"), ("containers", "config.json"), (".vscode", "config.json"), ("", "config.json")] {
+            assert!(!is_denied_in(d, n), "{d}/{n} should be allowed");
+        }
+        for c in ["cat ~/.config/containers/auth.json", "type C:\\Users\\jo\\.docker\\config.json", "cat \"$XDG_RUNTIME_DIR/containers/auth.json\"", "jq .auths .docker/config.json"] {
+            assert!(command_names_denied(c), "{c}");
+        }
+        for c in ["cat auth.json", "cat src/auth.json", "cat .vscode/config.json"] {
+            assert!(!command_names_denied(c), "{c}");
+        }
+        let dir = std::env::temp_dir().join(format!("atlas-deny-284-{}", std::process::id()));
+        let file = dir.join("containers").join("auth.json");
+        assert!(path_denied(&file), "{}", file.display());
+        assert!(!path_denied(&dir.join("src").join("auth.json")));
     }
 }

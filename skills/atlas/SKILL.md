@@ -104,7 +104,8 @@ stays readable. Durable facts that are not lane work (a user's preference, a sta
 - atlas reads each agent's real context from its transcript. The defaults on a 1M window are a handoff point
   at 285k and a hard limit at 450k, scaled to the model's window. Past the handoff point the agent is told to
   wrap up; past the hard limit (enforced mode) every tool but `handoff` is denied. Under an enforced limit a
-  subagent past its handoff point is not compacted: atlas blocks its compaction, and it hands off.
+  subagent past its handoff point is not compacted: atlas blocks its compaction, and it hands off. A subagent
+  compacted before that gets its own checkpoint on lane `agent:<id>` and the card on its next tool call.
 - **Work lean to reach the handoff point later.** Find with `symbol`, `lookup`, `grep` or `section` before a
   Read, then read the lines around the hit; pass `budget_tokens` to `recall` (except on a stored output's
   h:ID key, which refuses it) and `read_note` unless you need the whole text; journal `pr:N head:SHA` when a PR opens and on each head move, so the orchestrator's card

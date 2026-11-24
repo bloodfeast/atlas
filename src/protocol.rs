@@ -456,14 +456,24 @@ pub fn serve_with_hooks_every(
                     open(&mut hooks, &mut failed);
                     let Some((id, args, arrived)) = msg else { continue };
                     let ev = crate::hooks::HookEvent::from_value(&args);
+                    // A tool call the watchdog answered while it waited in the
+                    // queue is not worked (#416): its answer is out, and the
+                    // work would only make every hook behind it later still
+                    // (on 2026-11-23 a backed-up queue refused every call of
+                    // a subagent, retries included).
+                    // Gated calls only (every subagent call but the handoff):
+                    // any other answer the watchdog gave is the worker's own.
+                    let stale = crate::hooks::gated(&ev) && pending.as_ref().is_some_and(|p| Watchdog::answered(p, &id));
+                    crate::hook_gate::begin(&id.to_string(), format!("{} {}", ev.event, ev.tool_name).trim_end());
                     // Tests: a hook slower than its budget.
                     #[cfg(test)]
-                    if ev.tool_name == tests::SLOW_TOOL {
+                    if !stale && ev.tool_name == tests::SLOW_TOOL {
                         std::thread::sleep(tests::SLOW);
                     }
                     // A panic in hook code (#253) answers empty and drops the
                     // hook state; `open` reopens it on the next message.
                     let (text, panicked) = match (hooks.as_mut(), &failed) {
+                        _ if stale => (String::new(), false),
                         (Some(h), _) => crate::hooks::guard(&settings, &ev, || h.handle_from(&ev, arrived).to_json(&ev.event)),
                         (None, Some(e)) => (notice.answer(e, &ev), false),
                         (None, None) => (String::new(), false),
@@ -472,14 +482,28 @@ pub fn serve_with_hooks_every(
                         hooks = None;
                     }
                     // Answered already when the watchdog took it.
-                    if pending.as_ref().is_none_or(|p| Watchdog::claim(p, &id)) {
-                        let r = ok(id, content(text, false));
+                    let won = !stale && pending.as_ref().is_none_or(|p| Watchdog::claim(p, &id));
+                    if won {
+                        let r = ok(id, content(text.clone(), false));
                         if let Ok(mut w) = o.lock() {
                             let _ = write_line(&mut *w, &r);
                         }
-                    } else if let Some(h) = hooks.as_mut() {
+                    } else if let Some(h) = hooks.as_mut().filter(|_| !stale) {
                         // Refused by the watchdog: what this answer let in is undone.
                         h.answer_lost(&ev);
+                    }
+                    crate::hook_gate::end();
+                    if let Some(h) = hooks.as_ref().filter(|_| !ev.tool_use) {
+                        use crate::hook_gate::Outcome;
+                        let outcome = match won {
+                            true if text.contains("\"permissionDecision\":\"deny\"") || text.contains("\"decision\":\"block\"") => Outcome::Deny,
+                            true => Outcome::Pass,
+                            false if crate::hooks::overrun_denies(&ev) => Outcome::OverrunDeny,
+                            false if crate::hooks::gated(&ev) => Outcome::OverrunOpen,
+                            false => Outcome::Overrun,
+                        };
+                        let phases = if stale { &[][..] } else { h.budget_phases() };
+                        h.log_gate(crate::hook_gate::row(&ev.event, &ev.tool_name, !ev.agent_id.is_empty(), arrived, phases, outcome));
                     }
                     // Tests: the worker thread dies (unguarded).
                     #[cfg(test)]
@@ -596,8 +620,18 @@ pub fn serve_with_hooks_every(
 }
 
 /// The hooks read and not yet answered: request id (as JSON) to the id,
-/// the answer the watchdog gives it, and its deadline.
-type Pending = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (Value, String, std::time::Instant)>>>;
+/// the event, when it arrived, its budget and its deadline. The watchdog's
+/// answer is made when it is due, naming what was slow (#416).
+type Pending = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Watched>>>;
+
+/// One hook the watchdog waits on.
+struct Watched {
+    id: Value,
+    ev: crate::hooks::HookEvent,
+    arrived: std::time::Instant,
+    limit: std::time::Duration,
+    deadline: std::time::Instant,
+}
 
 /// The answer to a hook whose budget ran out while the worker was busy (see
 /// [`crate::hook_budget`]): a thread that writes [`crate::hooks::overrun_answer`]
@@ -628,12 +662,13 @@ impl Watchdog {
                     let mut due = Vec::new();
                     let mut next = now + std::time::Duration::from_millis(200);
                     if let Ok(mut m) = p.lock() {
-                        m.retain(|_, (id, event, deadline)| {
-                            if *deadline + WATCH_GRACE <= now {
-                                due.push((id.clone(), std::mem::take(event)));
+                        m.retain(|key, w| {
+                            if w.deadline + WATCH_GRACE <= now {
+                                let why = crate::hook_gate::why(key, w.arrived);
+                                due.push((w.id.clone(), crate::hooks::overrun_answer(&w.ev, w.limit, &why)));
                                 false
                             } else {
-                                next = next.min(*deadline + WATCH_GRACE);
+                                next = next.min(w.deadline + WATCH_GRACE);
                                 true
                             }
                         });
@@ -651,14 +686,21 @@ impl Watchdog {
         Watchdog { pending, limit, stop, thread }
     }
 
-    /// Notes a hook just read at `arrived`, due `limit` later, with the
-    /// answer the watchdog gives it then ([`crate::hooks::overrun_answer`]:
-    /// a gate's is its refusal).
+    /// Notes a hook just read at `arrived`, due `limit` later; the answer
+    /// the watchdog gives it then is [`crate::hooks::overrun_answer`] (a
+    /// launch's or a merge's is its refusal).
     fn expect(p: &Pending, id: &Value, args: &Value, arrived: std::time::Instant, limit: std::time::Duration) {
-        let answer = crate::hooks::overrun_answer(&crate::hooks::HookEvent::from_value(args), limit);
+        let ev = crate::hooks::HookEvent::from_value(args);
+        let limit = crate::hook_budget::for_event(limit, &ev.event);
         if let Ok(mut m) = p.lock() {
-            m.insert(id.to_string(), (id.clone(), answer, arrived + limit));
+            m.insert(id.to_string(), Watched { id: id.clone(), ev, arrived, limit, deadline: arrived + limit });
         }
+    }
+
+    /// Whether the watchdog answered hook `id` already (it is no longer
+    /// pending); one never noted reads as unanswered.
+    fn answered(p: &Pending, id: &Value) -> bool {
+        p.lock().map(|m| !m.contains_key(&id.to_string())).unwrap_or(false)
     }
 
     /// Takes the hook `id` for the worker to answer: false when the watchdog
@@ -997,7 +1039,7 @@ mod tests {
         serve_with_hooks(&mut server, Some(settings), None, io::BufReader::new(input), out.clone()).unwrap();
         let a = answers(&out);
         assert!(a["first"].0.contains("\"permissionDecision\":\"deny\"") && a["first"].0.contains(crate::hooks::GATE_OVERRUN), "{a:?}");
-        assert!(crate::hooks::GATE_OVERRUN.contains("retry the call"));
+        assert!(a["first"].0.contains("retry the call"), "{a:?}");
         assert!(!a["second"].0.contains("deny"), "the refused launch held the builder slot: {a:?}");
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1066,5 +1108,83 @@ mod tests {
         assert!(a["c"].0.contains("\"permissionDecision\":\"deny\""), "the lost launch B freed builder A's slot: {a:?}");
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #416: a subagent's Read and Bash queued past their budget behind slow
+    /// hooks go ahead, told the check was skipped; a launch and a merge
+    /// queued with them are refused, the reason naming the queue wait; the
+    /// worker does not work the calls the watchdog answered; and the gate
+    /// rows count both kinds.
+    #[test]
+    fn an_overrun_fails_open_for_a_subagent_call_and_closed_for_a_launch() {
+        if !crate::hook_budget::enforced() {
+            return;
+        }
+        let (dir, mut server, mut settings) = served("hook-gate-416");
+        settings.hook_budget = std::time::Duration::from_millis(1_000);
+        settings.snapshot_secs = 0;
+        let index_db = settings.index_db.clone();
+        let msg = |id: &str, agent: &str, tool: &str, input: Value| {
+            let args = crate::json!({"event": "PreToolUse", "session_id": "S", "agent_id": agent, "tool_name": tool, "tool_input": input, "tool_use_id": id});
+            (crate::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "hook", "arguments": args}}).to_string() + "\n").into_bytes()
+        };
+        let line = |s: String| (s + "\n").into_bytes();
+        let ms = std::time::Duration::from_millis;
+        let out = Shared::default();
+        let input = AfterAnswer {
+            out: out.clone(),
+            steps: vec![
+                (None, ms(0), line(hook_msg("warm", "TodoWrite"))),
+                // Two slow hooks keep the worker 2 s past the arrival of
+                // the calls behind them: the watchdog answers those at 1.25 s.
+                (Some("warm"), ms(0), line(hook_msg("slow1", SLOW_TOOL))),
+                (None, ms(0), line(hook_msg("slow2", SLOW_TOOL))),
+                (None, ms(0), msg("read", "y1", "Read", crate::json!({"file_path": "/a.rs"}))),
+                (None, ms(0), msg("bash", "y1", "Bash", crate::json!({"command": "echo ok"}))),
+                (None, ms(0), msg("launch", "", "Agent", crate::json!({"prompt": "Kind: builder", "subagent_type": "general-purpose"}))),
+                (None, ms(0), line(gate_msg("merge"))),
+                // Once the worker is past them all: a call in time.
+                (Some("merge"), ms(1_500), msg("again", "y1", "Read", crate::json!({"file_path": "/a.rs"}))),
+                (Some("again"), ms(0), Vec::new()),
+            ]
+            .into(),
+        };
+        serve_with_hooks(&mut server, Some(settings), None, io::BufReader::new(input), out.clone()).unwrap();
+        let a = answers(&out);
+        for id in ["read", "bash"] {
+            let t = &a[id].0;
+            assert!(!t.contains("permissionDecision") && t.contains(crate::hooks::GATE_SKIPPED) && t.contains("slow: queue"), "{id}: {a:?}");
+        }
+        for id in ["launch", "merge"] {
+            let t = &a[id].0;
+            assert!(t.contains("\"permissionDecision\":\"deny\"") && t.contains(crate::hooks::GATE_OVERRUN) && t.contains("slow: queue"), "{id}: {a:?}");
+        }
+        assert!(!a["again"].0.contains(crate::hooks::GATE_SKIPPED), "{a:?}");
+        drop(server);
+        let conn = crate::store::open_raw(&index_db).unwrap();
+        let rows = crate::hook_gate::logged(&conn, "").unwrap();
+        let t: HashMap<String, crate::hook_gate::EventTotals> = crate::hook_gate::totals(&rows).into_iter().collect();
+        let sub = &t["PreToolUse sub"];
+        assert_eq!((sub.n, sub.overruns, sub.open, sub.refused), (3, 2, 2, 0), "{rows:?}");
+        assert!(t["PreToolUse"].refused >= 2 && t["PreToolUse"].overruns >= 2, "{rows:?}");
+        // The calls the watchdog answered were not worked.
+        assert!(rows.iter().filter(|r| r.outcome.overrun() && r.event == "PreToolUse" && r.tool != SLOW_TOOL).all(|r| r.work_ms == 0.0), "{rows:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #333 item 2: the watchdog gives a PreCompact the longer budget, so a
+    /// slow first open still answers with the compaction instructions.
+    #[test]
+    fn the_watchdog_waits_the_per_event_budget() {
+        let p: Pending = Default::default();
+        let arrived = std::time::Instant::now();
+        let limit = std::time::Duration::from_millis(300);
+        let due = |event: &str, id: &str| {
+            Watchdog::expect(&p, &json!(id), &json!({"event": event, "session_id": "s"}), arrived, limit);
+            p.lock().unwrap()[&json!(id).to_string()].deadline
+        };
+        assert_eq!(due("PreCompact", "a"), arrived + std::time::Duration::from_millis(crate::hook_budget::LONG_MS));
+        assert_eq!(due("SessionStart", "b"), arrived + std::time::Duration::from_millis(crate::hook_budget::LONG_MS));
+        assert_eq!(due("PreToolUse", "c"), arrived + limit);
     }
 }

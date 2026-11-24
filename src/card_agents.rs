@@ -94,6 +94,8 @@ impl GhFail {
             GhFail::NoAuth => "gh not logged in".into(),
             // No time left, so no gh was started (#331 r4 nit 2).
             GhFail::Timeout if budget.is_zero() => "gh skipped: hook budget spent".into(),
+            // A few ms are said in ms, never `0.0 s` (#333).
+            GhFail::Timeout if budget < Duration::from_millis(100) => format!("gh over {} ms", budget.as_millis()),
             GhFail::Timeout => format!("gh over {:.1} s", budget.as_secs_f64()),
             GhFail::Failed(m) => format!("gh: {m}"),
         }
@@ -173,7 +175,12 @@ fn same_repo(named: &str, repo: &str) -> bool {
 /// as abc`, `Merged.`, `Merged #331`), not by an object (`merged origin/main`, which merges
 /// main into the branch). `not merged` and `verdict: x` (no value) stay
 /// open.
-fn says_ended<'a>(ws: impl Iterator<Item = &'a str>) -> bool {
+///
+/// `own` is the entry's PR (#333): `merged #N` ends it only when N is
+/// `own` (`-- merged #329 into the branch` on PR 330 does not). A sha
+/// (`merged 3c1d2e0`) or an aside (`merged (squash abc)`) ends it; `in`,
+/// `with` and `and` do unless a branch follows (`merged in origin/main`).
+fn says_ended<'a>(ws: impl Iterator<Item = &'a str>, own: u64) -> bool {
     let kv = |w: &str| w.split_once(':').is_some_and(|(k, v)| !k.is_empty() && !v.is_empty());
     let mut ws = ws.skip_while(|w| kv(w) || !w.chars().any(char::is_alphanumeric));
     let Some(w) = ws.next() else { return false };
@@ -181,18 +188,32 @@ fn says_ended<'a>(ws: impl Iterator<Item = &'a str>) -> bool {
     if word != "merged" && word != "closed" {
         return false;
     }
-    let clause_ends = w.ends_with(|c: char| ",;.:)]!".contains(c));
-    let joins =
-        |n: &str| matches!(n.to_ascii_lowercase().as_str(), "as" | "into" | "to" | "in" | "on" | "at" | "by" | "via" | "with" | "and");
-    // `merged #331 as abc` names the PR itself.
-    clause_ends || ws.next().is_none_or(|n| joins(n) || n.starts_with('#') || !n.chars().any(char::is_alphanumeric))
+    if w.ends_with(|c: char| ",;.:)]!".contains(c)) {
+        return true;
+    }
+    let Some(n) = ws.next() else { return true };
+    let bare = n.trim_end_matches(|c: char| ",;.:)]!".contains(c)).to_ascii_lowercase();
+    // `merged #331 as abc` names the PR: this entry's own, or another.
+    if let Some((_, num)) = bare.rsplit_once('#') {
+        return num.parse::<u64>().is_ok_and(|x| x == own);
+    }
+    let sha = (7..=40).contains(&bare.len()) && bare.chars().all(|c| c.is_ascii_hexdigit()) && bare.chars().any(|c| c.is_ascii_digit());
+    let branch = |x: &str| {
+        let x = x.trim_end_matches(|c: char| ",;.:)]!".contains(c)).to_ascii_lowercase();
+        x.contains('/') || matches!(x.as_str(), "main" | "master" | "origin" | "upstream" | "trunk" | "develop" | "head")
+    };
+    match bare.as_str() {
+        "as" | "into" | "to" | "on" | "at" | "by" | "via" => true,
+        "in" | "with" | "and" => ws.next().is_none_or(|x| !branch(x)),
+        _ => sha || n.starts_with('(') || !n.chars().any(char::is_alphanumeric),
+    }
 }
 
 /// Whether a line's words from its `pr:` value on say merged or closed
 /// (`pr:329 merged`, `pr: o/r#9 head:abc -- merged as def`).
-fn after_pr(line: &str) -> bool {
+fn after_pr(line: &str, own: u64) -> bool {
     let line = line.to_ascii_lowercase().replace("pr: ", "pr:");
-    says_ended(line.split_whitespace().skip_while(|w| !w.starts_with("pr:")))
+    says_ended(line.split_whitespace().skip_while(|w| !w.starts_with("pr:")), own)
 }
 
 /// A `pr:` entry: the PR, whether the entry says it is merged or closed,
@@ -203,7 +224,10 @@ fn after_pr(line: &str) -> bool {
 /// head:SHA` is read word by word (#331 r3 N3).
 fn pr_entry(h: &Head) -> Option<(Pr, bool, String)> {
     let line = first_line(h);
-    let meta = meta_value(&h.meta, "pr").unwrap_or("");
+    // `head: abc` is one word, as `head:abc` (#333: `pr: o/r#N head: abc
+    // merged` closed nothing).
+    let meta = meta_value(&h.meta, "pr").unwrap_or("").replace(": ", ":");
+    let meta = meta.as_str();
     let mut meta_words = meta.split_whitespace();
     let (n, repo) = meta_words
         .next()
@@ -223,8 +247,8 @@ fn pr_entry(h: &Head) -> Option<(Pr, bool, String)> {
     let ended = |w: &str| matches!(w.to_ascii_lowercase().trim_matches(|c: char| !c.is_ascii_alphabetic()), "merged" | "closed");
     // A meta `pr:` reads its own words after the value, and the text's
     // first words (`Merged.`, `Merged #331 as abc`).
-    let by_meta = !meta.is_empty() && (says_ended(meta_words) || says_ended(line.split_whitespace()));
-    let closed = ended(&state) || ended(&named(h, "verdict")) || by_meta || after_pr(line);
+    let by_meta = !meta.is_empty() && (says_ended(meta_words, n) || says_ended(line.split_whitespace(), n));
+    let closed = ended(&state) || ended(&named(h, "verdict")) || by_meta || after_pr(line, n);
     Some((Pr { number: n, head, draft }, closed, repo))
 }
 
@@ -528,7 +552,11 @@ pub fn items(store: &MemoryStore, agents: &[Agent], gh: &std::sync::Arc<GhList>,
     // call past it is left to finish (or be killed by its own deadline) and
     // counts as timed out.
     let (tx, rx) = std::sync::mpsc::channel();
-    for (i, ((_, b), d)) in asks.iter().enumerate() {
+    // The budget ran out before any gh started (#333): none is started, and
+    // the note says it was skipped.
+    let skipped = Instant::now() >= deadline;
+    let budget = if skipped { Duration::ZERO } else { budget };
+    for (i, ((_, b), d)) in asks.iter().enumerate().filter(|_| !skipped) {
         let (tx, gh, b, d) = (tx.clone(), std::sync::Arc::clone(gh), b.clone(), d.clone());
         std::thread::spawn(move || {
             let _ = tx.send((i, gh(&d, &b, deadline)));

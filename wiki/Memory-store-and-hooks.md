@@ -18,9 +18,12 @@ it. The design and the measured hook behaviour it rests on are in `docs/design/a
 | `remember` | yes | a memory (key = file name), rule or decision; an existing key gains a version and needs `expected_sha` (the head's sha, or its first 12 or more hex digits, as the ok line prints 16); a rule is one list item (a body without a leading `- ` is written as `- DATE AUTHOR: text`, later lines indented; blank lines or a second item are refused) |
 | `recall` | | by `key` (`history: true` for every version), by `query` (FTS5, best first, within `budget_tokens`: the leading records whole (the best, and a second within 0.8 of its score), the rest as pointers, one line each with key, score and title; a body is one `recall {key}` away), or `lane` |
 | `supersede` | yes | replaces `old` records with a new one placed right after the first |
-| `journal` | yes | a lane entry: `brief`, `decision`, `measurement` (conditions in `meta`), `commit`, `question`, `answered` (`refs: ["answers:<key>"]`), `next`, `note` |
+| `journal` | yes | a lane entry: `brief`, `decision`, `measurement` (conditions in `meta`), `commit`, `question`, `answered` (`refs: ["answers:<key>"]`), `next`, `note`, `defer` (below). A `decision` or `answered` entry that names an open question of its lane or a numbered sub-lane, by key or by Q-id (a token like `Q-RIVER-3` in the question's text), gets the `answers` ref itself; the reply names each link and lists the lane's questions still open (key, age, title, five at most) |
+| `journal` `entry: defer` | yes | parks questions: `refs: ["defers:<question key>"]` and a meta line `until: <UTC time or date>` or `until: next-session` (the next main-session start: SessionStart `startup`, `clear` or `resume`, never a subagent), optionally `proceeding_with: <option>`. A deferred question stays open but leaves the stale flag and the sweep's idle signal; an answer, or a decision naming it, still closes it |
+| `recall op=sweep` (`question_sweep`) | | the open questions that look settled, each with its evidence keys: a later `decision` or `answered` entry in the lane family, or a later rule or decision record, that names its key or Q-id (entries also by sharing three of its title's key terms); a later lane `commit` entry recording a merged PR; the lane idle past the stale age. It closes nothing; it prints the one `journal entry=answered` call with an `answers` ref per candidate |
+| `recall op=deferred` (`deferred_questions`) | | the deferred questions: those due first, each with its `A) ... B) ...` options and `proceeding_with`, ready to ask as multiple choice; then those still waiting, with their `until` |
 | `handoff` | yes | a lane handoff; also the one tool the context cap lets through |
-| `journal_status` | | one row per active lane (an open question, a queued entry, or a record in the last 14 days): entries, last entry, last commit, open questions, handoffs; then `+N idle lanes`. `all: true` lists every lane |
+| `journal_status` | | one row per active lane (an open question, a queued entry, or a record in the last 14 days): entries, last entry, last commit, open questions, handoffs; then `+N idle lanes`; then the listed lanes' open questions, one line each with key, age in days, `stale` past `memory.question_stale_days` (default 3), `deferred until ...` or `due`, and title. `all: true` lists every lane |
 | `memory_log` | | versions newest first, filtered by key, kind, scope, time, author |
 | `hook` | | the hooks' entry point: event fields in, hook JSON (or nothing) out |
 
@@ -166,7 +169,10 @@ or `"off"`.
 - **Resume card (`memory.resume_card`, on by default):** SessionStart with `source: startup` or `clear` injects
   where the work stands as keys, in at most 1,155 bytes (about 605 tokens on the test's card full of keys, at 1,121 bytes, by a public
   vocabulary times a fitted factor, not real tokens; `cargo test -p xtask` holds that card there, the bytes bind at runtime). The lines: the six newest live lanes, each with its open question count and newest
-  handoff; the live lanes' open questions; after a `/clear` only, the agents still running from the previous
+  handoff; the live lanes' open questions (a stale one as `KEY (5d, stale)`; a deferred one not yet due only
+  as `+N deferred`); the due deferred questions, each with its options and `proceeding_with`; `N questions
+  look settled: recall op=sweep` when the sweep finds any (none of these three adds a byte when nothing is
+  stale, due or settled); after a `/clear` only, the agents still running from the previous
   session (a new process has none, so none hold slots); the work queue's count, up to five that can start now
   and the next waiting; the previous session's goal when its newest `goal_status` says not met; handoffs
   the lanes line does not name; and, just before the question and always kept, the handoff the question names
@@ -237,6 +243,17 @@ or `"off"`.
   (`src/redact.rs`: denied file names, key-shaped tokens, `.env`-style assignments, the `ATLAS_LEAK_DENYLIST`
   terms). After the compaction SessionStart injects the newest checkpoint as a card headed by its own ref, within
   `compact.card_tokens` (default 400), before the ref report.
+- **A subagent's compaction:** past its handoff point under an enforced limit it is blocked (the agent hands
+  off). Otherwise PreCompact writes the agent's own checkpoint on lane `agent:<id>` from its own transcript and
+  answers with the same instructions; its card names no live agents. `SessionStart` never fires in a subagent,
+  so the card is given on the agent's next tool call, once. When no PreCompact came, a new `compact_boundary`
+  record in the agent's transcript writes the checkpoint then (`checkpoint (boundary)`), of the segment that
+  boundary closed, without waiting on the tool call's budget; a card the hook watchdog dropped is owed again.
+  Every record of a subagent's own transcript is marked `isSidechain`, and there those are read as its own.
+  Every subagent PreCompact is a `compact:subagent` hook-log row. The owed card and the boundaries seen are held
+  by the serving process only, so this needs the `mcp_tool` hooks: under `atlas --hook` (a process per event)
+  PreCompact still writes the agent's checkpoint, but no card follows, and a compaction with no PreCompact is
+  not seen. Persisting that state would put a store write on every subagent tool call's path.
 - **The live agents and their PRs:** the `agents` line names each agent of the session the host lists as running,
   by its lane (`LANE/NAME` when two share a lane), with `PR #N @head7 (ready|draft)` when atlas finds its PR, each
   part only when known. The PR is found without the agent's help, in order: the lane's newest `pr:` journal entry
@@ -252,9 +269,10 @@ or `"off"`.
   at the deadline. When a lookup fails the agent is named without a PR and a `prs:` line says why (`gh not found`,
   `gh not logged in`, `gh over 1.5 s`, `gh skipped: hook budget spent`, `gh: no network`,
   `worktree NAME gone`). At most six agents are named, running ones first, then `+N more`; the line comes after
-  `open`, `owed`, `rulings` and `files`, so it cannot push them out of the card's budget. The PreCompact instructions end with the same items ("Live agents now ..."), so
-  the summary can copy exact PR numbers. Six agents with PRs cost about 280 bytes on the card (about 70 tokens at 4
-  bytes a token) and about 330 bytes after the instructions; more agents add only `, +N more`. The lookup also
+  `open`, `owed`, `rulings` and `files`, so it cannot push them out of the card's budget. The PreCompact
+  instructions end with the same items ("Live agents now ..."), so the summary can copy exact PR numbers. Six
+  agents with PRs cost about 280 bytes on the card (about 70 tokens at 4 bytes a token) and about 330 bytes after
+  the instructions; more agents add only `, +N more`. The lookup also
   runs for the checkpoint written at a /clear (SessionEnd), so a /clear can take up to 1.5 s longer.
 - **An agent's own entries:** an entry is an agent's own when its `agent:` meta names it, or it names the agent's
   worktree or branch (a `worktree:`/`branch:` word or meta line, or the worktree's name as a word or path part of

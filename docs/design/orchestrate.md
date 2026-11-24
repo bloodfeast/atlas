@@ -173,6 +173,11 @@ also in `atlas settings`.
   window (450,000 x window / 1,000,000).
 - **`handoff`** is the soft point. In order: `kinds.X.handoff`, else `limit x handoff_pct / 100`, else
   `cap.warn_tokens`, else 285,000 scaled by the window. It is clamped to at most `limit`.
+- **`models`** (per kind, #403): `kinds.X.models.<id or alias>` gives `window`, `limit`, `handoff` and
+  `handoff_pct` for agents of that model, matched as `compact.model_windows` is (transcript model, else the meta
+  alias; an exact id beats a family alias). Unset keys are the kind's, then as above; an entry's `handoff` or
+  `handoff_pct` replaces the kind's pair. The model is read only for a kind with entries, and the hook text
+  names the entry that applied (`haiku builder: 90,000 (orchestrate.kinds.builder.models.haiku)`).
 - **`mode`** (per kind, else `orchestrate.mode`, default `enforced`):
   - `enforced`: past the hard limit every tool except `handoff` and `ToolSearch` is denied, and so is a
     SendMessage to the agent;

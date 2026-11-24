@@ -372,16 +372,98 @@ fn redirection(word: &str) -> Option<bool> {
 
 /// Every `gh pr merge` in a shell command.
 pub fn merges(command: &str) -> Vec<Merge> {
+    merges_within(command, 0)
+}
+
+/// The shells whose `-c` (or `-Command`, `/c`) string is read for merges
+/// too (#333 item 3): the quoted command is one word to [`words`].
+const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "pwsh", "powershell", "cmd"];
+
+/// How deep shells inside shells are read.
+const SHELL_DEPTH: usize = 4;
+
+/// A program's name without its folder or `.exe`, lowercased.
+fn program(s: &str) -> String {
+    let base = s.rsplit(['/', '\\']).next().unwrap_or(s).to_ascii_lowercase();
+    base.strip_suffix(".exe").map(str::to_string).unwrap_or(base)
+}
+
+/// Whether `flag` is the flag after which shell `sh` takes its command
+/// string: `-c` (with other one-letter flags, as `-lc`) for a POSIX shell,
+/// any prefix of `-Command` for PowerShell, `/c` or `/k` for cmd.
+fn command_flag(sh: &str, flag: &str) -> bool {
+    let f = flag.to_ascii_lowercase();
+    match sh {
+        "pwsh" | "powershell" => f.len() >= 2 && "-command".starts_with(&f),
+        "cmd" => f == "/c" || f == "/k",
+        _ => f.len() >= 2 && f.starts_with('-') && !f.starts_with("--") && f[1..].chars().all(|c| c.is_ascii_alphabetic()) && f.contains('c'),
+    }
+}
+
+/// `gh api` words after `api` that merge a PR through the REST endpoint
+/// (`-X PUT repos/OWNER/REPO/pulls/N/merge`): the merge, else `None` (any
+/// other method only reads whether the PR is merged).
+fn api_merge(rest: &[String]) -> Option<Merge> {
+    let mut put = false;
+    let mut found = None;
+    let mut j = 0;
+    while let Some(a) = rest.get(j) {
+        if a.is_empty() {
+            break;
+        }
+        let method = if a == "-X" || a == "--method" {
+            j += 1;
+            rest.get(j).map(String::as_str)
+        } else {
+            a.strip_prefix("--method=").or_else(|| a.strip_prefix("-X"))
+        };
+        if let Some(m) = method {
+            put = m.eq_ignore_ascii_case("PUT");
+        } else if !a.starts_with('-') && found.is_none() {
+            let path = a.split(['?', '#']).next().unwrap_or("");
+            let path = path.strip_prefix("https://api.github.com").unwrap_or(path).trim_matches('/');
+            let p: Vec<&str> = path.split('/').collect();
+            if let ["repos", owner, repo, "pulls", n, "merge"] = p.as_slice() {
+                if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() {
+                    // `{owner}/{repo}` is the current repository's, as gh fills it.
+                    let named = !(owner.starts_with('{') || repo.starts_with('{'));
+                    found = Some(Merge { selector: Some((*n).to_string()), repo: named.then(|| format!("{owner}/{repo}")) });
+                }
+            }
+        }
+        j += 1;
+    }
+    found.filter(|_| put)
+}
+
+fn merges_within(command: &str, depth: usize) -> Vec<Merge> {
     if !command.contains("merge") {
         return Vec::new();
     }
-    let w = words(command);
-    let is_gh = |s: &str| {
-        let base = s.rsplit(['/', '\\']).next().unwrap_or(s).to_ascii_lowercase();
-        base == "gh" || base == "gh.exe"
-    };
+    // A line continuation (`\` in bash, a backtick in PowerShell, then a
+    // newline) joins the lines before the words are read, as the shell does.
+    let joined = command.replace("\\\r\n", "").replace("\\\n", "").replace("`\r\n", "").replace("`\n", "");
+    let w = words(&joined);
+    let is_gh = |s: &str| program(s) == "gh";
     let mut out = Vec::new();
     for i in 0..w.len() {
+        let prog = program(&w[i]);
+        if depth < SHELL_DEPTH && SHELLS.contains(&prog.as_str()) {
+            let mut j = i + 1;
+            while let Some(a) = w.get(j).filter(|a| !a.is_empty()) {
+                if command_flag(&prog, a) {
+                    if let Some(inner) = w.get(j + 1) {
+                        out.extend(merges_within(inner, depth + 1));
+                    }
+                    break;
+                }
+                j += 1;
+            }
+        }
+        if is_gh(&w[i]) && w.get(i + 1).is_some_and(|x| x == "api") {
+            out.extend(api_merge(&w[i + 2..]));
+            continue;
+        }
         if !(is_gh(&w[i]) && w.get(i + 1).is_some_and(|x| x == "pr") && w.get(i + 2).is_some_and(|x| x == "merge")) {
             continue;
         }
@@ -580,6 +662,31 @@ mod tests {
         assert_eq!(merges("gh pr merge https://github.com/o/r/pull/7#x"), [Merge { selector: Some("https://github.com/o/r/pull/7#x".into()), repo: None }]);
         assert_eq!(merges("gh pr merge '#5'"), [Merge { selector: Some("#5".into()), repo: None }]);
         assert!(merges("gh pr view 99; git merge main; echo 'gh pr merge 3'").is_empty());
+    }
+
+    /// #333 item 3: the forms that merged past the gate.
+    #[test]
+    fn merges_through_the_api_an_inner_shell_or_a_continuation_are_read() {
+        let n = |s: &str, r: Option<&str>| Merge { selector: Some(s.into()), repo: r.map(str::to_string) };
+        // The REST endpoint, PUT only (a GET reads whether it is merged).
+        assert_eq!(merges("gh api -X PUT repos/o/r/pulls/12/merge -f merge_method=squash"), [n("12", Some("o/r"))]);
+        assert_eq!(merges("gh api --method=put /repos/o/r/pulls/3/merge"), [n("3", Some("o/r"))]);
+        assert_eq!(merges("gh api -XPUT 'repos/{owner}/{repo}/pulls/4/merge'"), [n("4", None)]);
+        assert_eq!(merges("gh api repos/o/r/pulls/12/merge -X PUT"), [n("12", Some("o/r"))]);
+        assert!(merges("gh api repos/o/r/pulls/12/merge").is_empty());
+        assert!(merges("gh api -X PUT repos/o/r/pulls/12/reviews; echo merge").is_empty());
+        // The quoted command of a shell.
+        assert_eq!(merges("bash -c \"gh pr merge 5 --squash\""), [n("5", None)]);
+        assert_eq!(merges("/usr/bin/bash -lc 'cd x && gh pr merge 6'"), [n("6", None)]);
+        assert_eq!(merges("pwsh -NoProfile -Command \"gh pr merge 7 -R o/r\""), [n("7", Some("o/r"))]);
+        assert_eq!(merges("powershell.exe -c 'gh pr merge 8'"), [n("8", None)]);
+        assert_eq!(merges("cmd /C \"gh pr merge 9\""), [n("9", None)]);
+        assert_eq!(merges("bash -c \"sh -c 'gh pr merge 10'\""), [n("10", None)]);
+        assert!(merges("bash -c \"echo merge\"").is_empty());
+        // A line continuation, bash's and PowerShell's.
+        assert_eq!(merges("gh pr \\\nmerge 11"), [n("11", None)]);
+        assert_eq!(merges("gh pr \\\r\n  merge 12"), [n("12", None)]);
+        assert_eq!(merges("gh pr `\nmerge 13"), [n("13", None)]);
     }
 
     #[test]

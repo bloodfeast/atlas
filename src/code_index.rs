@@ -348,7 +348,7 @@ pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rus
             }
         }
     }
-    let mut rows = Rows::default();
+    let mut rows = Rows { exclude: root.exclude.clone(), ..Rows::default() };
     // References into a package another root defines are stored: that
     // root's recorded packages, read here (its own run is not needed).
     code::ensure_schema(conn)?;
@@ -373,7 +373,15 @@ pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rus
                     code::scip_rows(&ix, &mut rows, &mut files, &read);
                     covered.extend(ix.doc_path.iter().map(|p| code::rebase("", p)));
                     let source = format!("prebuilt {} {}", ix.tool.0, ix.tool.1).trim_end().to_string();
-                    let mut langs: Vec<&str> = ix.doc_path.iter().zip(&ix.doc_lang).map(|(p, l)| code::lang_of(l, p)).collect();
+                    // The languages of the documents kept: an excluded
+                    // file's language is no unit of the root (#371).
+                    let mut langs: Vec<&str> = ix
+                        .doc_path
+                        .iter()
+                        .zip(&ix.doc_lang)
+                        .filter(|(p, _)| !code::excluded(&root.exclude, &code::rebase("", p)))
+                        .map(|(p, l)| code::lang_of(l, p))
+                        .collect();
                     langs.sort_unstable();
                     langs.dedup();
                     other_units = langs.into_iter().map(|l| code::Unit { dir: String::new(), lang: l.into(), source: source.clone() }).collect();
@@ -1108,7 +1116,7 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                     changed[i] = Some(if walk_all && seen_fp[i].is_empty() { Instant::now() - setup.debounce } else { Instant::now() });
                 }
                 seen_fp[i] = fp;
-            } else if snap.paths.iter().any(|p| code::relevant(p) && !code::excluded(&r.exclude, p)) {
+            } else if change_wakes(&snap.paths, &r.exclude) {
                 changed[i] = Some(Instant::now());
             }
             watcher.clear(i, snap.seq);
@@ -1179,6 +1187,13 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
             walk_all = true;
         }
     }
+}
+
+/// Whether a watched root's changed `paths` (relative, `/`-separated) wake
+/// its re-index: one is a file the code index reads ([`code::relevant`])
+/// and no `exclude` glob of the root names it ([`code::excluded`]).
+pub fn change_wakes(paths: &[String], exclude: &[String]) -> bool {
+    paths.iter().any(|p| code::relevant(p) && !code::excluded(exclude, p))
 }
 
 #[cfg(test)]

@@ -225,13 +225,15 @@ pub fn login_ok(s: &str) -> bool {
 /// What a name in `changes/` is, or why it is none of them.
 pub fn entry(name: &str) -> R<Entry> {
     let bad = || {
-        format!("changes/{name}: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md, changes/<pr>.none or an imported changes/public-<n>.md; see changes/README.md)")
+        format!("changes/{name}: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md, changes/<pr>.none or an imported changes/public-<n>.md or changes/public-<n>.none; see changes/README.md)")
     };
     let pr_of = |s: &str| number(s).filter(|_| !s.starts_with('0'));
     if name == "README.md" {
         return Ok(Entry::Readme);
     }
     if let Some(stem) = name.strip_suffix(".none") {
+        // An outside pull request's marker, imported: its public number.
+        let stem = stem.strip_prefix(PUBLIC).unwrap_or(stem);
         return pr_of(stem).map(Entry::None).ok_or_else(bad);
     }
     let stem = name.strip_suffix(".md").ok_or_else(bad)?;
@@ -899,6 +901,8 @@ mod tests {
         assert_eq!(entry("187.md"), Ok(Entry::Fragment(187)));
         assert_eq!(entry("187-docs-page.md"), Ok(Entry::Fragment(187)));
         assert_eq!(entry("42.none"), Ok(Entry::None(42)));
+        // An imported outside pull request's marker, by its public number.
+        assert_eq!(entry("public-42.none"), Ok(Entry::None(42)));
         assert_eq!(entry("README.md"), Ok(Entry::Readme));
         for bad in
             ["readme.md", "0187.md", "187", "187.txt", "187-.md", "187-Docs.md", "x187.md", "187.none.md", "-1.md", "187 .md", "187_a.md"]
@@ -1721,6 +1725,19 @@ mod tests {
         // A marker.
         let (ok, out) = check("none", "187", true, &[src, ("added", "changes/187.none")], &[("changes/187.none", b"")]);
         assert!(ok, "{out}");
+        // An import's marker: the outside pull request's, by its public
+        // number (`cargo xtask release import`).
+        let (ok, out) = check("public-none", "408", true, &[src, ("added", "changes/public-22.none")], &[("changes/public-22.none", b"")]);
+        assert!(ok, "{out}");
+        // An import's marker with an imported fragment is both.
+        let (ok, out) = check(
+            "public-both",
+            "408",
+            true,
+            &[src, ("added", "changes/public-22.none"), ("added", "changes/public-22.md")],
+            &[("changes/public-22.none", b""), ("changes/public-22.md", PUBLIC_FRAG.as_bytes())],
+        );
+        assert!(!ok && out.contains("changes/public-22.none marks") && out.contains("also adds a fragment"), "{out}");
         // Neither.
         let (ok, out) = check("neither", "187", true, &[src, ("modified", "README.md")], &[]);
         assert!(!ok && out.contains("::error::") && out.contains("changes/187.md") && out.contains("changes/187.none"), "{out}");
@@ -1871,7 +1888,16 @@ author: out-sider
     fn imported_fragments_have_their_own_names_and_an_author() {
         assert_eq!(entry("public-13.md"), Ok(Entry::Fragment(13)));
         assert_eq!(entry("public-13-docs.md"), Ok(Entry::Fragment(13)));
-        for bad in ["public-13.none", "public-.md", "public-013.md", "Public-13.md", "public-13-Docs.md", "public13.md", "public-x.md"] {
+        for bad in [
+            "public-.none",
+            "public-013.none",
+            "public-.md",
+            "public-013.md",
+            "Public-13.md",
+            "public-13-Docs.md",
+            "public13.md",
+            "public-x.md",
+        ] {
             assert!(entry(bad).unwrap_err().contains("not a fragment name"), "{bad}");
         }
         let f = parse_fragment("public-13.md", PUBLIC_FRAG).unwrap();
@@ -1933,7 +1959,8 @@ author: out-sider
 
     #[test]
     fn version_accepts_an_imported_fragment() {
-        let d = repo("public", &[("12.md", &frag("patch", "highlight", "- shines")), ("public-13.md", PUBLIC_FRAG)]);
+        let d =
+            repo("public", &[("12.md", &frag("patch", "highlight", "- shines")), ("public-13.md", PUBLIC_FRAG), ("public-14.none", "")]);
         assert_eq!(run_in(&d, true, &To::Replay).unwrap(), "0.5.1");
         assert_eq!(run_in(&d, false, &To::Replay).unwrap(), "0.5.1");
         let log = read_text(&d.join("CHANGELOG.md")).unwrap();
@@ -1945,6 +1972,7 @@ author: out-sider
             "{log}"
         );
         assert!(!d.join("changes/public-13.md").exists(), "folded and deleted");
+        assert!(!d.join("changes/public-14.none").exists(), "an imported marker is deleted with the rest");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1967,9 +1995,22 @@ author: out-sider
                 "{text:?}: {out}"
             );
         }
-        let (ok, out) = check("public-none", "301", false, &[("added", "changes/public-13.none")], &[("changes/public-13.none", b"")]);
-        assert!(!ok && out.contains("not a fragment name"), "{out}");
-        // A fold removes imported fragments too.
+        // An imported marker is the import's own marker, as `entry` reads it;
+        // a malformed one is refused by both.
+        let (ok, out) = check("public-none", "301", true, &[src, ("added", "changes/public-13.none")], &[("changes/public-13.none", b"")]);
+        assert!(ok && entry("public-13.none").is_ok(), "{out}");
+        let (ok, out) =
+            check("public-none-bad", "301", false, &[("added", "changes/public-013.none")], &[("changes/public-013.none", b"")]);
+        assert!(!ok && out.contains("not a fragment name") && entry("public-013.none").is_err(), "{out}");
+        // A fold removes imported fragments and markers too.
+        let (ok, out) = check(
+            "public-fold-none",
+            "302",
+            true,
+            &[("modified", "Cargo.toml"), ("modified", "CHANGELOG.md"), ("removed", "changes/public-13.none")],
+            &[],
+        );
+        assert!(ok, "{out}");
         let (ok, out) = check(
             "public-fold",
             "302",

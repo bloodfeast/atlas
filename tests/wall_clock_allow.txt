@@ -27,6 +27,8 @@
 9 elapsed tests/adversarial/parsers.rs -- a wall-time bound on work (perf claim); to become a count of work done
 2 elapsed tests/adversarial/queries.rs -- a wall-time bound on work (perf claim); to become a count of work done
 4 sleep tests/atlas.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+5 elapsed tests/gate_timing.rs -- an ignored measure that prints times (#416); asserts nothing
+2 sleep tests/gate_timing.rs -- an ignored measure's lock holder, holding another writer's lock in bursts (#416); asserts nothing
 1 elapsed tests/calibrate.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 2 sleep tests/calibrate.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 1 elapsed tests/code.rs -- a give-up bound on a poll for an event (outcome fixed unless it hangs); to become a readiness signal
@@ -38,7 +40,7 @@
 1 timeout tests/concurrency.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
 2 sleep tests/db_busy_handler.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 1 sleep tests/handles.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
-5 elapsed tests/hook_budget.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
+6 elapsed tests/hook_budget.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
 1 sleep tests/hook_budget.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
 1 timeout tests/hook_budget.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
 9 sleep tests/hooks.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock

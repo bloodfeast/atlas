@@ -226,6 +226,9 @@ pub struct Settings {
     pub transcripts: bool,
     /// The resume card at a new or cleared session (`memory.resume_card`).
     pub resume_card: bool,
+    /// Days after which an open question is flagged stale
+    /// (`memory.question_stale_days`, default [`crate::questions::STALE_DAYS`]).
+    pub question_stale_days: i64,
     /// Idea capture and its surfaces (`memory.ideas`), off by default.
     pub ideas: crate::ideas::IdeaSettings,
     /// The active project's repositories and links, when there is one.
@@ -237,6 +240,9 @@ pub struct Settings {
     pub trackers: Option<crate::trackers::Settings>,
     /// Worktree gc (`worktrees`; see [`crate::worktree_gc`]).
     pub worktrees: crate::worktree_gc::GcSettings,
+    /// The `pr_events` section, for the SessionStart auto-start
+    /// ([`crate::pr_autostart`]); `None` when absent or not valid.
+    pub pr_events: Option<crate::pr_listen::Settings>,
 }
 
 /// The default relevance floor: the negated bm25 a record needs. Derived by
@@ -412,11 +418,17 @@ impl Settings {
             user_state: m.user_state.clone(),
             transcripts: m.transcripts.unwrap_or(false),
             resume_card: m.resume_card.unwrap_or(true),
+            question_stale_days: m.question_stale_days.and_then(|d| i64::try_from(d).ok()).unwrap_or(crate::questions::STALE_DAYS),
             ideas: m.ideas.clone().unwrap_or_default(),
             graph: None,
             tree: m.tree.clone(),
             trackers: c.and_then(|c| crate::trackers::Settings::from_config(c.trackers.as_ref()).ok().flatten()),
             worktrees: crate::worktree_gc::GcSettings::from_spec(c.and_then(|c| c.worktrees.as_ref())),
+            // `.ok()` drops nothing a loaded configuration holds: loading
+            // rejects a `pr_events` section that is not valid, with the
+            // message (autostart without a port included), so no session
+            // runs on one in silence.
+            pr_events: c.and_then(|c| c.pr_events.as_ref()).and_then(|v| crate::pr_listen::Settings::from_config(Some(v)).ok()),
         })
     }
 

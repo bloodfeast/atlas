@@ -221,9 +221,25 @@ pub fn target(tool: &str, input: &Value) -> String {
     cut(&crate::redact::redact(first), TARGET_CHARS).replace('\\', "/")
 }
 
+/// Whether `path` is a subagent's own transcript (`agent-<id>.jsonl`, in
+/// `<session>/subagents/` or, written by older Claude Code, beside the
+/// session's). Every record there is marked `"isSidechain":true`, the
+/// compaction boundaries too: they are its main chain, not another's.
+pub fn own_sidechain(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("agent-") && n.ends_with(".jsonl"))
+}
+
+/// Whether a transcript record is another agent's, to be skipped: marked
+/// sidechain in a transcript that is not a subagent's own (`own`, see
+/// [`own_sidechain`]).
+pub(crate) fn foreign(raw: &[u8], own: bool) -> bool {
+    !own && crate::scan::find(raw, b"\"isSidechain\":true").is_some()
+}
+
 /// Reads a transcript's segment since its last compaction boundary.
-/// Subagent (sidechain) records are skipped. Fails open: an unreadable file
-/// is an empty tail.
+/// Subagent (sidechain) records are skipped, unless the transcript is a
+/// subagent's own ([`own_sidechain`]). Fails open: an unreadable file is
+/// an empty tail.
 ///
 /// Only the segment is read, once, and parsed: the newest boundary is found
 /// by reading back from the end, and the bytes before it are never read
@@ -234,11 +250,28 @@ pub fn tail(path: &Path, session: &str) -> Tail {
     // The record after the newest boundary starts the segment: a main-chain
     // record whose subtype is compact_boundary, as `segments` reads it (the
     // bare word may sit in any field, a Grep pattern for one).
-    let (from, len) = match last_line_span(path, u64::MAX, "\"compact_boundary\"", is_boundary) {
+    let own = own_sidechain(path);
+    let (from, len) = match last_line_span(path, u64::MAX, "\"compact_boundary\"", |l| is_boundary(l, own)) {
         Some((_, end, len)) => ((end + 1).min(len), len),
         None => (0, std::fs::metadata(path).map_or(0, |m| m.len())),
     };
     scan_file(path, from, len, session).unwrap_or_default()
+}
+
+/// The segment a transcript's newest compaction boundary closed: from the
+/// boundary before it (or the file's start) to that boundary, what a
+/// checkpoint written after the compaction covers (#295's fallback, when a
+/// subagent's compaction came with no PreCompact). With no boundary it is
+/// [`tail`]. Also returns where the segment ends (the boundary's byte
+/// offset, or the file's length). Never waits: the records before a
+/// boundary are written. Fails open: an unreadable file is an empty tail.
+pub fn closed(path: &Path, session: &str) -> (Tail, u64) {
+    let own = own_sidechain(path);
+    let Some((start, _, _)) = last_line_span(path, u64::MAX, "\"compact_boundary\"", |l| is_boundary(l, own)) else {
+        return (tail(path, session), std::fs::metadata(path).map_or(0, |m| m.len()));
+    };
+    let from = line_span_before(path, start, u64::MAX, "\"compact_boundary\"", |l| is_boundary(l, own)).map_or(0, |(_, end, _)| end + 1);
+    (scan_file(path, from.min(start), start, session).unwrap_or_default(), start)
 }
 
 /// [`scan`] over bytes `from` to `len` of a file, streamed through one
@@ -249,7 +282,7 @@ fn scan_file(path: &Path, from: u64, len: u64, session: &str) -> Option<Tail> {
     let mut f = std::fs::File::open(path).ok()?;
     f.seek(SeekFrom::Start(from)).ok()?;
     let mut r = f.take(len.saturating_sub(from));
-    let mut s = Scanner::default();
+    let mut s = Scanner { own: own_sidechain(path), ..Scanner::default() };
     let mut buf = vec![0u8; 4 << 20];
     // `buf[..have]` holds the file from byte `at`, ending in a partial line.
     let (mut have, mut at) = (0usize, from);
@@ -288,7 +321,7 @@ fn scan_file(path: &Path, from: u64, len: u64, session: &str) -> Option<Tail> {
 /// the deferral's window guess ([`window`]) reads. [`tail`] leaves it out,
 /// since it means reading the whole session.
 pub fn history_max_context(path: &Path) -> u64 {
-    std::fs::read(path).map_or(0, |b| max_context(&String::from_utf8_lossy(&b)))
+    std::fs::read(path).map_or(0, |b| max_context(&String::from_utf8_lossy(&b), own_sidechain(path)))
 }
 
 /// The newest whole line of a file that holds `needle` and that `accept`
@@ -315,6 +348,12 @@ pub(crate) fn last_line_where(path: &Path, cap: u64, needle: &str, accept: impl 
 /// rarest letter. (Decoding every line, and growing one buffer as the
 /// search went back, cost 130 ms over a 57 MB segment.)
 pub(crate) fn last_line_span(path: &Path, cap: u64, needle: &str, accept: impl Fn(&str) -> bool) -> Option<(u64, u64, u64)> {
+    line_span_before(path, u64::MAX, cap, needle, accept)
+}
+
+/// [`last_line_span`] over the occurrences of `needle` that start before
+/// byte `before` only.
+fn line_span_before(path: &Path, before: u64, cap: u64, needle: &str, accept: impl Fn(&str) -> bool) -> Option<(u64, u64, u64)> {
     // The first block is small (a boundary is often near the end: the
     // SessionStart after a compaction), later ones up to 4 MiB.
     const BLOCK: u64 = 4 << 20;
@@ -328,7 +367,7 @@ pub(crate) fn last_line_span(path: &Path, cap: u64, needle: &str, accept: impl F
     let floor = len.saturating_sub(cap);
     let mut buf = vec![0u8; BLOCK as usize + n.len()];
     // Every occurrence starting at or past `hi` has been judged.
-    let mut hi = len;
+    let mut hi = len.min(before);
     while hi > floor {
         // The block holds every occurrence that starts in [from, hi) whole.
         let from = hi.saturating_sub(size).max(floor);
@@ -435,10 +474,13 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Whether a transcript line is a compaction boundary of the main chain.
-fn is_boundary(line: &str) -> bool {
+/// Whether a transcript line is a compaction boundary of the main chain:
+/// its own subtype, not the word in a field (a Grep pattern for it). A
+/// sidechain boundary is one only in a subagent's own transcript (`own`,
+/// see [`own_sidechain`]).
+pub(crate) fn is_boundary(line: &str, own: bool) -> bool {
     line.contains("\"compact_boundary\"")
-        && !line.contains("\"isSidechain\":true")
+        && !foreign(line.as_bytes(), own)
         && crate::json::parse(line.trim_end()).is_ok_and(|v| v.get("subtype").and_then(Value::as_str) == Some("compact_boundary"))
 }
 
@@ -478,7 +520,9 @@ pub fn tail_settled(path: &Path, session: &str, wait: std::time::Duration) -> (T
         }
         std::thread::sleep(SETTLE_STEP);
     }
-    if let Some(p) = parent_transcript(path) {
+    // A subagent's transcript is never forked: the other files beside it
+    // are its siblings' (review N2 of #391).
+    if let Some(p) = parent_transcript(path).filter(|_| !own_sidechain(path)) {
         let stem = p.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
         let t = tail(&p, &stem);
         if has_usage(&t) {
@@ -543,9 +587,9 @@ fn hours_before(until: &str, hours: i64) -> String {
 }
 
 /// The largest context a text of transcript records shows.
-fn max_context(text: &str) -> u64 {
+fn max_context(text: &str, own: bool) -> u64 {
     let mut best = 0;
-    for line in text.lines().filter(|l| l.contains("\"usage\"") && !l.contains("\"isSidechain\":true")) {
+    for line in text.lines().filter(|l| l.contains("\"usage\"") && !foreign(l.as_bytes(), own)) {
         if let Ok(v) = crate::json::parse(line) {
             best = best.max(usage_ctx(&v).unwrap_or(0));
         }
@@ -563,7 +607,13 @@ pub fn usage_ctx(v: &Value) -> Option<u64> {
 /// Scans transcript records (`segment`, which starts at byte `offset` of
 /// the file) for the tail state.
 pub fn scan(segment: &[u8], offset: u64, session: &str) -> Tail {
-    let mut s = Scanner::default();
+    scan_in(segment, offset, session, false)
+}
+
+/// [`scan`] of a transcript that is a subagent's own when `own`
+/// ([`own_sidechain`]).
+fn scan_in(segment: &[u8], offset: u64, session: &str, own: bool) -> Tail {
+    let mut s = Scanner { own, ..Scanner::default() };
     let mut next = 0usize;
     while next < segment.len() {
         let start = next;
@@ -592,6 +642,9 @@ struct Scanner {
     /// The segment's active goal, read by the parser resume shares
     /// ([`crate::resume::goal_event`]).
     goal: Goal,
+    /// The transcript is a subagent's own: its sidechain records are read
+    /// ([`own_sidechain`]).
+    own: bool,
 }
 
 /// Whether an assistant line is about the compaction or the handoff
@@ -672,10 +725,10 @@ impl Scanner {
                 return;
             }
         }
-        let line = String::from_utf8_lossy(raw);
-        if line.contains("\"isSidechain\":true") {
+        if foreign(raw, self.own) {
             return;
         }
+        let line = String::from_utf8_lossy(raw);
         // A prefilter only: the text can sit nested in any record (a tool
         // result quoting a transcript), so the parsed type decides.
         let goal = line.contains(GOAL_CMD) || line.contains("\"goal_status\"");
@@ -1018,7 +1071,16 @@ pub fn by_hook(h: &Head) -> bool {
 ///
 /// [`crate::Error::Db`].
 pub fn newest(store: &MemoryStore, session: &str) -> Result<Option<Head>> {
-    Ok(store.lane(&format!("session:{session}"))?.into_iter().rev().find(by_hook))
+    newest_on(store, &format!("session:{session}"))
+}
+
+/// [`newest`] on any lane: a subagent's `agent:<id>` (#295).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn newest_on(store: &MemoryStore, lane: &str) -> Result<Option<Head>> {
+    Ok(store.lane(lane)?.into_iter().rev().find(by_hook))
 }
 
 /// How long after its SessionEnd a /clear checkpoint is still the one the
@@ -1165,14 +1227,15 @@ pub struct Curve {
 /// oldest first, with the boundary's time.
 pub fn segments(path: &Path, session: &str) -> Vec<(String, Tail)> {
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let own = own_sidechain(path);
     let mut out = Vec::new();
     let (mut seg_start, mut pos) = (0usize, 0usize);
     for line in bytes.split_inclusive(|&b| b == b'\n') {
         if find_from(line, b"\"compact_boundary\"", 0).is_some() {
             let text = String::from_utf8_lossy(line);
-            if is_boundary(&text) {
+            if is_boundary(&text, own) {
                 let time = crate::json::parse(text.trim_end()).ok().and_then(|v| v.get("timestamp").and_then(Value::as_str).map(str::to_string)).unwrap_or_default();
-                out.push((time, scan(&bytes[seg_start..pos], seg_start as u64, session)));
+                out.push((time, scan_in(&bytes[seg_start..pos], seg_start as u64, session, own)));
                 seg_start = pos + line.len();
             }
         }
@@ -1554,7 +1617,7 @@ mod tests {
         lines.push(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t9","content":"no match"}]}}"#.to_string());
         let text = lines.join("\n") + "\n";
         std::fs::write(&p, &text).unwrap();
-        let (at, rest) = last_line_where(&p, u64::MAX, "\"compact_boundary\"", is_boundary).unwrap();
+        let (at, rest) = last_line_where(&p, u64::MAX, "\"compact_boundary\"", |l| is_boundary(l, false)).unwrap();
         assert_eq!(at as usize, text.find(boundary).unwrap());
         assert!(rest.starts_with(boundary.as_bytes()));
         let t = tail(&p, "s");
@@ -1563,7 +1626,7 @@ mod tests {
         assert_eq!(t, scan(seg.as_bytes(), (text.len() - seg.len()) as u64, "s"), "the segment starts past the boundary's line");
         let result_at = text.rfind("{\"type\":\"user\"").unwrap();
         assert!(t.steps[0].result.as_deref().is_some_and(|r| r.starts_with(&format!("turn:s:b{result_at}@"))), "{:?}", t.steps);
-        assert!(last_line_where(&p, 300, "\"compact_boundary\"", is_boundary).is_none());
+        assert!(last_line_where(&p, 300, "\"compact_boundary\"", |l| is_boundary(l, false)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1761,5 +1824,41 @@ mod tests {
         let b = body(&s, &t, 160);
         assert!(b.starts_with("open: journal:L:0001@aaaaaaaaaaaa\nowed: journal:L:0002@bbbbbbbbbbbb\nfiles: src/card_agents.rs\nagents: "), "{b}");
         assert!(b.len() <= 160, "{b}");
+    }
+
+    /// Review M1/M2 of #391: a subagent's own transcript marks every record
+    /// sidechain; there they are read, boundaries included, and [`closed`]
+    /// reads the segment between the last two boundaries. Elsewhere a
+    /// sidechain record is still another agent's.
+    #[test]
+    fn a_subagents_own_sidechain_records_are_its_main_chain() {
+        let side = |l: String| l.replacen('{', "{\"isSidechain\":true,", 1);
+        let b = r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto","preTokens":100}}"#.to_string();
+        let lines = [
+            rec("assistant", "m1", r#"[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/one.rs"}}]"#, 10000),
+            b.clone(),
+            rec("assistant", "m2", r#"[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"src/two.rs"}}]"#, 20000),
+            rec("assistant", "m3", r#"[{"type":"tool_use","id":"t3","name":"Grep","input":{"pattern":"compact_boundary"}}]"#, 21000),
+            b,
+            rec("assistant", "m4", r#"[{"type":"tool_use","id":"t4","name":"Read","input":{"file_path":"src/three.rs"}}]"#, 3000),
+        ];
+        let text = lines.map(side).join("\n") + "\n";
+        let dir = std::env::temp_dir().join(format!("atlas-ckpt-own-side-{}", std::process::id()));
+        let sub = dir.join("s").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (own, other) = (sub.join("agent-a9f3.jsonl"), dir.join("s.jsonl"));
+        std::fs::write(&own, &text).unwrap();
+        std::fs::write(&other, &text).unwrap();
+        assert!(own_sidechain(&own) && !own_sidechain(&other));
+        let ids = |t: &Tail| t.steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        let t = tail(&own, "s");
+        assert_eq!((ids(&t), t.last_ctx), (vec!["t4".to_string()], 3000));
+        let (c, at) = closed(&own, "s");
+        assert_eq!(ids(&c), ["t2", "t3"], "between the boundaries");
+        assert_eq!(c.last_ctx, 21000);
+        assert_eq!(at as usize, text.rfind("{\"isSidechain\":true,\"type\":\"system\"").unwrap());
+        // In a session's transcript the same records are another agent's.
+        assert!(tail(&other, "s").steps.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -257,12 +257,15 @@ fn a_slow_gh_still_denies_the_merge_within_the_budget() {
     assert!(a.deny.is_none(), "{:?}", a.deny);
 }
 
-/// Review B1 of #329: the answer given for a hook cut at its budget refuses
-/// every call a gate could refuse, and passes the rest through.
+/// Review B1 of #329, narrowed by #416: the answer given for a hook cut at
+/// its budget refuses a launch, a resume and a merge, naming the slow
+/// phase; a subagent's other calls go ahead with a line saying the check
+/// was skipped; the rest pass through.
 #[test]
-fn an_overrun_answer_refuses_what_a_gate_could_refuse() {
+fn an_overrun_answer_refuses_launches_and_merges_only() {
     let limit = Duration::from_millis(3_000);
-    let deny = |ev: &HookEvent| atlas::hooks::overrun_answer(ev, limit).contains(atlas::hooks::GATE_OVERRUN);
+    let why = "phase cap 2900 ms";
+    let deny = |ev: &HookEvent| atlas::hooks::overrun_answer(ev, limit, why).contains(atlas::hooks::GATE_OVERRUN);
     let pre = |tool: &str, agent: &str, input: Value| HookEvent {
         event: "PreToolUse".into(),
         tool_name: tool.into(),
@@ -277,13 +280,31 @@ fn an_overrun_answer_refuses_what_a_gate_could_refuse() {
         pre("Agent", "", json!({"prompt": "Kind: builder"})),
         pre("Task", "", json!({})),
         pre("SendMessage", "", json!({"to": "a1"})),
-        // A subagent's tools: the context cap, and the hand-back's backstop.
-        pre("Read", "a1", json!({})),
-        pre("SubagentHandback", "a1", json!({"message": "done"})),
+        // A subagent's launch and merge stay refused.
+        pre("Agent", "a1", json!({"prompt": "Kind: builder"})),
+        pre("Bash", "a1", json!({"command": "gh pr merge 3"})),
     ];
     for ev in &gated {
+        let a = atlas::hooks::overrun_answer(ev, limit, why);
         assert!(deny(ev), "{ev:?}");
-        assert!(atlas::hooks::overrun_answer(ev, limit).contains("\"permissionDecision\":\"deny\""), "{ev:?}");
+        assert!(a.contains("\"permissionDecision\":\"deny\""), "{ev:?}");
+        // The reason names the slow phase and its time (#416).
+        assert!(a.contains("slow: phase cap 2900 ms") && a.contains("retry the call"), "{a}");
+    }
+    // A subagent's other gated calls fail open (#416): the context cap and
+    // the hand-back's backstop are skipped once, with a line saying so.
+    let skipped = [
+        pre("Read", "a1", json!({"file_path": "/a.rs"})),
+        pre("Bash", "a1", json!({"command": "echo ok"})),
+        pre("mcp__atlas__recall", "a1", json!({"op": "status"})),
+        pre("SubagentHandback", "a1", json!({"message": "done"})),
+    ];
+    for ev in &skipped {
+        let a = atlas::hooks::overrun_answer(ev, limit, why);
+        assert!(!a.contains("\"permissionDecision\""), "{ev:?}: {a}");
+        let v = json::parse(&a).unwrap_or_else(|e| panic!("{e}: {a}"));
+        let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
+        assert!(ctx.contains(atlas::hooks::GATE_SKIPPED) && ctx.contains("slow: phase cap 2900 ms") && ctx.contains("checked again"), "{a}");
     }
     let open = [
         merge_ev("gh pr view 99"),
@@ -324,12 +345,40 @@ fn a_session_start_spent_in_the_queue_is_still_recorded() {
         transcript_path: transcript.to_string_lossy().into_owned(),
         ..Default::default()
     };
-    h.handle_from(&ev, Instant::now() - Duration::from_secs(2));
+    // Past even SessionStart's longer budget (#333 item 2).
+    h.handle_from(&ev, Instant::now() - Duration::from_millis(atlas::hook_budget::LONG_MS + 1_000));
     assert_eq!(h.starts_owed(), 0);
     let store = atlas::memory::MemoryStore::open(&s.store).unwrap();
     assert!(atlas::orchestrate::session_start(&store, "s5").unwrap().is_some(), "the start was lost");
     // The session is noted for the agent cap from it.
     assert!(h.session_opened(&ev.transcript_path).is_some());
+}
+
+/// #333 item 2: SessionStart has the longer budget
+/// ([`atlas::hook_budget::LONG_MS`]); a prompt that waited as long is cut.
+#[test]
+fn a_session_start_has_a_longer_budget() {
+    let t = Temp::new("hook-budget-per-event");
+    let s = settings(t.path(), Duration::from_millis(200));
+    let mut h = Hooks::open(s).unwrap();
+    let transcript = t.path().join("sess.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    let ev = |event: &str| HookEvent {
+        event: event.into(),
+        session_id: "s9".into(),
+        source: "startup".into(),
+        trigger: "manual".into(),
+        prompt: "what is the widget cache".into(),
+        transcript_path: transcript.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let waited = Instant::now() - Duration::from_secs(2);
+    // PreCompact enters no phase; its longer budget is the watchdog's
+    // (protocol's `the_watchdog_waits_the_per_event_budget`).
+    let a = h.handle_from(&ev("SessionStart"), waited);
+    assert!(!a.context.contains("hook time budget"), "{}", a.context);
+    let a = h.handle_from(&ev("UserPromptSubmit"), waited);
+    assert!(a.context.contains("hook time budget (200 ms) spent"), "{}", a.context);
 }
 
 /// Review S2 of #329: once a deferred start is written, the agent cap
@@ -404,7 +453,114 @@ fn a_command_hook_past_its_budget_answers_and_exits() {
     assert!(took < Duration::from_millis(4_000), "{took:?}");
     let v = json::parse(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout:?}"));
     assert_eq!(v["hookSpecificOutput"]["permissionDecision"].as_str(), Some("deny"), "{stdout}");
-    assert_eq!(v["hookSpecificOutput"]["permissionDecisionReason"].as_str(), Some(atlas::hooks::GATE_OVERRUN), "{stdout}");
+    let reason = v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap_or("");
+    assert!(reason.starts_with(atlas::hooks::GATE_OVERRUN) && reason.contains("slow: phase "), "{stdout}");
+    // A subagent's plain shell call past the budget goes ahead (#416).
+    let (ok, stdout, _) = run(
+        json!({"hook_event_name": "PreToolUse", "session_id": "s-cmd", "agent_id": "a1", "cwd": cwd, "tool_name": "Bash", "tool_input": {"command": "echo ok"}}),
+    );
+    assert!(ok && !stdout.contains("permissionDecision") && stdout.contains(atlas::hooks::GATE_SKIPPED), "{stdout}");
     let (ok, stdout, _) = run(json!({"hook_event_name": "UserPromptSubmit", "session_id": "s-cmd", "cwd": cwd, "prompt": "a prompt"}));
     assert!(ok && stdout.contains("hook time budget (300 ms) spent; skipped: the whole answer"), "{stdout}");
+}
+
+/// #333 item 1: an edit's re-index that another writer's lock refused after
+/// the answer is kept owed and done after a later answer, not dropped.
+#[test]
+fn a_reindex_refused_by_the_lock_stays_owed() {
+    let t = Temp::new("hook-budget-reindex");
+    let s = settings(t.path(), Duration::from_millis(3_000));
+    let root = t.path().join("app");
+    write(&root.join("src/a.rs"), "pub struct A;\n");
+    let notes = t.path().join("notes");
+    write(&notes.join("n.md"), "# N\n");
+    drop(atlas::store::Store::open(&s.index_db, atlas::paths::Vaults::new(&[("notes".to_string(), notes.clone())]).unwrap()).unwrap());
+    let spec = atlas::config::CodeSpec {
+        roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: root.clone(), build_scripts: false, scip: Default::default(), exclude: Vec::new() }],
+        ..Default::default()
+    };
+    let code = atlas::code::CodeSetup::from_spec(&spec, &s.index_db, false);
+    let mut conn = atlas::db::Connection::open(&s.index_db).unwrap();
+    atlas::code_index::index_root(&code, &mut conn, &code.roots[0], &atlas::code_index::RustSource::ScanOnly("test".into())).unwrap();
+    let mut h = Hooks::open(s.clone()).unwrap();
+    let a = root.join("src/a.rs");
+    std::fs::write(&a, "pub struct A;\n\npub fn two() -> u32 {\n    2\n}\n").unwrap();
+    let path = a.to_string_lossy().into_owned();
+    let edit = HookEvent {
+        event: "PostToolUse".into(),
+        session_id: "s1".into(),
+        tool_name: "Edit".into(),
+        tool_input: json!({"file_path": path, "old_string": "x", "new_string": "y"}),
+        ..HookEvent::default()
+    };
+    h.handle(&edit);
+    // The server's work after an answer waits on a lock for AFTER_WAIT.
+    let holder = atlas::db::Connection::open(&s.index_db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    {
+        let _wait = atlas::hook_budget::Active::until(Instant::now() + atlas::hook_budget::AFTER_WAIT);
+        h.after();
+    }
+    assert_eq!(h.reindex_owed(), 1, "the refused re-index was dropped");
+    holder.execute_batch("ROLLBACK").unwrap();
+    h.after();
+    assert_eq!(h.reindex_owed(), 0);
+    let v = atlas::code::symbol(&conn, "two", atlas::code::Limits { defs: 5, refs: 5, impls: 5 }).unwrap();
+    assert_eq!(v.totals[0], 1, "the edit was re-indexed once the lock was gone");
+}
+
+/// #333 item 1: opening the index store (a Markdown rescan after a hook's
+/// answer) gives up at the active deadline, not after its own 30 s.
+#[test]
+fn opening_the_index_store_stops_at_the_active_deadline() {
+    let t = Temp::new("hook-budget-open");
+    let db = t.path().join("state").join("index.sqlite");
+    let notes = t.path().join("notes");
+    write(&notes.join("n.md"), "# N\n");
+    let vaults = || atlas::paths::Vaults::new(&[("notes".to_string(), notes.clone())]).unwrap();
+    drop(atlas::store::Store::open(&db, vaults()).unwrap());
+    let holder = atlas::db::Connection::open(&db).unwrap();
+    holder.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE").unwrap();
+    let t0 = Instant::now();
+    let r = {
+        let _wait = atlas::hook_budget::Active::until(Instant::now() + atlas::hook_budget::AFTER_WAIT);
+        atlas::store::Store::open(&db, vaults()).map(drop)
+    };
+    let took = t0.elapsed();
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert!(took < Duration::from_secs(2), "{took:?} ({r:?})");
+}
+
+/// #333 item 2: `atlas --hook` for a SessionStart waits its longer budget,
+/// so a slow first open (a 1 s stall, past the 300 ms of every other hook)
+/// still answers with the work, not the overrun line.
+#[test]
+fn a_command_session_start_waits_its_longer_budget() {
+    use std::process::{Command, Stdio};
+    let t = Temp::new("hook-budget-cmd-start");
+    write(&t.path().join("vault").join("Index.md"), "# Index\n");
+    let cfg = t.path().join("atlas.json");
+    write(
+        &cfg,
+        r#"{"db": "state/atlas.sqlite", "vaults": [{"name": "notes", "path": "vault"}], "models": {"auto_download": false, "files": []}, "hooks": {"budget_ms": 300}}"#,
+    );
+    let mut child = Command::new(bin())
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--hook")
+        .env("ATLAS_TEST_HOOK_STALL_MS", "1000")
+        .env_remove("ATLAS_HOOK_BUDGET_OFF")
+        .current_dir(t.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let cwd = t.path().to_string_lossy().into_owned();
+    let ev = json!({"hook_event_name": "SessionStart", "session_id": "s-cmd-start", "cwd": cwd, "source": "startup"});
+    child.stdin.take().unwrap().write_all(ev.to_string().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(!stdout.contains("hook time budget"), "{stdout}");
 }

@@ -235,25 +235,47 @@ fn normalise(id: &str) -> String {
     m.strip_suffix("[1m]").unwrap_or(&m).to_string()
 }
 
+/// The family of a normalised model id: the first of [`FAMILIES`] it contains.
+fn family_of(m: &str) -> Option<&'static str> {
+    FAMILIES.iter().find(|f| m.contains(*f)).copied()
+}
+
+/// The key of `keys` that `model` matches, both normalised ([`normalise`]):
+/// an exact id key first, else the first key that is the model's family
+/// alias (`haiku`, `opus`, `sonnet`, `fable`). How `compact.model_windows`
+/// and `orchestrate.kinds.<kind>.models` are matched (#195, #403).
+pub fn match_model<'a>(model: &str, keys: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let m = normalise(model);
+    let family = family_of(&m);
+    let mut alias = None;
+    for k in keys {
+        let n = normalise(k);
+        if n == m {
+            return Some(k);
+        }
+        if alias.is_none() && family == Some(n.as_str()) {
+            alias = Some(k);
+        }
+    }
+    alias
+}
+
 /// The context window of `model` (#195, rulings ATLAS-VERSION 0014 and
 /// 0016). Keys of `overrides` (`compact.model_windows`) and the id are
 /// both normalised ([`normalise`]): an exact id key wins, then a family
 /// alias key (`haiku`, `opus`, `sonnet`, `fable`) matching any id of that
-/// family. Else by family: a `haiku` model is 200k, an `opus`, `sonnet` or
-/// `fable` one has `inferred` ([`crate::orchestrate::inferred_window`]).
+/// family. Else by family: a Haiku of generation 4 or older is 200k; any
+/// other `haiku`, `opus`, `sonnet` or `fable` one (Haiku 5.5 ran past 200k
+/// in Claude Code, #403) has `inferred` ([`crate::orchestrate::inferred_window`]).
 /// `None` for any other model, or a family whose inferred window is
 /// unknown (0).
 pub fn model_window(model: &str, overrides: &std::collections::BTreeMap<String, u64>, inferred: u64) -> Option<u64> {
+    if let Some(k) = match_model(model, overrides.keys().map(String::as_str)) {
+        return overrides.get(k).copied();
+    }
     let m = normalise(model);
-    let keyed = || overrides.iter().map(|(k, w)| (normalise(k), *w));
-    if let Some((_, w)) = keyed().find(|(k, _)| *k == m) {
-        return Some(w);
-    }
-    let family = FAMILIES.iter().find(|f| m.contains(*f))?;
-    if let Some((_, w)) = keyed().find(|(k, _)| k == family) {
-        return Some(w);
-    }
-    if *family == "haiku" {
+    let family = family_of(&m)?;
+    if family == "haiku" && ["haiku-3", "haiku-4", "3-haiku", "3-5-haiku"].iter().any(|g| m.contains(g)) {
         Some(200_000)
     } else {
         (inferred > 0).then_some(inferred)
@@ -420,6 +442,23 @@ mod tests {
         assert_eq!(model_window("gpt-x", &none, 1_000_000), None);
         let o: std::collections::BTreeMap<String, u64> = [("gpt-x".to_string(), 128_000)].into_iter().collect();
         assert_eq!(model_window("gpt-x", &o, 1_000_000), Some(128_000));
+    }
+
+    /// #403: Haiku 5.5 runs past 200k in Claude Code (local subagent
+    /// transcripts of 2026-11-13 reach 298,266 context tokens on
+    /// `claude-haiku-5-5`, none compacted or refused), so a Haiku id after
+    /// generation 4, and the bare `haiku` alias, take the inferred window;
+    /// the older Haikus keep 200k.
+    #[test]
+    fn a_current_haiku_has_the_inferred_window_and_older_ones_200k() {
+        let none = std::collections::BTreeMap::new();
+        assert_eq!(model_window("claude-haiku-5-5", &none, 1_000_000), Some(1_000_000));
+        assert_eq!(model_window("haiku", &none, 1_000_000), Some(1_000_000), "the meta file's alias");
+        assert_eq!(model_window("claude-haiku-5-5", &none, 200_000), Some(200_000), "1M context off");
+        assert_eq!(model_window("claude-haiku-5-5", &none, 0), None, "an unknown inferred window");
+        for old in ["claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022", "claude-3-haiku-20240307"] {
+            assert_eq!(model_window(old, &none, 1_000_000), Some(200_000), "{old}");
+        }
     }
 
     /// S1 of the #205 review (ruling ATLAS-VERSION 0016): ids and keys are

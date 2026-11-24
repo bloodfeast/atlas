@@ -95,7 +95,27 @@ pub fn card(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &st
 ///
 /// [`crate::Error::Db`].
 pub fn card_with(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, cleared: bool, ideas: Option<&str>) -> Result<Option<String>> {
-    build(store, orch, transcript, now, cleared, ideas, CARD_BYTES)
+    build(store, orch, transcript, now, cleared, Opts { ideas, stale_days: crate::questions::STALE_DAYS, budget: CARD_BYTES })
+}
+
+/// [`card_with`] with open questions flagged stale past `stale_days`
+/// (`memory.question_stale_days`).
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn card_stale_after(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, cleared: bool, ideas: Option<&str>, stale_days: i64) -> Result<Option<String>> {
+    build(store, orch, transcript, now, cleared, Opts { ideas, stale_days, budget: CARD_BYTES })
+}
+
+/// The card's tunables.
+struct Opts<'a> {
+    /// The pending ideas' line.
+    ideas: Option<&'a str>,
+    /// Days after which an open question is stale.
+    stale_days: i64,
+    /// The card's bytes.
+    budget: usize,
 }
 
 /// [`card`] in `budget` bytes, for the gate's test in xtask.
@@ -105,10 +125,11 @@ pub fn card_with(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now
 /// [`crate::Error::Db`].
 #[cfg(feature = "dev")]
 pub fn card_within(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, cleared: bool, budget: usize) -> Result<Option<String>> {
-    build(store, orch, transcript, now, cleared, None, budget)
+    build(store, orch, transcript, now, cleared, Opts { ideas: None, stale_days: crate::questions::STALE_DAYS, budget })
 }
 
-fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, cleared: bool, ideas: Option<&str>, budget: usize) -> Result<Option<String>> {
+fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, cleared: bool, opts: Opts<'_>) -> Result<Option<String>> {
+    let Opts { ideas, stale_days, budget } = opts;
     let prev = previous_transcript(Path::new(transcript));
     let mut lines: Vec<String> = Vec::new();
 
@@ -121,7 +142,14 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
         .map(|l| (l.lane, l.last_work))
         .collect();
     live.sort_by(|a, b| b.1.cmp(&a.1));
-    let questions: Vec<(String, String, String)> = store.open_questions()?.into_iter().filter(|(l, _, _)| live.iter().any(|(x, _)| x == l)).collect();
+    let all_qs: Vec<crate::questions::Question> = crate::questions::open(store)?.into_iter().filter(|q| live.iter().any(|(x, _)| x == &q.lane)).collect();
+    // The card is built at a main session's start (#406): a defer until the
+    // next session written before now is due.
+    let start = crate::checkpoint::epoch_secs(now).max(crate::questions::last_start(store)?);
+    let state = |q: &crate::questions::Question| q.state(now, start);
+    let questions: Vec<(String, String, String)> =
+        all_qs.iter().filter(|q| state(q) == crate::questions::State::Open).map(|q| (q.lane.clone(), q.key.clone(), q.title.clone())).collect();
+    let deferred = all_qs.iter().filter(|q| state(q) == crate::questions::State::Deferred).count();
     let mut named: Vec<&str> = Vec::new();
     if !live.is_empty() {
         let shown: Vec<String> = live
@@ -143,9 +171,30 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
         lines.push(format!("- live lanes{}: {}", more(live.len(), MAX_LANES), shown.join("; ")));
     }
 
-    if !questions.is_empty() {
-        let shown: Vec<&str> = questions.iter().take(MAX_QUESTIONS).map(|(_, k, _)| k.as_str()).collect();
+    if !questions.is_empty() || deferred > 0 {
+        // Only a stale question carries its age: the line is as it was when
+        // none is stale or deferred.
+        let mut shown: Vec<String> = all_qs
+            .iter()
+            .filter(|q| state(q) == crate::questions::State::Open)
+            .take(MAX_QUESTIONS)
+            .map(|q| match q.age_days(now).filter(|_| q.stale(now, start, stale_days)) {
+                Some(d) => format!("{} ({d}d, stale)", q.key),
+                None => q.key.clone(),
+            })
+            .collect();
+        if deferred > 0 {
+            shown.push(format!("+{deferred} deferred (recall op=deferred)"));
+        }
         lines.push(format!("- open questions for the user{}: {}", more(questions.len(), MAX_QUESTIONS), shown.join(", ")));
+    }
+    let due = crate::questions::due_line(&all_qs, now, start, MAX_QUESTIONS);
+    if !due.is_empty() {
+        lines.push(due);
+    }
+    let settled = crate::questions::sweep(store, &all_qs, now, start, stale_days)?.len();
+    if settled > 0 {
+        lines.push(format!("- {settled} question{} settled: recall op=sweep", if settled == 1 { " looks" } else { "s look" }));
     }
 
     // Only a cleared session's process still runs the previous session's

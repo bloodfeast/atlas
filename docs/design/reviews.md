@@ -89,10 +89,13 @@ runs. A store error fails open and is logged as a miss.
 
 ## 4. Not done here
 
-- The threat model: the gate stops a forgotten review, not an evasive agent. It does not see a merge that lands
-  without `gh pr merge` (`git push origin HEAD:main`, `gh api -X PUT repos/O/R/pulls/N/merge`), nor one inside a
-  quoted script (`bash -c "gh pr merge 99"`, `pwsh -Command "..."`). A local `git merge` is left alone on purpose,
-  since the verify scripts merge onto origin/main locally.
+- The threat model: the gate stops a forgotten review, not an evasive agent. Since #333 it reads
+  `gh api -X PUT repos/O/R/pulls/N/merge`, a merge inside a shell's `-c` or `-Command` string (`bash -c`, `sh`,
+  `zsh`, `dash`, `ksh`, `pwsh`, `powershell`, `cmd`, four deep) and one split over a line continuation. It does not
+  see a merge that lands any other way: `git push origin HEAD:main`, `curl -X PUT .../pulls/N/merge` (or any HTTP
+  client), GraphQL's `mergePullRequest` through `gh api graphql`, PowerShell's `iex` / `Invoke-Expression` of a
+  built string, or a script file that runs `gh pr merge`. A local `git merge` is left alone on purpose, since the
+  verify scripts merge onto origin/main locally.
 - A push between the gate's `gh pr view` and the merge lands a head nobody reviewed. `--match-head-commit` would
   close that, but the hook cannot rewrite the command; requiring the flag is a possible follow-up.
 - In `cd other && gh pr merge 99`, `gh pr view` runs in the event's folder, so it may read another repo's #99. The

@@ -158,8 +158,7 @@ pub fn is_secret_line(line: &str, deny: &[String]) -> bool {
         return true;
     }
     for t in line.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\' | '+' | '='))) {
-        let name = t.rsplit(['/', '\\']).next().unwrap_or(t);
-        if !name.is_empty() && crate::sources::is_denied(name) {
+        if crate::sources::text_path_denied(t) {
             return true;
         }
         if key_token(t) {

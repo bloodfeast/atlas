@@ -498,8 +498,9 @@ subject ending `(public #<n>)`, pushes the branch to the development repository 
 whose body names the public pull request and commit. A changelog fragment the outside pull request carries,
 `changes/<n>.md`, is renamed `changes/public-<n>.md` (a slug kept), with `author: <login>` added to its front
 matter, so it never collides with a development pull request's fragment; `cargo xtask version` folds it like any
-other, and each of its lines in the CHANGELOG ends `Thanks to @<login> (#<n>).`. The development `dev-pr` check
-takes an imported fragment as the pull request's own. A change that does not apply to the development `main`, or
+other, and each of its lines in the CHANGELOG ends `Thanks to @<login> (#<n>).`. A marker, `changes/<n>.none`
+for a change with nothing user-facing, becomes `changes/public-<n>.none`. The development `dev-pr` check takes
+an imported fragment or marker as the pull request's own. A change that does not apply to the development `main`, or
 that GitHub ties to no merged outside pull request, is named and left for the owner to bring in by hand, with a
 `Public-commit:` trailer naming it.
 

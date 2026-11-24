@@ -10,7 +10,8 @@
 #
 # Fails a build-path pull request that adds neither changes/PR.md (or
 # changes/PR-slug.md, or an imported outside pull request's
-# changes/public-N.md) nor changes/PR.none, unless it removes fragments and
+# changes/public-N.md) nor changes/PR.none (or an import's
+# changes/public-N.none), unless it removes fragments and
 # writes CHANGELOG.md and Cargo.toml (the `cargo xtask version` commit);
 # fails one that adds both; and fails any file
 # it adds or changes in changes/ that is not a well-formed fragment, a marker
@@ -187,6 +188,11 @@ check_fragment() {
 fail=0
 own=0
 none=0
+marker=
+# An imported fragment or marker (changes/public-N.*) counts as any pull
+# request's own: the check trusts that only an import adds one, as the
+# development repository is owner-reviewed. A stray changes/public-N.none
+# in a pull request that is not an import is for its review to catch.
 present=$(printf '%s\n' "$listing" | grep -v "^removed$tab" | cut -f2 | grep '^changes/' || true)
 while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -198,12 +204,16 @@ while IFS= read -r f; do
     if [ "$name" = README.md ]; then
         continue
     fi
-    if printf '%s\n' "$name" | grep -Eq '^[1-9][0-9]*\.none$'; then
-        [ "$name" != "$pr.none" ] || none=1
+    # A marker: this pull request's, or an import's (the outside pull
+    # request's, by its public number: `cargo xtask release import`).
+    if printf '%s\n' "$name" | grep -Eq '^(public-)?[1-9][0-9]*\.none$'; then
+        case $name in
+            "$pr.none" | public-*) none=1; marker=$f ;;
+        esac
         continue
     fi
     if ! printf '%s\n' "$name" | grep -Eq '^(public-)?[1-9][0-9]*(-[a-z0-9]+)*\.md$'; then
-        echo "::error file=$safe::$safe: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md, changes/<pr>.none or an imported changes/public-<n>.md)"
+        echo "::error file=$safe::$safe: not a fragment name (changes/<pr>.md, changes/<pr>-<slug>.md, changes/<pr>.none or an imported changes/public-<n>.md or changes/public-<n>.none)"
         fail=1
         continue
     fi
@@ -223,7 +233,7 @@ $present
 EOF
 
 # A fold removes other pull requests' fragments; removing its own does not count.
-folded=$(printf '%s\n' "$listing" | grep -E "^removed${tab}changes/((public-)?[1-9][0-9]*(-[a-z0-9]+)*\.md|[1-9][0-9]*(-[a-z0-9]+)*\.none)$" \
+folded=$(printf '%s\n' "$listing" | grep -E "^removed${tab}changes/(public-)?([1-9][0-9]*(-[a-z0-9]+)*\.md|[1-9][0-9]*(-[a-z0-9]+)*\.none)$" \
     | grep -vE "^removed${tab}changes/$pr(-[a-z0-9]+)*\.(md|none)$" || true)
 # A fold also writes CHANGELOG.md and Cargo.toml: deleting another pull
 # request's fragment is not a way around adding one's own.
@@ -234,7 +244,7 @@ if [ -n "$folded" ]; then
     fi
 fi
 if [ "$own" = 1 ] && [ "$none" = 1 ]; then
-    echo "::error::changes/$pr.none marks a pull request with no user-facing change, but this one also adds a fragment: keep one"
+    echo "::error::$marker marks a pull request with no user-facing change, but this one also adds a fragment: keep one"
     fail=1
 fi
 if [ "$build" = true ] && [ "$own" = 0 ] && [ "$none" = 0 ] && [ -z "$folded" ]; then

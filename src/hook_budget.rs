@@ -27,6 +27,24 @@ pub const DEFAULT_MS: u64 = 3_000;
 /// in the shipped hooks is 10 s.
 pub const MAX_MS: u64 = 10_000;
 
+/// The least budget of the events no gate answers whose work is a store's
+/// first open and a checkpoint (#333 item 2): PreCompact, SessionStart and
+/// SessionEnd. A cut PreCompact loses atlas's compaction instructions and a
+/// cut SessionStart the session card, while the compaction itself takes tens
+/// of seconds; their hook timeouts are 10 s.
+pub const LONG_MS: u64 = 8_000;
+
+/// The budget of `event` given the configured one: at least [`LONG_MS`] for
+/// PreCompact, SessionStart and SessionEnd, the configured one otherwise.
+/// Never more than [`MAX_MS`].
+pub fn for_event(limit: Duration, event: &str) -> Duration {
+    if matches!(event, "PreCompact" | "SessionStart" | "SessionEnd") {
+        limit.max(Duration::from_millis(LONG_MS)).min(Duration::from_millis(MAX_MS))
+    } else {
+        limit
+    }
+}
+
 /// The environment variable that turns the per-phase timings on.
 pub const TIMINGS_VAR: &str = "ATLAS_HOOK_TIMINGS";
 
@@ -141,6 +159,7 @@ impl Budget {
             return false;
         }
         self.current = Some(name);
+        crate::hook_gate::phase(name);
         test_delay(name);
         true
     }
@@ -161,6 +180,7 @@ impl Budget {
     pub fn mark(&mut self, name: &'static str) {
         self.close();
         self.current = Some(name);
+        crate::hook_gate::phase(name);
     }
 
     /// Ends the last phase.

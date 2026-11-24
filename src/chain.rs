@@ -217,8 +217,15 @@ fn hash12(b: &[u8]) -> String {
 
 /// The visible records of transcript bytes `seg` (starting at byte `base`
 /// of the file), which start a sub-segment: a blob whose text an earlier
-/// record of it holds is left out.
+/// record of it holds is left out. Sidechain records are skipped
+/// ([`records_of`] reads a subagent's own transcript).
 pub fn records(seg: &[u8], base: u64) -> Vec<Rec> {
+    records_of(seg, base, false)
+}
+
+/// [`records`] of a transcript that is a subagent's own when `own`
+/// ([`crate::checkpoint::own_sidechain`]): its sidechain records are read.
+pub fn records_of(seg: &[u8], base: u64, own: bool) -> Vec<Rec> {
     let deny = crate::redact::denylist();
     let mut secret = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
@@ -230,7 +237,7 @@ pub fn records(seg: &[u8], base: u64) -> Vec<Rec> {
         let off = base + at as u64;
         at = end + 1;
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-        if has(raw, "\"isSidechain\":true") {
+        if crate::checkpoint::foreign(raw, own) {
             continue;
         }
         let blob = raw.starts_with(b"{\"type\":\"api-request-blob\"");
@@ -282,6 +289,8 @@ struct Parsed {
     base: u64,
     /// Its bytes.
     seg: Vec<u8>,
+    /// Whether they are a subagent's own transcript's ([`records_of`]).
+    own: bool,
     /// Its records.
     recs: std::sync::Arc<Vec<Rec>>,
     /// Its [`parsed_size`].
@@ -308,9 +317,9 @@ fn parsed_size(seg: &[u8], recs: &[Rec]) -> usize {
 /// [`RECORDS_CACHE_BYTES`]; a range not asked for in [`RECORDS_IDLE`] is
 /// dropped at the next lookup. (No timer thread drops it sooner: a server
 /// that never resolves another chain key keeps at most the budget.)
-fn records_cached(seg: Vec<u8>, base: u64) -> std::sync::Arc<Vec<Rec>> {
+fn records_cached(seg: Vec<u8>, base: u64, own: bool) -> std::sync::Arc<Vec<Rec>> {
     static CACHE: std::sync::Mutex<Vec<Parsed>> = std::sync::Mutex::new(Vec::new());
-    records_in(&CACHE, seg, base, RECORDS_CACHE_BYTES)
+    records_in(&CACHE, seg, base, own, RECORDS_CACHE_BYTES)
 }
 
 /// Drops the entries of `cache` last used `idle` or longer before `now`.
@@ -320,12 +329,12 @@ fn drop_idle(cache: &std::sync::Mutex<Vec<Parsed>>, now: std::time::Instant, idl
 }
 
 /// [`records_cached`] over the cache `cache`, keeping at most `budget`.
-fn records_in(cache: &std::sync::Mutex<Vec<Parsed>>, seg: Vec<u8>, base: u64, budget: usize) -> std::sync::Arc<Vec<Rec>> {
+fn records_in(cache: &std::sync::Mutex<Vec<Parsed>>, seg: Vec<u8>, base: u64, own: bool, budget: usize) -> std::sync::Arc<Vec<Rec>> {
     drop_idle(cache, std::time::Instant::now(), RECORDS_IDLE);
     let lock = || cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     {
         let mut c = lock();
-        if let Some(i) = c.iter().position(|e| e.base == base && e.seg == seg) {
+        if let Some(i) = c.iter().position(|e| e.base == base && e.own == own && e.seg == seg) {
             let mut e = c.remove(i);
             e.used = std::time::Instant::now();
             let recs = e.recs.clone();
@@ -334,11 +343,11 @@ fn records_in(cache: &std::sync::Mutex<Vec<Parsed>>, seg: Vec<u8>, base: u64, bu
         }
     }
     // Parsed outside the lock: another thread's lookup does not wait on it.
-    let recs = std::sync::Arc::new(records(&seg, base));
+    let recs = std::sync::Arc::new(records_of(&seg, base, own));
     let size = parsed_size(&seg, &recs);
     if size <= budget {
         let mut c = lock();
-        c.insert(0, Parsed { base, seg, recs: recs.clone(), size, used: std::time::Instant::now() });
+        c.insert(0, Parsed { base, seg, own, recs: recs.clone(), size, used: std::time::Instant::now() });
         let mut kept = 0;
         let n = c.iter().take(RECORDS_CACHE_ENTRIES).take_while(|e| {
             kept += e.size;
@@ -741,8 +750,9 @@ enum Ev {
     User(u64, u64),
 }
 
-/// A line's event, if any.
-fn event(raw: &[u8], off: u64) -> Option<Ev> {
+/// A line's event, if any; `own` reads sidechain records (a subagent's own
+/// transcript, [`crate::checkpoint::own_sidechain`]).
+fn event(raw: &[u8], off: u64, own: bool) -> Option<Ev> {
     let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
     if raw.starts_with(b"{\"type\":\"") && !(raw.starts_with(b"{\"type\":\"user\"") || raw.starts_with(b"{\"type\":\"assistant\"")) {
         return None;
@@ -751,7 +761,7 @@ fn event(raw: &[u8], off: u64) -> Option<Ev> {
     // subtype, a message's role): only the head is searched, so a long
     // record costs its newline search and little more.
     let head = &raw[..raw.len().min(HEAD_BYTES)];
-    if has(head, "\"isSidechain\":true") {
+    if crate::checkpoint::foreign(head, own) {
         None
     } else if has(head, "\"subtype\":\"compact_boundary\"") {
         Some(Ev::Boundary(off, raw.len() as u64, hash12(raw), ts_fast(raw)))
@@ -766,6 +776,7 @@ fn event(raw: &[u8], off: u64) -> Option<Ev> {
 
 /// The events of the lines that start in bytes `a..b` of a file, streamed.
 fn events(path: &Path, a: u64, b: u64) -> Option<Vec<Ev>> {
+    let own = crate::checkpoint::own_sidechain(path);
     let mut f = std::fs::File::open(path).ok()?;
     // From the byte before `a`: a line starts at `a` only after a newline.
     let from = a.saturating_sub(1);
@@ -788,14 +799,14 @@ fn events(path: &Path, a: u64, b: u64) -> Option<Vec<Ev>> {
             } else if off >= b {
                 return Some(out);
             } else {
-                out.extend(event(&buf[start..start + j], off));
+                out.extend(event(&buf[start..start + j], off, own));
             }
             start += j + 1;
         }
         if k == 0 {
             let off = at + start as u64;
             if start < have && !skip && off < b {
-                out.extend(event(&buf[start..have], off));
+                out.extend(event(&buf[start..have], off, own));
             }
             return Some(out);
         }
@@ -867,6 +878,7 @@ fn link_line(path: &Path, ls: &[Link], i: usize) -> String {
     let t0 = if i == 0 { String::new() } else { ls[i - 1].ts.clone() };
     // The heading: the first records' file names, read 256 KiB at a time
     // until two are found, at most HEADING_BYTES in.
+    let own = crate::checkpoint::own_sidechain(path);
     let mut cands = Vec::new();
     let (mut at, end) = (from, ls[i].off);
     while at < end && at < from + HEADING_BYTES && heading(&cands, 2).len() < 2 {
@@ -879,7 +891,7 @@ fn link_line(path: &Path, ls: &[Link], i: usize) -> String {
                 break;
             }
             let head = &raw[..raw.len().min(HEAD_BYTES)];
-            if raw.starts_with(b"{\"type\":\"") || has(head, "\"isSidechain\":true") || !(has(head, "\"type\":\"user\"") || has(head, "\"role\":\"assistant\"")) {
+            if raw.starts_with(b"{\"type\":\"") || crate::checkpoint::foreign(head, own) || !(has(head, "\"type\":\"user\"") || has(head, "\"role\":\"assistant\"")) {
                 continue;
             }
             if let Ok(v) = crate::json::parse(&String::from_utf8_lossy(raw)) {
@@ -916,14 +928,21 @@ pub fn card(path: &Path) -> Option<String> {
 /// [`card`], and where the transcript's current sub-segment starts (its
 /// last link's start, or 0), from one link scan.
 pub fn card_and_head(path: &Path) -> Option<(String, u64)> {
+    card_upto(path, u64::MAX)
+}
+
+/// [`card_and_head`] of the transcript's first `until` bytes only: the
+/// card as it stood before a compaction whose boundary starts there (#295's
+/// fallback, written after the boundary).
+pub fn card_upto(path: &Path, until: u64) -> Option<(String, u64)> {
     // The keys name the transcript read (a forked session's parent, when
     // its own is not written yet).
-    let s8: String = path.file_stem()?.to_string_lossy().chars().take(SHORT).collect();
-    let len = std::fs::metadata(path).ok()?.len();
+    let s8 = short_of(path)?;
+    let len = std::fs::metadata(path).ok()?.len().min(until);
     let ls = links(path, &s8, len)?;
     let from = ls.last().map_or(0, Link::starts);
     let seg = read_range(path, from, len)?;
-    let l = listing(&s8, &records(&seg, from));
+    let l = listing(&s8, &records_of(&seg, from, crate::checkpoint::own_sidechain(path)));
     let n = ls.len();
     Some((format!("{l}chain_depth: {n} chain_index: {n}\n{}", links_block(path, &ls, n)), from))
 }
@@ -988,18 +1007,43 @@ fn same(h12: &str, written: &str) -> bool {
     h12.starts_with(written) || written.starts_with(h12)
 }
 
+/// The prefix of a subagent transcript's key session (#295): `ag-` and the
+/// agent id's first [`SHORT`] characters. No session id (hex) starts so.
+const AGENT_KEY: &str = "ag-";
+
+/// The session part of the chain keys of the transcript at `path`: its
+/// name's first [`SHORT`] characters, or for a subagent's
+/// `agent-<id>.jsonl` [`AGENT_KEY`] and the id's (every subagent's name
+/// starts `agen`).
+pub fn short_of(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy();
+    Some(match stem.strip_prefix("agent-") {
+        Some(id) => format!("{AGENT_KEY}{}", id.chars().take(SHORT).collect::<String>()),
+        None => stem.chars().take(SHORT).collect(),
+    })
+}
+
 /// The transcripts of session `s8` in a project folder: every
-/// `<session>.jsonl` there whose name starts with `s8`, sorted.
+/// `<session>.jsonl` there whose name starts with `s8`, sorted. A
+/// subagent's key ([`AGENT_KEY`]) names `<session>/subagents/agent-<id>.jsonl`
+/// files of the folder's sessions.
 fn transcripts_in(dir: &Path, s8: &str) -> std::result::Result<Vec<PathBuf>, Miss> {
     let rd = std::fs::read_dir(dir).map_err(|e| Miss::NoTranscript(format!("no transcripts folder {}: {e}", dir.display())))?;
-    let mut hits: Vec<PathBuf> = rd
-        .flatten()
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with(s8) && n.ends_with(".jsonl") && e.path().is_file()
-        })
-        .map(|e| e.path())
-        .collect();
+    let named = |e: &std::fs::DirEntry, start: &str| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        n.starts_with(start) && n.ends_with(".jsonl") && e.path().is_file()
+    };
+    let mut hits: Vec<PathBuf> = match s8.strip_prefix(AGENT_KEY) {
+        Some(id) => {
+            let start = format!("agent-{id}");
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| std::fs::read_dir(e.path().join("subagents")).ok())
+                .flat_map(|sub| sub.flatten().filter(|e| named(e, &start)).map(|e| e.path()).collect::<Vec<_>>())
+                .collect()
+        }
+        None => rd.flatten().filter(|e| named(e, s8)).map(|e| e.path()).collect(),
+    };
     if hits.is_empty() {
         return Err(Miss::NoTranscript(format!("no transcript of session {s8} in this project ({})", dir.display())));
     }
@@ -1134,7 +1178,7 @@ pub fn resolve_parts(dir: &Path, key: &str) -> std::result::Result<Reply, Miss> 
 fn reply_in(path: &Path, key: &str, k: &Key, s8: &str) -> std::result::Result<Reply, Miss> {
     let len = std::fs::metadata(path).map_err(|_| unreadable(key))?.len();
     let ls = links(path, s8, len).ok_or_else(|| unreadable(key))?;
-    let recs_of = |from: u64, to: u64| read_range(path, from, to).map(|b| records_cached(b, from)).ok_or_else(|| unreadable(key));
+    let recs_of = |from: u64, to: u64| read_range(path, from, to).map(|b| records_cached(b, from, crate::checkpoint::own_sidechain(path))).ok_or_else(|| unreadable(key));
     let out = match k.clone() {
         Key::Link { off, hash, .. } => {
             let i = ls.iter().position(|l| l.off == off).ok_or_else(|| dangling(key, "no link starts there"))?;
@@ -1427,20 +1471,20 @@ mod tests {
         let cache = std::sync::Mutex::new(Vec::new());
         let one = [user("one: src/cache_one.rs", &ts(0)), user("two: src/cache_two.rs", &ts(1))].join("\n") + "\n";
         let all = RECORDS_CACHE_BYTES;
-        let a = records_in(&cache, one.clone().into_bytes(), 0, all);
-        let b = records_in(&cache, one.clone().into_bytes(), 0, all);
+        let a = records_in(&cache, one.clone().into_bytes(), 0, false, all);
+        let b = records_in(&cache, one.clone().into_bytes(), 0, false, all);
         assert!(std::sync::Arc::ptr_eq(&a, &b), "the same bytes are not parsed again");
         assert_eq!(a.len(), 2);
         // The same offset with other bytes (a transcript rewritten), or the
         // same bytes at another offset, is parsed again.
         let other = one.replace("cache_two", "cache_new");
-        let c = records_in(&cache, other.into_bytes(), 0, all);
+        let c = records_in(&cache, other.into_bytes(), 0, false, all);
         assert!(!std::sync::Arc::ptr_eq(&a, &c) && c[1].vis.contains("cache_new"));
-        let d = records_in(&cache, one.clone().into_bytes(), 7, all);
+        let d = records_in(&cache, one.clone().into_bytes(), 7, false, all);
         assert!(!std::sync::Arc::ptr_eq(&a, &d) && d[0].off == 7);
         // At most RECORDS_CACHE_ENTRIES ranges are kept, the newest first.
         for i in 0..RECORDS_CACHE_ENTRIES as u64 + 2 {
-            records_in(&cache, one.clone().into_bytes(), 100 + i, all);
+            records_in(&cache, one.clone().into_bytes(), 100 + i, false, all);
         }
         let c = cache.lock().unwrap();
         assert_eq!(c.len(), RECORDS_CACHE_ENTRIES);
@@ -1460,12 +1504,12 @@ mod tests {
         let budget = size * 5 / 2;
         assert!(3 * one.len() <= budget);
         for i in 0..4 {
-            records_in(&cache, one.clone().into_bytes(), i, budget);
+            records_in(&cache, one.clone().into_bytes(), i, false, budget);
             assert!(used(&cache) <= budget, "{} over {budget}", used(&cache));
         }
         assert_eq!(cache.lock().unwrap().iter().map(|e| e.base).collect::<Vec<_>>(), [3, 2]);
         // A range over the whole budget is parsed and not kept.
-        let r = records_in(&cache, one.clone().into_bytes(), 9, size - 1);
+        let r = records_in(&cache, one.clone().into_bytes(), 9, false, size - 1);
         assert_eq!(r.len(), 2);
         assert!(cache.lock().unwrap().iter().all(|e| e.base != 9));
         // An entry not asked for in RECORDS_IDLE is dropped; a newer one stays.

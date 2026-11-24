@@ -55,14 +55,17 @@ op=status` (`3` or `#3`), an agent id, or a lane one started agent holds; one th
 is refused, with each listed. A slot's number belongs to its launch, given when the agent starts: it is the
 same with or without `--lane`, and does not move when other agents start or finish, so `release 3` frees
 the agent the listing showed as `#3`, or is refused when no held slot carries 3 any more. A row listed
-released can be named as well. With `--transcript PATH` the selector is an agent id in that session. One whose transcript ends in a disk-full tool error stops counting by itself
-after `orchestrate.disk_full_minutes` (default 10).
+released can be named as well. With `--transcript PATH` the selector is an agent id in that session. One
+whose transcript ends in a disk-full tool error stops counting by itself after `orchestrate.disk_full_minutes`
+(default 10).
 
 `atlas queue list`, `atlas queue next` and `recall op=status` also count an unfinished agent of another
 session as released, on positive evidence only: the machine booted after the agent last wrote, or the
 Claude Code process its launch entry names as `owner:` is gone. The server names an owner only when the
 process above it, past any shell or launcher, is Claude Code; otherwise none is named and only a reboot
-counts. The listing shows such an agent as `released: boot after last write` (or `owning Claude Code
+counts. Of a chain of such processes (a `node` or `npx` shim between Claude Code and the server) the
+topmost is the owner, and a parent that started after its child is a reused process id, so the walk stops
+below it. The listing shows such an agent as `released: boot after last write` (or `owning Claude Code
 process gone`); the json `held_slots` rows carry `agent`, `slot` and `released`, and a released row is not
 `running`. Without that evidence an agent counts until `stale_minutes`. The admission hook
 needs neither: its session's process started after any reboot, and counts from then. Worktree gc keeps its

@@ -41,7 +41,7 @@ use crate::json::Value;
 
 /// Read tools that always answer whole: the work queue, a lane's journal
 /// (see [`dedupable`]) and the hook.
-const WHOLE: &[&str] = &["hook", "decision_queue", "awaiting", "journal_status", "discussion_status", "read_discussion", "list_discussions", "misses", "next_id"];
+const WHOLE: &[&str] = &["hook", "decision_queue", "awaiting", "journal_status", "question_sweep", "deferred_questions", "discussion_status", "read_discussion", "list_discussions", "misses", "next_id"];
 
 /// The caller of every call when no hook names one: the server process.
 pub const PROCESS: &str = "";

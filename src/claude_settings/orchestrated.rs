@@ -168,22 +168,10 @@ fn default_label(atlas: &Value, a: &Answers, m: Machine, i: usize) -> String {
     match (effective(atlas, a, m, i), i) {
         (Some(Value::String(s)), _) => s,
         (Some(v), _) => v.to_string(),
-        (None, HANDOFF) => format!("{} on a 1M window, scaled to the window", thousands(DEFAULT_HANDOFF)),
-        (None, LIMIT) => format!("{} on a 1M window, scaled to the window", thousands(DEFAULT_LIMIT)),
+        (None, HANDOFF) => format!("{} on a 1M window, scaled to the window", crate::orchestrate::thousands(DEFAULT_HANDOFF)),
+        (None, LIMIT) => format!("{} on a 1M window, scaled to the window", crate::orchestrate::thousands(DEFAULT_LIMIT)),
         (None, _) => "not set".into(),
     }
-}
-
-fn thousands(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// The answers: one per option, `None` for "keep what is in effect".

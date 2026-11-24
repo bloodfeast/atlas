@@ -587,7 +587,9 @@ impl Store {
         // SQLITE_BUSY without consulting the busy handler when several
         // processes start at once, so the whole open is retried.
         let audit_log = db_path.with_file_name(AUDIT_LOG);
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // Cut to the hook's deadline when one is active on this thread (#333
+        // item 1: a rescan after a hook's answer waited out the 30 s here).
+        let deadline = Instant::now() + crate::hook_budget::cut(Duration::from_secs(30));
         let mut wait = 5;
         loop {
             match Store::open_once(db_path, &vaults, &mut atlas) {

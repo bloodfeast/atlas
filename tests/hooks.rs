@@ -2705,14 +2705,17 @@ mod subagent_window {
 
     /// The real layout (ruling 0016): a haiku subagent's meta says
     /// `"model": "haiku"` and `"pickedEffortModel": "claude-opus-5-5"`, and
-    /// its transcript says `claude-haiku-5-5`. Over its 200k limit it is
-    /// judged on 200k (let compact), not on the parent's 1M.
+    /// its transcript names its own model. A Haiku 4.5 over its 200k limit
+    /// is judged on 200k (let compact), not on the parent's 1M; Haiku 5.5
+    /// and the bare alias have the inferred 1M (#403: Haiku 5.5 subagents
+    /// ran to 298k in Claude Code).
     #[test]
-    fn a_haiku_subagent_is_judged_on_200k_not_its_parents_picked_effort_model() {
+    fn a_haiku_subagent_is_judged_on_its_own_window_not_its_parents_picked_effort_model() {
         let t = Temp::new("hook-sub-window-real");
-        let (mut h, tp) = session(&t, &[("hk", Some("haiku"), Some("claude-haiku-5-5")), ("alias", Some("haiku"), None)], |_| {});
-        assert!(!blocked(&mut h, &tp, "hk"), "the transcript says haiku: 200k");
-        assert!(!blocked(&mut h, &tp, "alias"), "no transcript model: the meta alias haiku, 200k");
+        let (mut h, tp) = session(&t, &[("h4", Some("haiku"), Some("claude-haiku-4-5")), ("h5", Some("haiku"), Some("claude-haiku-5-5")), ("alias", Some("haiku"), None)], |_| {});
+        assert!(!blocked(&mut h, &tp, "h4"), "the transcript says haiku 4.5: 200k");
+        assert!(blocked(&mut h, &tp, "h5"), "the transcript says haiku 5.5: 1M");
+        assert!(blocked(&mut h, &tp, "alias"), "no transcript model: the meta alias haiku, today Haiku 5.5: 1M");
     }
 
     #[test]
@@ -2746,7 +2749,7 @@ mod subagent_window {
     #[test]
     fn the_transcript_model_beats_the_meta_alias() {
         let t = Temp::new("hook-sub-window-source");
-        let (mut h, tp) = session(&t, &[("op", Some("haiku"), Some("claude-opus-5-5")), ("hk", Some("opus"), Some("claude-haiku-5-5"))], |_| {});
+        let (mut h, tp) = session(&t, &[("op", Some("haiku"), Some("claude-opus-5-5")), ("hk", Some("opus"), Some("claude-haiku-4-5"))], |_| {});
         assert!(blocked(&mut h, &tp, "op"), "the transcript's opus wins over the alias haiku: 1M");
         assert!(!blocked(&mut h, &tp, "hk"), "the transcript's haiku wins over the alias opus: 200k");
     }
@@ -3573,4 +3576,202 @@ fn a_parked_builder_stays_on_the_card_and_in_the_precompact_text() {
     assert!(ck.body.contains("agents: build-9 parked (own job running)\n"), "{}", ck.body);
     let text = a.to_json("PreCompact");
     assert!(text.ends_with("Live agents now (copy each PR number exactly into the state): build-9 parked (own job running)\n"), "{text}");
+}
+
+/// #333 (review r4 nit 3 of #331): the card's gh lookup at PreCompact is
+/// cut at the hook's own deadline, not given its full 1.5 s past it.
+#[test]
+fn the_precompact_gh_lookup_ends_at_the_hooks_deadline() {
+    let t = Temp::new("hook-card-gh-deadline");
+    let mut s = compaction(t.path());
+    s.hook_budget = std::time::Duration::from_millis(300);
+    seed(&s);
+    // A linked worktree on branch `feat` of o/atlas.
+    let common = t.path().join("repo").join("main.git");
+    let gd = common.join("worktrees").join("wq");
+    std::fs::create_dir_all(&gd).unwrap();
+    std::fs::write(common.join("config"), "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://github.com/o/atlas.git\n").unwrap();
+    std::fs::write(gd.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
+    std::fs::write(gd.join("commondir"), "../..\n").unwrap();
+    std::fs::write(common.join("packed-refs"), "abcdef0123456789abcdef0123456789abcdef01 refs/heads/feat\n").unwrap();
+    let wt = t.path().join("repo").join("wq");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gd.display())).unwrap();
+    {
+        let mut store = MemoryStore::open(&s.store).unwrap();
+        let w = atlas::worktree_ledger::Worktree { path: wt.to_string_lossy().into_owned(), repo: "repo".into(), branch: "feat".into() };
+        let o = atlas::worktree_ledger::Owner { lane: Some("build-9"), holds: true, description: "d", tool_use_id: "tu9", session: "s1" };
+        atlas::worktree_ledger::record(store.conn(), &s.store, &w, &o, &atlas::memory::now()).unwrap();
+        let mut wr = store.writer().unwrap();
+        let launch = Draft {
+            title: "launch: builder".into(),
+            meta: "agent: aaa111\nsession: s1\nstart: 2000-01-01T00:00:00.000Z\n".into(),
+            body: "Kind: builder\nLane: build-9\nUses: worktree:wq\n".into(),
+            reason: "t".into(),
+            author: "hook".into(),
+            client: "t".into(),
+            ..Draft::default()
+        };
+        wr.create("journal:build-9:0001", "journal", "launch", "build-9", &launch, None).unwrap();
+        let wait = Draft { title: "waiting: mutants".into(), body: "waiting: mutants".into(), reason: "t".into(), author: "t".into(), client: "t".into(), ..Draft::default() };
+        wr.create("journal:build-9:0002", "journal", "note", "build-9", &wait, None).unwrap();
+        wr.commit().unwrap();
+    }
+    let tp = t.path().join("s1.jsonl");
+    working_transcript(&tp, 300_000);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let given = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let g = given.clone();
+    h.set_pr_list(std::sync::Arc::new(move |_: &Path, _: &str, deadline: std::time::Instant| -> Result<Option<atlas::card_agents::Pr>, atlas::card_agents::GhFail> {
+        *g.lock().unwrap() = Some(deadline);
+        Ok(None)
+    }));
+    // The event waited in the queue: about 1 s of its budget is left, less
+    // than gh's own 1.5 s.
+    let budget = atlas::hook_budget::for_event(s.hook_budget, "PreCompact");
+    let arrived = std::time::Instant::now() - budget + std::time::Duration::from_millis(1_000);
+    h.handle_from(&HookEvent { trigger: "manual".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") }, arrived);
+    let deadline = given.lock().unwrap().expect("gh was asked for the parked builder's branch");
+    assert!(deadline <= arrived + budget, "gh's deadline is {:?} past the hook's", deadline - (arrived + budget));
+}
+
+/// A main session `s1` in `proj` with subagent `a9`, under its handoff point,
+/// for #295: the settings, the project folder, the parent's and the
+/// agent's transcripts.
+fn subagent_fixture(t: &Temp) -> (Settings, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let mut s = compaction(t.path());
+    s.cap.warn_tokens = 285_000;
+    s.cap.block_tokens = 450_000;
+    s.compact.window = 1_000_000;
+    seed(&s);
+    let dir = t.path().join("proj");
+    let parent = dir.join("s1.jsonl");
+    let sub = dir.join("s1").join("subagents").join("agent-a9f3c2.jsonl");
+    std::fs::create_dir_all(sub.parent().unwrap()).unwrap();
+    working_transcript(&parent, 200_000);
+    working_transcript(&sub, 100_000);
+    // Claude Code marks every record of a subagent's own transcript
+    // sidechain, its boundaries too (review M1 of #391).
+    let text = std::fs::read_to_string(&sub).unwrap();
+    std::fs::write(&sub, text.lines().map(|l| side(&format!("{l}\n"))).collect::<String>()).unwrap();
+    (s, dir, parent, sub)
+}
+
+/// Transcript line(s) `l` as a subagent's own transcript holds them: marked
+/// `"isSidechain":true`, the key leading as Claude Code writes it.
+fn side(l: &str) -> String {
+    l.lines().map(|x| format!("{}\n", x.replacen('{', "{\"isSidechain\":true,", 1))).collect()
+}
+
+/// The record Claude Code writes where it compacted a transcript.
+fn boundary_line() -> String {
+    let b = json!({"type": "system", "subtype": "compact_boundary", "timestamp": "2020-01-01T00:00:00.000Z",
+        "compactMetadata": {"trigger": "auto", "preTokens": 100000, "postTokens": 9000, "durationMs": 12000}});
+    format!("{b}\n")
+}
+
+/// #295: a subagent's compaction that is not blocked writes the agent's own
+/// checkpoint (lane `agent:<id>`), answers with the compaction instructions,
+/// and its card is given on the agent's next tool call, once. Its chain keys
+/// resolve from the project folder.
+#[test]
+fn a_subagents_compaction_gets_a_checkpoint_and_its_card() {
+    let t = Temp::new("hook-sub-card");
+    let (s, dir, parent, sub) = subagent_fixture(&t);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let tp = parent.to_string_lossy().into_owned();
+    let call = |h: &mut Hooks| h.handle(&HookEvent { agent_id: "a9f3c2".into(), tool_name: "Bash".into(), transcript_path: tp.clone(), ..ev("PreToolUse") });
+    assert!(!call(&mut h).context.contains("atlas checkpoint"));
+    let a = h.handle(&HookEvent { agent_id: "a9f3c2".into(), trigger: "auto".into(), transcript_path: tp.clone(), ..ev("PreCompact") });
+    assert!(a.block.is_none(), "{a:?}");
+    assert_eq!(a.instructions, atlas::claude_settings::COMPACT_INSTRUCTIONS, "a subagent's summary gets atlas's instructions");
+    let store = MemoryStore::open(&s.store).unwrap();
+    let ck = atlas::checkpoint::newest_on(&store, "agent:a9f3c2").unwrap().expect("the agent's checkpoint");
+    assert!(store.lane("session:s1").unwrap().is_empty(), "not the session's checkpoint");
+    assert!(ck.title.contains(" context tokens") && !ck.title.contains("unknown") && !ck.title.contains("unread"), "the agent's own records read: {}", ck.title);
+    assert!(ck.body.contains("src/export.rs"), "its steps: {}", ck.body);
+    let key = atlas::chain::written_keys(&ck.body).into_iter().find(|k| k.starts_with("turn:ag-a9f3:")).unwrap_or_else(|| panic!("an agent group key: {}", ck.body));
+    atlas::chain::resolve(&dir, &key).unwrap_or_else(|e| panic!("{key}: {e}"));
+    drop(store);
+    // Claude Code compacts; the agent's next tool call gets the card, once.
+    append(&sub, &side(&boundary_line()));
+    let c = call(&mut h);
+    assert!(c.context.contains("atlas checkpoint") && c.context.contains(&key), "{}", c.context);
+    assert!(!call(&mut h).context.contains("atlas checkpoint"));
+    // Another agent's calls get nothing of it.
+    let other = h.handle(&HookEvent { agent_id: "b7".into(), tool_name: "Bash".into(), transcript_path: tp.clone(), ..ev("PreToolUse") });
+    assert!(!other.context.contains("atlas checkpoint"), "{}", other.context);
+}
+
+/// #295: with no PreCompact for it, a subagent's compaction is seen as the
+/// `compact_boundary` in its transcript: the checkpoint is written and the
+/// card given on the next tool call. The checkpoint is of the segment the
+/// boundary closed, not the stub after it (review M2 of #391): its card
+/// names turn keys of records before the boundary. The word in a tool
+/// call's input is no boundary (review S1).
+#[test]
+fn a_subagents_compaction_without_precompact_is_seen_in_its_transcript() {
+    let t = Temp::new("hook-sub-boundary");
+    let (s, dir, parent, sub) = subagent_fixture(&t);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let tp = parent.to_string_lossy().into_owned();
+    let call = |h: &mut Hooks| h.handle(&HookEvent { agent_id: "a9f3c2".into(), tool_name: "Read".into(), transcript_path: tp.clone(), ..ev("PreToolUse") });
+    assert!(!call(&mut h).context.contains("atlas checkpoint"));
+    // A Grep for the word: no compaction.
+    let grep = json!({"type": "assistant", "message": {"id": "m8", "role": "assistant", "content": [{"type": "tool_use", "id": "t8", "name": "Grep", "input": {"pattern": "compact_boundary"}}]}});
+    let grep = format!("{grep}\n");
+    assert!(grep.contains("\"compact_boundary\""), "the raw line holds the boundary's needle: {grep}");
+    append(&sub, &side(&grep));
+    let g = call(&mut h);
+    assert!(!g.context.contains("atlas checkpoint"), "a Grep pattern is no boundary: {}", g.context);
+    assert!(atlas::checkpoint::newest_on(&MemoryStore::open(&s.store).unwrap(), "agent:a9f3c2").unwrap().is_none(), "no checkpoint for a Grep");
+    let at = std::fs::metadata(&sub).unwrap().len();
+    append(&sub, &side(&boundary_line()));
+    let after = json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "summary stub src/after_stub.rs"}]}});
+    append(&sub, &side(&format!("{after}\n")));
+    append(&sub, &side(&usage_line("m9", 9_000)));
+    let c = call(&mut h);
+    assert!(c.context.contains("atlas checkpoint"), "{}", c.context);
+    let ck = atlas::checkpoint::newest_on(&MemoryStore::open(&s.store).unwrap(), "agent:a9f3c2").unwrap().expect("written at the boundary");
+    assert!(ck.title.contains("checkpoint (boundary)") && !ck.title.contains("at 9000 "), "{}", ck.title);
+    assert!(ck.body.contains("src/export.rs") && !ck.body.contains("after_stub"), "the segment before the boundary: {}", ck.body);
+    // Every turn key the card names is of a record before the boundary.
+    let keys: Vec<String> = atlas::chain::written_keys(&ck.body).into_iter().filter(|k| k.starts_with("turn:ag-a9f3:")).collect();
+    assert!(!keys.is_empty(), "pre-boundary turn keys: {}", ck.body);
+    for k in &keys {
+        let off: u64 = k.split(":b").nth(1).and_then(|r| r.split(['@', '-']).next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("a byte key: {k}"));
+        assert!(off < at, "{k} is past the boundary at {at}");
+        let r = atlas::chain::resolve(&dir, k).unwrap_or_else(|e| panic!("{k}: {e}"));
+        assert!(!r.contains("after_stub"), "{k}: {r}");
+    }
+    assert!(!call(&mut h).context.contains("atlas checkpoint"));
+    // A second compaction: a second card.
+    append(&sub, &side(&boundary_line()));
+    assert!(call(&mut h).context.contains("atlas checkpoint"));
+}
+
+/// Review S2 of #391: a card that went out on an answer the watchdog
+/// dropped is owed again to the agent's next tool call; its checkpoint is
+/// not written twice.
+#[test]
+fn a_subagents_card_lost_to_the_watchdog_is_given_again() {
+    let t = Temp::new("hook-sub-lost");
+    let (s, _dir, parent, sub) = subagent_fixture(&t);
+    let mut h = Hooks::open(s.clone()).unwrap();
+    h.set_offer_paths(None);
+    let tp = parent.to_string_lossy().into_owned();
+    let event = |id: &str| HookEvent { agent_id: "a9f3c2".into(), tool_name: "Read".into(), tool_use_id: id.into(), transcript_path: tp.clone(), ..ev("PreToolUse") };
+    assert!(!h.handle(&event("tu0")).context.contains("atlas checkpoint"));
+    append(&sub, &side(&boundary_line()));
+    assert!(h.handle(&event("tu1")).context.contains("atlas checkpoint"));
+    // Another call's loss changes nothing.
+    h.answer_lost(&event("tu9"));
+    h.answer_lost(&event("tu1"));
+    assert!(h.handle(&event("tu2")).context.contains("atlas checkpoint"), "owed again");
+    assert!(!h.handle(&event("tu3")).context.contains("atlas checkpoint"), "once");
+    let store = MemoryStore::open(&s.store).unwrap();
+    assert_eq!(store.lane("agent:a9f3c2").unwrap().len(), 1, "one checkpoint");
 }

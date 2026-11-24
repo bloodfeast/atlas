@@ -816,6 +816,10 @@ pub struct Rows {
     pub linked: HashSet<String>,
     /// The packages this root's SCIP indexes define symbols of.
     pub pkg_defs: HashSet<String>,
+    /// The root's `exclude` globs ([`excluded`]), set before the SCIP rows
+    /// are built: a document they name gives no rows, no counts in
+    /// [`Rows::stats`] and no package in [`Rows::pkg_defs`] (#371).
+    pub exclude: Vec<String>,
     /// The packages this root's references go into without defining them
     /// (its dependencies, linked or not).
     pub pkg_uses: HashSet<String>,
@@ -998,15 +1002,21 @@ pub fn rust_rows(ix: &Index<'_>, rows: &mut Rows, files: &mut HashMap<String, u3
     let parsed: Vec<Option<Parsed<'_>>> = ix.symbols.iter().map(|s| parse_symbol(s)).collect();
     // A symbol is the project's when it has a definition here (or is an
     // impl block, whose occurrence is not marked as one).
+    let paths: Vec<String> = ix.doc_path.iter().map(|p| p.replace('\\', "/")).collect();
+    // A document the root's `exclude` globs name gives no rows, counts and
+    // packages (#371): rust-analyzer reads the whole workspace.
+    let excluded_doc: Vec<bool> = paths.iter().map(|p| excluded(&rows.exclude, p)).collect();
     let mut defined = vec![false; ix.symbols.len()];
+    let mut defined_kept = vec![false; ix.symbols.len()];
     for i in 0..ix.occurrences() {
         if ix.occ_roles[i] & scip::ROLE_DEFINITION != 0 {
             defined[ix.occ_sym[i] as usize] = true;
+            defined_kept[ix.occ_sym[i] as usize] |= !excluded_doc[ix.occ_doc[i] as usize];
         }
     }
-    let (pkg, pkg_keys, pkg_link) = package_links(ix, &defined, rows);
+    let (pkg, pkg_keys, pkg_link) = package_links(ix, &defined_kept, rows);
     let mut pkg_used = vec![false; pkg_keys.len()];
-    let doc_file: Vec<u32> = ix.doc_path.iter().map(|p| rows.file(files, &p.replace('\\', "/"), "rust")).collect();
+    let doc_file: Vec<u32> = paths.iter().zip(&excluded_doc).map(|(p, &x)| if x { u32::MAX } else { rows.file(files, p, "rust") }).collect();
     // Per document, the definitions with an enclosing range, for `within`.
     let mut encl: Vec<Vec<(i32, i32, u32)>> = vec![Vec::new(); ix.doc_path.len()];
     for i in 0..ix.occurrences() {
@@ -1022,6 +1032,9 @@ pub fn rust_rows(ix: &Index<'_>, rows: &mut Rows, files: &mut HashMap<String, u3
         let s = ix.occ_sym[i] as usize;
         let Some(p) = &parsed[s] else { continue };
         let doc = ix.occ_doc[i] as usize;
+        if excluded_doc[doc] {
+            continue;
+        }
         let file = doc_file[doc];
         let line = ix.occ_line[i].max(0) as u32 + 1;
         let col = ix.occ_col[i].max(0) as u32;
@@ -1338,7 +1351,12 @@ pub fn scip_rows_in(
     text_of: &dyn Fn(&str) -> Option<String>,
 ) {
     let parsed: Vec<Option<Generic<'_>>> = ix.symbols.iter().map(|s| parse_generic(s)).collect();
+    let paths: Vec<String> = ix.doc_path.iter().map(|p| rebase(dir, p)).collect();
+    // A document the root's `exclude` globs name gives no rows, counts and
+    // packages (#371).
+    let excluded_doc: Vec<bool> = paths.iter().map(|p| excluded(&rows.exclude, p)).collect();
     let mut defined = vec![false; ix.symbols.len()];
+    let mut defined_kept = vec![false; ix.symbols.len()];
     // The first definition occurrence of each symbol, for impl edges.
     let mut first_def: Vec<Option<usize>> = vec![None; ix.symbols.len()];
     let mut has_def = vec![false; ix.doc_path.len()];
@@ -1346,14 +1364,14 @@ pub fn scip_rows_in(
         if ix.occ_roles[i] & scip::ROLE_DEFINITION != 0 {
             let s = ix.occ_sym[i] as usize;
             defined[s] = true;
+            defined_kept[s] |= !excluded_doc[ix.occ_doc[i] as usize];
             first_def[s].get_or_insert(i);
             has_def[ix.occ_doc[i] as usize] |= parsed[s].is_some();
         }
     }
-    let (pkg, pkg_keys, pkg_link) = package_links(ix, &defined, rows);
+    let (pkg, pkg_keys, pkg_link) = package_links(ix, &defined_kept, rows);
     let mut pkg_used = vec![false; pkg_keys.len()];
-    let paths: Vec<String> = ix.doc_path.iter().map(|p| rebase(dir, p)).collect();
-    let keep: Vec<bool> = paths.iter().map(|p| !skip.contains(p) && !p.starts_with("../")).collect();
+    let keep: Vec<bool> = paths.iter().zip(&excluded_doc).map(|(p, &x)| !x && !skip.contains(p) && !p.starts_with("../")).collect();
     let langs: Vec<&'static str> = paths.iter().zip(&ix.doc_lang).map(|(p, l)| lang_of(l, p)).collect();
     let doc_file: Vec<u32> =
         paths.iter().zip(&langs).zip(&keep).map(|((p, l), &k)| if k { rows.file(files, p, l) } else { u32::MAX }).collect();
@@ -1426,10 +1444,13 @@ pub fn scip_rows_in(
         }
         let s = ix.occ_sym[i] as usize;
         let Some(g) = &parsed[s] else { continue };
+        let doc = ix.occ_doc[i] as usize;
+        if excluded_doc[doc] {
+            continue;
+        }
         if !defined[s] && !external_ref(rows, pkg[s], &pkg_keys, &pkg_link, &mut pkg_used) {
             continue;
         }
-        let doc = ix.occ_doc[i] as usize;
         if !keep[doc] {
             continue;
         }

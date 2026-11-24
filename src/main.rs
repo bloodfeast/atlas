@@ -567,6 +567,11 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
         let b = hook_hits::tune(&verdicts, scale, active);
         println!("tuned recall.inject_floor {:.4} (hit scale {scale}): keeps {} of {}, {} hits, net {:.0} tokens", b.floor, b.kept, verdicts.len(), b.hits, b.net / bpt);
     }
+    // Gate timing per event (#416): p50/p95/max from arrival, the queue's
+    // p95, refusals, and the watchdog's answers past the budget.
+    for line in atlas::hook_gate::report_lines(&atlas::hook_gate::logged(&conn, since).map_err(s)?) {
+        println!("{line}");
+    }
     if rows {
         println!("row\thook\ttime\tsession\tagent\tkey\tcos\tfts\tbytes\tread\thit");
         for (i, h) in &verdicts {
@@ -1079,7 +1084,7 @@ fn run() -> Result<ExitCode, String> {
                 let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
                 let s = atlas::pr_listen::Settings::from_config(loaded.as_ref().and_then(|c| c.pr_events.as_ref()))?;
                 let graph = setup.memory.graph.as_deref();
-                atlas::pr_listen::cli(&rest, &mut store, &atlas::pr_events::served(graph), &atlas::pr_events::forwarded(graph), &s)
+                atlas::pr_listen::cli(&rest, &mut store, &setup.memory.store, &atlas::pr_events::served(graph), &atlas::pr_events::forwarded(graph), &s)
             }
             "track" => {
                 let settings = atlas::trackers::Settings::from_config(loaded.as_ref().and_then(|c| c.trackers.as_ref()))?;
@@ -1127,8 +1132,11 @@ fn run() -> Result<ExitCode, String> {
             // printing, so the other never exits before the answer is
             // flushed or prints a second one (review N1 of #329).
             let answered = std::sync::Arc::new(std::sync::Mutex::new(false));
+            // Its phases name what was slow in an overrun's answer (#416).
+            atlas::hook_gate::begin("command", &format!("{} {}", ev.event, ev.tool_name));
+            atlas::hook_gate::phase("open");
             if atlas::hook_budget::enforced() {
-                let limit = setup.memory.hook_budget;
+                let limit = atlas::hook_budget::for_event(setup.memory.hook_budget, &ev.event);
                 let (done, overrun) = (answered.clone(), ev.clone());
                 let due = atlas::hook_budget::process_start() + limit + std::time::Duration::from_millis(250);
                 let _ = std::thread::Builder::new().name("atlas-hook-watch".into()).spawn(move || {
@@ -1137,7 +1145,8 @@ fn run() -> Result<ExitCode, String> {
                     // (Claude Code waits for the process, not only its answer).
                     let mut done = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if !*done {
-                        print!("{}", atlas::hooks::overrun_answer(&overrun, limit));
+                        let why = atlas::hook_gate::why("command", atlas::hook_budget::process_start());
+                        print!("{}", atlas::hooks::overrun_answer(&overrun, limit, &why));
                         *done = true;
                     }
                     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -1184,6 +1193,11 @@ fn run() -> Result<ExitCode, String> {
             }
             // The budget counts from the process's start.
             let mut a = h.handle_from(&ev, atlas::hook_budget::process_start());
+            atlas::hook_gate::end();
+            if !ev.tool_use {
+                let outcome = if a.deny.is_some() || a.block.is_some() { atlas::hook_gate::Outcome::Deny } else { atlas::hook_gate::Outcome::Pass };
+                h.log_gate(atlas::hook_gate::row(&ev.event, &ev.tool_name, !ev.agent_id.is_empty(), atlas::hook_budget::process_start(), h.budget_phases(), outcome));
+            }
             // The update notice (issue #190): a line the user sees, never the
             // model's context, once per version. Local files only: the
             // server's check fetched what it says. A session with no user

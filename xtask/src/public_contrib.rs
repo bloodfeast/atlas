@@ -14,7 +14,8 @@
 //!     the outside pull request carries, changes/<n>.md, is renamed
 //!     changes/public-<n>.md with `author: <login>` added, so it never
 //!     collides with a development pull request's and the CHANGELOG line
-//!     credits its author. A change the development main holds already is
+//!     credits its author; a marker, changes/<n>.none, becomes
+//!     changes/public-<n>.none. A change the development main holds already is
 //!     skipped and named. --dry-run makes the commits and pushes nothing.
 //!     Refuses before anything is opened when the public main holds a
 //!     commit the release's address check refuses ([`address_guard`]).
@@ -596,6 +597,22 @@ fn import_one(
         if name == "README.md" || name.contains('/') {
             continue;
         }
+        // A marker (no user-facing change) is kept as the import's own, so
+        // the development repository's fragment check finds one.
+        if name.strip_suffix(".none").is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
+            let new = format!("public-{n}.none");
+            if !names.contains(&new) {
+                let tf = work.join(&new);
+                write(&tf, "")?;
+                let blob = git_out(root, &["hash-object", "-w", "--no-filters", &tf.to_string_lossy()])?;
+                if !git_bytes(root, &["update-index", "--add", "--cacheinfo", &format!("100644,{blob},changes/{new}")], Some(&index))?.0 {
+                    return Err(format!("cannot add changes/{new}"));
+                }
+                notes.push(format!("`changes/{name}` is `changes/{new}` here"));
+                names.push(new);
+            }
+            continue;
+        }
         let Some(stem) = name.strip_suffix(".md") else {
             notes.push(format!("`changes/{name}` is left out"));
             continue;
@@ -1135,6 +1152,28 @@ mod tests {
         let held = w.import(&Map(m), false, &opened).unwrap();
         assert!(held.opened.is_empty() && held.skipped.iter().any(|s| s.contains(short(&sha)) && s.contains("holds")), "{held:?}");
         assert!(w.guard().is_ok(), "the export guard passes once imported");
+        w.done();
+    }
+
+    /// An outside pull request with no user-facing change carries a marker,
+    /// `changes/<n>.none`. The import keeps it as `changes/public-<n>.none`,
+    /// which the development repository's fragment check takes as the
+    /// import's own marker; left out, the check failed the import.
+    #[test]
+    fn import_keeps_a_marker_in_its_own_namespace() {
+        let w = world("import-none");
+        let sha = w.outside(22, &[("src/lib.rs", "fn a() {}\nfn tested() {}\n"), ("changes/22.none", "")], "tests: a test-only change");
+        let mut m = HashMap::new();
+        answers(&mut m, &sha, 22, "outsider");
+        let opened = std::cell::RefCell::new(Vec::new());
+        let r = w.import(&Map(m), false, &opened).unwrap();
+        assert_eq!((r.opened.len(), r.skipped.len(), r.failed.len()), (1, 0, 0), "{r:?}");
+        let body = opened.borrow()[0].2.clone();
+        assert!(body.contains("`changes/22.none` is `changes/public-22.none` here"), "{body}");
+        let origin = w.d.join("dev.git");
+        let tip = sh(&origin, &["rev-parse", "refs/heads/import/public-22"]);
+        assert_eq!(sh(&origin, &["ls-tree", "-r", "--name-only", &tip, "changes"]), "changes/README.md\nchanges/public-22.none");
+        assert_eq!(sh(&origin, &["show", &format!("{tip}:changes/public-22.none")]), "");
         w.done();
     }
 

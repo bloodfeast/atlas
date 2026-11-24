@@ -107,3 +107,59 @@ fn a_launch_refused_in_another_session_frees_its_slot() {
     let from_a = reviewer(&mut h, &a, "a1", "general-purpose");
     assert!(from_a.deny.is_none(), "session s2's rejected launch still held the slot: {from_a:?}");
 }
+
+/// #370: a rejected launch that is never relaunched leaves the held-slot
+/// listing at once, not after the pending TTL: the listing reads the
+/// session transcript from the launch's admission for its refusal. A
+/// launch with no refusal stays listed.
+#[test]
+fn a_rejection_with_no_relaunch_is_not_listed() {
+    let t = Temp::new("orch-cap-370-no-relaunch");
+    let s = Session::new(t.path());
+    let st = settings(t.path(), &builders_and_reviewer(), &[]);
+    let mut h = Hooks::open(st).unwrap();
+    assert!(reviewer(&mut h, &s, "t1", "on-track").deny.is_none());
+    assert!(launch(&mut h, &s, "t2", "general-purpose", "Kind: builder\nLane: WALRUS\n\nBuild it.").deny.is_none());
+    let store = atlas::memory::MemoryStore::open(&t.path().join("state").join("memory.sqlite")).unwrap();
+    let ids = || atlas::orchestrate::pending_slots(&store, std::time::SystemTime::now()).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    assert_eq!(ids(), ["t1", "t2"]);
+    s.reject("t1");
+    assert_eq!(ids(), ["t2"], "the rejected launch is still listed");
+}
+
+/// #370: a pending table an older build made (no `scan_from` column) is
+/// listed, and gains the column on the next write.
+#[test]
+fn a_pending_table_from_an_older_build_is_read_and_upgraded() {
+    let t = Temp::new("orch-cap-370-old-table");
+    let s = Session::new(t.path());
+    let st = settings(t.path(), &builders_and_reviewer(), &[]);
+    let path = st.store.clone();
+    let mut h = Hooks::open(st).unwrap();
+    {
+        let store = atlas::memory::MemoryStore::open(&path).unwrap();
+        store.conn().execute_batch("CREATE TABLE agent_pending(tool_use_id TEXT NOT NULL, transcript TEXT NOT NULL, kind TEXT NOT NULL, lane TEXT NOT NULL, description TEXT NOT NULL, time INTEGER NOT NULL);").unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        store
+            .conn()
+            .execute("INSERT INTO agent_pending VALUES('old1', ?1, 'builder', 'OLD', 'd', ?2)", atlas::db::params![s.tp(), now])
+            .unwrap();
+        let ids: Vec<String> = atlas::orchestrate::pending_slots(&store, std::time::SystemTime::now()).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["old1"]);
+    }
+    assert!(reviewer(&mut h, &s, "t1", "general-purpose").deny.is_none());
+    let store = atlas::memory::MemoryStore::open(&path).unwrap();
+    let ids: Vec<String> = atlas::orchestrate::pending_slots(&store, std::time::SystemTime::now()).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, ["old1", "t1"]);
+}
+
+fn builders_and_reviewer() -> OrchestrateSpec {
+    OrchestrateSpec {
+        enabled: Some(true),
+        kinds: vec![
+            (Kind::Reviewer, KindSpec { max: Some(1), ..Default::default() }),
+            (Kind::Builder, KindSpec { max: Some(4), ..Default::default() }),
+        ],
+        ..Default::default()
+    }
+}

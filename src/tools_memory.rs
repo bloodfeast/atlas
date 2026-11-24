@@ -34,7 +34,7 @@ const LEAD_RATIO: f64 = 0.8;
 const LEAD_BODIES: usize = 2;
 
 /// The tools answered here (no vault rescan first).
-pub(super) const MEMORY_TOOLS: &[&str] = &["remember", "recall", "supersede", "journal", "handoff", "journal_status", "memory_log", "hook"];
+pub(super) const MEMORY_TOOLS: &[&str] = &["remember", "recall", "supersede", "journal", "handoff", "journal_status", "memory_log", "question_sweep", "deferred_questions", "hook"];
 
 /// The memory store and hook state of a server, opened on first use.
 pub struct MemState {
@@ -250,6 +250,8 @@ impl Server {
             }
             "journal_status" => self.journal_status(a).map(Answer::Text),
             "memory_log" => self.memory_log(a).map(Answer::Text),
+            "question_sweep" => self.question_sweep().map(Answer::Text),
+            "deferred_questions" => self.deferred_questions().map(Answer::Text),
             "journal" | "handoff" => {
                 let mut out = self.memory_write(name, a)?;
                 // The style rule (#274), once per writing context (the
@@ -518,7 +520,32 @@ impl Server {
         let (lanes, idle) = self.status_lanes(a)?;
         let mut out = status_text(&lanes, idle);
         out.push_str(&crate::queue::held_text(&self.held_slots()?, &crate::memory::now()));
+        // #406: each listed lane's open questions, with age and flags.
+        let names: Vec<String> = lanes.into_iter().map(|l| l.lane).collect();
+        let m = self.mem()?;
+        let days = m.settings.question_stale_days;
+        let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
+        let open = crate::questions::open(store)?;
+        out.push_str(&crate::questions::status_lines(&open, &crate::memory::now(), crate::questions::last_start(store)?, days, &names));
         Ok(out)
+    }
+
+    /// `recall op=sweep`: the open questions that look settled (#406).
+    fn question_sweep(&mut self) -> Result<String> {
+        let m = self.mem()?;
+        let days = m.settings.question_stale_days;
+        let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
+        let open = crate::questions::open(store)?;
+        let found = crate::questions::sweep(store, &open, &crate::memory::now(), crate::questions::last_start(store)?, days)?;
+        Ok(crate::questions::sweep_text(&found))
+    }
+
+    /// `recall op=deferred`: the deferred questions, due ones first (#406).
+    fn deferred_questions(&mut self) -> Result<String> {
+        let m = self.mem()?;
+        let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
+        let open = crate::questions::open(store)?;
+        Ok(crate::questions::deferred_text(&open, &crate::memory::now(), crate::questions::last_start(store)?))
     }
 
     /// The agent cap's held slots (public #16): none with orchestrated mode
@@ -538,6 +565,26 @@ impl Server {
 
     fn journal_status_json(&mut self, a: &Map) -> Result<Value> {
         let (lanes, idle) = self.status_lanes(a)?;
+        let questions: Vec<Value> = {
+            let m = self.mem()?;
+            let days = m.settings.question_stale_days;
+            let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
+            let (now, start) = (crate::memory::now(), crate::questions::last_start(store)?);
+            crate::questions::open(store)?
+                .into_iter()
+                .filter(|q| lanes.iter().any(|l| l.lane == q.lane))
+                .map(|q| {
+                    let state = match q.state(&now, start) {
+                        crate::questions::State::Open => "open",
+                        crate::questions::State::Deferred => "deferred",
+                        crate::questions::State::Due => "due",
+                    };
+                    let age = q.age_days(&now).map_or(Value::Null, |d| crate::json!(d));
+                    let stale = q.stale(&now, start, days);
+                    crate::json!({"lane": q.lane, "key": q.key, "title": q.title, "age_days": age, "state": state, "stale": stale})
+                })
+                .collect()
+        };
         let lanes: Vec<Value> = lanes
             .into_iter()
             .map(|l| crate::json!({"lane": l.lane, "entries": l.entries, "last": l.last, "last_commit": l.last_commit, "open_questions": l.open_questions, "handoffs": l.handoffs}))
@@ -547,7 +594,7 @@ impl Server {
             .into_iter()
             .map(|h| crate::json!({"kind": h.kind.name(), "lane": h.lane, "description": h.description, "since": h.since, "running": h.running && h.released.is_none(), "agent": h.agent, "slot": h.slot, "released": h.released.map(crate::orchestrate::DeadReason::text)}))
             .collect();
-        Ok(crate::json!({"lanes": lanes, "idle": idle, "held_slots": held}))
+        Ok(crate::json!({"lanes": lanes, "idle": idle, "held_slots": held, "questions": questions}))
     }
 
     /// The lanes `journal_status` lists, and how many idle lanes it left
@@ -628,6 +675,17 @@ impl Server {
             }
             _ => None,
         };
+        // #406: a decision or answered entry answers the open questions of
+        // its lane family it names; a defer entry parks open questions.
+        let new_entry = if name == "journal" && opt_str(a, "amend")?.is_none() { opt_str(a, "entry")? } else { None };
+        let answering = matches!(new_entry, Some("decision" | "answered"));
+        let reopening = new_entry == Some(crate::questions::REOPEN_ENTRY);
+        let open_qs = if answering || reopening || new_entry == Some(crate::questions::ENTRY) { crate::questions::open(store)? } else { Vec::new() };
+        if reopening {
+            let is_question = |k: &str| store.head(k).ok().flatten().is_some_and(|h| h.kind == "journal" && h.sub == "question");
+            crate::questions::check_reopen(&open_qs, &refs, is_question).map_err(Error::InvalidArgument)?;
+        }
+        let mut linked: Vec<String> = Vec::new();
         let mut w = store.writer()?;
         let draft = |title: String, meta: String, body: String| Draft { title, meta, body, reason: reason.clone(), author: author.clone(), client: client.clone(), provenance: None, time: None };
         // A memory written to the user layer, and the keys it replaces: its
@@ -681,9 +739,16 @@ impl Server {
                         None if entry == crate::reviews::ENTRY => with_newline(crate::reviews::canonical_meta(review_meta)),
                         None => opt_str(a, "meta")?.map(|s| with_newline(s.to_string())).unwrap_or_default(),
                     };
+                    if entry == crate::questions::ENTRY {
+                        crate::questions::check_defer(&open_qs, &meta, &refs).map_err(Error::InvalidArgument)?;
+                    }
                     let (title, body) = title_and_body(head, rest);
                     let r = w.create(&key, "journal", entry, lane, &draft(title, meta, body), None)?;
                     let mut all = refs.clone();
+                    if answering {
+                        linked = crate::questions::links(&open_qs, lane, text, &refs);
+                        all.extend(linked.iter().map(|k| ("answers".to_string(), k.clone())));
+                    }
                     all.push(("lane".into(), lane.to_string()));
                     w.add_refs(&key, &all)?;
                     r
@@ -862,6 +927,18 @@ impl Server {
         w.commit()?;
         let mut out = format!("ok {} v{} sha={}{}\n", written.key, written.seq, &written.sha[..16], if written.changed { "" } else { " (unchanged)" });
         out.push_str(&warning);
+        for k in &linked {
+            out.push_str(&format!("answers {k} (named in this entry)\n"));
+        }
+        if !linked.is_empty() {
+            out.push_str("wrong one? journal entry=reopen refs=[\"reopens:<key>\"]\n");
+        }
+        if answering {
+            let lane = arg_nonblank(a, "lane")?;
+            let open = crate::questions::open(store)?;
+            let start = crate::questions::last_start(store)?;
+            out.push_str(&crate::questions::nudge(&open, lane, &crate::memory::now(), start, settings.question_stale_days));
+        }
         if let (Some((key, old)), Some(dir)) = (user_write, settings.user_memory.as_ref()) {
             let index = settings.exports.iter().find(|e| e.name == USER).map_or("MEMORY.md", |e| e.index.as_str());
             let store = self.mem()?.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;

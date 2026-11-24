@@ -47,13 +47,16 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const SECRET_BYTES: usize = 32;
 
 /// `atlas pr-events` usage.
-pub const USAGE: &str = "atlas pr-events serve [--port N] [--lane LANE]
+pub const USAGE: &str = "atlas pr-events serve [--port N] [--lane LANE] [--auto]
   Listens on 127.0.0.1:PORT for the deliveries `gh webhook forward` posts to
   http://127.0.0.1:PORT/github, checks each signature against its repository's
   secret (one per repository in the project's repos list, generated at start and
   held only in memory), and files one journal note per event in the lane that
   waits on the PR (else LANE, default pr-events). Port and lane also come from
-  the configuration's pr_events section (port, lane).
+  the configuration's pr_events section (port, lane); pr_events.repos limits
+  the repositories served, and pr_events.autostart has SessionStart start this
+  listener when none runs for the store (`--auto`, which leaves at once when one
+  does).
   It runs one `gh webhook forward` per repository (the gh-webhook extension),
   each with a new secret at every start, restarted with backoff when it ends.
   Ctrl-C stops them and deletes only the `cli` hooks atlas saw them make.";
@@ -215,7 +218,7 @@ pub fn parse_ignoring(event: &str, body: &[u8], ignore: &Ignore) -> std::result:
         if action == Action::Reviewed && ignore.review(&login) {
             return Ok(Parsed::Ignored("a review by an ignored login"));
         }
-        if action != Action::Reviewed && ignore.comment(&login) {
+        if action != Action::Reviewed && ignore.comment(event_host(&v).as_deref(), &login) {
             return Ok(Parsed::Ignored("a comment by the gh user or an ignored login"));
         }
     }
@@ -269,15 +272,32 @@ pub struct Ctx {
 /// `pr_events.ignore_logins`, whose reviews are ignored too.
 #[derive(Debug, Clone, Default)]
 pub struct Ignore {
-    me: Vec<String>,
+    /// The gh user per host (#394): a login names a person only on its own
+    /// host, so `octo` on github.com is not `octo` on an Enterprise host.
+    me: Vec<(String, String)>,
     logins: Vec<String>,
 }
 
+/// A host as [`Ignore`] keys it: lowercased, github.com for none.
+fn host_key(host: Option<&str>) -> String {
+    host.unwrap_or("github.com").to_ascii_lowercase()
+}
+
+/// The host a delivery came from: the authority of `repository.html_url`
+/// (an event names its repository as `OWNER/NAME` only). `None` when the
+/// payload has no such URL.
+fn event_host(v: &Value) -> Option<String> {
+    let url = v.pointer("/repository/html_url").and_then(Value::as_str)?;
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split('/').next().filter(|h| !h.is_empty())?;
+    Some(host.to_ascii_lowercase())
+}
+
 impl Ignore {
-    /// The gh user, one per host served when known, and the configured
-    /// logins.
-    pub fn new(gh_users: &[String], logins: &[String]) -> Ignore {
-        Ignore { me: gh_users.to_vec(), logins: logins.to_vec() }
+    /// The gh user on each host it was read on (`None`: github.com), and
+    /// the configured logins.
+    pub fn new(gh_users: &[(Option<String>, String)], logins: &[String]) -> Ignore {
+        Ignore { me: gh_users.iter().map(|(h, l)| (host_key(h.as_deref()), l.clone())).collect(), logins: logins.to_vec() }
     }
 
     /// Whether a review by `login` is ignored: a configured login only.
@@ -285,10 +305,13 @@ impl Ignore {
         any_is(&self.logins, login)
     }
 
-    /// Whether a review comment or PR comment by `login` is ignored: the gh
-    /// user or a configured login.
-    pub fn comment(&self, login: &str) -> bool {
-        any_is(&self.me, login) || any_is(&self.logins, login)
+    /// Whether a review comment or PR comment by `login` on `host` (see
+    /// [`event_host`]; `None` when unknown) is ignored: the gh user of that
+    /// host, or a configured login. On an unknown host no gh user is
+    /// matched, so a comment is heard rather than dropped.
+    pub fn comment(&self, host: Option<&str>, login: &str) -> bool {
+        let me = host.is_some_and(|h| self.me.iter().any(|(mh, l)| mh.eq_ignore_ascii_case(h) && any_is(std::slice::from_ref(l), login)));
+        me || any_is(&self.logins, login)
     }
 }
 
@@ -327,6 +350,16 @@ pub fn gh_user(gh: &dyn pr_supervise::Gh, host: Option<&str>) -> std::result::Re
     } else {
         Err("gh api user answered no login".into())
     }
+}
+
+/// [`gh_user`] on each of `hosts` (`None`: github.com), asked at once, one
+/// thread a host, so an unreachable host delays the start by one timeout,
+/// not one per host (#394). In the order of `hosts`.
+pub fn gh_users(gh: &dyn pr_supervise::Gh, hosts: &[Option<String>]) -> Vec<(Option<String>, std::result::Result<String, String>)> {
+    std::thread::scope(|sc| {
+        let asks: Vec<_> = hosts.iter().map(|h| (h.clone(), sc.spawn(move || gh_user(gh, h.as_deref())))).collect();
+        asks.into_iter().map(|(h, t)| (h, t.join().unwrap_or_else(|_| Err("gh api user panicked".into())))).collect()
+    })
 }
 
 /// One HTTP request as read.
@@ -622,6 +655,13 @@ pub struct Settings {
     pub lane: Option<String>,
     /// Logins whose reviews and comments file nothing (default none).
     pub ignore_logins: Vec<String>,
+    /// The repositories to serve, `OWNER/NAME` (github.com) or
+    /// `HOST/OWNER/NAME` (#384); empty serves every repository of the
+    /// project that has a remote.
+    pub repos: Vec<pr_supervise::Target>,
+    /// Whether SessionStart starts the listener when none runs for the
+    /// store (#386; default off). Needs `port`.
+    pub autostart: bool,
 }
 
 impl Settings {
@@ -633,7 +673,7 @@ impl Settings {
     /// A message naming a bad key or value.
     pub fn from_config(v: Option<&Value>) -> std::result::Result<Settings, String> {
         let Some(v) = v else { return Ok(Settings::default()) };
-        let f = crate::config::Fields::new("pr_events", v, &["port", "lane", "ignore_logins"]).map_err(|e| e.to_string())?;
+        let f = crate::config::Fields::new("pr_events", v, &["port", "lane", "ignore_logins", "repos", "autostart"]).map_err(|e| e.to_string())?;
         let port = f
             .uint("port")
             .map_err(|e| e.to_string())?
@@ -647,7 +687,40 @@ impl Settings {
         if let Some(bad) = ignore_logins.iter().find(|l| !is_login(l)) {
             return Err(format!("pr_events.ignore_logins: {bad:?} is not a GitHub login"));
         }
-        Ok(Settings { port, lane, ignore_logins })
+        let mut repos = Vec::new();
+        for spec in f.strings("repos").map_err(|e| e.to_string())?.unwrap_or_default() {
+            let t = pr_supervise::Target::parse(&spec)
+                .ok_or_else(|| format!("pr_events.repos: {spec:?} is not OWNER/NAME or HOST/OWNER/NAME"))?;
+            if !repos.contains(&t) {
+                repos.push(t);
+            }
+        }
+        let autostart = f.boolean("autostart").map_err(|e| e.to_string())?.unwrap_or(false);
+        if autostart && port.is_none() {
+            return Err("pr_events.autostart needs pr_events.port: the listener it starts takes no flags".into());
+        }
+        Ok(Settings { port, lane, ignore_logins, repos, autostart })
+    }
+
+    /// The repositories `serve` serves (#384): of `served` ([`pr_events::served`])
+    /// and `forwarded` ([`pr_events::forwarded`]), those `repos` names, or all
+    /// when it names none; and the entries of `repos` that name no repository
+    /// of the project with a remote.
+    pub fn allowed(&self, served: &[String], forwarded: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
+        if self.repos.is_empty() {
+            return (served.to_vec(), forwarded.to_vec(), Vec::new());
+        }
+        let kept: Vec<String> =
+            forwarded.iter().filter(|s| pr_supervise::Target::parse(s).is_some_and(|t| self.repos.contains(&t))).cloned().collect();
+        let names: Vec<String> = kept.iter().filter_map(|s| pr_supervise::Target::parse(s)).map(|t| t.repo).collect();
+        let served = served.iter().filter(|s| names.iter().any(|n| n.eq_ignore_ascii_case(s))).cloned().collect();
+        let unknown = self
+            .repos
+            .iter()
+            .filter(|t| !forwarded.iter().any(|s| pr_supervise::Target::parse(s).as_ref() == Some(*t)))
+            .map(pr_supervise::Target::key)
+            .collect();
+        (served, kept, unknown)
     }
 }
 
@@ -791,6 +864,8 @@ fn supervised(
 /// `atlas pr-events ARGS`. `served` is [`pr_events::served`] of the active
 /// project and `forwarded` its [`pr_events::forwarded`] (the same
 /// repositories, each with its host when that is not github.com).
+/// `store_path` is the memory store's file, beside which the listener's
+/// lock and pid file sit ([`crate::pr_autostart`]).
 ///
 /// # Errors
 ///
@@ -799,6 +874,7 @@ fn supervised(
 pub fn cli(
     args: &[String],
     store: &mut MemoryStore,
+    store_path: &std::path::Path,
     served: &[String],
     forwarded: &[String],
     settings: &Settings,
@@ -814,10 +890,47 @@ pub fn cli(
             };
             let lane = flag("--lane").or_else(|| settings.lane.clone()).unwrap_or_else(|| pr_events::DEFAULT_LANE.to_string());
             check_lane(&lane)?;
+            // #386: the listener holds the store's lock for its life, so a
+            // SessionStart sees it runs. Started by SessionStart (`--auto`),
+            // it waits for the starter to let go and leaves when another
+            // listener holds it; started by hand, it serves either way (a
+            // second `serve` on a store serves without forwarders, M2).
+            let paths = crate::pr_autostart::Paths::for_store(store_path);
+            let auto = args.iter().any(|a| a == "--auto");
+            let wait = if auto { crate::pr_autostart::WAIT } else { Duration::ZERO };
+            // A lock that cannot be taken at all (ENOLCK on some NFS): a
+            // listener started by hand serves without it, as it did before
+            // the lock; one started by a session stops, as its session's
+            // own try of the lock did not fail.
+            let held = match crate::pr_autostart::hold(&paths, wait) {
+                Err(e) if !auto => {
+                    say(format_args!(
+                        "atlas pr-events: the store's listener lock cannot be taken ({e}); serving without it, so a session's auto-start does not see this listener"
+                    ));
+                    None
+                }
+                r => r?,
+            };
+            let _hold = match held {
+                Some(h) => Some(h),
+                None if auto => {
+                    let pid = crate::pr_autostart::recorded(&paths).map_or_else(String::new, |p| format!(" (pid {p})"));
+                    say(format_args!("atlas pr-events: a listener already runs for this store{pid}; this one leaves"));
+                    return Ok(ExitCode::SUCCESS);
+                }
+                None => None,
+            };
+            let (served, forwarded, unknown) = settings.allowed(served, forwarded);
+            for u in &unknown {
+                say(format_args!("atlas pr-events: pr_events.repos names {u}, which no repository of the project with a remote is; not served"));
+            }
+            if forwarded.is_empty() && !settings.repos.is_empty() {
+                return Err("pr-events serve: pr_events.repos names none of the active project's repositories with a remote".into());
+            }
             let secrets = Secrets::new();
             let mut repos = Vec::new();
             let mut hosts: Vec<Option<String>> = Vec::new();
-            for spec in forwarded {
+            for spec in &forwarded {
                 let Some(t) = pr_supervise::Target::parse(spec) else { continue };
                 secrets.rotate(&t.repo).map_err(|e| format!("the random source: {e}"))?;
                 repos.push(t.key());
@@ -836,14 +949,14 @@ pub fn cli(
             // Read once per host served: the gh user's own replies (agents
             // commenting as that user) wake no one (#385).
             let mut me = Vec::new();
-            for host in &hosts {
-                let on = host.as_deref().unwrap_or("github.com");
-                match gh_user(&pr_supervise::SystemGh, host.as_deref()) {
+            for (host, got) in gh_users(&pr_supervise::SystemGh, &hosts) {
+                let on = host.as_deref().unwrap_or("github.com").to_string();
+                match got {
                     Ok(login) => {
                         say(format_args!(
-                            "atlas pr-events: comments by {login} (the gh user on {on}) are ignored; its reviews still count"
+                            "atlas pr-events: comments by {login} on {on} (the gh user there) are ignored; its reviews still count"
                         ));
-                        me.push(login);
+                        me.push((host, login));
                     }
                     Err(e) => {
                         say(format_args!("atlas pr-events: could not read the gh user on {on} ({e}); its own comments are not ignored"));
@@ -852,7 +965,7 @@ pub fn cli(
             }
             let ctx = Ctx {
                 secrets: secrets.clone(),
-                served: served.to_vec(),
+                served,
                 lane: lane.clone(),
                 proofs: pr_supervise::Proofs::new(),
                 ignore: Ignore::new(&me, &settings.ignore_logins),
@@ -870,6 +983,10 @@ pub fn cli(
 mod sender_tests;
 
 #[cfg(test)]
+#[path = "pr_listen_repos_tests.rs"]
+mod repos_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::queue;
@@ -884,7 +1001,7 @@ mod tests {
         format!("sha256={}", sha256::hmac(secret.as_bytes(), body).iter().map(|b| format!("{b:02x}")).collect::<String>())
     }
 
-    pub(super) struct Dir(std::path::PathBuf);
+    pub(super) struct Dir(pub(super) std::path::PathBuf);
 
     impl Drop for Dir {
         fn drop(&mut self) {
@@ -1068,7 +1185,7 @@ mod tests {
         let v = crate::json::parse(r#"{"port": 8765, "lane": "pr-inbox"}"#).unwrap();
         assert_eq!(
             Settings::from_config(Some(&v)).unwrap(),
-            Settings { port: Some(8765), lane: Some("pr-inbox".into()), ignore_logins: Vec::new() }
+            Settings { port: Some(8765), lane: Some("pr-inbox".into()), ..Settings::default() }
         );
         for bad in [r#"{"port": 0}"#, r#"{"port": 70000}"#, r#"{"lane": "a b"}"#, r#"{"other": 1}"#] {
             assert!(Settings::from_config(Some(&crate::json::parse(bad).unwrap())).is_err(), "{bad}");

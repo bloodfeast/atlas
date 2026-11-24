@@ -522,6 +522,42 @@ pub fn at_launch(store: &MemoryStore, orch: &OrchSettings, repos: &[Repo], l: &L
     done
 }
 
+/// Undoes what [`at_launch`] wrote for launch `tool_use_id` (#333, review
+/// N2 of #329): a launch atlas let in whose answer was lost (the watchdog
+/// refused it). The table is a ledger, so nothing is deleted or reopened:
+/// each open row of the launch is closed (`ended_at`), and the span it
+/// closed at its start (same folder) is opened again as a new row of the
+/// same owner. A bumped `last_modified` stays. Returns the rows closed.
+///
+/// # Errors
+///
+/// [`crate::Error::StoreTooNew`] or [`crate::Error::Db`], with nothing
+/// written.
+pub fn forget_launch(conn: &Connection, store: &Path, tool_use_id: &str) -> Result<usize> {
+    if tool_use_id.is_empty() {
+        return Ok(0);
+    }
+    let mut st = conn.prepare(&format!("SELECT id, path_key, created_at FROM worktree_owners WHERE tool_use_id = ?1 AND {OPEN}"))?;
+    let made: Vec<(i64, String, String)> = st.query_map([tool_use_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<crate::db::Result<_>>()?;
+    drop(st);
+    if made.is_empty() {
+        return Ok(0);
+    }
+    let now = crate::memory::now();
+    crate::memory::guarded(conn, store, || {
+        for (id, key, at) in &made {
+            conn.execute("UPDATE worktree_owners SET ended_at = ?2 WHERE id = ?1", params![id, now])?;
+            conn.execute(
+                "INSERT INTO worktree_owners(path, path_key, repo, branch, lane, description, tool_use_id, session, created_at, last_modified)
+                 SELECT path, path_key, repo, branch, lane, description, tool_use_id, session, ?3, ?3 FROM worktree_owners
+                 WHERE id = (SELECT max(id) FROM worktree_owners WHERE path_key = ?1 AND ended_at = ?2 AND removed_at IS NULL AND id != ?4)",
+                params![key, at, now, id],
+            )?;
+        }
+        Ok(made.len())
+    })
+}
+
 /// The hook's call at an admitted Agent launch (after the queue and the
 /// judge let it through): [`at_launch`] when `orchestrate.enabled` is on,
 /// beside the hook's answer and never changing it. A failure is one stderr

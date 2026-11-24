@@ -79,7 +79,8 @@ fn a_spent_budget_keeps_the_session_start_notify_line() {
     h.settings.worktrees.notify_bytes = 1;
     std::fs::write(crate::worktree_gc::summary_path(h.store().path()), "5000000000 3\n").unwrap();
     let ev = HookEvent { event: "SessionStart".into(), session_id: "s1".into(), source: "startup".into(), ..HookEvent::default() };
-    let a = h.handle_from(&ev, Instant::now() - Duration::from_secs(5));
+    // Past SessionStart's longer budget too (#333 item 2).
+    let a = h.handle_from(&ev, Instant::now() - Duration::from_millis(crate::hook_budget::LONG_MS + 1_000));
     assert!(h.budget.skipped().contains(&"worktree_gc"), "{:?}", h.budget.skipped());
     assert!(a.context.contains("3 stale worktrees hold"), "{a:?}");
     assert!(!crate::worktree_gc::stamp_path(h.store().path()).exists(), "a skipped tick wrote its stamp");
