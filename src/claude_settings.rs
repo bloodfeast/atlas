@@ -2251,10 +2251,13 @@ fn project_name(dir: &str, taken: &[String]) -> String {
 
 /// Whether a folder holds code the code index would read: Rust, WGSL, or a
 /// language of [`crate::langs`] (a source file or a unit marker such as
-/// `go.mod`).
-fn has_code(dir: &Path) -> bool {
-    dir.join("Cargo.toml").is_file()
-        || crate::code::walk(dir).is_ok_and(|w| !w.rust.is_empty() || !w.wgsl.is_empty() || !w.source.is_empty() || !crate::code::units(&w).is_empty())
+/// `go.mod`), and whether that code includes C++ (a source file or a
+/// compilation database).
+fn code_kinds(dir: &Path) -> (bool, bool) {
+    let Ok(w) = crate::code::walk(dir) else { return (dir.join("Cargo.toml").is_file(), false) };
+    let units = crate::code::units(&w);
+    let cpp = units.iter().any(|u| u.lang.name == "cpp") || w.source.iter().any(|f| crate::langs::of_path(&f.path).is_some_and(|l| l.name == "cpp"));
+    (dir.join("Cargo.toml").is_file() || !w.rust.is_empty() || !w.wgsl.is_empty() || !w.source.is_empty() || !units.is_empty(), cpp)
 }
 
 // ------------------------------------------------------- the project vault
@@ -2543,7 +2546,7 @@ pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&Vaul
         }
     };
     // A walk of the folder: not under the lock, and it depends on nothing there.
-    let code = has_code(Path::new(&key));
+    let (code, cpp) = code_kinds(Path::new(&key));
     // From here on every decision rests on the file as read under the lock.
     let held = if io.dry_run { p.unlocked() } else { p.lock_config()? };
     let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
@@ -2588,9 +2591,15 @@ pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&Vaul
         did.push(format!("source {name}"));
         manual.push(format!("add {{\"name\": \"{name}\", \"root\": \"{key}\", \"include\": [\"**/*.md\"]}} to {}", to("\"sources\"")));
         if code {
-            adds.push((&["code", "roots"], crate::json!({"name": format!("{name}-code"), "root": key.clone()})));
+            // C++ is asked about: scip-clang runs on its compilation
+            // database only once the user approves it (`atlas trust cpp`).
+            let (root, extra) = match cpp {
+                true => (crate::json!({"name": format!("{name}-code"), "root": key.clone(), "cpp": {"trust": "ask"}}), ", \"cpp\": {\"trust\": \"ask\"}"),
+                false => (crate::json!({"name": format!("{name}-code"), "root": key.clone()}), ""),
+            };
+            adds.push((&["code", "roots"], root));
             did.push(format!("code root {name}-code"));
-            manual.push(format!("add {{\"name\": \"{name}-code\", \"root\": \"{key}\"}} to {}", to("\"code\".\"roots\"")));
+            manual.push(format!("add {{\"name\": \"{name}-code\", \"root\": \"{key}\"{extra}}} to {}", to("\"code\".\"roots\"")));
         }
     }
     if let Some(v) = &plan {

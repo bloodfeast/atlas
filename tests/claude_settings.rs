@@ -687,6 +687,25 @@ fn add_project_makes_a_go_module_a_code_root() {
     assert_eq!(c.code.as_ref().unwrap().roots.len(), 1, "{text}");
 }
 
+/// A folder with C++ gets a code root whose C++ is asked about
+/// (`cpp.trust` "ask"); one without keeps the default, off.
+#[test]
+fn add_project_asks_about_a_folders_cpp() {
+    let h = Home::new("cs-project-cpp");
+    let proj = h.t.path().join("work").join("chaos");
+    write(&proj.join("README.md"), "# Chaos\n");
+    write(&proj.join("Main.cpp"), "int main() { return 0; }\n");
+    let (ok, text) = h.run(&["add-project", &proj.to_string_lossy()]);
+    assert!(ok, "{text}");
+    let go = h.t.path().join("work").join("payments");
+    write(&go.join("go.mod"), "module example.com/payments\n\ngo 1.22\n");
+    let (ok, text) = h.run(&["add-project", &go.to_string_lossy()]);
+    assert!(ok, "{text}");
+    let c = atlas::config::Config::load(&h.config()).unwrap();
+    let trust: Vec<(&str, atlas::config::CppTrust)> = c.code.as_ref().unwrap().roots.iter().map(|r| (r.name.as_str(), r.cpp)).collect();
+    assert_eq!(trust, [("chaos-code", atlas::config::CppTrust::Ask), ("payments-code", atlas::config::CppTrust::Off)]);
+}
+
 #[test]
 fn add_project_makes_a_typescript_or_javascript_package_a_code_root() {
     let h = Home::new("cs-project-ts");
