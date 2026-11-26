@@ -138,7 +138,8 @@ stays readable. Durable facts that are not lane work (a user's preference, a sta
   file in the unit's folder (a symlink, or one only in a build folder, is not read). Until it is approved,
   and again after it changes, C++ is only scanned: definitions without references.
 - **A running server keeps its configuration.** After a change, the hooks read the new one at once; the
-  MCP server reads it when the client reconnects (`/mcp` in Claude Code, a restart elsewhere).
+  MCP server reads it, and picks its project, only when the client reconnects (`/mcp` in Claude Code,
+  `/reload` in OpenCode, whose background service keeps the server when the terminal closes).
 
 ## Changing atlas itself
 
