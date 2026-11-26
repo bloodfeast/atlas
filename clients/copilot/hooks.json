@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot",
+        "powershell": "atlas --hook --client copilot",
+        "timeoutSec": 15
+      }
+    ],
+    "userPromptTransformed": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot --event userPromptTransformed",
+        "powershell": "atlas --hook --client copilot --event userPromptTransformed",
+        "timeoutSec": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot",
+        "powershell": "atlas --hook --client copilot",
+        "timeoutSec": 15
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot",
+        "powershell": "atlas --hook --client copilot",
+        "timeoutSec": 15
+      }
+    ],
+    "subagentStart": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot --event subagentStart",
+        "powershell": "atlas --hook --client copilot --event subagentStart",
+        "timeoutSec": 15
+      }
+    ],
+    "SubagentStop": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot",
+        "powershell": "atlas --hook --client copilot",
+        "timeoutSec": 15
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot",
+        "powershell": "atlas --hook --client copilot",
+        "timeoutSec": 15
+      }
+    ],
+    "PreCompact": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot",
+        "powershell": "atlas --hook --client copilot",
+        "timeoutSec": 15
+      }
+    ],
+    "SessionEnd": [
+      {
+        "type": "command",
+        "bash": "atlas --hook --client copilot",
+        "powershell": "atlas --hook --client copilot",
+        "timeoutSec": 15
+      }
+    ]
+  }
+}

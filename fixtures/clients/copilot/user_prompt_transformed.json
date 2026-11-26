@@ -1,0 +1,7 @@
+{
+  "sessionId": "72cd1675-6a93-4fde-a0dd-6f847aa3e1dc",
+  "timestamp": 1795707688480,
+  "cwd": "/work/proj",
+  "prompt": "Do these three steps, nothing else: 1) view the file hello.txt; 2) run the shell command: echo hi; 3) ask the task agent to run the shell command ls. Then reply with the single word done.",
+  "transformedPrompt": "<current_datetime>2026-11-26T15:41:28.480+00:00</current_datetime>\n\nDo these three steps, nothing else: 1) view the file hello.txt; 2) run the shell command: echo hi; 3) ask the task agent to run the shell command ls. Then reply with the single word done.\n\n<system_reminder>\n<context_window>\nFirst context window id: 72cd1675-6a93-4fde-a0dd-6f847aa3e1dc:v2:0\nCurrent context window id: 72cd1675-6a93-4fde-a0dd-6f847aa3e1dc:v2:0\nContext window number: 1\n</context_window>\n</system_reminder>"
+}

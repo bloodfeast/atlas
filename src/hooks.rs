@@ -1072,6 +1072,10 @@ pub struct Hooks {
     /// A command hook's state (one process per event): `drift_told` would
     /// be empty on every prompt, so the drift is told at SessionStart.
     command_hook: bool,
+    /// Whether the client is Claude Code (the default). Another client
+    /// (`atlas --hook --client`) gets none of what only Claude Code's own
+    /// files carry: the settings offer, the status line, the hooks' drift.
+    claude_code: bool,
     /// The records the last answer injected, for the memory eval.
     last: Vec<Injected>,
     /// The vaults and sources, by name, that lines refs resolve against.
@@ -1232,6 +1236,7 @@ impl Hooks {
             misses: crate::compact::MissTracker::default(),
             drift_told: HashSet::new(),
             command_hook: false,
+            claude_code: true,
             last: Vec::new(),
             roots: Vec::new(),
             orch: crate::orchestrate::Agents::default(),
@@ -1657,11 +1662,18 @@ impl Hooks {
         self.offer = p;
     }
 
+    /// Marks the client as one other than Claude Code (see
+    /// [`crate::clients`]): its sessions are not offered Claude Code
+    /// settings, and Claude Code's status line and hooks are left alone.
+    pub fn set_other_client(&mut self) {
+        self.claude_code = false;
+    }
+
     /// The hook drift warning, when the live atlas hooks differ from
     /// hooks/hooks.json (see [`crate::claude_settings::hook_drift_line`]).
     fn drift_line(&self) -> Option<String> {
         let (ideas_on, asks_on) = (self.ideas.is_some(), self.ideas.as_ref().is_some_and(crate::ideas::Live::asks));
-        self.offer.as_ref().and_then(|p| crate::claude_settings::hook_drift_line(p, ideas_on, asks_on))
+        self.offer.as_ref().filter(|_| self.claude_code).and_then(|p| crate::claude_settings::hook_drift_line(p, ideas_on, asks_on))
     }
 
     /// Loads what the first recall would (the term frequencies, the model
@@ -2260,10 +2272,10 @@ impl Hooks {
                 let asks = !self.unattended && !matches!(ev.source.as_str(), "resume" | "compact");
                 // The status line badge follows atlas to its new version
                 // folder, silently (#194, ruling (a)).
-                if let (Some(p), Some(exe)) = (self.offer.as_ref(), crate::claude_settings::badge_exe()) {
+                if let (Some(p), Some(exe), true) = (self.offer.as_ref(), crate::claude_settings::badge_exe(), self.claude_code) {
                     crate::claude_settings::repair_statusline(p, &exe);
                 }
-                if let Some(line) = self.offer.as_ref().filter(|_| asks).and_then(crate::claude_settings::session_start_line) {
+                if let Some(line) = self.offer.as_ref().filter(|_| asks && self.claude_code).and_then(crate::claude_settings::session_start_line) {
                     a.context = line;
                 }
                 // Per folder: whether to add this project as a source (or,
@@ -2322,7 +2334,7 @@ impl Hooks {
                 // recalling event routed to a command hook, and no mcp_tool
                 // UserPromptSubmit (a resident server tells it at the first
                 // prompt). A line of its own, outside the questions' budget.
-                if fresh && self.offer.as_ref().is_some_and(crate::claude_settings::drift_told_at_session_start) {
+                if fresh && self.claude_code && self.offer.as_ref().is_some_and(crate::claude_settings::drift_told_at_session_start) {
                     if let Some(line) = self.drift_line() {
                         if !a.context.is_empty() {
                             a.context.push('\n');

@@ -1,0 +1,15 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "72cd1675-6a93-4fde-a0dd-6f847aa3e1dc",
+  "timestamp": "2026-11-26T15:41:31.030Z",
+  "cwd": "/work/proj",
+  "tool_use_id": "call_t3QzWDLIhOTgybZhIEkiou5t",
+  "tool_name": "Read",
+  "tool_input": {
+    "path": "/work/proj/hello.txt"
+  },
+  "tool_result": {
+    "result_type": "success",
+    "text_result_for_llm": "hello from the scratch project\n"
+  }
+}

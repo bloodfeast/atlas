@@ -1,0 +1,16 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "72cd1675-6a93-4fde-a0dd-6f847aa3e1dc",
+  "timestamp": "2026-11-26T15:41:31.169Z",
+  "cwd": "/work/proj",
+  "tool_use_id": "call_4vsU8GPfpxVNFPXDN36JUUYZ",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo hi",
+    "description": "Print hi"
+  },
+  "tool_result": {
+    "result_type": "success",
+    "text_result_for_llm": "hi\n<shellId: 0 completed with exit code 0>"
+  }
+}

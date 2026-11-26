@@ -706,6 +706,9 @@ fn run() -> Result<ExitCode, String> {
     let mut config: Option<PathBuf> = None;
     let mut project: Option<String> = None;
     let mut mode = Mode::Serve;
+    // `--hook --client NAME [--event NAME]`: a hook client other than Claude Code.
+    let mut hook_client = atlas::clients::Client::Claude;
+    let mut hook_event = String::new();
     let mut phrases = Vec::new();
     #[cfg(feature = "dev")]
     let mut bench_opts = bench::Opts::default();
@@ -870,6 +873,11 @@ fn run() -> Result<ExitCode, String> {
                 mode = Mode::MemoryImport(pairs);
             }
             "--hook" => mode = Mode::Hook,
+            "--client" => {
+                let n = args.next().ok_or("--client needs a name: claude, copilot, codex, gemini or opencode")?;
+                hook_client = atlas::clients::Client::parse(&n).ok_or_else(|| format!("--client {n:?}: expected claude, copilot, codex, gemini or opencode"))?;
+            }
+            "--event" => hook_event = args.next().ok_or("--event needs an event name")?,
             "--statusline" => mode = Mode::StatusLine,
             "--project" => project = Some(args.next().ok_or("--project needs a name")?),
             "--phrase" => phrases.push(args.next().ok_or("--phrase needs text")?),
@@ -1109,8 +1117,16 @@ fn run() -> Result<ExitCode, String> {
         },
         Mode::Hook => {
             // A command hook: the event JSON on stdin, the answer on stdout.
-            let v = hook_input.unwrap_or(atlas::json::Value::Null);
+            let raw = hook_input.unwrap_or(atlas::json::Value::Null);
+            // Another client's event in Claude Code's shape, and every answer
+            // back in the client's (`atlas::clients`).
+            let v = hook_client.input(raw.clone(), &hook_event);
             let ev = atlas::hooks::HookEvent::from_value(&v);
+            let shaped = std::sync::Arc::new((raw, v));
+            let to_client = {
+                let shaped = shaped.clone();
+                move |out: String| hook_client.output(&shaped.0, &shaped.1, &out)
+            };
             // A store a newer atlas made is told to the user and the model (a
             // failing command hook shows only in verbose mode). The notice
             // belongs to this process, and each `--hook` run is its own: the
@@ -1119,7 +1135,7 @@ fn run() -> Result<ExitCode, String> {
             // told once, but a legacy settings file that routes
             // UserPromptSubmit or PostToolUse here tells it on every event.
             let refuse = |e: atlas::Error| -> Result<ExitCode, String> {
-                print!("{}", atlas::hooks::RefusalNotice::default().answer(&e, &ev));
+                print!("{}", to_client(atlas::hooks::RefusalNotice::default().answer(&e, &ev)));
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 Ok(ExitCode::SUCCESS)
             };
@@ -1137,7 +1153,7 @@ fn run() -> Result<ExitCode, String> {
             atlas::hook_gate::phase("open");
             if atlas::hook_budget::enforced() {
                 let limit = atlas::hook_budget::for_event(setup.memory.hook_budget, &ev.event);
-                let (done, overrun) = (answered.clone(), ev.clone());
+                let (done, overrun, to_client) = (answered.clone(), ev.clone(), to_client.clone());
                 let due = atlas::hook_budget::process_start() + limit + std::time::Duration::from_millis(250);
                 let _ = std::thread::Builder::new().name("atlas-hook-watch".into()).spawn(move || {
                     std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
@@ -1146,7 +1162,7 @@ fn run() -> Result<ExitCode, String> {
                     let mut done = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if !*done {
                         let why = atlas::hook_gate::why("command", atlas::hook_budget::process_start());
-                        print!("{}", atlas::hooks::overrun_answer(&overrun, limit, &why));
+                        print!("{}", to_client(atlas::hooks::overrun_answer(&overrun, limit, &why)));
                         *done = true;
                     }
                     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -1173,6 +1189,9 @@ fn run() -> Result<ExitCode, String> {
             };
             h.detect_offer_paths();
             h.set_command_hook();
+            if hook_client != atlas::clients::Client::Claude {
+                h.set_other_client();
+            }
             // An ignored value is named once a session, at SessionStart, not
             // on every hook event.
             let (unattended, note) = atlas::claude_settings::unattended_decision(|k| std::env::var(k).ok());
@@ -1218,7 +1237,7 @@ fn run() -> Result<ExitCode, String> {
                         std::thread::park();
                     }
                 }
-                print!("{}", a.to_json(&ev.event));
+                print!("{}", to_client(a.to_json(&ev.event)));
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 *done = true;
             }

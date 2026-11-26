@@ -1,0 +1,15 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "72cd1675-6a93-4fde-a0dd-6f847aa3e1dc",
+  "timestamp": "2026-11-26T15:41:34.139Z",
+  "cwd": "/work/proj",
+  "tool_use_id": "call_d7hBljKDoWX1DeUN5BDtsprP",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "Run ls command",
+    "prompt": "Run exactly the shell command `ls` and return its output.",
+    "agent_type": "task",
+    "name": "list-files",
+    "mode": "sync"
+  }
+}

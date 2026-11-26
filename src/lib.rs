@@ -33,6 +33,7 @@ pub mod checkpoint;
 pub mod chunk;
 pub mod compact;
 pub mod claude_settings;
+pub mod clients;
 pub mod code;
 pub mod code_index;
 pub mod config;
