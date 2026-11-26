@@ -232,8 +232,13 @@ fn copilot_output(raw: &Value, ev: &Value, event: &str, a: &Value) -> String {
         }
         "PreToolUse" => {
             // The nested deny is the shape measured to stop the call.
-            if let Some(r) = h.get("permissionDecisionReason").filter(|_| h.get("permissionDecision").and_then(Value::as_str) == Some("deny")) {
-                out.insert("hookSpecificOutput".into(), crate::json!({"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": r.clone()}));
+            if let Some(r) =
+                h.get("permissionDecisionReason").filter(|_| h.get("permissionDecision").and_then(Value::as_str) == Some("deny"))
+            {
+                out.insert(
+                    "hookSpecificOutput".into(),
+                    crate::json!({"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": r.clone()}),
+                );
             }
         }
         "PostToolUse" => {
