@@ -134,7 +134,7 @@ stays readable. Durable facts that are not lane work (a user's preference, a sta
   a root's C++ trust, or work around a refusal or a "scan only" note. A project's repositories are its code
   roots already. Say what is missing, and let the user decide.
 - **C++ is approved by the user.** scip-clang runs the compilers `compile_commands.json` names, so
-  `atlas trust cpp ROOT` is the user's command: tell them, never run it. The database must be a regular
+  `atlas trust cpp ROOT` is the user's command: when atlas's line asks, tell them, with ROOT the code root's name the line gives (not a folder); never run it. Without that line there is nothing to approve. The database must be a regular
   file in the unit's folder (a symlink, or one only in a build folder, is not read). Until it is approved,
   and again after it changes, C++ is only scanned: definitions without references.
 - **A running server keeps its configuration.** After a change, the hooks read the new one at once; the
