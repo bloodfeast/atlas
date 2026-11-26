@@ -217,7 +217,11 @@ fn scip_clang_runs_only_on_a_trusted_root_and_an_approved_database() {
     let t = Temp::new("cpp-trust");
     let root = t.path().join("repo");
     copy_sources(&root);
-    let system_db = r#"[{"directory": ".", "arguments": ["/usr/bin/c++", "-c", "shapes.cpp"], "file": "shapes.cpp"}]"#;
+    // A compiler outside the repository, as /usr/bin/c++ would be.
+    let cxx = t.path().join("sys/c++");
+    write(&cxx, "");
+    let system_db = format!(r#"[{{"directory": ".", "arguments": ["{}", "-c", "shapes.cpp"], "file": "shapes.cpp"}}]"#, cxx.display());
+    let system_db = system_db.as_str();
     write(&root.join("compile_commands.json"), system_db);
     let bin = t.path().join("bin");
     let tool = stand_in(&bin);
@@ -237,13 +241,13 @@ fn scip_clang_runs_only_on_a_trusted_root_and_an_approved_database() {
     indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
     assert_eq!(recorded(&bin).len(), 1, "an approved database runs");
     // A changed database (a pull) needs a new approval.
-    write(&root.join("compile_commands.json"), &system_db.replace("-c", "-O2 -c"));
+    write(&root.join("compile_commands.json"), &system_db.replace(r#""-c""#, r#""-O2", "-c""#));
     let (rep, _) = indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
     assert_eq!(recorded(&bin).len(), 1, "not run again");
     assert!(note(&rep).contains("not approved"), "{}", note(&rep));
     // A compiler inside the repository is never run, even trusted.
     write(&root.join("tools/cc"), "#!/bin/sh\n");
-    write(&root.join("compile_commands.json"), &system_db.replace("/usr/bin/c++", &root.join("tools/cc").to_string_lossy()));
+    write(&root.join("compile_commands.json"), &system_db.replace(&cxx.to_string_lossy().into_owned(), &root.join("tools/cc").to_string_lossy()));
     let (rep, _) = indexed_trusted(&root, &db, fixed(), CppTrust::Always);
     assert_eq!(recorded(&bin).len(), 1, "not run");
     assert!(note(&rep).contains("inside the repository"), "{}", note(&rep));

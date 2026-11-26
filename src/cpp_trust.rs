@@ -71,49 +71,140 @@ pub fn approve(name: &str, root: &Path, units: &[PathBuf], state: &Path) -> std:
     Ok(done)
 }
 
-/// Checks every compiler a database names: an absolute path outside the
-/// root, or a bare name found on `PATH` outside the root.
+/// Arguments, or prefixes of them, that make a compiler load or run
+/// another program or library: a toolchain or plugin path, a response file
+/// that could hold more of them, an assembler or linker pass-through.
+const UNSAFE_ARGS: &[&str] = &[
+    "-B",
+    "-fplugin",
+    "-fpass-plugin",
+    "-load",
+    "-plugin",
+    "-mllvm",
+    "--gcc-toolchain",
+    "--gcc-install-dir",
+    "-ccc-",
+    "@",
+    "--driver-mode",
+    "-fuse-ld",
+    "--ld-path",
+    "-fno-integrated-as",
+    "-no-integrated-as",
+    "-Wa,",
+    "-Wl,",
+    "-Xassembler",
+    "-Xlinker",
+];
+
+/// Checks every command of a database. Each must name a compiler (an
+/// absolute path, or a bare name found on `PATH`) that resolves outside the
+/// root and outside the system's pseudo-file folders, and pass no argument
+/// that loads another program ([`UNSAFE_ARGS`]). A command that cannot be
+/// read is refused, never skipped.
 ///
 /// # Errors
 ///
-/// The first compiler refused, and why; or a database that is no JSON array.
+/// The first command refused, and why; or a database that is no JSON array.
 pub fn compilers_outside(text: &str, root: &Path) -> std::result::Result<(), String> {
     let v = crate::json::parse(text).map_err(|e| format!("{DATABASE} is no JSON: {e}"))?;
     let entries = v.as_array().ok_or_else(|| format!("{DATABASE} is no JSON array"))?;
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    for e in entries {
-        let Some(c) = compiler(e) else { continue };
+    let root = std::fs::canonicalize(root).map_err(|e| format!("the root cannot be resolved: {e}"))?;
+    for (i, e) in entries.iter().enumerate() {
+        let args = arguments(e).ok_or_else(|| format!("{DATABASE} entry {i} has no readable command: not run"))?;
+        let c = args.first().ok_or_else(|| format!("{DATABASE} entry {i} has an empty command: not run"))?;
+        if let Some(bad) = args.iter().skip(1).find(|a| UNSAFE_ARGS.iter().any(|u| a.starts_with(u))) {
+            return Err(format!("{DATABASE} passes {bad}, which loads another program: not run"));
+        }
         let path = if c.contains('/') || c.contains('\\') {
-            let p = PathBuf::from(&c);
+            let p = PathBuf::from(c);
             if !p.is_absolute() {
                 return Err(format!("{DATABASE} names the compiler {c}, a relative path: not run"));
             }
             p
         } else {
-            match crate::langs::on_path(&c) {
-                Some(p) => p,
-                None => return Err(format!("{DATABASE} names the compiler {c}, not found on PATH: not run")),
-            }
+            crate::langs::on_path(c).ok_or_else(|| format!("{DATABASE} names the compiler {c}, not found on PATH: not run"))?
         };
-        let real = std::fs::canonicalize(&path).unwrap_or(path);
+        // Fail closed: a path that cannot be resolved is not run.
+        let real = std::fs::canonicalize(&path)
+            .map_err(|e| format!("{DATABASE} names the compiler {}, which cannot be resolved ({e}): not run", path.display()))?;
         if real.starts_with(&root) {
             return Err(format!("{DATABASE} names the compiler {}, inside the repository: not run", real.display()));
+        }
+        if ["/proc", "/dev", "/sys"].iter().any(|d| real.starts_with(d)) {
+            return Err(format!("{DATABASE} names the compiler {}, a system pseudo-file: not run", real.display()));
         }
     }
     Ok(())
 }
 
-/// The compiler of one database entry: the first of its `arguments`, or the
-/// first word of its `command` (a leading quoted word kept whole).
-fn compiler(e: &Value) -> Option<String> {
-    if let Some(first) = e.get("arguments").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_str) {
-        return Some(first.to_string());
+/// One database entry's command words: its `arguments`, or its `command`
+/// split as a shell splits it ([`split_command`]); `None` when neither is
+/// readable.
+fn arguments(e: &Value) -> Option<Vec<String>> {
+    if let Some(a) = e.get("arguments") {
+        return a.as_array()?.iter().map(|x| x.as_str().map(str::to_string)).collect();
     }
-    let cmd = e.get("command").and_then(Value::as_str)?.trim_start();
-    if let Some(rest) = cmd.strip_prefix('"') {
-        return rest.split_once('"').map(|(w, _)| w.to_string());
+    split_command(e.get("command")?.as_str()?)
+}
+
+/// Splits a command line as clang's compilation database does (POSIX shell
+/// rules): words split on unquoted blanks; single quotes keep everything to
+/// the next single quote; double quotes keep everything but a backslash
+/// before `"`, `\` or `$`; a backslash outside quotes escapes the next
+/// character; quoted and unquoted text next to each other join into one
+/// word. `None` for an unterminated quote or a trailing backslash.
+pub fn split_command(cmd: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut it = cmd.chars();
+    while let Some(ch) = it.next() {
+        match ch {
+            ' ' | '\t' | '\n' | '\r' => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\\' => {
+                cur.push(it.next()?);
+                in_word = true;
+            }
+            '\'' => {
+                in_word = true;
+                loop {
+                    match it.next()? {
+                        '\'' => break,
+                        c => cur.push(c),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match it.next()? {
+                        '"' => break,
+                        '\\' => match it.next()? {
+                            c @ ('"' | '\\' | '$') => cur.push(c),
+                            c => {
+                                cur.push('\\');
+                                cur.push(c);
+                            }
+                        },
+                        c => cur.push(c),
+                    }
+                }
+            }
+            c => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
     }
-    cmd.split_whitespace().next().map(str::to_string)
+    if in_word {
+        words.push(cur);
+    }
+    Some(words)
 }
 
 fn key(name: &str, root: &Path, unit: &Path) -> String {
@@ -181,12 +272,37 @@ mod tests {
         std::fs::create_dir_all(t.join("tools")).unwrap();
         let inside = t.join("tools").join("cc");
         std::fs::write(&inside, "").unwrap();
+        // A compiler outside the repository, as /usr/bin/c++ would be.
+        let sys = std::env::temp_dir().join(format!("atlas-cpp-trust-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::write(sys.join("c++"), "").unwrap();
+        let cxx = sys.join("c++").to_string_lossy().into_owned();
         let db = |c: &str| format!(r#"[{{"directory": ".", "arguments": ["{c}", "-c", "a.cc"], "file": "a.cc"}}]"#);
-        assert!(compilers_outside(&db("/usr/bin/c++"), &t).is_ok());
+        assert!(compilers_outside(&db(&cxx), &t).is_ok());
         assert!(compilers_outside(&db(&inside.to_string_lossy()), &t).unwrap_err().contains("inside the repository"));
         assert!(compilers_outside(&db("./tools/cc"), &t).unwrap_err().contains("relative path"));
-        assert!(compilers_outside(r#"[{"command": "\"/usr/bin/c++\" -c a.cc", "file": "a.cc"}]"#, &t).is_ok());
+        assert!(compilers_outside(&format!(r#"[{{"command": "\"{cxx}\" -c a.cc", "file": "a.cc"}}]"#), &t).is_ok());
         assert!(compilers_outside(r#"[{"command": "tools/cc -c a.cc", "file": "a.cc"}]"#, &t).is_err());
+        // Shell quoting joins words: `/usr/bin/c""++` is `/usr/bin/c++`, and
+        // a quoted relative path is still relative.
+        let joined = format!("{}/c\\\"\\\"++", sys.display());
+        assert!(compilers_outside(&format!(r#"[{{"command": "{joined} -c a.cc"}}]"#), &t).is_ok(), "{joined}");
+        assert!(compilers_outside(r#"[{"command": "'./tools/cc' -c a.cc"}]"#, &t).unwrap_err().contains("relative path"));
+        // An argument that loads another program, an unreadable entry, an
+        // unterminated quote, an unresolvable compiler: all refused.
+        for bad in [
+            r#"[{"arguments": ["/usr/bin/c++", "-fplugin=/tmp/x.so", "-c", "a.cc"]}]"#,
+            r#"[{"arguments": ["/usr/bin/c++", "-B/tmp/evil", "-c", "a.cc"]}]"#,
+            r#"[{"arguments": ["/usr/bin/c++", "-Xclang", "-load", "-Xclang", "/tmp/x.so"]}]"#,
+            r#"[{"arguments": ["/usr/bin/c++", "@flags.rsp"]}]"#,
+            r#"[{"file": "a.cc"}]"#,
+            r#"[{"command": "\"/usr/bin/c++ -c a.cc"}]"#,
+            r#"[{"arguments": ["/no/such/compiler", "-c", "a.cc"]}]"#,
+        ] {
+            assert!(compilers_outside(bad, &t).is_err(), "{bad}");
+        }
+        assert_eq!(split_command(r#"a "b c" d\ e 'f g'h"#).unwrap(), ["a", "b c", "d e", "f gh"]);
         std::fs::remove_dir_all(&t).ok();
+        std::fs::remove_dir_all(&sys).ok();
     }
 }
