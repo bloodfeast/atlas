@@ -1059,6 +1059,9 @@ pub struct Hooks {
     /// The configured projects, for the project offer of a project-scoped
     /// configuration (it replaces the folder offer there).
     offer_ctx: Option<crate::claude_settings::OfferCtx>,
+    /// The code index's state folder and its code roots whose C++ is asked
+    /// about (`cpp.trust` "ask"): SessionStart's C++ question.
+    cpp_ask: Option<(PathBuf, Vec<(String, PathBuf)>)>,
     /// The repository each session works in (see [`crate::project::Tracker`]).
     tracker: crate::project::Tracker,
     /// The session of the event being handled.
@@ -1224,6 +1227,7 @@ impl Hooks {
             index: None,
             project_roots: None,
             offer_ctx: None,
+            cpp_ask: None,
             unattended: false,
             tracker: crate::project::Tracker::default(),
             session: String::new(),
@@ -1629,6 +1633,12 @@ impl Hooks {
     pub fn serve_setup(&mut self) {
         self.set_unattended(true);
         self.set_binding(Some(binding_compiler()));
+    }
+
+    /// Turns on SessionStart's question about unapproved C++ databases
+    /// (see [`crate::cpp_trust::session_line`]).
+    pub fn set_cpp_ask(&mut self, state: PathBuf, roots: Vec<(String, PathBuf)>) {
+        self.cpp_ask = Some((state, roots));
     }
 
     /// Turns on the project offer of a project-scoped configuration.
@@ -2302,6 +2312,11 @@ impl Hooks {
                         }
                     }
                     _ => {}
+                }
+                // Per code root: whether to approve a C++ database the indexer
+                // found unapproved, once per content.
+                if asks {
+                    lines.extend(self.cpp_ask.as_ref().and_then(|(state, roots)| crate::cpp_trust::session_line(state, roots, Path::new(&ev.cwd))));
                 }
                 for line in lines {
                     if !a.context.is_empty() {

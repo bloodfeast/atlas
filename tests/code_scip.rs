@@ -86,6 +86,7 @@ fn setup(f: &Fixture, name: &str) -> CodeSetup {
             root: f.root.clone(),
             build_scripts: false,
             scip: Default::default(),
+            cpp: Default::default(),
             exclude: Vec::new(),
         }],
         debounce_s: Some(0),

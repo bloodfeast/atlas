@@ -25,6 +25,7 @@ fn setup(root: &Path, db: &Path, exclude: &[&str]) -> CodeSetup {
             root: root.to_path_buf(),
             build_scripts: false,
             scip: Default::default(),
+            cpp: Default::default(),
             exclude: exclude.iter().map(|s| s.to_string()).collect(),
         }],
         debounce_s: Some(0),

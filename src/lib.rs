@@ -36,6 +36,7 @@ pub mod claude_settings;
 pub mod code;
 pub mod code_index;
 pub mod config;
+pub mod cpp_trust;
 pub mod crop;
 pub mod db;
 pub mod digest;

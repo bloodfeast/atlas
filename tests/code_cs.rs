@@ -50,6 +50,7 @@ fn setup(root: &Path, db: &Path, indexers: Indexers) -> CodeSetup {
             root: root.to_path_buf(),
             build_scripts: false,
             scip: Default::default(),
+            cpp: Default::default(),
             exclude: Vec::new(),
         }],
         debounce_s: Some(0),

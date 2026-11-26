@@ -11,7 +11,7 @@ and makes no network calls at query time.
 **You do not need Obsidian.** A vault is any folder of Markdown files; Obsidian is an optional reader for it.
 
 Memory, search and the hooks work whatever language a project is written in. The code index covers Rust, Go,
-TypeScript, JavaScript, Python, C#, Java, Kotlin, WGSL and Protocol Buffers, and any language with a SCIP
+TypeScript, JavaScript, Python, C#, Java, Kotlin, C++, WGSL and Protocol Buffers, and any language with a SCIP
 indexer ([Code index](https://github.com/bloodfeast/atlas/wiki/Code-index)).
 
 ## Install

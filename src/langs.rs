@@ -342,6 +342,7 @@ pub struct Driver {
     /// when one is missing the unit is scanned and the note says why.
     pub needs: &'static [&'static str],
     /// Its arguments, run in the unit's folder; `{out}` is the output file,
+    /// `{out_dir}` the folder it is written in (for a tool's other output),
     /// `{marker}` the unit's marker file (a C# solution or project; left out
     /// when the unit has none), `{name}` the unit folder's name (a Python
     /// project's name).
@@ -985,6 +986,277 @@ const CS_KEYWORDS: &[&str] = &[
     "nint",
     "nuint",
 ];
+
+/// Folders whose C++ files are not indexed: build trees and vendored code.
+/// A `compile_commands.json` in one is still no marker (see [`CPP_MARKERS`]).
+const CPP_SKIP: &[&str] = &["build", "cmake-build-*", "bazel-*", "_deps", "third_party", "vendor"];
+
+/// A C++ unit is a folder holding a JSON compilation database: scip-clang
+/// reads it, run from that folder. A project without one is scanned.
+const CPP_MARKERS: &[&str] = &["compile_commands.json"];
+
+/// The files whose change makes a C++ root stale: the database, and the
+/// build files that regenerate it.
+const CPP_STALE: &[&str] =
+    &["compile_commands.json", "CMakeLists.txt", "*.cmake", "meson.build", "BUILD", "BUILD.bazel", "MODULE.bazel", "WORKSPACE", "Makefile"];
+
+const CPP_QUOTES: &[Quote] = &[
+    Quote { open: "//", close: "", escape: false, multiline: false, template: "" },
+    Quote { open: "/*", close: "*/", escape: false, multiline: true, template: "" },
+    // A preprocessor directive (`#include`, `#if`, `#define`) is no code.
+    Quote { open: "#", close: "", escape: false, multiline: false, template: "" },
+    // Raw strings with an empty delimiter run across lines and know no
+    // escapes; one with a delimiter (`R"x(...)x"`) is not recognised.
+    Quote { open: "u8R\"(", close: ")\"", escape: false, multiline: true, template: "" },
+    Quote { open: "LR\"(", close: ")\"", escape: false, multiline: true, template: "" },
+    Quote { open: "R\"(", close: ")\"", escape: false, multiline: true, template: "" },
+    Quote { open: "\"", close: "\"", escape: true, multiline: false, template: "" },
+    Quote { open: "'", close: "'", escape: true, multiline: false, template: "" },
+];
+
+/// Specifiers and attributes before a C++ declaration's type or keyword.
+macro_rules! cpp_lead {
+    () => {
+        concat!(
+            r"^\s*(?:template\s*<[^;{}]*>\s*)?(?:\[\[[^\]]*\]\]\s*)*",
+            r"(?:(?:static|inline|constexpr|consteval|constinit|virtual|explicit|extern|friend|mutable|thread_local|typename)\s+)*"
+        )
+    };
+}
+
+/// A C++ identifier.
+macro_rules! cpp_id {
+    () => {
+        r"[A-Za-z_]\w*"
+    };
+}
+
+/// A C++ type before a declarator: qualified names, template arguments,
+/// cv-qualifiers, pointers and references.
+macro_rules! cpp_type {
+    () => {
+        r"(?:(?:const|volatile|unsigned|signed|long|short)\s+)*(?:::)?[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?(?:\s*::\s*[A-Za-z_]\w*)*(?:\s+const)?(?:\s*[*&]+\s*(?:const\s*)?)*"
+    };
+}
+
+const CPP_RULES: &[Rule] = &[
+    // Namespaces: a named one (its last segment names it, as SCIP's
+    // namespace descriptors do), and an anonymous one, whose definitions
+    // take the enclosing container.
+    Rule {
+        scope: "|namespace",
+        re: r"^\s*(?:inline\s+)?namespace\s+(?:[\w:]+::)?(?P<name>[A-Za-z_]\w*)\s*(?:\{|$)",
+        does: Does::Open,
+        opens: "namespace",
+    },
+    Rule { scope: "|namespace", re: r"^\s*namespace\s*(?:\{|$)", does: Does::Open, opens: "namespace" },
+    // A forward declaration (`class X;`, `friend class Y;`) defines
+    // nothing; matched first, so the variable rule does not take it.
+    Rule {
+        scope: "|namespace|class",
+        re: r"^\s*(?:template\s*<[^;{}]*>\s*)?(?:friend\s+)?(?:class|struct|union|enum(?:\s+class|\s+struct)?)\s+[\w:]+\s*;",
+        does: Does::Open,
+        opens: "",
+    },
+    // Types, at the top level, in a namespace or nested in a type: a
+    // definition, never a forward declaration.
+    Rule {
+        scope: "|namespace|class",
+        re: concat!(
+            cpp_lead!(),
+            r"(?:class|struct)\s+(?:\[\[[^\]]*\]\]\s*)?(?:alignas\([^)]*\)\s*)?(?P<name>",
+            cpp_id!(),
+            r")\s*(?:final\s*)?(?:\{|:|$)"
+        ),
+        does: Does::Def("class"),
+        opens: "class",
+    },
+    Rule {
+        scope: "|namespace|class",
+        re: concat!(cpp_lead!(), r"union\s+(?P<name>", cpp_id!(), r")\s*(?:\{|$)"),
+        does: Does::Def("union"),
+        opens: "class",
+    },
+    Rule {
+        scope: "|namespace|class",
+        re: concat!(cpp_lead!(), r"enum\s+(?:class\s+|struct\s+)?(?P<name>", cpp_id!(), r")\s*(?::\s*[\w:\s]+)?\s*(?:\{|$)"),
+        does: Does::Def("enum"),
+        opens: "enum",
+    },
+    // Aliases and concepts.
+    Rule {
+        scope: "|namespace|class",
+        re: concat!(cpp_lead!(), r"using\s+(?P<name>", cpp_id!(), r")\s*="),
+        does: Does::Def("type"),
+        opens: "",
+    },
+    Rule {
+        scope: "|namespace|class",
+        re: concat!(r"^\s*typedef\b[^;]*?\b(?P<name>", cpp_id!(), r")\s*(?:\[[^\]]*\]\s*)?;"),
+        does: Does::Def("type"),
+        opens: "",
+    },
+    Rule {
+        scope: "|namespace",
+        re: concat!(cpp_lead!(), r"concept\s+(?P<name>", cpp_id!(), r")\s*="),
+        does: Does::Def("concept"),
+        opens: "",
+    },
+    // A type's members: a constructor or destructor (stored under the
+    // type's name), then methods, then fields.
+    Rule { scope: "class", re: concat!(cpp_lead!(), r"(?P<name>~", cpp_id!(), r")\s*\("), does: Does::Def("method"), opens: "" },
+    Rule { scope: "class", re: concat!(cpp_lead!(), r"(?P<name>", cpp_id!(), r")\s*\("), does: Does::DefOwner("ctor"), opens: "" },
+    Rule {
+        scope: "class",
+        re: concat!(cpp_lead!(), cpp_type!(), r"\s*\b(?P<name>", cpp_id!(), r"|operator\s*[^\s(]+)\s*\("),
+        does: Does::Def("method"),
+        opens: "",
+    },
+    Rule {
+        scope: "class",
+        re: concat!(cpp_lead!(), cpp_type!(), r"\s+(?P<name>", cpp_id!(), r")\s*(?:\[[^\]]*\]\s*)?(?::\s*\d+\s*)?(?:=|\{|;)"),
+        does: Does::Def("field"),
+        opens: "",
+    },
+    // A member defined outside its type (`double Circle::area() const`), a
+    // constructor or destructor included: named by its own name, with the
+    // type as its container.
+    Rule {
+        scope: "|namespace",
+        re: concat!(
+            cpp_lead!(),
+            r"(?:",
+            cpp_type!(),
+            r"\s+)?(?P<container>",
+            cpp_id!(),
+            r")(?:<[^;{}()]*>)?::~?(?P<name>",
+            cpp_id!(),
+            r")\s*\("
+        ),
+        does: Does::Def("method"),
+        opens: "",
+    },
+    // Free functions and variables at the top level or in a namespace.
+    Rule {
+        scope: "|namespace",
+        re: concat!(cpp_lead!(), cpp_type!(), r"\s*\b(?P<name>", cpp_id!(), r")\s*\("),
+        does: Does::Def("function"),
+        opens: "",
+    },
+    Rule {
+        scope: "|namespace",
+        re: concat!(cpp_lead!(), cpp_type!(), r"\s+(?P<name>", cpp_id!(), r")\s*(?:\[[^\]]*\]\s*)?(?:=|\{|;)"),
+        does: Does::Def("variable"),
+        opens: "",
+    },
+    // An enum's members, one or more per line inside its braces. Members on
+    // the enum's own line (`enum class C { A, B };`) are not found: a rule
+    // for them also took a short body's first word (`{ v_ = v; }`).
+    Rule {
+        scope: "enum",
+        re: concat!(r"(?:^|,)\s*(?P<name>", cpp_id!(), r")\s*(?:=[^,]*)?\s*(?:,|$|\})"),
+        does: Does::Def("field"),
+        opens: "",
+    },
+];
+
+/// A line that continues the declaration before it: a constructor's member
+/// initializers, a trailing return type, a `requires` clause.
+const CPP_CONTINUED: &str = r"^\s*(?::|,|->|requires\b|;)";
+
+/// C++ keywords and built-in type names: never a definition's name.
+const CPP_KEYWORDS: &[&str] = &[
+    "alignas",
+    "alignof",
+    "and",
+    "asm",
+    "auto",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "char8_t",
+    "char16_t",
+    "char32_t",
+    "class",
+    "co_await",
+    "co_return",
+    "co_yield",
+    "concept",
+    "const",
+    "const_cast",
+    "consteval",
+    "constexpr",
+    "constinit",
+    "continue",
+    "decltype",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "dynamic_cast",
+    "else",
+    "enum",
+    "explicit",
+    "export",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "friend",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "mutable",
+    "namespace",
+    "new",
+    "noexcept",
+    "not",
+    "nullptr",
+    "or",
+    "private",
+    "protected",
+    "public",
+    "register",
+    "reinterpret_cast",
+    "requires",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "static_assert",
+    "static_cast",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "thread_local",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typeid",
+    "typename",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "wchar_t",
+    "while",
+];
+
+/// The `--recall-check` truth for C++: a type, alias or concept keyword
+/// and the name after it, or a function whose body opens on its line.
+const CPP_TRUTH: &str = concat!(
+    r"^\s*(?:template\s*<[^;{}]*>\s*)?",
+    r"(?P<kw>class|struct|union|enum(?:\s+class|\s+struct)?|concept|using)\s+(?:\[\[[^\]]*\]\]\s*)?(?P<name>[A-Za-z_]\w*)\s*(?:final\s*)?(?:\{|:|=|$)"
+);
 
 /// C# build output, restored packages and tool folders.
 const CS_SKIP: &[&str] = &["obj", "bin", "packages", "TestResults", "artifacts", "node_modules"];
@@ -1767,6 +2039,49 @@ pub static LANGS: &[Lang] = &[
         }),
         driver: None,
     },
+    Lang {
+        name: "cpp",
+        exts: &["cc", "cpp", "cxx", "c++", "h", "hh", "hpp", "hxx", "ipp", "tpp"],
+        skip_dirs: CPP_SKIP,
+        markers: CPP_MARKERS,
+        nested_units: false,
+        units_of: None,
+        stale: CPP_STALE,
+        scanner: ScanRow {
+            quotes: CPP_QUOTES,
+            rules: CPP_RULES,
+            file_container: false,
+            continued_by: CPP_CONTINUED,
+            header_continued: "",
+            allman: true,
+            not_names: CPP_KEYWORDS,
+            indent: false,
+            once: &[],
+        },
+        truth: CPP_TRUTH,
+        // The scanner does not know which macros are set, so it adds no
+        // definitions where the index has none (they could be another
+        // platform's `#if` branch).
+        fills: false,
+        unindexed: None,
+        packages: None,
+        grpc: None,
+        driver: Some(Driver {
+            tool: "scip-clang",
+            node_package: None,
+            find: &[Find::Path],
+            version_arg: "--version",
+            needs: &[],
+            // Run in the unit's folder, the project root the database's
+            // paths are relative to; every output goes to atlas's state.
+            args: &["--compdb-path", "{marker}", "--index-output-path", "{out}", "--supplementary-output-dir", "{out_dir}"],
+            env: &[],
+            fail_hint: None,
+            prereq: None,
+            projects: None,
+            not_on_windows: Some("scip-clang has no Windows build"),
+        }),
+    },
 ];
 
 /// The row of a language by its name.
@@ -1968,6 +2283,7 @@ impl Driver {
             .iter()
             .filter_map(|a| match *a {
                 "{out}" => Some(out.as_os_str().to_os_string()),
+                "{out_dir}" => out.parent().map(|d| d.as_os_str().to_os_string()),
                 "{marker}" => marker.map(std::ffi::OsString::from),
                 "{name}" => Some(std::ffi::OsString::from(name)),
                 _ => Some(std::ffi::OsString::from(a)),

@@ -68,6 +68,7 @@ fn setup(root: &Path, db: &Path, indexers: Indexers, scip: code::Prebuilt) -> Co
             root: root.to_path_buf(),
             build_scripts: false,
             scip,
+            cpp: Default::default(),
             exclude: Vec::new(),
         }],
         debounce_s: Some(0),

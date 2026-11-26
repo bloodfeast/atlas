@@ -578,6 +578,18 @@ fn index_units(
                 Some(why) => Err(why.to_string()),
                 None => driver.clone(),
             };
+            // scip-clang reads the repository's own compilation database,
+            // which names the compiler it may run: only on a trusted root.
+            let unit_driver = match unit_driver {
+                Ok(_) if lang.name == "cpp" => {
+                    let unit = root.root.join(&u.dir);
+                    match crate::cpp_trust::refusal(&root.name, &root.root, root.cpp, &unit, &setup.dir) {
+                        Some(why) => Err(why),
+                        None => unit_driver,
+                    }
+                }
+                other => other,
+            };
             let source = match (&unit_driver, pre) {
                 (Err(why), None) => format!("scan only: {why}"),
                 (Err(_), Some(p)) => read_prebuilt(root, walk, owner, &u.dir, &p, rows, files, covered),

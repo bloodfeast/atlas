@@ -1,6 +1,6 @@
 ---
 name: atlas
-description: How to work with atlas, the project memory - recall past rulings and decisions before asking, journal to a lane, write handoffs, plan and start queued work by its key, write lean agent briefs with Kind and Lane lines, and keep state across context limits and compaction. Use when orchestrating or briefing agents, when recalling what was decided earlier, when an atlas cap, handoff or compaction message appears, or when a session is about to compact or clear; load it before your first journal or handoff.
+description: How to work with atlas, the project memory - recall past rulings and decisions before asking, journal to a lane, write handoffs, plan and start queued work by its key, write lean agent briefs with Kind and Lane lines, and keep state across context limits and compaction. Use when orchestrating or briefing agents, when recalling what was decided earlier, when an atlas cap, handoff or compaction message appears, when a session is about to compact or clear, when atlas asks a session-start question (a project, a setting, a C++ database), or before changing atlas's configuration; load it before your first journal or handoff.
 ---
 
 # Working with atlas
@@ -124,6 +124,22 @@ stays readable. Durable facts that are not lane work (a user's preference, a sta
 - **Write a compaction summary as keys and deltas:** a ruling as one line with its key, the state with its
   journal key, commit or file and line, and only the few exact lines the next step needs. Never restate what
   one recall returns.
+
+## atlas's questions and the user's configuration
+
+- **Ask a session-start question first.** A line from atlas at session start (a project or vault to add, a
+  setting offered, orchestrated mode, a C++ database to approve) is asked in one line at the start of the
+  first reply, then the task is done. Run the command the line names only on the user's answer.
+- **The configuration is the user's.** Never edit `atlas.json` or a project file by hand to add a root, raise
+  a root's C++ trust, or work around a refusal or a "scan only" note. A project's repositories are its code
+  roots already. Say what is missing, and let the user decide.
+- **C++ is approved by the user.** scip-clang runs the compilers `compile_commands.json` names, so
+  `atlas trust cpp ROOT` is the user's command: when atlas's line asks, tell them, with ROOT the code root's name the line gives (not a folder); never run it. Without that line there is nothing to approve. The database must be a regular
+  file in the unit's folder (a symlink, or one only in a build folder, is not read). Until it is approved,
+  and again after it changes, C++ is only scanned: definitions without references.
+- **A running server keeps its configuration.** After a change, the hooks read the new one at once; the
+  MCP server reads it, and picks its project, only when the client reconnects (`/mcp` in Claude Code,
+  `/reload` in OpenCode, whose background service keeps the server when the terminal closes).
 
 ## Changing atlas itself
 

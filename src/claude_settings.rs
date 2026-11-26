@@ -2231,7 +2231,7 @@ pub fn project_line(p: &Paths, cwd: &Path, roots: &[PathBuf]) -> Option<String> 
         ("atlas settings", String::new())
     };
     Some(format!(
-        "atlas: this project ({name}) is not indexed. In your first reply, whatever the task, ask the user in one line: \"create a vault for this project at {at}? yes / other folder / no\" (yes is the default; yes and other folder also add the project as a source). On yes run `{run} add-project --vault \"{key}\"`, on other folder `{run} add-project --vault-at \"FOLDER\" \"{key}\"`, on no `atlas settings add-project --no \"{key}\"`;{which} `atlas settings undo` reverses a yes. With no answer, or no user to ask, run nothing: atlas asks again next session."
+        "atlas: this project ({name}) is not indexed. Start your first reply with this question, in one line, whatever the task, then do the task: \"create a vault for this project at {at}? yes / other folder / no\" (yes is the default; yes and other folder also add the project as a source). On yes run `{run} add-project --vault \"{key}\"`, on other folder `{run} add-project --vault-at \"FOLDER\" \"{key}\"`, on no `atlas settings add-project --no \"{key}\"`;{which} `atlas settings undo` reverses a yes. With no answer, or no user to ask, run nothing: atlas asks again next session."
     ))
 }
 
@@ -2251,10 +2251,13 @@ fn project_name(dir: &str, taken: &[String]) -> String {
 
 /// Whether a folder holds code the code index would read: Rust, WGSL, or a
 /// language of [`crate::langs`] (a source file or a unit marker such as
-/// `go.mod`).
-fn has_code(dir: &Path) -> bool {
-    dir.join("Cargo.toml").is_file()
-        || crate::code::walk(dir).is_ok_and(|w| !w.rust.is_empty() || !w.wgsl.is_empty() || !w.source.is_empty() || !crate::code::units(&w).is_empty())
+/// `go.mod`), and whether that code includes C++ (a source file or a
+/// compilation database).
+fn code_kinds(dir: &Path) -> (bool, bool) {
+    let Ok(w) = crate::code::walk(dir) else { return (dir.join("Cargo.toml").is_file(), false) };
+    let units = crate::code::units(&w);
+    let cpp = units.iter().any(|u| u.lang.name == "cpp") || w.source.iter().any(|f| crate::langs::of_path(&f.path).is_some_and(|l| l.name == "cpp"));
+    (dir.join("Cargo.toml").is_file() || !w.rust.is_empty() || !w.wgsl.is_empty() || !w.source.is_empty() || !units.is_empty(), cpp)
 }
 
 // ------------------------------------------------------- the project vault
@@ -2543,7 +2546,7 @@ pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&Vaul
         }
     };
     // A walk of the folder: not under the lock, and it depends on nothing there.
-    let code = has_code(Path::new(&key));
+    let (code, cpp) = code_kinds(Path::new(&key));
     // From here on every decision rests on the file as read under the lock.
     let held = if io.dry_run { p.unlocked() } else { p.lock_config()? };
     let c = crate::config::Config::load(&cfg).map_err(|e| e.to_string())?;
@@ -2588,9 +2591,15 @@ pub fn add_project_vault(p: &Paths, io: &mut Io, dir: &Path, vault: Option<&Vaul
         did.push(format!("source {name}"));
         manual.push(format!("add {{\"name\": \"{name}\", \"root\": \"{key}\", \"include\": [\"**/*.md\"]}} to {}", to("\"sources\"")));
         if code {
-            adds.push((&["code", "roots"], crate::json!({"name": format!("{name}-code"), "root": key.clone()})));
+            // C++ is asked about: scip-clang runs on its compilation
+            // database only once the user approves it (`atlas trust cpp`).
+            let (root, extra) = match cpp {
+                true => (crate::json!({"name": format!("{name}-code"), "root": key.clone(), "cpp": {"trust": "ask"}}), ", \"cpp\": {\"trust\": \"ask\"}"),
+                false => (crate::json!({"name": format!("{name}-code"), "root": key.clone()}), ""),
+            };
+            adds.push((&["code", "roots"], root));
             did.push(format!("code root {name}-code"));
-            manual.push(format!("add {{\"name\": \"{name}-code\", \"root\": \"{key}\"}} to {}", to("\"code\".\"roots\"")));
+            manual.push(format!("add {{\"name\": \"{name}-code\", \"root\": \"{key}\"{extra}}} to {}", to("\"code\".\"roots\"")));
         }
     }
     if let Some(v) = &plan {
@@ -2983,11 +2992,11 @@ pub fn repos_line(p: &Paths, cwd: &Path, ctx: &OfferCtx) -> Option<String> {
         // a project of its own first (named after its configuration folder, or
         // by the user in a terminal), so "add to an existing project" is no answer.
         return Some(format!(
-            "atlas: this folder ({folder}) holds {n} git repo{plural} ({shown}) and atlas has no projects yet. In your first reply, whatever the task, ask the user in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} (atlas first moves its current setup into a project of its own) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses new, the move included. With no answer, or no user to ask, run nothing: atlas asks again next session."
+            "atlas: this folder ({folder}) holds {n} git repo{plural} ({shown}) and atlas has no projects yet. Start your first reply with this question, in one line, whatever the task, then do the task: new project here with these {n} repo{plural} and a vault for its notes at {vault} (atlas first moves its current setup into a project of its own) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses new, the move included. With no answer, or no user to ask, run nothing: atlas asks again next session."
         ));
     }
     Some(format!(
-        "atlas: this folder ({folder}) is no atlas project and holds {n} git repo{plural} ({shown}). In your first reply, whatever the task, ask the user in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} / add to an existing project ({existing}) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on add `atlas settings add-project --to NAME \"{key}\"`, on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses either. With no answer, or no user to ask, run nothing: atlas asks again next session."
+        "atlas: this folder ({folder}) is no atlas project and holds {n} git repo{plural} ({shown}). Start your first reply with this question, in one line, whatever the task, then do the task: new project here with these {n} repo{plural} and a vault for its notes at {vault} / add to an existing project ({existing}) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on add `atlas settings add-project --to NAME \"{key}\"`, on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses either. With no answer, or no user to ask, run nothing: atlas asks again next session."
     ))
 }
 

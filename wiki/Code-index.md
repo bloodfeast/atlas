@@ -3,8 +3,8 @@
 Memory, recall and history, search over Markdown notes and sources, discussions, the work queue, projects and
 multi-repo, and the hooks work whatever programming language a project uses, as does `.proto` indexing (rpc
 call sites are found in any language's files). The code index (`symbol`, item ranges on reads, grep
-annotations) covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C#, Python, Java and Kotlin (through
-scip-go, scip-typescript, scip-dotnet, scip-python and scip-java when they are installed, or a prebuilt
+annotations) covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C#, Python, Java, Kotlin and C++ (through
+scip-go, scip-typescript, scip-dotnet, scip-python, scip-java and scip-clang when they are installed, or a prebuilt
 `index.scip` from CI, WSL or Docker, else an owned scanner), and any language with a SCIP indexer from a
 `.scip` file. Build and test digests recognise `cargo test`, `nextest`, `go test` (plain and `-json`), jest,
 vitest, `dotnet test`, pytest, Maven and Gradle output, and other runners get the generic digest (see
@@ -183,6 +183,33 @@ app:src/lib.rs:8-10	Open for Store
   and in types (with type parameters and receiver types: `fun <T> List<T>.second()`), secondary constructors
   and object expressions' members; string templates (`${...}`, holding strings and running across lines) and
   raw strings are blanked first. Backticked names are not read.
+- **C++** (`.cc`, `.cpp`, `.cxx`, `.c++` and the headers `.h`, `.hh`, `.hpp`, `.hxx`, `.ipp`, `.tpp`; `.c` stays C,
+  which is not indexed) is a row of the same table. A folder with a `compile_commands.json` is a unit and claims
+  its subtree; `build`, `cmake-build-*`, `bazel-*`, `_deps`, `third_party` and `vendor` are skipped, and a
+  database inside one is not read, nor is a symlink to one: the database must be a regular file in the unit's
+  folder (with CMake, `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, then a copy at the root). atlas finds **scip-clang**
+  on `PATH` (it has no Windows build; atlas never installs it: put the binary from its GitHub releases,
+  `sourcegraph/scip-clang`, on `PATH`; it finds the standard headers through the compiler the database names,
+  so a C++ compiler with its headers must be installed, such as `clang` or `g++`) and runs `scip-clang --compdb-path compile_commands.json
+  --index-output-path FILE --supplementary-output-dir DIR` in the unit's folder, every output in atlas's
+  `code/` folder. scip-clang runs the compilers the database names, and the database is the repository's own
+  file, so it runs only where the root allows it: `code.roots[].cpp.trust` is `"off"` by default (C++ is
+  scanned), `"ask"` runs it on a database the user approved since it last changed (`atlas trust cpp ROOT`; a
+  session in the root is asked once per content of an unapproved one, and the agent is told to leave the
+  approval to the user), or `"always"`. `atlas settings add-project` sets `"ask"` on a folder with C++, and a
+  project's repositories get `"ask"`. Whatever the setting, a database is refused when a compiler is a
+  relative path or a file inside the repository, or an argument is not on atlas's list of what indexing
+  needs (include paths, macros, the language and standard, warnings, optimisation and machine options, output
+  and dependency files, C and C++ source files; no toolchain or plugin path, wrapper, response file or
+  pass-through to another tool); the unit's note says why. Without
+  scip-clang, or until the database is approved, the scanner reads namespaces (the last segment is the
+  container, as in SCIP), classes, structs, unions and enums with their members, aliases and concepts,
+  constructors and destructors (under the type's name), methods (also when defined outside their type,
+  `double Circle::area() const`), fields, free functions and variables, with comments, strings (raw strings
+  with an empty delimiter too) and preprocessor lines blanked first: definitions, kinds, containers and item
+  ranges, no references. The scanner adds nothing where scip-clang's index has no row: it does not know which
+  macros are set, so an `#if` branch the build left out stays out. A `compile_commands.json`,
+  `CMakeLists.txt`, `*.cmake`, `meson.build`, Bazel file or `Makefile` change re-indexes the root.
 - **Prebuilt indexes**: a unit may be indexed from a `.scip` file written elsewhere, by CI or by you (from WSL
   or Docker on Windows): an `index.scip` in the unit's folder, or the file `code.roots[].scip` names for it (see
   [[Configuration reference]]). Its document paths are relative to the unit's folder. A unit reads it when it
@@ -304,8 +331,8 @@ annotated again.
 | Discussions, the work queue (`next_id`, the decision queue) | any |
 | Projects and multi-repo, the repository graph | any |
 | Hooks: recall, handoffs, the context cap, routing to handles | any |
-| `symbol`: definitions, references, callers, impl edges | Rust, WGSL, Protocol Buffers, Go (scip-go when found), TypeScript and JavaScript (scip-typescript when found), C# (scip-dotnet when found), Python (scip-python when found, not on Windows), Java (scip-java when found, not on Windows); any of them from a prebuilt `index.scip`; else definitions only from the scanner, and always for Kotlin; any language with a SCIP indexer, from a `.scip` file given with `--code-index --scip FILE` (tested with scip-go, scip-typescript, scip-dotnet, scip-python and scip-java output) |
-| Item ranges on Read and shell reads, Grep annotations | Rust, WGSL, Protocol Buffers, Go, TypeScript, JavaScript, C#, Python, Java, Kotlin; the languages of a `--scip` file until one of their files changes |
+| `symbol`: definitions, references, callers, impl edges | Rust, WGSL, Protocol Buffers, Go (scip-go when found), TypeScript and JavaScript (scip-typescript when found), C# (scip-dotnet when found), Python (scip-python when found, not on Windows), Java (scip-java when found, not on Windows), C++ (scip-clang when found and the root's `cpp.trust` allows it, not on Windows); any of them from a prebuilt `index.scip`; else definitions only from the scanner, and always for Kotlin; any language with a SCIP indexer, from a `.scip` file given with `--code-index --scip FILE` (tested with scip-go, scip-typescript, scip-dotnet, scip-python and scip-java output) |
+| Item ranges on Read and shell reads, Grep annotations | Rust, WGSL, Protocol Buffers, Go, TypeScript, JavaScript, C#, Python, Java, Kotlin, C++; the languages of a `--scip` file until one of their files changes |
 | rpcs: generated stubs, exact callers and server implementations (`symbol` of an rpc) | Go, TypeScript, JavaScript, C#, Python, Java, Kotlin (stubs and calls through them from a SCIP index; implementations from SCIP impl edges or the scanner's type headers); word call sites in any language's source files where no index resolved the call |
 | References from one code root into another (a package another root defines) | any language whose SCIP indexer names its packages: Go, TypeScript, JavaScript, Python, Java, Rust; calls into another root's generated gRPC stubs as rpc call sites. Not C# (scip-dotnet writes no package name for a project's own symbols) and not scanner-only roots |
 | Build and test digests with failures by test | `cargo build`, `cargo test`, `cargo nextest`, `go test` (plain, `-v` and `-json`), jest, vitest, `dotnet test`, pytest, Maven (Surefire) and Gradle test output; other build tools and test runners get the generic digest |

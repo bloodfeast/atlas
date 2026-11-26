@@ -476,7 +476,14 @@ fn a_reindex_refused_by_the_lock_stays_owed() {
     write(&notes.join("n.md"), "# N\n");
     drop(atlas::store::Store::open(&s.index_db, atlas::paths::Vaults::new(&[("notes".to_string(), notes.clone())]).unwrap()).unwrap());
     let spec = atlas::config::CodeSpec {
-        roots: vec![atlas::config::CodeRootSpec { name: "app".into(), root: root.clone(), build_scripts: false, scip: Default::default(), exclude: Vec::new() }],
+        roots: vec![atlas::config::CodeRootSpec {
+            name: "app".into(),
+            root: root.clone(),
+            build_scripts: false,
+            scip: Default::default(),
+            cpp: Default::default(),
+            exclude: Vec::new(),
+        }],
         ..Default::default()
     };
     let code = atlas::code::CodeSetup::from_spec(&spec, &s.index_db, false);

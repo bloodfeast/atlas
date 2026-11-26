@@ -140,6 +140,7 @@ fn setup(f: &Fixture) -> CodeSetup {
             root: f.root.clone(),
             build_scripts: false,
             scip: Default::default(),
+            cpp: Default::default(),
             exclude: Vec::new(),
         }],
         debounce_s: Some(0),
@@ -352,7 +353,14 @@ fn code_config_is_read_and_unconfigured_symbol_is_refused() {
     let setup = CodeSetup::from_spec(c.code.as_ref().unwrap(), c.db.as_ref().unwrap(), true);
     assert_eq!(
         setup.roots,
-        [CodeRoot { name: "app".into(), root: t.path().join("app"), build_scripts: false, scip: Default::default(), exclude: Vec::new() }]
+        [CodeRoot {
+            name: "app".into(),
+            root: t.path().join("app"),
+            build_scripts: false,
+            scip: Default::default(),
+            cpp: Default::default(),
+            exclude: Vec::new()
+        }]
     );
     assert!(setup.defer_on_cargo && setup.defer_lock.is_none(), "defaults: wait for cargo, no lock file");
     assert_eq!(setup.debounce, Duration::from_secs(5));

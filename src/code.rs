@@ -219,6 +219,8 @@ pub struct CodeRoot {
     pub scip: Prebuilt,
     /// See [`crate::config::CodeRootSpec::exclude`].
     pub exclude: Vec<String>,
+    /// Whether scip-clang may run on its C++ ([`crate::config::CppTrust`]).
+    pub cpp: crate::config::CppTrust,
 }
 
 impl CodeRoot {
@@ -438,6 +440,7 @@ impl CodeSetup {
                     build_scripts: r.build_scripts,
                     scip: r.scip.clone(),
                     exclude: r.exclude.clone(),
+                    cpp: r.cpp,
                 })
                 .collect(),
             rust_analyzer: spec.rust_analyzer.clone(),
@@ -1132,8 +1135,10 @@ pub fn lang_of(doc_lang: &str, path: &str) -> &'static str {
         "scala" | "sc" => "scala",
         "cs" => "csharp",
         "rs" => "rust",
-        "c" | "h" => "c",
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "c" => "c",
+        // A bare `.h` is C++'s: atlas reads no C, and a SCIP document that
+        // names C keeps it (above).
+        "cc" | "cpp" | "cxx" | "c++" | "h" | "hh" | "hpp" | "hxx" | "ipp" | "tpp" => "cpp",
         "rb" => "ruby",
         "php" => "php",
         "dart" => "dart",
@@ -2965,6 +2970,13 @@ mod tests {
         assert_eq!(lang_of("", "Shapes.cs"), "csharp");
         assert_eq!(lang_of("python", "x"), "python");
         assert_eq!(lang_of("", "README"), "other");
+        // C++: every source and header form the cpp row reads; a bare `.h`
+        // is C++, and a SCIP document's own language still wins.
+        for p in ["a.cc", "a.cpp", "a.cxx", "a.c++", "a.hh", "a.hpp", "a.hxx", "a.ipp", "a.tpp", "a.h", "A.H"] {
+            assert_eq!(lang_of("", p), "cpp", "{p}");
+        }
+        assert_eq!(lang_of("c", "a.h"), "c");
+        assert_eq!(lang_of("", "a.c"), "c");
     }
 
     #[test]

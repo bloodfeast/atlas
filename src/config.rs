@@ -74,6 +74,23 @@ pub struct SourceSpec {
     pub names_kind: Option<String>,
 }
 
+/// Whether atlas may run scip-clang on a code root's C++
+/// (`code.roots[].cpp.trust`). The compilation database scip-clang reads is
+/// the repository's own file and names the compiler it may run, so this is
+/// off unless the root is trusted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CppTrust {
+    /// The root's C++ is scanned; scip-clang never runs (the default).
+    #[default]
+    Off,
+    /// scip-clang runs on a database whose content was approved (`atlas
+    /// trust cpp`, or the session-start question); after any change to it
+    /// the root is scanned until it is approved again.
+    Ask,
+    /// scip-clang runs on any database the root holds.
+    Always,
+}
+
 /// A code root: a folder whose Rust (through `rust-analyzer scip`) and
 /// WGSL (through [`crate::wgsl`]) are indexed for the `symbol` tool.
 #[derive(Debug, Clone)]
@@ -95,6 +112,8 @@ pub struct CodeRootSpec {
     /// or `false`, other folders following the convention. Paths are
     /// relative to the configuration file.
     pub scip: crate::code::Prebuilt,
+    /// Whether scip-clang may run on its C++ ([`CppTrust`]).
+    pub cpp: CppTrust,
     /// Globs, relative to the root, of folders and files the code index
     /// leaves out ([`crate::code::excluded`]): the walk never enters them,
     /// so no unit of their own is indexed and nothing there is scanned. An
@@ -834,6 +853,18 @@ fn code_excludes(f: &Fields<'_>) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// A code root's `cpp` object: `{"trust": "off" | "ask" | "always"}`.
+fn cpp_trust(f: &Fields<'_>, at: &str) -> Result<CppTrust> {
+    let Some(v) = f.get("cpp") else { return Ok(CppTrust::Off) };
+    let c = Fields::new(at, v, &["trust"])?;
+    match c.string("trust")?.as_deref() {
+        None | Some("off") => Ok(CppTrust::Off),
+        Some("ask") => Ok(CppTrust::Ask),
+        Some("always") => Ok(CppTrust::Always),
+        Some(_) => Err(c.bad("trust", "\"off\", \"ask\" or \"always\"")),
+    }
+}
+
 /// Reads a code root's `scip`: `true` or absent (the convention), `false`
 /// (none), a path (the root folder's file), or an object from unit folder
 /// to a path or `false`.
@@ -1007,12 +1038,13 @@ impl Config {
                 ..CodeSpec::default()
             };
             for (i, x) in f.list("roots")?.iter().enumerate() {
-                let r = Fields::new(&format!("{pre}code.roots[{i}]"), x, &["name", "root", "build_scripts", "scip", "exclude"])?;
+                let r = Fields::new(&format!("{pre}code.roots[{i}]"), x, &["name", "root", "build_scripts", "scip", "exclude", "cpp"])?;
                 code.roots.push(CodeRootSpec {
                     name: r.req_string("name")?,
                     root: absolute(base, Path::new(&r.req_string("root")?)),
                     build_scripts: r.boolean("build_scripts")?.unwrap_or(false),
                     scip: prebuilt_spec(&r, &format!("code.roots[{i}].scip"), base)?,
+                    cpp: cpp_trust(&r, &format!("code.roots[{i}].cpp"))?,
                     exclude: code_excludes(&r)?,
                 });
             }
