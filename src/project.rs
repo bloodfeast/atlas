@@ -868,7 +868,11 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
                     root: path.clone(),
                     build_scripts: false,
                     scip: Default::default(),
-                    cpp: Default::default(),
+                    // A project's repository is asked about its C++, as
+                    // add-project's code root is: nothing runs before the
+                    // user approves its database (`atlas trust cpp`), and a
+                    // repository with none never asks.
+                    cpp: crate::config::CppTrust::Ask,
                     exclude: Vec::new(),
                 });
             }

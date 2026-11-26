@@ -684,6 +684,9 @@ fn a_root_of_repos_is_discovered_offered_written_routed_and_indexed() {
         assert!(e.sources.iter().any(|x| x.name == s), "source {s}");
         assert!(e.code.as_ref().unwrap().roots.iter().any(|x| x.name == format!("{s}-code")), "code root {s}");
     }
+    // A repository's C++ is asked about: scip-clang runs only on a database
+    // the user approved.
+    assert!(e.code.as_ref().unwrap().roots.iter().all(|x| x.cpp == atlas::config::CppTrust::Ask));
     assert_eq!(e.db.as_deref(), Some(r.join("state").join("acme").join("atlas.sqlite").as_path()));
 
     // The unmapped repo is reported once.
