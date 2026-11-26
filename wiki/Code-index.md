@@ -188,7 +188,9 @@ app:src/lib.rs:8-10	Open for Store
   its subtree; `build`, `cmake-build-*`, `bazel-*`, `_deps`, `third_party` and `vendor` are skipped, and a
   database inside one is not read, nor is a symlink to one: the database must be a regular file in the unit's
   folder (with CMake, `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, then a copy at the root). atlas finds **scip-clang**
-  on `PATH` (it has no Windows build) and runs `scip-clang --compdb-path compile_commands.json
+  on `PATH` (it has no Windows build; atlas never installs it: put the binary from its GitHub releases,
+  `sourcegraph/scip-clang`, on `PATH`; it finds the standard headers through the compiler the database names,
+  so a C++ compiler with its headers must be installed, such as `clang` or `g++`) and runs `scip-clang --compdb-path compile_commands.json
   --index-output-path FILE --supplementary-output-dir DIR` in the unit's folder, every output in atlas's
   `code/` folder. scip-clang runs the compilers the database names, and the database is the repository's own
   file, so it runs only where the root allows it: `code.roots[].cpp.trust` is `"off"` by default (C++ is
