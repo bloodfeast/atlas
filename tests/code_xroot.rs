@@ -133,7 +133,8 @@ fn setup(t: &Temp) -> (CodeSetup, PathBuf) {
         root,
         build_scripts: false,
         scip: Default::default(),
-        cpp: Default::default(), exclude: Vec::new(),
+        cpp: Default::default(),
+        exclude: Vec::new(),
     };
     let spec = atlas::config::CodeSpec { roots: vec![root("svc", svc), root("lib", lib)], debounce_s: Some(0), ..Default::default() };
     let mut code = CodeSetup::from_spec(&spec, &db, false);
@@ -280,7 +281,8 @@ fn a_rust_crate_using_a_sibling_roots_crate_gets_its_references() {
         root,
         build_scripts: false,
         scip: Default::default(),
-        cpp: Default::default(), exclude: Vec::new(),
+        cpp: Default::default(),
+        exclude: Vec::new(),
     };
     let spec = atlas::config::CodeSpec { roots: vec![root("geo", geo), root("app", app)], debounce_s: Some(0), ..Default::default() };
     let mut code = CodeSetup::from_spec(&spec, &db, false);

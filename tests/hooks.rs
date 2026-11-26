@@ -1109,7 +1109,8 @@ fn an_edit_reindexes_the_file_once_the_answer_is_out() {
             root: root.clone(),
             build_scripts: false,
             scip: Default::default(),
-            cpp: Default::default(), exclude: Vec::new(),
+            cpp: Default::default(),
+            exclude: Vec::new(),
         }],
         ..Default::default()
     };

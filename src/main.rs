@@ -585,8 +585,22 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
 
 /// The bare words recognised as `argv[1]`, or after leading
 /// [`LEADING_OPTIONS`].
-const SUBCOMMANDS: &[&str] =
-    &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules", "backlog", "pr-events", "worktrees", "track", "trust"];
+const SUBCOMMANDS: &[&str] = &[
+    "run",
+    "slice",
+    "settings",
+    "grammar",
+    "ruling",
+    "entry",
+    "queue",
+    "ideas",
+    "rules",
+    "backlog",
+    "pr-events",
+    "worktrees",
+    "track",
+    "trust",
+];
 
 /// The usage of a subcommand asked for its help, `None` when it was not: only
 /// the first word after it counts, so `atlas run -- cargo --help` still runs and a

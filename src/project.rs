@@ -868,7 +868,8 @@ pub fn resolve(c: &Config, cwd: &Path, named: Option<&str>) -> Result<Resolved> 
                     root: path.clone(),
                     build_scripts: false,
                     scip: Default::default(),
-                    cpp: Default::default(), exclude: Vec::new(),
+                    cpp: Default::default(),
+                    exclude: Vec::new(),
                 });
             }
         }

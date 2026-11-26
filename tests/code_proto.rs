@@ -158,7 +158,8 @@ fn indexed(t: &Temp) -> (IndexReport, Server) {
             root,
             build_scripts: false,
             scip: Default::default(),
-            cpp: Default::default(), exclude: Vec::new(),
+            cpp: Default::default(),
+            exclude: Vec::new(),
         }],
         debounce_s: Some(0),
         ..Default::default()

@@ -13,8 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use atlas::code::{self, CodeSetup, Indexers};
-use atlas::config::CppTrust;
 use atlas::code_index::{self, IndexReport, RustSource};
+use atlas::config::CppTrust;
 use atlas::json;
 use atlas::tools::{CodeState, Server};
 use common::*;
@@ -77,7 +77,11 @@ fn stand_in(dir: &Path) -> PathBuf {
 
 /// Each recorded run: its working folder, then its arguments.
 fn recorded(dir: &Path) -> Vec<Vec<String>> {
-    fs::read_to_string(dir.join("args.txt")).unwrap_or_default().lines().map(|l| l.split_whitespace().map(str::to_string).collect()).collect()
+    fs::read_to_string(dir.join("args.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.split_whitespace().map(str::to_string).collect())
+        .collect()
 }
 
 fn indexed(root: &Path, db: &Path, indexers: Indexers) -> (IndexReport, Server) {
@@ -197,7 +201,11 @@ fn a_found_scip_clang_runs_in_the_units_folder_with_every_output_in_atlas_state(
     assert_eq!(run[5], "--supplementary-output-dir");
     let state = db.parent().unwrap().canonicalize().unwrap();
     for out in [&run[4], &run[6]] {
-        assert!(Path::new(out).canonicalize().unwrap_or_else(|_| PathBuf::from(out)).starts_with(&state), "{out} is not in {}", state.display());
+        assert!(
+            Path::new(out).canonicalize().unwrap_or_else(|_| PathBuf::from(out)).starts_with(&state),
+            "{out} is not in {}",
+            state.display()
+        );
     }
     assert!(!root.join("index.scip").exists(), "nothing is written to the source tree");
     // The run failed, so the unit is scanned.
@@ -247,7 +255,10 @@ fn scip_clang_runs_only_on_a_trusted_root_and_an_approved_database() {
     assert!(note(&rep).contains("not approved"), "{}", note(&rep));
     // A compiler inside the repository is never run, even trusted.
     write(&root.join("tools/cc"), "#!/bin/sh\n");
-    write(&root.join("compile_commands.json"), &system_db.replace(&cxx.to_string_lossy().into_owned(), &root.join("tools/cc").to_string_lossy()));
+    write(
+        &root.join("compile_commands.json"),
+        &system_db.replace(&cxx.to_string_lossy().into_owned(), &root.join("tools/cc").to_string_lossy()),
+    );
     let (rep, _) = indexed_trusted(&root, &db, fixed(), CppTrust::Always);
     assert_eq!(recorded(&bin).len(), 1, "not run");
     assert!(note(&rep).contains("inside the repository"), "{}", note(&rep));
@@ -270,7 +281,15 @@ fn the_trust_command_approves_a_roots_databases() {
             root.display()
         ),
     );
-    let run = |args: &[&str]| std::process::Command::new(bin()).arg("--config").arg(&cfg).args(args).env("CLAUDE_CONFIG_DIR", t.path().join("claude")).output().unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(bin())
+            .arg("--config")
+            .arg(&cfg)
+            .args(args)
+            .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
+            .output()
+            .unwrap()
+    };
     let o = run(&["trust", "cpp", "svc"]);
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success(), "{out} {}", String::from_utf8_lossy(&o.stderr));
