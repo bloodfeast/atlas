@@ -645,6 +645,8 @@ fn the_first_session_in_a_project_offers_it_once_and_add_project_indexes_it() {
     // The first session there: one line, asking, until it is answered.
     let first = session_start(&h, &proj);
     assert!(first.contains("this project (Demo App) is not indexed") && first.contains("atlas settings add-project"), "{first}");
+    // Asked first, not after the task: a long first turn would bury it.
+    assert!(first.contains("Start your first reply with this question, in one line, whatever the task, then do the task"), "{first}");
     assert!(session_start(&h, &proj).contains("this project"), "unanswered, so it returns");
     // A home folder is never offered.
     assert!(!session_start(&h, h.t.path()).contains("this project"));
@@ -1226,7 +1228,7 @@ fn the_first_session_offers_orchestrated_mode_once() {
     assert!(ok);
     let p = h.paths();
     let line = cs::orchestrate_line(&p).unwrap();
-    for w in ["In your first reply, whatever the task, ask the user whether to work in orchestrated mode", "--yes --mode MODE --fresh auto|ask", "--compile N --gpu N --builders N --reviewers N --research N", "from this machine's cores", "--handoff N --limit N", "285k and 450k", "atlas settings orchestrate --no", "or no user to ask, run nothing"] {
+    for w in ["Start your first reply by asking whether to work in orchestrated mode, then do the task", "--yes --mode MODE --fresh auto|ask", "--compile N --gpu N --builders N --reviewers N --research N", "from this machine's cores", "--handoff N --limit N", "285k and 450k", "atlas settings orchestrate --no", "or no user to ask, run nothing"] {
         assert!(line.contains(w), "{w}: {line}");
     }
     assert!(!line.contains("2, 2, 1"), "the line names the rule, not numbers: {line}");

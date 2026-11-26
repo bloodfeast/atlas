@@ -2231,7 +2231,7 @@ pub fn project_line(p: &Paths, cwd: &Path, roots: &[PathBuf]) -> Option<String> 
         ("atlas settings", String::new())
     };
     Some(format!(
-        "atlas: this project ({name}) is not indexed. In your first reply, whatever the task, ask the user in one line: \"create a vault for this project at {at}? yes / other folder / no\" (yes is the default; yes and other folder also add the project as a source). On yes run `{run} add-project --vault \"{key}\"`, on other folder `{run} add-project --vault-at \"FOLDER\" \"{key}\"`, on no `atlas settings add-project --no \"{key}\"`;{which} `atlas settings undo` reverses a yes. With no answer, or no user to ask, run nothing: atlas asks again next session."
+        "atlas: this project ({name}) is not indexed. Start your first reply with this question, in one line, whatever the task, then do the task: \"create a vault for this project at {at}? yes / other folder / no\" (yes is the default; yes and other folder also add the project as a source). On yes run `{run} add-project --vault \"{key}\"`, on other folder `{run} add-project --vault-at \"FOLDER\" \"{key}\"`, on no `atlas settings add-project --no \"{key}\"`;{which} `atlas settings undo` reverses a yes. With no answer, or no user to ask, run nothing: atlas asks again next session."
     ))
 }
 
@@ -2992,11 +2992,11 @@ pub fn repos_line(p: &Paths, cwd: &Path, ctx: &OfferCtx) -> Option<String> {
         // a project of its own first (named after its configuration folder, or
         // by the user in a terminal), so "add to an existing project" is no answer.
         return Some(format!(
-            "atlas: this folder ({folder}) holds {n} git repo{plural} ({shown}) and atlas has no projects yet. In your first reply, whatever the task, ask the user in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} (atlas first moves its current setup into a project of its own) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses new, the move included. With no answer, or no user to ask, run nothing: atlas asks again next session."
+            "atlas: this folder ({folder}) holds {n} git repo{plural} ({shown}) and atlas has no projects yet. Start your first reply with this question, in one line, whatever the task, then do the task: new project here with these {n} repo{plural} and a vault for its notes at {vault} (atlas first moves its current setup into a project of its own) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses new, the move included. With no answer, or no user to ask, run nothing: atlas asks again next session."
         ));
     }
     Some(format!(
-        "atlas: this folder ({folder}) is no atlas project and holds {n} git repo{plural} ({shown}). In your first reply, whatever the task, ask the user in one line: new project here with these {n} repo{plural} and a vault for its notes at {vault} / add to an existing project ({existing}) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on add `atlas settings add-project --to NAME \"{key}\"`, on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses either. With no answer, or no user to ask, run nothing: atlas asks again next session."
+        "atlas: this folder ({folder}) is no atlas project and holds {n} git repo{plural} ({shown}). Start your first reply with this question, in one line, whatever the task, then do the task: new project here with these {n} repo{plural} and a vault for its notes at {vault} / add to an existing project ({existing}) / skip. On new run `atlas settings add-project --new \"{key}\"` (add `--vault-at \"FOLDER\"` if the user names another vault folder, `--no-vault` if they want none), on add `atlas settings add-project --to NAME \"{key}\"`, on skip `atlas settings add-project --no \"{key}\"`; `atlas settings undo` reverses either. With no answer, or no user to ask, run nothing: atlas asks again next session."
     ))
 }
 
