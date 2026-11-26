@@ -114,6 +114,8 @@ Modes:
   --setup                first-run setup: the model, the Claude Code settings offer, the project
   --rescan               re-index every vault and source, then exit
   --hook                 a Claude Code command hook: the event JSON on stdin, the answer on stdout
+  --client NAME          with --hook: the hook client, claude (default), copilot, codex, gemini or opencode
+  --event NAME           with --hook: the event, for a client whose input names none (Copilot's camelCase events)
   --statusline           the update badge for a Claude Code status line (reads the update state file only; prints nothing when no update is pending)
   --recall-check [--phrase TEXT ...]   every identifier and phrase is found by lookup
   --token-report         the token ledger in about 15 lines: the measured ratio, credit, cost and net, the savings by source, the last 7 days

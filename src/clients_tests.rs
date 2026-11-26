@@ -3,8 +3,16 @@ use crate::hooks::HookEvent;
 
 /// A Copilot payload captured from Copilot CLI 1.0.114 (paths made neutral).
 fn copilot(name: &str) -> Value {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/clients/copilot").join(name);
-    crate::json::parse(&std::fs::read_to_string(p).unwrap()).unwrap()
+    let text = match name {
+        "post_tool_use_bash.json" => include_str!("../fixtures/clients/copilot/post_tool_use_bash.json"),
+        "post_tool_use_read.json" => include_str!("../fixtures/clients/copilot/post_tool_use_read.json"),
+        "pre_tool_use_agent.json" => include_str!("../fixtures/clients/copilot/pre_tool_use_agent.json"),
+        "session_start.json" => include_str!("../fixtures/clients/copilot/session_start.json"),
+        "subagent_start.json" => include_str!("../fixtures/clients/copilot/subagent_start.json"),
+        "user_prompt_transformed.json" => include_str!("../fixtures/clients/copilot/user_prompt_transformed.json"),
+        n => panic!("no fixture {n}"),
+    };
+    crate::json::parse(text).unwrap()
 }
 
 /// Claude Code's answer with `fields` in its `hookSpecificOutput`.
@@ -211,8 +219,13 @@ fn copilot_s_saved_output_is_the_whole_output() {
 
 /// Every command in the file `clients/<dir>/<file>`, with its event.
 fn template(dir: &str, file: &str, key: &str) -> Vec<(String, String)> {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("clients").join(dir).join(file);
-    let v = crate::json::parse(&std::fs::read_to_string(p).unwrap()).unwrap();
+    let text = match (dir, file) {
+        ("copilot", "hooks.json") => include_str!("../clients/copilot/hooks.json"),
+        ("codex", "hooks.json") => include_str!("../clients/codex/hooks.json"),
+        ("gemini", "settings.json") => include_str!("../clients/gemini/settings.json"),
+        _ => panic!("no template {dir}/{file}"),
+    };
+    let v = crate::json::parse(text).unwrap();
     let mut out = Vec::new();
     for (event, entries) in v.get("hooks").and_then(Value::as_object).unwrap().iter() {
         for e in entries.as_array().unwrap() {
