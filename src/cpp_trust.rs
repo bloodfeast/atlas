@@ -86,7 +86,6 @@ const VALUE_FLAGS: &[&str] = &[
     "-MF",
     "-MT",
     "-MQ",
-    "-isysroot",
     "-target",
     "--target",
     "-arch",
@@ -115,10 +114,7 @@ fn allowed(a: &str) -> bool {
         "-f",
         "-m",
         "-M",
-        "-x",
         "-o",
-        "--sysroot=",
-        "-isysroot",
         "-target",
         "--target=",
         "-arch",
@@ -127,7 +123,7 @@ fn allowed(a: &str) -> bool {
         "-pthread",
     ];
     const EXACT: &[&str] =
-        &["-c", "-E", "-S", "-pedantic", "-pedantic-errors", "-w", "-pipe", "-shared", "-static", "-ansi", "-v", "-H", "-P", "-C"];
+        &["-c", "-E", "-S", "-pedantic", "-pedantic-errors", "-w", "-pipe", "-shared", "-static", "-ansi", "-v", "-H", "-P", "-C", "-x"];
     // Prefixes above that still reach another program or library.
     const DENIED: &[&str] = &[
         "-Wa,",
@@ -145,6 +141,10 @@ fn allowed(a: &str) -> bool {
         "-mllvm",
         "-gcc-toolchain",
         "-gcc-install-dir",
+        "-fopenmp-targets",
+        "--offload",
+        "--cuda-",
+        "-fgpu-",
     ];
     if !a.starts_with('-') {
         return !a.starts_with('@');
@@ -167,6 +167,13 @@ fn refused_arg(args: &[String]) -> Option<&str> {
         if VALUE_FLAGS.contains(&a) {
             // The value is a path or a word: never a flag or a response file.
             match args.get(i + 1) {
+                // A language, for -x: only C and C++ (CUDA, HIP and OpenCL
+                // start a device toolchain).
+                Some(v)
+                    if a == "-x" && !matches!(v.as_str(), "c" | "c++" | "c-header" | "c++-header" | "c-cpp-output" | "c++-cpp-output") =>
+                {
+                    return Some(v.as_str());
+                }
                 Some(v) if !v.starts_with('-') && !v.starts_with('@') => i += 1,
                 Some(v) => return Some(v.as_str()),
                 None => return Some(a),
@@ -415,10 +422,20 @@ mod tests {
             "-gcc-toolchain=/tmp/x",
             "-fno-integrated-cc1",
             "-fcompare-debug",
+            "--sysroot=/tmp/x",
+            "-fopenmp-targets=nvptx64",
+            "-xcuda",
         ] {
             let db = format!(r#"[{{"arguments": ["{cxx}", "{flag}", "-c", "a.cc"]}}]"#);
             assert!(compilers_outside(&db, &t).unwrap_err().contains("not on atlas's list"), "{flag}");
         }
+        // -x takes only a C or C++ language; -isysroot is refused.
+        for (flag, v) in [("-x", "cuda"), ("-x", "hip"), ("-isysroot", "/tmp/x")] {
+            let db = format!(r#"[{{"arguments": ["{cxx}", "{flag}", "{v}", "-c", "a.cc"]}}]"#);
+            assert!(compilers_outside(&db, &t).unwrap_err().contains("not on atlas's list"), "{flag} {v}");
+        }
+        let db = format!(r#"[{{"arguments": ["{cxx}", "-x", "c++", "-c", "a.cc"]}}]"#);
+        assert!(compilers_outside(&db, &t).is_ok(), "{db}");
         // A flag's value is never a flag or a response file.
         for v in ["@evil.rsp", "-fplugin=/tmp/x.so"] {
             let db = format!(r#"[{{"arguments": ["{cxx}", "-I", "{v}", "-c", "a.cc"]}}]"#);
