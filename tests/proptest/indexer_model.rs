@@ -87,7 +87,14 @@ impl World {
         if walk || !s.started {
             let pending = s.changed.is_some();
             match after_walk(self.stored.as_deref(), &current, &s.seen, s.failed.as_deref(), pending, !s.started) {
-                Walked::Current => s.changed = None,
+                Walked::Current => {
+                    s.changed = None;
+                    // As the loop does: a walk that finds the stored fingerprint
+                    // clears a failure.
+                    if self.stored.as_deref() == Some(current.as_str()) {
+                        s.failed = None;
+                    }
+                }
                 Walked::Changing { at_once } => s.changed = Some(if at_once { now - QUIET } else { now }),
                 Walked::Mark => s.changed = Some(now - QUIET),
                 Walked::Keep => {}
