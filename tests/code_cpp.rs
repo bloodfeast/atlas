@@ -13,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use atlas::code::{self, CodeSetup, Indexers};
+use atlas::config::CppTrust;
 use atlas::code_index::{self, IndexReport, RustSource};
 use atlas::json;
 use atlas::tools::{CodeState, Server};
@@ -37,12 +38,17 @@ fn vaults(db: &Path) -> atlas::paths::Vaults {
 }
 
 fn setup(root: &Path, db: &Path, indexers: Indexers) -> CodeSetup {
+    setup_trusted(root, db, indexers, CppTrust::Off)
+}
+
+fn setup_trusted(root: &Path, db: &Path, indexers: Indexers, trust: CppTrust) -> CodeSetup {
     let spec = atlas::config::CodeSpec {
         roots: vec![atlas::config::CodeRootSpec {
             name: "svc".into(),
             root: root.to_path_buf(),
             build_scripts: false,
             scip: Default::default(),
+            cpp: trust,
             exclude: Vec::new(),
         }],
         debounce_s: Some(0),
@@ -75,7 +81,11 @@ fn recorded(dir: &Path) -> Vec<Vec<String>> {
 }
 
 fn indexed(root: &Path, db: &Path, indexers: Indexers) -> (IndexReport, Server) {
-    let code = setup(root, db, indexers);
+    indexed_trusted(root, db, indexers, CppTrust::Off)
+}
+
+fn indexed_trusted(root: &Path, db: &Path, indexers: Indexers, trust: CppTrust) -> (IndexReport, Server) {
+    let code = setup_trusted(root, db, indexers, trust);
     drop(atlas::store::Store::open(db, vaults(db)).unwrap());
     let mut conn = atlas::db::Connection::open(db).unwrap();
     let rep = code_index::index_root(&code, &mut conn, &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
@@ -177,7 +187,7 @@ fn a_found_scip_clang_runs_in_the_units_folder_with_every_output_in_atlas_state(
     let bin = t.path().join("bin");
     let tool = stand_in(&bin);
     let db = t.path().join("state/atlas.sqlite");
-    let (rep, _s) = indexed(&root, &db, Indexers::Fixed(vec![("scip-clang".into(), tool)]));
+    let (rep, _s) = indexed_trusted(&root, &db, Indexers::Fixed(vec![("scip-clang".into(), tool)]), CppTrust::Always);
     let runs = recorded(&bin);
     assert_eq!(runs.len(), 1, "{runs:?}");
     let run = &runs[0];
@@ -195,4 +205,74 @@ fn a_found_scip_clang_runs_in_the_units_folder_with_every_output_in_atlas_state(
     assert_eq!(rep.units[0].lang, "cpp");
     assert!(rep.units[0].source.starts_with("scan only"), "{:?}", rep.units[0]);
     assert!(!labels(&db, &root.join("shapes.hpp")).is_empty());
+}
+
+/// scip-clang reads the repository's own compilation database, which names
+/// the compiler it may run: it runs only on a root whose `cpp.trust` allows
+/// it, with `ask` only on a database approved since it last changed, and
+/// never with a compiler inside the repository.
+#[cfg(unix)]
+#[test]
+fn scip_clang_runs_only_on_a_trusted_root_and_an_approved_database() {
+    let t = Temp::new("cpp-trust");
+    let root = t.path().join("repo");
+    copy_sources(&root);
+    let system_db = r#"[{"directory": ".", "arguments": ["/usr/bin/c++", "-c", "shapes.cpp"], "file": "shapes.cpp"}]"#;
+    write(&root.join("compile_commands.json"), system_db);
+    let bin = t.path().join("bin");
+    let tool = stand_in(&bin);
+    let db = t.path().join("state/atlas.sqlite");
+    let fixed = || Indexers::Fixed(vec![("scip-clang".into(), tool.clone())]);
+    let note = |rep: &IndexReport| rep.units[0].source.clone();
+    // Off by default: scanned, and the note says how to allow it.
+    let (rep, _) = indexed(&root, &db, fixed());
+    assert!(recorded(&bin).is_empty());
+    assert!(note(&rep).contains("scip-clang is off for this root"), "{}", note(&rep));
+    // Ask: not before the database is approved.
+    let (rep, _) = indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
+    assert!(recorded(&bin).is_empty());
+    assert!(note(&rep).contains("not approved"), "{}", note(&rep));
+    let state = setup(&root, &db, fixed()).dir;
+    atlas::cpp_trust::approve("svc", &root, &[root.clone()], &state).unwrap();
+    indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
+    assert_eq!(recorded(&bin).len(), 1, "an approved database runs");
+    // A changed database (a pull) needs a new approval.
+    write(&root.join("compile_commands.json"), &system_db.replace("-c", "-O2 -c"));
+    let (rep, _) = indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
+    assert_eq!(recorded(&bin).len(), 1, "not run again");
+    assert!(note(&rep).contains("not approved"), "{}", note(&rep));
+    // A compiler inside the repository is never run, even trusted.
+    write(&root.join("tools/cc"), "#!/bin/sh\n");
+    write(&root.join("compile_commands.json"), &system_db.replace("/usr/bin/c++", &root.join("tools/cc").to_string_lossy()));
+    let (rep, _) = indexed_trusted(&root, &db, fixed(), CppTrust::Always);
+    assert_eq!(recorded(&bin).len(), 1, "not run");
+    assert!(note(&rep).contains("inside the repository"), "{}", note(&rep));
+}
+
+/// `atlas trust cpp ROOT` approves the root's databases as they are now.
+#[test]
+fn the_trust_command_approves_a_roots_databases() {
+    let t = Temp::new("cpp-trust-cli");
+    let root = t.path().join("repo");
+    copy_sources(&root);
+    write(&root.join("compile_commands.json"), "[]\n");
+    let cfg = t.path().join("atlas.json");
+    let state = t.path().join("state");
+    write(
+        &cfg,
+        &format!(
+            r#"{{"db": "{}", "vaults": [], "models": {{"auto_download": false, "files": []}}, "code": {{"roots": [{{"name": "svc", "root": "{}", "cpp": {{"trust": "ask"}}}}]}}}}"#,
+            state.join("atlas.sqlite").display(),
+            root.display()
+        ),
+    );
+    let run = |args: &[&str]| std::process::Command::new(bin()).arg("--config").arg(&cfg).args(args).env("CLAUDE_CONFIG_DIR", t.path().join("claude")).output().unwrap();
+    let o = run(&["trust", "cpp", "svc"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{out} {}", String::from_utf8_lossy(&o.stderr));
+    assert!(out.contains("compile_commands.json"), "{out}");
+    let trust = fs::read_to_string(state.join("code").join(atlas::cpp_trust::TRUST_FILE)).unwrap();
+    assert!(trust.contains("svc:"), "{trust}");
+    let o = run(&["trust", "cpp", "nope"]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("no code root named nope"));
 }

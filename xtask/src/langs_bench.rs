@@ -139,7 +139,7 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
                     root: root.to_path_buf(),
                     build_scripts: false,
                     scip: Default::default(),
-                    exclude: Vec::new(),
+                    cpp: Default::default(), exclude: Vec::new(),
                 }],
                 dir: Some(scratch.join("run")),
                 timeout_s: Some(1800),
@@ -292,7 +292,7 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
                 root: root.to_path_buf(),
                 build_scripts: false,
                 scip: Default::default(),
-                exclude: Vec::new(),
+                cpp: Default::default(), exclude: Vec::new(),
             }],
             dir: Some(scratch.join("code")),
             ..Default::default()
@@ -309,7 +309,7 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
                 root: root.to_path_buf(),
                 build_scripts: false,
                 scip: Default::default(),
-                exclude: Vec::new(),
+                cpp: Default::default(), exclude: Vec::new(),
             },
             &rust,
         )

@@ -163,6 +163,7 @@ Subcommands:
   atlas track check | smoke [--issue KEY] [--page ID] [--jql Q] [--cql Q] | issue KEY | jql Q [--fields LIST] | page ID | cql Q | snapshot ITEM   project tracking: read Jira and Confluence directly, read-only, with a token from the environment variable project_tracking.atlassian names
   atlas ideas [list | show ID | file TEXT... | dismiss ID... | answer ID yes|no | convert ID ruling|queue | labels]   ideas caught from prompts, and the questions about them
   atlas worktrees [list | history PATH | backfill | gc [--apply]]   the worktree ownership ledger: open owners, one path's spans, an owner row for each worktree without one, and the cleanup of stale worktrees, their build output and atlas's Docker objects (a dry run without --apply)
+  atlas trust cpp ROOT   approves the code root ROOT's compile_commands.json as it is now, so scip-clang runs on it while code.roots[].cpp.trust is \"ask\" (refused when it names a compiler inside the repository)
 
 SHAPE is test, build, grep, listing, source, summary or generic. More: https://github.com/bloodfeast/atlas/wiki
 ";
@@ -585,7 +586,7 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
 /// The bare words recognised as `argv[1]`, or after leading
 /// [`LEADING_OPTIONS`].
 const SUBCOMMANDS: &[&str] =
-    &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules", "backlog", "pr-events", "worktrees", "track"];
+    &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules", "backlog", "pr-events", "worktrees", "track", "trust"];
 
 /// The usage of a subcommand asked for its help, `None` when it was not: only
 /// the first word after it counts, so `atlas run -- cargo --help` still runs and a
@@ -606,6 +607,7 @@ fn sub_help(word: &str, rest: &[String]) -> Option<&'static str> {
         "ruling" | "entry" => atlas::records::USAGE,
         "queue" => atlas::queue::USAGE,
         "worktrees" => atlas::worktree_ledger::USAGE,
+        "trust" => atlas::cpp_trust::USAGE,
         "ideas" => atlas::ideas::cli::USAGE,
         "rules" => atlas::memory::rules::USAGE,
         "backlog" => atlas::backlog::USAGE,
@@ -1032,6 +1034,10 @@ fn run() -> Result<ExitCode, String> {
                 settings_mode(config.as_deref(), rest[0] == "on", "update")
             }
             "settings" => atlas::claude_settings::cli(rest, config.as_deref(), &setup.db, setup.memory.user_state.as_deref(), project.as_deref()),
+            "trust" => atlas::cpp_trust::cli(&rest, setup.code.as_ref()).map(|out| {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }),
             "queue" if atlas::trackers::plan::wants(&rest) => {
                 // `queue plan --from-jql`: reads the tracker (#305).
                 let settings = atlas::trackers::Settings::from_config(loaded.as_ref().and_then(|c| c.trackers.as_ref()))?;

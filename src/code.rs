@@ -219,6 +219,8 @@ pub struct CodeRoot {
     pub scip: Prebuilt,
     /// See [`crate::config::CodeRootSpec::exclude`].
     pub exclude: Vec<String>,
+    /// Whether scip-clang may run on its C++ ([`crate::config::CppTrust`]).
+    pub cpp: crate::config::CppTrust,
 }
 
 impl CodeRoot {
@@ -438,6 +440,7 @@ impl CodeSetup {
                     build_scripts: r.build_scripts,
                     scip: r.scip.clone(),
                     exclude: r.exclude.clone(),
+                    cpp: r.cpp,
                 })
                 .collect(),
             rust_analyzer: spec.rust_analyzer.clone(),
