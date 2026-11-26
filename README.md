@@ -72,7 +72,8 @@ The wiki is the full manual.
   [Install and setup](https://github.com/bloodfeast/atlas/wiki/Install-and-setup) ·
   [Configuration reference](https://github.com/bloodfeast/atlas/wiki/Configuration-reference) ·
   [Reference configuration](https://github.com/bloodfeast/atlas/wiki/Reference-configuration) ·
-  [Projects and multi-repo](https://github.com/bloodfeast/atlas/wiki/Projects-and-multi-repo)
+  [Projects and multi-repo](https://github.com/bloodfeast/atlas/wiki/Projects-and-multi-repo) ·
+  [Other clients](https://github.com/bloodfeast/atlas/wiki/Other-clients)
 - **What it saves:** [Token savings and method](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method) ·
   [Handles and digests](https://github.com/bloodfeast/atlas/wiki/Handles-and-digests)
 - **Reference:** [Tools reference](https://github.com/bloodfeast/atlas/wiki/Tools-reference) ·

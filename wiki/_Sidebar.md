@@ -6,6 +6,7 @@
 - [[Configuration reference]]
 - [[Reference configuration]]
 - [[Projects and multi-repo]]
+- [[Other clients]]
 
 **What it saves**
 - [[Token savings and method]]

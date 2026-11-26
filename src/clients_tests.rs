@@ -188,3 +188,47 @@ fn copilot_s_saved_output_is_the_whole_output() {
     std::fs::remove_dir_all(&elsewhere).unwrap();
     std::fs::remove_file(&saved).unwrap();
 }
+
+/// Every command in the file `clients/<dir>/<file>`, with its event.
+fn template(dir: &str, file: &str, key: &str) -> Vec<(String, String)> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("clients").join(dir).join(file);
+    let v = crate::json::parse(&std::fs::read_to_string(p).unwrap()).unwrap();
+    let mut out = Vec::new();
+    for (event, entries) in v.get("hooks").and_then(Value::as_object).unwrap().iter() {
+        for e in entries.as_array().unwrap() {
+            // Claude-style groups nest their commands; Copilot's are flat.
+            let hooks = e.get("hooks").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![e.clone()]);
+            for h in hooks {
+                out.push((event.clone(), s(&h, key).to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_hook_templates_name_their_client_and_the_events_it_maps() {
+    let copilot = template("copilot", "hooks.json", "bash");
+    for (event, cmd) in &copilot {
+        let camel = event.starts_with(|c: char| c.is_ascii_lowercase());
+        let want = if camel { format!("atlas --hook --client copilot --event {event}") } else { "atlas --hook --client copilot".to_string() };
+        assert_eq!(cmd, &want, "{event}");
+        // A camelCase event reaches the hooks only through its mapping.
+        if camel {
+            let mapped = HookEvent::from_value(&Client::Copilot.input(crate::json!({"sessionId": "s", "prompt": "p"}), event));
+            assert!(!mapped.event.is_empty(), "{event} maps to no event");
+        }
+    }
+    // UserPromptSubmit's answer is dropped by Copilot: its recall goes through userPromptTransformed.
+    assert!(copilot.iter().any(|(e, _)| e == "userPromptTransformed"));
+    assert!(!copilot.iter().any(|(e, _)| e == "UserPromptSubmit"));
+
+    for (event, cmd) in template("codex", "hooks.json", "command") {
+        assert_eq!(cmd, "atlas --hook --client codex", "{event}");
+    }
+    for (event, cmd) in template("gemini", "settings.json", "command") {
+        assert_eq!(cmd, "atlas --hook --client gemini", "{event}");
+        let mapped = HookEvent::from_value(&Client::Gemini.input(crate::json!({"hook_event_name": event.as_str()}), ""));
+        assert!(["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"].contains(&mapped.event.as_str()), "{event}");
+    }
+}
