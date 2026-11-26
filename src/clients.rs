@@ -47,12 +47,21 @@ impl Client {
     /// The client's hook input `v` in Claude Code's shape. `event` is the
     /// event the hooks file named with `--event`, for a client whose input
     /// does not name it (Copilot's camelCase events).
+    ///
+    /// Another client's `transcript_path` is dropped: atlas reads a transcript
+    /// as Claude Code writes it (the context size, the checkpoint), and a
+    /// misread size could deny tools past the hard limit.
     pub fn input(self, v: Value, event: &str) -> Value {
-        match self {
-            Client::Claude | Client::OpenCode | Client::Codex => v,
+        let mut v = match self {
+            Client::Claude | Client::OpenCode => return v,
+            Client::Codex => v,
             Client::Copilot => copilot_input(v, event),
             Client::Gemini => gemini_input(v),
+        };
+        if let Some(m) = v.as_object_mut() {
+            m.remove("transcript_path");
         }
+        v
     }
 
     /// atlas's answer `out` (Claude Code's hook JSON, PreCompact's plain
@@ -123,6 +132,8 @@ fn saved_output(text: &str) -> Option<&str> {
     let path = std::path::Path::new(p);
     let name = path.file_name()?.to_str()?;
     let ours = name.contains("-copilot-tool-output-") && name.ends_with(".txt") && path.parent() == Some(std::env::temp_dir().as_path());
+    // Nor through a link: a planted one would pass the name.
+    let ours = ours && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
     ours.then_some(p)
 }
 
@@ -171,6 +182,12 @@ fn copilot_input(v: Value, event: &str) -> Value {
         return Value::Object(c);
     }
     let tool = s(&v, "tool_name").to_string();
+    // Copilot's `task` arrives as `Agent`. atlas's agent caps free a slot at
+    // SubagentStop, which Copilot's built-in general-purpose agent never
+    // sends: under its own name the launch passes the caps.
+    if tool == "Agent" {
+        m.insert("tool_name".into(), Value::from("task"));
+    }
     if tool == "Read" {
         if let Some(i) = m.get_mut("tool_input").and_then(Value::as_object_mut) {
             if !i.contains_key("file_path") {
@@ -189,7 +206,7 @@ fn copilot_input(v: Value, event: &str) -> Value {
 
 /// atlas's answer for Copilot. Measured: Copilot reads a flat
 /// `additionalContext` (SessionStart, SubagentStart, PostToolUse), a flat
-/// `modifiedResult`, a nested or flat `permissionDecision`, and
+/// `modifiedResult`, a nested `permissionDecision`, and
 /// `modifiedTransformedPrompt` from `userPromptTransformed`; it ignores
 /// Claude's nested `additionalContext`, any input rewrite, and
 /// `UserPromptSubmit`'s output.
@@ -214,9 +231,9 @@ fn copilot_output(raw: &Value, ev: &Value, event: &str, a: &Value) -> String {
             out.insert("modifiedTransformedPrompt".into(), Value::from(format!("{shown}\n\n{context}")));
         }
         "PreToolUse" => {
+            // The nested deny is the shape measured to stop the call.
             if let Some(r) = h.get("permissionDecisionReason").filter(|_| h.get("permissionDecision").and_then(Value::as_str) == Some("deny")) {
-                out.insert("permissionDecision".into(), Value::from("deny"));
-                out.insert("permissionDecisionReason".into(), r.clone());
+                out.insert("hookSpecificOutput".into(), crate::json!({"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": r.clone()}));
             }
         }
         "PostToolUse" => {

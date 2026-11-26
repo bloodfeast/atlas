@@ -30,9 +30,10 @@ fn copilot_events_read_as_claude_code_s() {
     assert_eq!(ev.tool_name, "Bash");
     assert_eq!(ev.tool_response.get("stdout").and_then(Value::as_str), Some("hi\n<shellId: 0 completed with exit code 0>"));
 
+    // A subagent launch keeps Copilot's own name, so atlas's agent caps pass it.
     let ev = HookEvent::from_value(&Client::Copilot.input(copilot("pre_tool_use_agent.json"), ""));
-    assert_eq!((ev.event.as_str(), ev.tool_name.as_str()), ("PreToolUse", "Agent"));
-    assert_eq!(ev.tool_prompt, "Run exactly the shell command `ls` and return its output.");
+    assert_eq!((ev.event.as_str(), ev.tool_name.as_str()), ("PreToolUse", "task"));
+    assert!(!crate::hooks::gated(&ev));
 
     let ev = HookEvent::from_value(&Client::Copilot.input(copilot("session_start.json"), ""));
     assert_eq!((ev.event.as_str(), ev.source.as_str(), ev.cwd.as_str()), ("SessionStart", "new", "/work/proj"));
@@ -50,7 +51,13 @@ fn copilot_camel_case_events_take_their_name_from_the_hooks_file() {
 
     let ev = HookEvent::from_value(&Client::Copilot.input(copilot("subagent_start.json"), "subagentStart"));
     assert_eq!((ev.event.as_str(), ev.agent_id.as_str(), ev.agent_type.as_str()), ("SubagentStart", "186f57d1-e621-4f4d-b246-d365abd42605", "task"));
-    assert!(ev.transcript_path.ends_with("events.jsonl"));
+    // Copilot's events.jsonl is no Claude Code transcript: atlas reads none.
+    assert_eq!(ev.transcript_path, "");
+    let stop = crate::json!({"hook_event_name": "Stop", "session_id": "s", "transcript_path": "/home/dev/.copilot/session-state/s/events.jsonl"});
+    for c in [Client::Copilot, Client::Codex, Client::Gemini] {
+        assert_eq!(HookEvent::from_value(&c.input(stop.clone(), "")).transcript_path, "", "{c:?}");
+    }
+    assert_ne!(HookEvent::from_value(&Client::Claude.input(stop, "")).transcript_path, "");
 }
 
 #[test]
@@ -72,7 +79,10 @@ fn copilot_gets_a_deny_but_no_rewrite() {
     let raw = copilot("pre_tool_use_agent.json");
     let v = Client::Copilot.input(raw.clone(), "");
     let deny = claude("PreToolUse", crate::json!({"permissionDecision": "deny", "permissionDecisionReason": "over the cap"}));
-    assert_eq!(parsed(&Client::Copilot.output(&raw, &v, &deny)), crate::json!({"permissionDecision": "deny", "permissionDecisionReason": "over the cap"}));
+    assert_eq!(
+        parsed(&Client::Copilot.output(&raw, &v, &deny)),
+        crate::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "over the cap"}})
+    );
     // Copilot ignores a rewrite from a command hook: atlas sends none.
     let rewrite = claude("PreToolUse", crate::json!({"updatedInput": {"command": "x"}, "additionalContext": "a note"}));
     assert_eq!(Client::Copilot.output(&raw, &v, &rewrite), "");
@@ -184,6 +194,16 @@ fn copilot_s_saved_output_is_the_whole_output() {
         let raw = crate::json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "cat x"}, "tool_result": {"text_result_for_llm": format!("Output too large to read at once (1 KB). Saved to: {forged}\n")}});
         let ev = HookEvent::from_value(&Client::Copilot.input(raw, ""));
         assert!(ev.tool_response.get("persistedOutputPath").is_none(), "{forged}");
+    }
+    // A link with Copilot's name, in the temporary folder, is not followed.
+    #[cfg(unix)]
+    {
+        let link = dir.join(format!("1795709139290-copilot-tool-output-atlas-link-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&copy, &link).unwrap();
+        let raw = crate::json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "cat x"}, "tool_result": {"text_result_for_llm": format!("Output too large to read at once (1 KB). Saved to: {}\n", link.display())}});
+        assert!(HookEvent::from_value(&Client::Copilot.input(raw, "")).tool_response.get("persistedOutputPath").is_none());
+        std::fs::remove_file(&link).unwrap();
     }
     std::fs::remove_dir_all(&elsewhere).unwrap();
     std::fs::remove_file(&saved).unwrap();

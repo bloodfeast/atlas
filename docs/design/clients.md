@@ -13,7 +13,16 @@ Other clients; this is the design and what it rests on.
 - `atlas --hook --client NAME [--event NAME]` applies both around the command hook, including the refusal and
   the overrun answers. `--event` names an event whose input does not (Copilot's camelCase events).
 - `Hooks::set_other_client` drops what only Claude Code's own files carry: the Claude Code settings offer, the
-  status line repair and the hooks' drift check.
+  status line repair and the hooks' drift check, and the orchestrated-mode offer.
+- Another client's `transcript_path` is dropped on the way in: atlas reads transcripts as Claude Code writes
+  them, and a misread context size could deny tools past the hard limit. The context cap is off there.
+- Agent caps count Claude Code's launches only. A cap's slot is freed at SubagentStop, which Copilot's built-in
+  general-purpose agent never sends; Copilot's `task` keeps its own name, and the OpenCode plugin does not map
+  `task`, so the caps pass them.
+- A failure of atlas itself exits 0 for another client (`other_client_hook` in `main.rs`): Copilot denies a
+  tool call whose PreToolUse command hook exits non-zero.
+- The OpenCode plugin spawns atlas without blocking (OpenCode's server runs every session's hooks) and does
+  not apply atlas's Bash rewrite, which only appends an exit-code marker OpenCode reports itself.
 - OpenCode's hooks are code, not commands: `clients/opencode/atlas/index.ts` builds Claude-shaped events and
   reads Claude-shaped answers, so its `Client` changes no JSON.
 - No new transport. Every event is its own `atlas --hook` process, as a Claude Code command hook always could
@@ -31,7 +40,7 @@ what reached it. Codex and Gemini CLI follow their documentation only.
 | Input | PascalCase events in Claude Code's shape and tool names (`view` as `Read`, `bash` as `Bash`, `task` as `Agent`); Read names `path`; result in `tool_result.text_result_for_llm` | plugin hooks `session` `prompt`, `context`, `compaction`; `tool` `execute.before`, `execute.after` | Claude Code's | own event and tool names, `tool_response.llmContent` |
 | Session context | flat `additionalContext` (nested ignored) | edit the prompt | `additionalContext` | `hookSpecificOutput.additionalContext` |
 | Prompt context | UserPromptSubmit output dropped; `userPromptTransformed` `modifiedTransformedPrompt` works | edit the prompt | `additionalContext` | BeforeAgent `additionalContext` |
-| Deny | nested or flat `permissionDecision` | throw in `execute.before` | `permissionDecision` | `decision: deny` |
+| Deny | nested `permissionDecision` (flat not tried) | throw in `execute.before` | `permissionDecision` | `decision: deny` |
 | Input rewrite | ignored (nested `updatedInput` and flat `modifiedArgs`) | replace `input` | `updatedInput` | `hookSpecificOutput.tool_input` |
 | Replace a result | flat `modifiedResult` | replace `result.content` | PostToolUse `decision: block`, its reason replaces the result | AfterTool `decision: deny`, its reason replaces the result |
 | Compaction | no output | `compaction` hook | stop only | advisory |
@@ -44,7 +53,8 @@ Both measured clients keep a long shell output in a file and pass the model a pa
 
 - **Copilot** passes a preview whose first line reads `Output too large to read at once (48.7 KB). Saved to:
   /tmp/<ms>-copilot-tool-output-<id>.txt`. That line is the command's own output as far as the hook can tell,
-  so a command could forge it: `saved_output` reads only a file named so, directly in the temporary folder.
+  so a command could forge it: `saved_output` reads only a regular file named so, directly in the temporary
+  folder, never through a link.
 - **OpenCode** cuts the output to its last 2,000 lines and names the whole in `result.output.outputPath`, a
   field the shell tool sets, with `metadata.truncated`.
 

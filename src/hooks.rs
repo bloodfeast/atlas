@@ -2282,7 +2282,8 @@ impl Hooks {
                 // with projects, its repositories as a project).
                 let mut lines: Vec<String> = Vec::new();
                 // Per user: whether to work in orchestrated mode.
-                lines.extend(self.offer.as_ref().filter(|_| asks).and_then(crate::claude_settings::orchestrate_line));
+                // Agent caps count Claude Code's launches only (see crate::clients).
+                lines.extend(self.offer.as_ref().filter(|_| asks && self.claude_code).and_then(crate::claude_settings::orchestrate_line));
                 match (self.offer.as_ref(), self.offer_ctx.as_ref()) {
                     (Some(p), Some(ctx)) if ctx.scoped => {
                         let cwd = Path::new(&ev.cwd);

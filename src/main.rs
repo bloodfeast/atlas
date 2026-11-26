@@ -2168,14 +2168,41 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!("atlas: {e}");
-            ExitCode::FAILURE
+            if other_client_hook(std::env::args().skip(1)) {
+                // Copilot denies a tool call whose PreToolUse hook exits
+                // non-zero: atlas's own failure must not stop the session's
+                // tools, so the event passes through.
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
+}
+
+/// Whether `args` run a command hook for a client other than Claude Code
+/// (`--hook --client NAME`), whose failure passes the event through.
+fn other_client_hook(args: impl Iterator<Item = String>) -> bool {
+    let args: Vec<String> = args.collect();
+    let client = args.iter().position(|a| a == "--client").and_then(|i| args.get(i + 1));
+    args.iter().any(|a| a == "--hook") && client.is_some_and(|c| c != "claude")
 }
 
 #[cfg(test)]
 mod tests {
     use super::split_subcommand;
+
+    #[test]
+    fn another_client_s_hook_fails_open() {
+        let a = |v: &[&str]| super::other_client_hook(v.iter().map(|s| s.to_string()));
+        assert!(a(&["--hook", "--client", "copilot"]));
+        assert!(a(&["--hook", "--client", "opencode", "--event", "x"]));
+        // Claude Code's hooks keep their exit code, and so does everything else.
+        assert!(!a(&["--hook"]));
+        assert!(!a(&["--hook", "--client", "claude"]));
+        assert!(!a(&["--rescan", "--client", "copilot"]));
+        assert!(!a(&["--hook", "--client"]));
+    }
 
     fn split(args: &[&str]) -> (Vec<String>, Option<(String, Vec<String>)>) {
         let mut v: Vec<String> = args.iter().map(|s| s.to_string()).collect();

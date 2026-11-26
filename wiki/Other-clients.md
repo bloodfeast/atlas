@@ -19,7 +19,8 @@ pick in it.
 | Digest of a long Bash result | yes | yes | yes | yes, as a block | yes, as a deny | no |
 | Recall on each prompt | yes | yes | yes | yes | yes | no |
 | Session card | yes | yes | yes | yes | yes | no |
-| Deny (merge gate, agent caps) | yes | yes | yes | yes | yes | no |
+| Deny (the merge gate) | yes | yes | yes | yes | yes | no |
+| Agent caps, orchestrated mode | yes | no | no | no | no | no |
 | Compaction instructions | yes | no | yes | no | no | no |
 | Subagent lane recall | yes | at start, no brief | no | at start | no | no |
 | Tested | yes | Copilot CLI 1.0.114 | OpenCode 2.4.1 | from its documentation | from its documentation | MCP only |
@@ -47,7 +48,9 @@ Each client starts `atlas` with no arguments. `atlas` must be on `PATH`, or give
 ## The hooks
 
 The files under `clients/` in the repository are ready to copy. Each runs `atlas --hook --client NAME`, one
-process per event.
+process per event. They need an `atlas` that knows `--client` on `PATH`: Copilot refuses every tool call whose
+PreToolUse hook fails, and an older `atlas` fails on the unknown flag. An `atlas` that knows `--client` lets the
+event through whenever it fails itself, with the error on standard error.
 
 - **GitHub Copilot:** copy `clients/copilot/hooks.json` to `~/.copilot/hooks/atlas.json` (every repository), or
   to `.github/hooks/atlas.json` in a trusted repository. VS Code, the GitHub Copilot app and Copilot CLI read
@@ -82,3 +85,5 @@ process per event.
   differ, so the cap and its warnings do not apply there.
 - **The skills** (`atlas`, `orchestrate`) are Claude Code skills. Other clients get the tools' own
   descriptions only.
+- **Agent caps:** atlas frees an agent's slot when the agent stops, and Copilot's built-in general-purpose agent
+  sends no stop. Other clients' launches are not counted, and their sessions are not offered orchestrated mode.
