@@ -1,6 +1,6 @@
 // Shapes for the scanner's tests. /* not a block comment */
 #pragma once
-#include <string>
+// No standard header: the checked-in index stays small.
 
 #define AREA(x) ((x) * (x))
 

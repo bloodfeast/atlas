@@ -299,3 +299,36 @@ fn the_trust_command_approves_a_roots_databases() {
     let o = run(&["trust", "cpp", "nope"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("no code root named nope"));
 }
+
+/// A stand-in scip-clang that copies `fixtures/scip/cpp/index.scip`, written
+/// by scip-clang 0.4.1 from this fixture, to its output path.
+#[cfg(unix)]
+fn indexing_stand_in(dir: &Path) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    fs::copy(cpp_fixture().join("index.scip"), dir.join("index.scip")).unwrap();
+    let p = dir.join("scip-clang");
+    fs::write(&p, "#!/bin/sh\n[ \"$1\" = --version ] && echo 'scip-clang 0.4.1' && exit 0\ncp \"$(dirname \"$0\")/index.scip\" \"$4\"\n")
+        .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[cfg(unix)]
+#[test]
+fn a_scip_clang_index_gives_definitions_and_references() {
+    let t = Temp::new("cpp-index");
+    let root = t.path().join("repo");
+    copy_sources(&root);
+    write(&root.join("compile_commands.json"), "[]\n");
+    let tool = indexing_stand_in(&t.path().join("bin"));
+    let db = t.path().join("state/atlas.sqlite");
+    let (rep, mut s) = indexed_trusted(&root, &db, Indexers::Fixed(vec![("scip-clang".into(), tool)]), CppTrust::Always);
+    assert_eq!(rep.units.len(), 1, "{:?}", rep.units);
+    assert_eq!(rep.units[0].source, "scip-clang 0.4.1");
+    // The definitions and references are the index's, not the scanner's: a
+    // call in the inactive `#if defined(FAST)` branch is no reference.
+    let (defs, refs) = answer(&mut s, "area");
+    assert_eq!(defs, ["shapes.cpp:8 method Circle", "shapes.hpp:31 method Shape"]);
+    assert_eq!(refs, ["shapes.cpp:17 geo::total", "shapes.cpp:17 geo::total", "shapes.hpp:43 geo::Circle"]);
+}
