@@ -38,8 +38,8 @@ what reached it. Codex and Gemini CLI follow their documentation only.
 | | Copilot | OpenCode | Codex (docs) | Gemini CLI (docs) |
 |---|---|---|---|---|
 | Input | PascalCase events in Claude Code's shape and tool names (`view` as `Read`, `bash` as `Bash`, `task` as `Agent`); Read names `path`; result in `tool_result.text_result_for_llm` | plugin hooks `session` `prompt`, `context`, `compaction`; `tool` `execute.before`, `execute.after` | Claude Code's | own event and tool names, `tool_response.llmContent` |
-| Session context | flat `additionalContext` (nested ignored) | edit the prompt | `additionalContext` | `hookSpecificOutput.additionalContext` |
-| Prompt context | UserPromptSubmit output dropped; `userPromptTransformed` `modifiedTransformedPrompt` works | edit the prompt | `additionalContext` | BeforeAgent `additionalContext` |
+| Session context | flat `additionalContext` (nested ignored) | `context` hook: add to the prompt's message in each model call | `additionalContext` | `hookSpecificOutput.additionalContext` |
+| Prompt context | UserPromptSubmit output dropped; `userPromptTransformed` `modifiedTransformedPrompt` works | the same (a `prompt` hook's edit is stored and shown as the user's words) | `additionalContext` | BeforeAgent `additionalContext` |
 | Deny | nested `permissionDecision` (flat not tried) | throw in `execute.before` | `permissionDecision` | `decision: deny` |
 | Input rewrite | ignored (nested `updatedInput` and flat `modifiedArgs`) | replace `input` | `updatedInput` | `hookSpecificOutput.tool_input` |
 | Replace a result | flat `modifiedResult` | replace `result.content` | PostToolUse `decision: block`, its reason replaces the result | AfterTool `decision: deny`, its reason replaces the result |

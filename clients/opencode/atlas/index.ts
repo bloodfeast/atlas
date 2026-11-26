@@ -5,9 +5,10 @@
 // `~/.config/opencode/plugins/atlas/` for every project. `atlas` must be on PATH,
 // or set ATLAS_BIN to the binary. Add atlas's MCP server too (wiki: Other clients).
 //
-// Measured on OpenCode v2.4.1: a `prompt` hook's edit persists as the user's
-// input, a `tool` `execute.before` throw denies the call and its message reaches
-// the model, and `execute.after` may replace the result's content.
+// Measured on OpenCode v2.4.1: a `context` hook's change reaches the model call
+// only (the stored prompt, which the user sees, stays as typed), a `tool`
+// `execute.before` throw denies the call and its message reaches the model, and
+// `execute.after` may replace the result's content.
 import { spawn } from "node:child_process"
 
 const BIN = process.env.ATLAS_BIN || "atlas"
@@ -113,6 +114,11 @@ export default {
   async setup(ctx: any) {
     const cwd: string = ctx.location?.directory || process.cwd()
     const started = new Set<string>()
+    // atlas's notes for a prompt, by its message id. They join that message in
+    // every model call (the `context` hook), never the stored prompt: OpenCode
+    // shows the stored one as the user's own words.
+    const notesFor = new Map<string, string>()
+    const KEEP = 500
     // Context a tool hook gave before the tool ran: it goes out with the result.
     const pending = new Map<string, string[]>()
     const base = (sessionID: string, event: string) => ({ hook_event_name: event, session_id: sessionID, cwd })
@@ -126,7 +132,16 @@ export default {
       }
       const c = specific(await hook({ ...base(e.sessionID, "UserPromptSubmit"), prompt: e.prompt?.text || "" })).additionalContext
       if (c) notes.push(c)
-      if (notes.length) e.prompt.text = `${e.prompt.text}\n\n<atlas>\n${notes.join("\n")}\n</atlas>`
+      if (!notes.length) return
+      notesFor.set(e.messageID, `<atlas>\n${notes.join("\n")}\n</atlas>`)
+      if (notesFor.size > KEEP) notesFor.delete(notesFor.keys().next().value as string)
+    })
+
+    await ctx.session.hook("context", (e: any) => {
+      for (const m of e.messages || []) {
+        const n = m.role === "user" ? notesFor.get(m.id) : undefined
+        if (n && Array.isArray(m.content)) m.content.push({ type: "text", text: n })
+      }
     })
 
     await ctx.tool.hook("execute.before", async (e: any) => {

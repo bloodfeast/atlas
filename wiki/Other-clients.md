@@ -69,8 +69,8 @@ event through whenever it fails itself, with the error on standard error.
   `userPromptTransformed` carries the prompt's recall (Copilot drops what a command hook answers to
   UserPromptSubmit), and `subagentStart` carries a subagent's start. Copilot ignores a hook's rewrite of a
   tool's input, so atlas sends none. A long output Copilot keeps in a file is digested from that file.
-- **OpenCode** runs plugins, not commands. The plugin adds the session card and the prompt's recall to the
-  prompt, which OpenCode keeps as your input, so they stay in the history. A long shell output OpenCode cut
+- **OpenCode** runs plugins, not commands. The plugin adds the session card and each prompt's recall to that
+  prompt in every model call, but never to the prompt OpenCode stores and shows you. A long shell output OpenCode cut
   short is digested from the file it keeps.
 - **Codex** speaks Claude Code's hook JSON; a digest goes back as a PostToolUse block whose reason replaces the
   result. Not yet run against Codex itself.
