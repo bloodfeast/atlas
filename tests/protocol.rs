@@ -418,7 +418,8 @@ fn help_lists_every_mode_and_subcommand() {
         assert!(all.contains(f), "--help lacks {f}:\n{text}");
     }
     let subs = main_rs.split("const SUBCOMMANDS: &[&str] =").nth(1).unwrap().split_once('[').unwrap().1.split(']').next().unwrap();
-    let subs: Vec<&str> = subs.split(',').map(|w| w.trim().trim_matches('"')).collect();
+    // A list laid out one word per line ends with a comma.
+    let subs: Vec<&str> = subs.split(',').map(|w| w.trim().trim_matches('"')).filter(|w| !w.is_empty()).collect();
     assert!(subs.contains(&"ideas") && subs.len() > 5, "{subs:?}");
     for w in subs.iter().copied().chain(["digest", "crop", "doctor"]) {
         assert!(text.contains(&format!("  atlas {w} ")) || text.contains(&format!("  atlas {w}\n")), "--help lacks atlas {w}:\n{text}");
@@ -456,7 +457,8 @@ fn tree(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Option<Vec<u8>
 fn help_touches_nothing() {
     let main_rs = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")).unwrap();
     let subs = main_rs.split("const SUBCOMMANDS: &[&str] =").nth(1).unwrap().split_once('[').unwrap().1.split(']').next().unwrap();
-    let subs: Vec<&str> = subs.split(',').map(|w| w.trim().trim_matches('"')).collect();
+    // A list laid out one word per line ends with a comma.
+    let subs: Vec<&str> = subs.split(',').map(|w| w.trim().trim_matches('"')).filter(|w| !w.is_empty()).collect();
     let t = std::env::temp_dir().join(format!("atlas-help-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&t);
     std::fs::create_dir_all(t.join(".claude")).unwrap();
