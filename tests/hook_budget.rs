@@ -434,6 +434,8 @@ fn a_command_hook_past_its_budget_answers_and_exits() {
             .arg("--hook")
             .env("ATLAS_TEST_HOOK_STALL_MS", "5000")
             .env_remove("ATLAS_HOOK_BUDGET_OFF")
+            // Not the developer's own Claude settings: SessionStart points their status line at this binary.
+            .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
             .current_dir(t.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -550,6 +552,8 @@ fn a_command_session_start_waits_its_longer_budget() {
         .arg("--hook")
         .env("ATLAS_TEST_HOOK_STALL_MS", "1000")
         .env_remove("ATLAS_HOOK_BUDGET_OFF")
+        // Not the developer's own Claude settings: SessionStart points their status line at this binary.
+        .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
         .current_dir(t.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
