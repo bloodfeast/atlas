@@ -60,6 +60,7 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `code.indexers`
 - `code.roots`
 - `code.roots[].build_scripts`
+- `code.roots[].cpp`
 - `code.roots[].exclude`
 - `code.roots[].name`
 - `code.roots[].root`

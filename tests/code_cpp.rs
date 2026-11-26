@@ -237,7 +237,7 @@ fn scip_clang_runs_only_on_a_trusted_root_and_an_approved_database() {
     assert!(recorded(&bin).is_empty());
     assert!(note(&rep).contains("not approved"), "{}", note(&rep));
     let state = setup(&root, &db, fixed()).dir;
-    atlas::cpp_trust::approve("svc", &root, &[root.clone()], &state).unwrap();
+    atlas::cpp_trust::approve("svc", &root, std::slice::from_ref(&root), &state).unwrap();
     indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
     assert_eq!(recorded(&bin).len(), 1, "an approved database runs");
     // A changed database (a pull) needs a new approval.

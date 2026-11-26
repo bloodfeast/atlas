@@ -71,35 +71,54 @@ pub fn approve(name: &str, root: &Path, units: &[PathBuf], state: &Path) -> std:
     Ok(done)
 }
 
-/// Arguments, or prefixes of them, that make a compiler load or run
-/// another program or library: a toolchain or plugin path, a response file
-/// that could hold more of them, an assembler or linker pass-through.
-const UNSAFE_ARGS: &[&str] = &[
-    "-B",
-    "-fplugin",
-    "-fpass-plugin",
-    "-load",
-    "-plugin",
-    "-mllvm",
-    "--gcc-toolchain",
-    "--gcc-install-dir",
-    "-ccc-",
-    "@",
-    "--driver-mode",
-    "-fuse-ld",
-    "--ld-path",
-    "-fno-integrated-as",
-    "-no-integrated-as",
-    "-Wa,",
-    "-Wl,",
-    "-Xassembler",
-    "-Xlinker",
-];
+/// Flags whose value is the next argument, all of them safe to index with.
+const VALUE_FLAGS: &[&str] =
+    &["-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-D", "-U", "-o", "-x", "-MF", "-MT", "-MQ", "-isysroot", "-target", "--target", "-arch"];
+
+/// Whether one compiler argument is on the allowlist of what indexing
+/// needs: include paths, macros, the language and standard, warnings and
+/// optimisation and machine options, output and dependency files, and the
+/// source file itself. Anything else, such as a toolchain or plugin path, a
+/// wrapper, a response file or a pass-through to another tool, is not.
+fn allowed(a: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-D", "-U", "-std=", "--std=", "-O", "-g", "-W", "-f",
+        "-m", "-M", "-x", "-o", "--sysroot=", "-isysroot", "-target", "--target=", "-arch", "-nostdinc", "-stdlib=", "-pthread",
+    ];
+    const EXACT: &[&str] = &["-c", "-E", "-S", "-pedantic", "-pedantic-errors", "-w", "-pipe", "-shared", "-static", "-ansi", "-v", "-H", "-P", "-C"];
+    // Prefixes above that still reach another program or library.
+    const DENIED: &[&str] = &["-Wa,", "-Wl,", "-Wp,", "-fplugin", "-fpass-plugin", "-mllvm", "-fuse-ld", "-fprofile-use", "-fprofile-sample-use"];
+    if !a.starts_with('-') {
+        return !a.starts_with('@');
+    }
+    if DENIED.iter().any(|d| a.starts_with(d)) {
+        return false;
+    }
+    EXACT.contains(&a) || PREFIXES.iter().any(|p| a.starts_with(p))
+}
+
+/// The first argument after the compiler that is not allowed ([`allowed`]);
+/// a flag's separate value is taken with it.
+fn refused_arg(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if !allowed(a) {
+            return Some(a);
+        }
+        if VALUE_FLAGS.contains(&a) {
+            // The value is a path or a word, never a flag of its own.
+            i += 1;
+        }
+        i += 1;
+    }
+    None
+}
 
 /// Checks every command of a database. Each must name a compiler (an
 /// absolute path, or a bare name found on `PATH`) that resolves outside the
-/// root and outside the system's pseudo-file folders, and pass no argument
-/// that loads another program ([`UNSAFE_ARGS`]). A command that cannot be
+/// root and outside the system's pseudo-file folders, and pass only allowed
+/// arguments ([`allowed`]). A command that cannot be
 /// read is refused, never skipped.
 ///
 /// # Errors
@@ -112,8 +131,8 @@ pub fn compilers_outside(text: &str, root: &Path) -> std::result::Result<(), Str
     for (i, e) in entries.iter().enumerate() {
         let args = arguments(e).ok_or_else(|| format!("{DATABASE} entry {i} has no readable command: not run"))?;
         let c = args.first().ok_or_else(|| format!("{DATABASE} entry {i} has an empty command: not run"))?;
-        if let Some(bad) = args.iter().skip(1).find(|a| UNSAFE_ARGS.iter().any(|u| a.starts_with(u))) {
-            return Err(format!("{DATABASE} passes {bad}, which loads another program: not run"));
+        if let Some(bad) = refused_arg(&args[1..]) {
+            return Err(format!("{DATABASE} passes {bad}, which is not on atlas's list of flags safe to index with: not run"));
         }
         let path = if c.contains('/') || c.contains('\\') {
             let p = PathBuf::from(c);
@@ -124,6 +143,11 @@ pub fn compilers_outside(text: &str, root: &Path) -> std::result::Result<(), Str
         } else {
             crate::langs::on_path(c).ok_or_else(|| format!("{DATABASE} names the compiler {c}, not found on PATH: not run"))?
         };
+        // clang-cl and cl read options spelled like file names (`/clang:`).
+        let stem = Path::new(c).file_stem().map(|x| x.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if stem == "cl" || stem.ends_with("clang-cl") {
+            return Err(format!("{DATABASE} names the compiler {c}, a cl-style driver: not run"));
+        }
         // Fail closed: a path that cannot be resolved is not run.
         let real = std::fs::canonicalize(&path)
             .map_err(|e| format!("{DATABASE} names the compiler {}, which cannot be resolved ({e}): not run", path.display()))?;
@@ -152,8 +176,15 @@ fn arguments(e: &Value) -> Option<Vec<String>> {
 /// the next single quote; double quotes keep everything but a backslash
 /// before `"`, `\` or `$`; a backslash outside quotes escapes the next
 /// character; quoted and unquoted text next to each other join into one
-/// word. `None` for an unterminated quote or a trailing backslash.
+/// word. `None` for an unterminated quote, any backslash, or a control
+/// character other than a tab or a line break.
 pub fn split_command(cmd: &str) -> Option<Vec<String>> {
+    // A backslash, or a control character other than the blanks split on,
+    // is where shells and compilation-database readers can disagree: such a
+    // command is refused rather than guessed at.
+    if cmd.contains('\\') || cmd.chars().any(|c| c.is_control() && !matches!(c, ' ' | '\t' | '\n' | '\r')) {
+        return None;
+    }
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
@@ -301,7 +332,19 @@ mod tests {
         ] {
             assert!(compilers_outside(bad, &t).is_err(), "{bad}");
         }
-        assert_eq!(split_command(r#"a "b c" d\ e 'f g'h"#).unwrap(), ["a", "b c", "d e", "f gh"]);
+        assert_eq!(split_command(r#"a "b c" 'f g'h"#).unwrap(), ["a", "b c", "f gh"]);
+        assert_eq!(split_command(r#"a d\ e"#), None, "a backslash is refused");
+        assert_eq!(split_command("a\u{b}b"), None, "a vertical tab is refused");
+        // Only flags safe to index with pass.
+        let ok = format!(r#"[{{"arguments": ["{cxx}", "-std=c++20", "-O2", "-Iinclude", "-isystem", "/usr/include", "-DX=1", "-Wall", "-fPIC", "-c", "a.cc", "-o", "a.o"]}}]"#);
+        assert!(compilers_outside(&ok, &t).is_ok(), "{ok}");
+        for flag in ["-wrapper", "-specs=x", "--config=x", "-Xclang", "--rtlib=x", "-fplugin-arg-x", "-Wp,x", "-no-canonical-prefixes", "--prefix=x"] {
+            let db = format!(r#"[{{"arguments": ["{cxx}", "{flag}", "-c", "a.cc"]}}]"#);
+            assert!(compilers_outside(&db, &t).unwrap_err().contains("not on atlas's list"), "{flag}");
+        }
+        std::fs::write(sys.join("clang-cl"), "").unwrap();
+        let cl = format!(r#"[{{"arguments": ["{}", "/c", "a.cc"]}}]"#, sys.join("clang-cl").display());
+        assert!(compilers_outside(&cl, &t).unwrap_err().contains("cl-style"));
         std::fs::remove_dir_all(&t).ok();
         std::fs::remove_dir_all(&sys).ok();
     }
