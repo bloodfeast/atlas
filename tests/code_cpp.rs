@@ -264,6 +264,44 @@ fn scip_clang_runs_only_on_a_trusted_root_and_an_approved_database() {
     assert!(note(&rep).contains("inside the repository"), "{}", note(&rep));
 }
 
+/// A database the indexer refused as unapproved is asked about at
+/// SessionStart once per content, in a session inside the root (or above it),
+/// and no more once approved.
+#[cfg(unix)]
+#[test]
+fn the_session_asks_once_about_each_content_of_an_unapproved_database() {
+    let t = Temp::new("cpp-ask");
+    let root = t.path().join("repo");
+    copy_sources(&root);
+    let cxx = t.path().join("sys/c++");
+    write(&cxx, "");
+    let system_db = format!(r#"[{{"directory": ".", "arguments": ["{}", "-c", "shapes.cpp"], "file": "shapes.cpp"}}]"#, cxx.display());
+    write(&root.join("compile_commands.json"), &system_db);
+    let tool = stand_in(&t.path().join("bin"));
+    let db = t.path().join("state/atlas.sqlite");
+    let fixed = || Indexers::Fixed(vec![("scip-clang".into(), tool.clone())]);
+    let state = setup(&root, &db, fixed()).dir;
+    let roots = [("svc".to_string(), root.clone())];
+    let ask = |cwd: &Path| atlas::cpp_trust::session_line(&state, &roots, cwd);
+    // Nothing refused yet, nothing asked.
+    assert_eq!(ask(&root), None);
+    indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
+    // A session elsewhere is not asked, and that spends nothing.
+    assert_eq!(ask(&t.path().join("other")), None);
+    let line = ask(&root.join("src")).expect("asked inside the root");
+    assert!(line.contains("`atlas trust cpp svc`") && line.contains("Never run it yourself"), "{line}");
+    assert_eq!(ask(&root), None, "asked once");
+    // A changed database is asked about again, from a folder above the root.
+    write(&root.join("compile_commands.json"), &system_db.replace(r#""-c""#, r#""-O2", "-c""#));
+    indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
+    assert!(ask(t.path()).is_some(), "a new content is asked about");
+    // Approved: no question, even for a content never asked about.
+    write(&root.join("compile_commands.json"), &system_db.replace(r#""-c""#, r#""-O3", "-c""#));
+    indexed_trusted(&root, &db, fixed(), CppTrust::Ask);
+    atlas::cpp_trust::approve("svc", &root, std::slice::from_ref(&root), &state).unwrap();
+    assert_eq!(ask(&root), None);
+}
+
 /// `atlas trust cpp ROOT` approves the root's databases as they are now.
 #[test]
 fn the_trust_command_approves_a_roots_databases() {

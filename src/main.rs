@@ -1208,6 +1208,12 @@ fn run() -> Result<ExitCode, String> {
                 h.set_offer_ctx(offer_ctx.clone());
             }
             h.set_roots(ref_roots(&setup));
+            if let Some(code) = &setup.code {
+                let ask: Vec<(String, std::path::PathBuf)> = code.roots.iter().filter(|r| r.cpp == atlas::config::CppTrust::Ask).map(|r| (r.name.clone(), r.root.clone())).collect();
+                if !ask.is_empty() {
+                    h.set_cpp_ask(code.dir.clone(), ask);
+                }
+            }
             if timings {
                 eprintln!("atlas hook timings --hook: setup={t_setup:.1} open={:.1}", atlas::hook_budget::ms_since(t_open));
             }

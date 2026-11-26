@@ -12,6 +12,9 @@
 //!   file inside the root is refused ([`compilers_outside`]).
 //!
 //! The approvals are kept in [`TRUST_FILE`] in the code index's state folder.
+//! A database the indexer found unapproved is noted in [`PENDING_FILE`], and
+//! SessionStart asks the user about it once per content ([`session_line`]),
+//! noting it in [`ASKED_FILE`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,12 @@ use crate::json::Value;
 /// The file, in the code index's state folder, that holds the approved
 /// databases: `{"ROOT:UNIT": "sha256"}`.
 pub const TRUST_FILE: &str = "cpp-trust.json";
+
+/// The databases the indexer refused as unapproved: `{"ROOT:UNIT": "sha256"}`.
+pub const PENDING_FILE: &str = "cpp-pending.json";
+
+/// The databases SessionStart has asked about: `{"ROOT:UNIT": "sha256"}`.
+pub const ASKED_FILE: &str = "cpp-asked.json";
 
 /// The database a C++ unit holds.
 pub const DATABASE: &str = "compile_commands.json";
@@ -40,8 +49,17 @@ pub fn refusal(name: &str, root: &Path, trust: CppTrust, unit: &Path, state: &Pa
     if let Err(why) = compilers_outside(&text, root) {
         return Some(why);
     }
-    if trust == CppTrust::Ask && approved(state, &key(name, root, unit)).as_deref() != Some(digest(&text).as_str()) {
-        return Some(format!("{DATABASE} is not approved since it last changed (`atlas trust cpp {name}`)"));
+    if trust == CppTrust::Ask {
+        let (k, d) = (key(name, root, unit), digest(&text));
+        if read(state, TRUST_FILE).get(&k) != Some(&d) {
+            // Noted for SessionStart's question; a failed write only loses it.
+            let mut pending = read(state, PENDING_FILE);
+            if pending.get(&k) != Some(&d) {
+                pending.insert(k, d);
+                let _ = write(state, PENDING_FILE, pending);
+            }
+            return Some(format!("{DATABASE} is not approved since it last changed (`atlas trust cpp {name}`)"));
+        }
     }
     None
 }
@@ -54,7 +72,7 @@ pub fn refusal(name: &str, root: &Path, trust: CppTrust, unit: &Path, state: &Pa
 /// A database that cannot be read, whose compilers are refused, or a trust
 /// file that cannot be written.
 pub fn approve(name: &str, root: &Path, units: &[PathBuf], state: &Path) -> std::result::Result<Vec<String>, String> {
-    let mut map = read(state);
+    let mut map = read(state, TRUST_FILE);
     let mut done = Vec::new();
     for unit in units {
         let db = unit.join(DATABASE);
@@ -63,12 +81,43 @@ pub fn approve(name: &str, root: &Path, units: &[PathBuf], state: &Path) -> std:
         map.insert(key(name, root, unit), digest(&text));
         done.push(db.display().to_string());
     }
-    std::fs::create_dir_all(state).map_err(|e| e.to_string())?;
-    let obj: crate::json::Map = map.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
-    let tmp = state.join(format!("{TRUST_FILE}.part"));
-    std::fs::write(&tmp, format!("{}\n", Value::Object(obj))).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, state.join(TRUST_FILE)).map_err(|e| e.to_string())?;
+    write(state, TRUST_FILE, map)?;
     Ok(done)
+}
+
+/// SessionStart's question about the C++ databases the indexer refused as
+/// unapproved, for the roots `(name, folder)` of `roots` that hold the
+/// session's folder `cwd` or lie inside it. Each database's content is asked
+/// about once: the asked ones are noted, so the next question comes when the
+/// file changes. The user approves it, never the agent: the database names the
+/// compilers scip-clang runs. `None` when nothing waits.
+pub fn session_line(state: &Path, roots: &[(String, PathBuf)], cwd: &Path) -> Option<String> {
+    let pending = read(state, PENDING_FILE);
+    if pending.is_empty() {
+        return None;
+    }
+    let (trusted, mut asked) = (read(state, TRUST_FILE), read(state, ASKED_FILE));
+    let near = |r: &Path| cwd.starts_with(r) || r.starts_with(cwd);
+    let mut names: Vec<&str> = Vec::new();
+    for (k, d) in &pending {
+        let Some((name, _)) = k.split_once(':') else { continue };
+        if !roots.iter().any(|(n, r)| n == name && near(r)) || trusted.get(k) == Some(d) || asked.get(k) == Some(d) {
+            continue;
+        }
+        asked.insert(k.clone(), d.clone());
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    write(state, ASKED_FILE, asked).ok()?;
+    let roots = names.join(", ");
+    let run = names.iter().map(|n| format!("`atlas trust cpp {n}`")).collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "atlas: the C++ of {roots} is only scanned (definitions, no references): its {DATABASE} is not approved since it last changed, and scip-clang runs the compilers that file names. In your first reply, whatever the task, tell the user in one line and that, after checking the file, they approve it by running {run} themselves (in Claude Code with a leading `!`). Never run it yourself. atlas asks again only when the file changes."
+    ))
 }
 
 /// Flags whose value is the next argument, all of them safe to index with.
@@ -327,14 +376,18 @@ fn digest(text: &str) -> String {
     crate::sha256::hex(text.as_bytes())
 }
 
-fn approved(state: &Path, key: &str) -> Option<String> {
-    read(state).remove(key)
-}
-
-fn read(state: &Path) -> BTreeMap<String, String> {
-    let Ok(text) = std::fs::read_to_string(state.join(TRUST_FILE)) else { return BTreeMap::new() };
+fn read(state: &Path, file: &str) -> BTreeMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(state.join(file)) else { return BTreeMap::new() };
     let Ok(v) = crate::json::parse(&text) else { return BTreeMap::new() };
     v.as_object().map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()).unwrap_or_default()
+}
+
+fn write(state: &Path, file: &str, map: BTreeMap<String, String>) -> std::result::Result<(), String> {
+    std::fs::create_dir_all(state).map_err(|e| e.to_string())?;
+    let obj: crate::json::Map = map.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+    let tmp = state.join(format!("{file}.part"));
+    std::fs::write(&tmp, format!("{}\n", Value::Object(obj))).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, state.join(file)).map_err(|e| e.to_string())
 }
 
 /// `atlas trust`'s usage.
