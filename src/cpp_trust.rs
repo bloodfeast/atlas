@@ -91,6 +91,9 @@ const VALUE_FLAGS: &[&str] = &[
     "-arch",
 ];
 
+/// The extensions of a source file a command may compile: C and C++.
+const SOURCE_EXTS: &[&str] = &["c", "cc", "cpp", "cxx", "c++", "h", "hh", "hpp", "hxx", "i", "ii", "ipp", "tpp"];
+
 /// Whether one compiler argument is on the allowlist of what indexing
 /// needs: include paths, macros, the language and standard, warnings and
 /// optimisation and machine options, output and dependency files, and the
@@ -145,9 +148,17 @@ fn allowed(a: &str) -> bool {
         "--offload",
         "--cuda-",
         "-fgpu-",
+        "-fsycl",
+        "-foffload",
+        "-fcuda",
+        "-fhip",
+        "-fopenmp-target",
     ];
     if !a.starts_with('-') {
-        return !a.starts_with('@');
+        // A source file: a C or C++ one, so no other language's toolchain
+        // is chosen by its extension (.cu, .hip, .cl, .s).
+        let ext = a.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        return !a.starts_with('@') && SOURCE_EXTS.contains(&ext.as_str());
     }
     if DENIED.iter().any(|d| a.starts_with(d)) {
         return false;
@@ -434,6 +445,15 @@ mod tests {
             let db = format!(r#"[{{"arguments": ["{cxx}", "{flag}", "{v}", "-c", "a.cc"]}}]"#);
             assert!(compilers_outside(&db, &t).unwrap_err().contains("not on atlas's list"), "{flag} {v}");
         }
+        // A source file of another language is refused.
+        for src in ["kernel.cu", "a.hip", "k.cl", "start.s"] {
+            let db = format!(r#"[{{"arguments": ["{cxx}", "-c", "{src}"]}}]"#);
+            assert!(compilers_outside(&db, &t).unwrap_err().contains("not on atlas's list"), "{src}");
+        }
+        for flag in ["-fsycl", "-foffload=x", "-fcuda-is-device", "-fhip-new-launch-api", "-fopenmp-targets=x"] {
+            let db = format!(r#"[{{"arguments": ["{cxx}", "{flag}", "-c", "a.cc"]}}]"#);
+            assert!(compilers_outside(&db, &t).is_err(), "{flag}");
+        }
         let db = format!(r#"[{{"arguments": ["{cxx}", "-x", "c++", "-c", "a.cc"]}}]"#);
         assert!(compilers_outside(&db, &t).is_ok(), "{db}");
         // A flag's value is never a flag or a response file.
@@ -442,7 +462,7 @@ mod tests {
             assert!(compilers_outside(&db, &t).unwrap_err().contains("not on atlas's list"), "{v}");
         }
         std::fs::write(sys.join("clang-cl"), "").unwrap();
-        let cl = format!(r#"[{{"arguments": ["{}", "/c", "a.cc"]}}]"#, sys.join("clang-cl").display());
+        let cl = format!(r#"[{{"arguments": ["{}", "a.cc"]}}]"#, sys.join("clang-cl").display());
         assert!(compilers_outside(&cl, &t).unwrap_err().contains("cl-style"));
         std::fs::remove_dir_all(&t).ok();
         std::fs::remove_dir_all(&sys).ok();
