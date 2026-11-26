@@ -987,7 +987,6 @@ const CS_KEYWORDS: &[&str] = &[
     "nuint",
 ];
 
-/// C# build output, restored packages and tool folders.
 /// Folders whose C++ files are not indexed: build trees and vendored code.
 /// A `compile_commands.json` in one is still no marker (see [`CPP_MARKERS`]).
 const CPP_SKIP: &[&str] = &["build", "cmake-build-*", "bazel-*", "_deps", "third_party", "vendor"];
@@ -1259,6 +1258,7 @@ const CPP_TRUTH: &str = concat!(
     r"(?P<kw>class|struct|union|enum(?:\s+class|\s+struct)?|concept|using)\s+(?:\[\[[^\]]*\]\]\s*)?(?P<name>[A-Za-z_]\w*)\s*(?:final\s*)?(?:\{|:|=|$)"
 );
 
+/// C# build output, restored packages and tool folders.
 const CS_SKIP: &[&str] = &["obj", "bin", "packages", "TestResults", "artifacts", "node_modules"];
 
 /// The files whose change makes a C# root stale.
