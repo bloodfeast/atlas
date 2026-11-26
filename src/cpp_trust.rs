@@ -116,7 +116,7 @@ pub fn session_line(state: &Path, roots: &[(String, PathBuf)], cwd: &Path) -> Op
     let roots = names.join(", ");
     let run = names.iter().map(|n| format!("`atlas trust cpp {n}`")).collect::<Vec<_>>().join(", ");
     Some(format!(
-        "atlas: the C++ of {roots} is only scanned (definitions, no references): its {DATABASE} is not approved since it last changed, and scip-clang runs the compilers that file names. In your first reply, whatever the task, tell the user in one line and that, after checking the file, they approve it by running {run} themselves (in Claude Code with a leading `!`). Never run it yourself. atlas asks again only when the file changes."
+        "atlas: the C++ of {roots} is only scanned (definitions, no references): its {DATABASE} is not approved since it last changed, and scip-clang runs the compilers that file names. Start your first reply, whatever the task, with one line telling the user so, and that, after checking the file, they approve it by running {run} themselves (in Claude Code with a leading `!`); then do the task. Never run it yourself. atlas asks again only when the file changes."
     ))
 }
 
