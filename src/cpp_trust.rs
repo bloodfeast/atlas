@@ -72,8 +72,25 @@ pub fn approve(name: &str, root: &Path, units: &[PathBuf], state: &Path) -> std:
 }
 
 /// Flags whose value is the next argument, all of them safe to index with.
-const VALUE_FLAGS: &[&str] =
-    &["-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-D", "-U", "-o", "-x", "-MF", "-MT", "-MQ", "-isysroot", "-target", "--target", "-arch"];
+const VALUE_FLAGS: &[&str] = &[
+    "-I",
+    "-isystem",
+    "-iquote",
+    "-idirafter",
+    "-include",
+    "-imacros",
+    "-D",
+    "-U",
+    "-o",
+    "-x",
+    "-MF",
+    "-MT",
+    "-MQ",
+    "-isysroot",
+    "-target",
+    "--target",
+    "-arch",
+];
 
 /// Whether one compiler argument is on the allowlist of what indexing
 /// needs: include paths, macros, the language and standard, warnings and
@@ -82,12 +99,53 @@ const VALUE_FLAGS: &[&str] =
 /// wrapper, a response file or a pass-through to another tool, is not.
 fn allowed(a: &str) -> bool {
     const PREFIXES: &[&str] = &[
-        "-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-D", "-U", "-std=", "--std=", "-O", "-g", "-W", "-f",
-        "-m", "-M", "-x", "-o", "--sysroot=", "-isysroot", "-target", "--target=", "-arch", "-nostdinc", "-stdlib=", "-pthread",
+        "-I",
+        "-isystem",
+        "-iquote",
+        "-idirafter",
+        "-include",
+        "-imacros",
+        "-D",
+        "-U",
+        "-std=",
+        "--std=",
+        "-O",
+        "-g",
+        "-W",
+        "-f",
+        "-m",
+        "-M",
+        "-x",
+        "-o",
+        "--sysroot=",
+        "-isysroot",
+        "-target",
+        "--target=",
+        "-arch",
+        "-nostdinc",
+        "-stdlib=",
+        "-pthread",
     ];
-    const EXACT: &[&str] = &["-c", "-E", "-S", "-pedantic", "-pedantic-errors", "-w", "-pipe", "-shared", "-static", "-ansi", "-v", "-H", "-P", "-C"];
+    const EXACT: &[&str] =
+        &["-c", "-E", "-S", "-pedantic", "-pedantic-errors", "-w", "-pipe", "-shared", "-static", "-ansi", "-v", "-H", "-P", "-C"];
     // Prefixes above that still reach another program or library.
-    const DENIED: &[&str] = &["-Wa,", "-Wl,", "-Wp,", "-fplugin", "-fpass-plugin", "-mllvm", "-fuse-ld", "-fprofile-use", "-fprofile-sample-use"];
+    const DENIED: &[&str] = &[
+        "-Wa,",
+        "-Wl,",
+        "-Wp,",
+        "-fplugin",
+        "-fpass-plugin",
+        "-fuse-ld",
+        "-fprofile-use",
+        "-fprofile-sample-use",
+        "-fintegrated-cc1",
+        "-fno-integrated-cc1",
+        "-fno-integrated-as",
+        "-fcompare-debug",
+        "-mllvm",
+        "-gcc-toolchain",
+        "-gcc-install-dir",
+    ];
     if !a.starts_with('-') {
         return !a.starts_with('@');
     }
@@ -107,8 +165,12 @@ fn refused_arg(args: &[String]) -> Option<&str> {
             return Some(a);
         }
         if VALUE_FLAGS.contains(&a) {
-            // The value is a path or a word, never a flag of its own.
-            i += 1;
+            // The value is a path or a word: never a flag or a response file.
+            match args.get(i + 1) {
+                Some(v) if !v.starts_with('-') && !v.starts_with('@') => i += 1,
+                Some(v) => return Some(v.as_str()),
+                None => return Some(a),
+            }
         }
         i += 1;
     }
@@ -336,11 +398,31 @@ mod tests {
         assert_eq!(split_command(r#"a d\ e"#), None, "a backslash is refused");
         assert_eq!(split_command("a\u{b}b"), None, "a vertical tab is refused");
         // Only flags safe to index with pass.
-        let ok = format!(r#"[{{"arguments": ["{cxx}", "-std=c++20", "-O2", "-Iinclude", "-isystem", "/usr/include", "-DX=1", "-Wall", "-fPIC", "-c", "a.cc", "-o", "a.o"]}}]"#);
+        let ok = format!(
+            r#"[{{"arguments": ["{cxx}", "-std=c++20", "-O2", "-Iinclude", "-isystem", "/usr/include", "-DX=1", "-Wall", "-fPIC", "-c", "a.cc", "-o", "a.o"]}}]"#
+        );
         assert!(compilers_outside(&ok, &t).is_ok(), "{ok}");
-        for flag in ["-wrapper", "-specs=x", "--config=x", "-Xclang", "--rtlib=x", "-fplugin-arg-x", "-Wp,x", "-no-canonical-prefixes", "--prefix=x"] {
+        for flag in [
+            "-wrapper",
+            "-specs=x",
+            "--config=x",
+            "-Xclang",
+            "--rtlib=x",
+            "-fplugin-arg-x",
+            "-Wp,x",
+            "-no-canonical-prefixes",
+            "--prefix=x",
+            "-gcc-toolchain=/tmp/x",
+            "-fno-integrated-cc1",
+            "-fcompare-debug",
+        ] {
             let db = format!(r#"[{{"arguments": ["{cxx}", "{flag}", "-c", "a.cc"]}}]"#);
             assert!(compilers_outside(&db, &t).unwrap_err().contains("not on atlas's list"), "{flag}");
+        }
+        // A flag's value is never a flag or a response file.
+        for v in ["@evil.rsp", "-fplugin=/tmp/x.so"] {
+            let db = format!(r#"[{{"arguments": ["{cxx}", "-I", "{v}", "-c", "a.cc"]}}]"#);
+            assert!(compilers_outside(&db, &t).unwrap_err().contains("not on atlas's list"), "{v}");
         }
         std::fs::write(sys.join("clang-cl"), "").unwrap();
         let cl = format!(r#"[{{"arguments": ["{}", "/c", "a.cc"]}}]"#, sys.join("clang-cl").display());
