@@ -1294,6 +1294,105 @@ pub fn stands_down(stored: Option<&str>, current: &str) -> bool {
     stored == Some(current)
 }
 
+/// One root's bookkeeping in the indexer's loop, apart from clocks, files and
+/// the store: when it is next due, its failure, the fingerprint last walked,
+/// and whether its first walk has ended. [`run`] keeps one per root; a model
+/// of the loop (tests/proptest/indexer_model.rs) drives the same type, so the
+/// two cannot drift apart. `T` is the clock: `Instant` here.
+#[derive(Debug, Clone)]
+pub struct RootTrack<T> {
+    /// When the root last changed: due once quiet since then.
+    pub changed: Option<T>,
+    /// The fingerprint and error of a failed attempt: not retried until the
+    /// root changes again.
+    pub failed: Option<(String, String)>,
+    /// The fingerprint last walked, or the one this indexer's last run
+    /// stored.
+    pub seen: String,
+    /// Whether the root's first walk since start has ended: until then its
+    /// state reads `Starting`, never "stale".
+    pub settled: bool,
+}
+
+impl<T> Default for RootTrack<T> {
+    fn default() -> Self {
+        RootTrack { changed: None, failed: None, seen: String::new(), settled: false }
+    }
+}
+
+impl<T: Copy> RootTrack<T> {
+    /// A walk that could not read the root: a failure to show, never a
+    /// current index. Read as '', the error would equal a mark.
+    pub fn walk_failed(&mut self, error: String) {
+        self.changed = None;
+        self.failed = Some((String::new(), error));
+        self.seen.clear();
+        self.settled = true;
+    }
+
+    /// A walk that found `current`, with `stored` the store's fingerprint
+    /// ([`after_walk`] decides). `now` is the clock; `at_once` a time already
+    /// quiet long enough.
+    pub fn walked(&mut self, stored: Option<&str>, current: &str, walk_all: bool, now: T, at_once: T) {
+        match after_walk(stored, current, &self.seen, self.failed.as_ref().map(|f| f.0.as_str()), self.changed.is_some(), walk_all) {
+            Walked::Current => {
+                self.changed = None;
+                // Current: a failure from an earlier walk (the folder
+                // briefly unreadable, now back unchanged) no longer holds.
+                if stored == Some(current) {
+                    self.failed = None;
+                }
+            }
+            Walked::Changing { at_once: go } => self.changed = Some(if go { at_once } else { now }),
+            Walked::Mark => self.changed = Some(at_once),
+            Walked::Keep => {}
+        }
+        self.seen = current.to_string();
+    }
+
+    /// The root changed at `at` (a watcher event, a deferral, a lease held
+    /// elsewhere): due once quiet since then.
+    pub fn touched(&mut self, at: T) {
+        self.changed = Some(at);
+    }
+
+    /// A pass that left the root not due: its first walk has ended.
+    pub fn settle_if_quiet(&mut self) {
+        if self.changed.is_none() {
+            self.settled = true;
+        }
+    }
+
+    /// Another server indexed `current` since the root was scheduled here
+    /// ([`stands_down`]): nothing to run.
+    pub fn stood_down(&mut self, current: String) {
+        self.changed = None;
+        // Another server stored these files: a failure here no longer holds.
+        self.failed = None;
+        self.seen = current;
+        self.settled = true;
+    }
+
+    /// A run begins: the change it answers is taken.
+    pub fn run_started(&mut self) {
+        self.changed = None;
+    }
+
+    /// A run stored `stored`, its walk's fingerprint, not today's: a file
+    /// edited during the run then reads as a change.
+    pub fn run_done(&mut self, stored: String) {
+        self.failed = None;
+        self.seen = stored;
+        self.settled = true;
+    }
+
+    /// A run failed with `error`: not retried until the root changes again.
+    pub fn run_failed(&mut self, error: String) {
+        self.failed = Some((self.seen.clone(), error));
+        self.settled = true;
+    }
+}
+
 fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, watcher: &Watcher) -> Result<()> {
     let mut conn = crate::store::open_raw(db)?;
     code::ensure_schema(&conn)?;
@@ -1309,17 +1408,10 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
     // cannot go back past the clock's start, so shortly after boot it is now.
     let due_now = || Instant::now().checked_sub(setup.debounce).unwrap_or_else(Instant::now);
     let n = setup.roots.len();
-    // Per root: when it last changed, and the fingerprint last walked.
-    let mut changed: Vec<Option<Instant>> = vec![None; n];
-    let mut seen_fp: Vec<String> = vec![String::new(); n];
-    // The fingerprint and error of a failed attempt: not retried until the
-    // root changes again.
-    let mut failed: Vec<Option<(String, String)>> = vec![None; n];
+    // Per root: its bookkeeping (see [`RootTrack`]).
+    let mut track: Vec<RootTrack<Instant>> = vec![RootTrack::default(); n];
     // Why a due root is waiting (see [`defer_reason`]).
     let mut deferred: Vec<Option<String>> = vec![None; n];
-    // Whether a root's first walk since start has finished: until then its
-    // state reads `Starting`, never "stale".
-    let mut settled: Vec<bool> = vec![false; n];
     let mut walk_all = true;
     let mut last_walk = Instant::now();
     loop {
@@ -1343,45 +1435,27 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                     Ok(fp) => fp,
                     Err(e) => {
                         // The root cannot be walked (its folder is gone or
-                        // unreadable): a failure to show, never a current
-                        // index. Read as '', the error would equal a mark.
-                        changed[i] = None;
-                        failed[i] = Some((String::new(), e.to_string()));
-                        seen_fp[i] = String::new();
+                        // unreadable).
+                        track[i].walk_failed(e.to_string());
                         watcher.clear(i, snap.seq);
                         set(shared, &r.name, RootState::Failed(e.to_string()));
-                        settled[i] = true;
                         continue;
                     }
                 };
                 let indexed = stored.get(&r.name).map(|x| x.fingerprint.as_str());
-                match after_walk(indexed, &fp, &seen_fp[i], failed[i].as_ref().map(|f| f.0.as_str()), changed[i].is_some(), walk_all) {
-                    Walked::Current => {
-                        changed[i] = None;
-                        // Current: a failure from an earlier walk (the folder
-                        // briefly unreadable, now back unchanged) no longer holds.
-                        if indexed == Some(fp.as_str()) {
-                            failed[i] = None;
-                        }
-                    }
-                    Walked::Changing { at_once } => changed[i] = Some(if at_once { due_now() } else { Instant::now() }),
-                    Walked::Mark => changed[i] = Some(due_now()),
-                    Walked::Keep => {}
-                }
-                seen_fp[i] = fp;
+                track[i].walked(indexed, &fp, walk_all, Instant::now(), due_now());
             } else if change_wakes(&snap.paths, &r.exclude) {
-                changed[i] = Some(Instant::now());
+                track[i].touched(Instant::now());
             }
             watcher.clear(i, snap.seq);
-            let state = match (&changed[i], &failed[i]) {
-                (Some(_), _) if !settled[i] && deferred[i].is_none() => RootState::Starting,
+            let t = &track[i];
+            let state = match (&t.changed, &t.failed) {
+                (Some(_), _) if !t.settled && deferred[i].is_none() => RootState::Starting,
                 (Some(_), _) => deferred[i].clone().map_or(RootState::Pending, RootState::Deferred),
                 (None, Some((_, e))) => RootState::Failed(e.clone()),
                 (None, None) => RootState::Idle,
             };
-            if changed[i].is_none() {
-                settled[i] = true;
-            }
+            track[i].settle_if_quiet();
             set(shared, &r.name, state);
         }
         if walk_all {
@@ -1390,14 +1464,14 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
         walk_all = false;
         // Index every root that has been quiet long enough.
         for (i, r) in setup.roots.iter().enumerate() {
-            let Some(at) = changed[i] else { continue };
+            let Some(at) = track[i].changed else { continue };
             if at.elapsed() < setup.debounce || shared.stop.load(Ordering::SeqCst) {
                 continue;
             }
             if let Some(why) = defer_reason(setup) {
                 // Look again after the quiet time (at least the floor, so a
                 // zero debounce does not spin).
-                changed[i] = Some(Instant::now() + DEFER_RECHECK.saturating_sub(setup.debounce));
+                track[i].touched(Instant::now() + DEFER_RECHECK.saturating_sub(setup.debounce));
                 set(shared, &r.name, RootState::Deferred(why.clone()));
                 deferred[i] = Some(why);
                 continue;
@@ -1405,7 +1479,7 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
             deferred[i] = None;
             if !take_lease(&mut conn, &holder, setup.timeout + Duration::from_secs(120))? {
                 // Another process is indexing: try again after the quiet time.
-                changed[i] = Some(Instant::now());
+                track[i].touched(Instant::now());
                 continue;
             }
             // Another server may have indexed it since it was scheduled
@@ -1423,35 +1497,27 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                 };
                 if stands_down(stored.get(&r.name).map(|x| x.fingerprint.as_str()), &fp) {
                     let _ = release_lease(&conn, &holder);
-                    changed[i] = None;
-                    failed[i] = None;
-                    seen_fp[i] = fp;
+                    track[i].stood_down(fp);
                     set(shared, &r.name, RootState::Idle);
-                    settled[i] = true;
                     continue;
                 }
             }
-            set(shared, &r.name, if settled[i] { RootState::Running } else { RootState::Starting });
+            set(shared, &r.name, if track[i].settled { RootState::Running } else { RootState::Starting });
             log_line(&setup.dir, &format!("{} indexing", r.name));
             let res = index_root(setup, &mut conn, r, &rust);
             let _ = release_lease(&conn, &holder);
-            changed[i] = None;
+            track[i].run_started();
             match res {
                 Ok(rep) => {
                     log_line(&setup.dir, &format!("{} done: {} in {:.0} ms ({} defs, {} refs, {} impls)", r.name, rep.rust, rep.total_ms, rep.write.defs, rep.write.refs, rep.write.impls));
-                    failed[i] = None;
-                    // The fingerprint the run stored, not today's: a file
-                    // edited during the run then reads as a change.
-                    seen_fp[i] = rep.fingerprint.clone();
+                    track[i].run_done(rep.fingerprint.clone());
                     shared.reports.lock().unwrap_or_else(|p| p.into_inner()).push(rep);
                     set(shared, &r.name, RootState::Idle);
-                    settled[i] = true;
                 }
                 Err(e) => {
                     log_line(&setup.dir, &format!("{} failed: {e}", r.name));
-                    failed[i] = Some((seen_fp[i].clone(), e.to_string()));
+                    track[i].run_failed(e.to_string());
                     set(shared, &r.name, RootState::Failed(e.to_string()));
-                    settled[i] = true;
                 }
             }
         }
@@ -1468,7 +1534,8 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
         }
         // Sleep until the next root is due, a change arrives, or the safety
         // net walk is due.
-        let next_due = changed.iter().flatten().map(|at| (*at + setup.debounce).saturating_duration_since(Instant::now())).min();
+        let next_due =
+            track.iter().filter_map(|t| t.changed.as_ref()).map(|at| (*at + setup.debounce).saturating_duration_since(Instant::now())).min();
         let net = setup.rescan_interval.saturating_sub(last_walk.elapsed());
         let wait = next_due.map_or(net, |d| d.min(net)).max(Duration::from_millis(10));
         if !watcher.wait_past(seen, wait) && last_walk.elapsed() >= setup.rescan_interval {

@@ -1,17 +1,16 @@
-//! A model of servers sharing one index: the per-root decisions of the
-//! indexer's loop (`code_index::after_walk`, `stands_down`) driven through
-//! random edits, edits during a run, marks, failed runs, and passes with and
-//! without a full walk, on a simulated clock. The bookkeeping around them
-//! mirrors `code_index::run`: a run stores its walk's fingerprint and the
-//! server remembers that one; a watcher sees every edit; the lease serialises
-//! runs; a server that finds the lease taken tries again after the quiet time.
+//! A model of servers sharing one index: the indexer loop's own per-root
+//! bookkeeping (`code_index::RootTrack`, which `code_index::run` keeps, and
+//! `stands_down`) driven through random edits, edits during a run, marks,
+//! failed runs, and passes with and without a full walk, on a simulated clock.
+//! Only the world is the model's: the clock, the servers, the store, a watcher
+//! that sees every edit, and the lease that serialises runs.
 //!
 //! The properties, for one root:
 //! - the servers settle: once events stop, no server runs again;
 //! - no edit is lost: unless a run failed, the stored fingerprint is the last
 //!   version's;
 //! - no useless run: a server never starts a run whose fingerprint is stored.
-use atlas::code_index::{after_walk, stands_down, Walked};
+use atlas::code_index::{stands_down, RootTrack};
 use proptest::prelude::*;
 
 /// The quiet time, in passes.
@@ -33,9 +32,8 @@ struct Server {
     /// Which configuration or version: servers of one variant compute one
     /// fingerprint for the same files.
     variant: u8,
-    seen: String,
-    changed: Option<i64>,
-    failed: Option<String>,
+    /// The loop's own per-root bookkeeping, as `code_index::run` keeps it.
+    track: RootTrack<i64>,
     started: bool,
     notified: bool,
     running: Option<String>,
@@ -76,62 +74,44 @@ impl World {
             // The run ends: it stores its walk's fingerprint, which the
             // server remembers.
             self.stored = Some(walked.clone());
-            s.seen = walked;
-            s.changed = None;
-            s.failed = None;
+            s.track.run_done(walked);
             s.runs += 1;
             self.lease = None;
             return;
         }
         let current = fingerprint(s.variant, version);
         if walk || !s.started {
-            let pending = s.changed.is_some();
-            match after_walk(self.stored.as_deref(), &current, &s.seen, s.failed.as_deref(), pending, !s.started) {
-                Walked::Current => {
-                    s.changed = None;
-                    // As the loop does: a walk that finds the stored fingerprint
-                    // clears a failure.
-                    if self.stored.as_deref() == Some(current.as_str()) {
-                        s.failed = None;
-                    }
-                }
-                Walked::Changing { at_once } => s.changed = Some(if at_once { now - QUIET } else { now }),
-                Walked::Mark => s.changed = Some(now - QUIET),
-                Walked::Keep => {}
-            }
-            s.seen = current.clone();
+            s.track.walked(self.stored.as_deref(), &current, !s.started, now, now - QUIET);
             s.started = true;
             s.notified = false;
         } else if s.notified {
-            s.changed = Some(now);
+            s.track.touched(now);
             s.notified = false;
         }
-        let Some(at) = s.changed else { return };
+        let Some(at) = s.track.changed else { return };
         if now - at < QUIET {
             return;
         }
         if self.lease.is_some_and(|h| h != i) {
-            s.changed = Some(now);
+            s.track.touched(now);
             return;
         }
         if stands_down(self.stored.as_deref(), &current) {
-            s.changed = None;
-            s.seen = current;
+            s.track.stood_down(current);
             return;
         }
         if self.stored.as_deref() == Some(current.as_str()) {
             self.useless += 1;
         }
         self.lease = Some(i);
-        s.changed = None;
+        s.track.run_started();
         s.running = Some(current);
     }
 
     fn fail(&mut self, i: usize) {
         let s = &mut self.servers[i];
         if s.running.take().is_some() {
-            s.failed = Some(s.seen.clone());
-            s.changed = None;
+            s.track.run_failed(String::new());
             self.lease = None;
         }
     }
