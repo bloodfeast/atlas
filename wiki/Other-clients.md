@@ -31,6 +31,19 @@ atlas offers them its MCP server only.
 A client other than Claude Code is never offered Claude Code settings, and atlas leaves Claude Code's own
 status line and hooks alone in its sessions.
 
+## atlas on PATH
+
+Other clients, and the commands atlas asks a model to run (`atlas settings add-project`), need `atlas` on `PATH`
+in every shell, not as a shell alias. Link the binary itself from the plugin's `bin/` folder:
+
+```sh
+ln -s <plugin>/bin/atlas-x86_64-unknown-linux-gnu ~/.local/bin/atlas
+```
+
+The name after `atlas-` is your machine's (`atlas-aarch64-apple-darwin`, for one). The link holds only while the
+plugin folder stays where it is, as one given to `claude --plugin-dir` does. A plugin installed with `/plugin`
+lives in a folder per version, so the link breaks at its next update: link it again then.
+
 ## The MCP server
 
 Each client starts `atlas` with no arguments. `atlas` must be on `PATH`, or give its full path.

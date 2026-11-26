@@ -7,7 +7,18 @@
 # The release script copies this file to bin/atlas beside binaries named
 # atlas-<arch>-<os>, for example atlas-x86_64-unknown-linux-gnu and
 # atlas-aarch64-apple-darwin.
-dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 127
+# Reached through a link (~/.local/bin/atlas, say), the binaries sit beside
+# the file the link names, not beside the link: follow each link first, with
+# `readlink` without -f, which older macOS lacks.
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink -- "$self") || break
+    case $link in
+        /*) self=$link ;;
+        *) self=$(dirname -- "$self")/$link ;;
+    esac
+done
+dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd) || exit 127
 case "$(uname -s)" in
     # Git Bash on Windows finds this script before atlas.exe on PATH.
     MINGW* | MSYS* | CYGWIN*) exec "$dir/atlas.exe" "$@" ;;
