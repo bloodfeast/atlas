@@ -853,9 +853,6 @@ fn code_excludes(f: &Fields<'_>) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Reads a code root's `scip`: `true` or absent (the convention), `false`
-/// (none), a path (the root folder's file), or an object from unit folder
-/// to a path or `false`.
 /// A code root's `cpp` object: `{"trust": "off" | "ask" | "always"}`.
 fn cpp_trust(f: &Fields<'_>, at: &str) -> Result<CppTrust> {
     let Some(v) = f.get("cpp") else { return Ok(CppTrust::Off) };
@@ -868,6 +865,9 @@ fn cpp_trust(f: &Fields<'_>, at: &str) -> Result<CppTrust> {
     }
 }
 
+/// Reads a code root's `scip`: `true` or absent (the convention), `false`
+/// (none), a path (the root folder's file), or an object from unit folder
+/// to a path or `false`.
 fn prebuilt_spec(f: &Fields<'_>, key: &str, base: &Path) -> Result<crate::code::Prebuilt> {
     use crate::code::Prebuilt;
     let folder = |d: &str| d.replace('\\', "/").trim_start_matches("./").trim_matches('/').to_string();
