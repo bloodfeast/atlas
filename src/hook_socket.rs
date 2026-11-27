@@ -148,6 +148,22 @@ pub fn job_args(mut v: Value) -> Value {
     crate::hooks::mark_tool_use(&v, None)
 }
 
+/// Whether a hook of `event` goes to the server. SessionStart comes before
+/// the server is marked and SessionEnd after it is gone, so both run in the
+/// hook's own process.
+pub fn goes_to_server(event: &str) -> bool {
+    !matches!(event, "SessionStart" | "SessionEnd" | "")
+}
+
+/// What the server takes from its socket: [`job_args`] of an event that
+/// [`goes_to_server`], `None` for any other. The hook never sends one, so
+/// one arriving was written to the socket by something else, and is
+/// dropped.
+pub fn socket_job(v: Value) -> Option<Value> {
+    let args = job_args(v);
+    goes_to_server(&crate::hooks::HookEvent::from_value(&args).event).then_some(args)
+}
+
 /// Where a command hook's event went.
 #[derive(Debug, PartialEq)]
 pub enum Route {
@@ -254,8 +270,7 @@ mod unix {
             return;
         }
         let arrived = Instant::now();
-        let Ok(v) = crate::json::parse(&text) else { return };
-        let args = job_args(v);
+        let Some(args) = crate::json::parse(&text).ok().and_then(socket_job) else { return };
         let ev = crate::hooks::HookEvent::from_value(&args);
         let answer = Arc::new(Answer::default());
         let job = Job { args: args.clone(), arrived, reply: Reply::Socket(key.clone(), answer.clone()) };
@@ -325,7 +340,7 @@ pub fn command_hook(input: &str) -> Option<String> {
     {
         let v = crate::json::parse(input).ok()?;
         let ev = crate::hooks::HookEvent::from_value(&v);
-        if matches!(ev.event.as_str(), "SessionStart" | "SessionEnd" | "") {
+        if !goes_to_server(&ev.event) {
             return None;
         }
         let dir = crate::server_check::live_dir()?;
@@ -388,5 +403,15 @@ mod tests {
         let a = job_args(v);
         assert_eq!(a.get("event").and_then(Value::as_str), Some("PreToolUse"));
         assert_eq!(a.get(crate::hooks::TOOL_USE_ARG), Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn the_server_drops_an_event_the_hook_never_sends_it() {
+        let job = |t: &str| socket_job(crate::json::parse(t).unwrap());
+        for e in ["SessionStart", "SessionEnd"] {
+            assert_eq!(job(&format!(r#"{{"hook_event_name":"{e}"}}"#)), None, "{e}");
+        }
+        assert_eq!(job(r#"{"prompt":"hi"}"#), None, "no event");
+        assert!(job(r#"{"hook_event_name":"Stop"}"#).is_some());
     }
 }
