@@ -2,9 +2,11 @@
 //!
 //! All hook logic is here, behind [`Hooks::handle`], which takes a
 //! [`HookEvent`] and returns a [`HookAnswer`]. Transports are thin adapters
-//! around it: the `hook` MCP tool (Claude Code `mcp_tool` hooks, answered on
-//! the server's hook worker thread), and `atlas --hook` (a command hook
-//! reading the event JSON on stdin). A pipe would be one more adapter.
+//! around it: `atlas --hook` (a command hook reading the event JSON on
+//! stdin), which hands the event to the session's server over its socket
+//! ([`crate::hook_socket`]) or works it in its own process, and the `hook`
+//! MCP tool (Claude Code `mcp_tool` hooks of an older setup). The server
+//! answers both on its hook worker thread.
 //!
 //! What the hooks can see was measured (`docs/design/atlas-c.md`, section 1):
 //! inside a subagent `transcript_path` is the parent's; the subagent's own
@@ -2367,10 +2369,11 @@ impl Hooks {
                     a.context.push_str(&line);
                 }
                 let fresh = ev.source == "startup" || ev.source == "clear";
-                // Hook drift, once a session, when no prompt will tell it: a
-                // recalling event routed to a command hook, and no mcp_tool
-                // UserPromptSubmit (a resident server tells it at the first
-                // prompt). A line of its own, outside the questions' budget.
+                // Hook drift, once a session, when no prompt will tell it:
+                // on Windows, a recalling event routed to a command hook that
+                // runs in its own process (elsewhere the session's server
+                // tells it at the first prompt). A line of its own, outside
+                // the questions' budget.
                 if fresh && self.offer.as_ref().is_some_and(crate::claude_settings::drift_told_at_session_start) {
                     if let Some(line) = self.drift_line() {
                         if !a.context.is_empty() {

@@ -82,6 +82,8 @@ pub const THREADS: &[&str] = &[
     "atlas-endsession",
     "atlas-restart-point",
     "atlas-restart-warn",
+    "atlas-hook-socket",
+    "atlas-hook-conn",
 ];
 
 /// The longest panic literal written, in characters.

@@ -30,11 +30,14 @@ One Rust binary, one dependency (SQLite, bundled), no network at query time.
   before that gap is the panic that ended it. At 1 MiB the file is renamed to `atlas-server.log.1`, by one
   appender at a time (under `atlas-server.log.lock`; a lock older than 10 s is taken over). `atlas --hook`
   and the CLI modes do not write to it.
-- **Hooks** (`hooks/hooks.json`). Each is an `mcp_tool` hook that calls the running server's `hook`
-  tool, so no process starts per hook. Claude Code substitutes `${tool_input}` and `${tool_response}`
-  into the call as JSON text. Plugin hooks also fire inside subagents, with `agent_id` set (measured).
-  `atlas --hook` is the same logic as a command hook, reading the event on stdin. SessionStart is that
-  command hook, because Claude Code runs no `mcp_tool` hook at SessionStart (measured on 2.1.316). Its
+- **Hooks** (`hooks/hooks.json`). Each is the command hook `atlas --hook`, reading the event on stdin.
+  It finds the server its own Claude Code started by the server's marker (`src/server_check.rs`) and
+  hands the event to it over a Unix socket (`src/hook_socket.rs`), so the server's hook worker answers
+  every event and what it keeps between them stays in one process. SessionStart and SessionEnd, and
+  every event on Windows or with no reachable socket, run in the hook's own process; with every server
+  of the session stopped, the hook does nothing but the once-per-loss notice. Plugin hooks also fire
+  inside subagents, with `agent_id` set (measured). The `hook` MCP tool still answers the `mcp_tool`
+  hooks of an older plugin. SessionStart's
   only output is the settings offer, once, and these until answered: for a folder atlas does not index, a line asking the
   model to ask the user whether to create a vault for the project, default yes, which also adds the project
   as a source (`atlas settings add-project --vault`).

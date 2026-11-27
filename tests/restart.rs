@@ -87,7 +87,7 @@ fn serve_answers(dir: &Path, set: Settings, every: Duration) -> (mpsc::Sender<Ve
     let input = BufReader::new(ChanReader { rx, buf: Vec::new(), at: 0 });
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
     let h = std::thread::spawn(move || {
-        atlas::protocol::serve_with_hooks_every(&mut server, Some(set), None, input, ChanWriter(out_tx), every).unwrap();
+        atlas::protocol::serve_with_hooks_every(&mut server, Some(set), None, input, ChanWriter(out_tx), every, None).unwrap();
     });
     // The hook state opens at the first hook and counts only agents that
     // write after it opened: the agents' files come after this answer.

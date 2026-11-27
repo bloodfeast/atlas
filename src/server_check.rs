@@ -1,14 +1,16 @@
 //! Whether this session's atlas server still runs, and the prompt hook's
 //! notice when it does not.
 //!
-//! Most of atlas's hooks are `mcp_tool` hooks on the resident server. When
-//! Claude Code loses that server (it exited, or a `/clear` dropped the
-//! plugin's server as stale), each of those hooks fails and atlas falls
-//! silent with no word to the user. So each server leaves a marker at
-//! start naming the Claude Code process it serves ([`mark`]), and a command
-//! hook on UserPromptSubmit (`atlas --server-check`), which needs no server,
-//! says so when every marker of its own Claude Code names a server that no
-//! longer runs ([`check`]).
+//! atlas's hooks are command hooks (`atlas --hook`) that hand their event to
+//! the session's resident server over its socket ([`crate::hook_socket`]).
+//! When Claude Code loses that server (it exited, or a `/clear` dropped the
+//! plugin's server as stale), the hooks have nobody to work their events.
+//! So each server leaves a marker at start naming the Claude Code process it
+//! serves ([`mark`]), and the hook, which needs no server to run, finds by
+//! these markers the server to send to; when every marker of its own Claude
+//! Code names a server that no longer runs ([`check`]), the UserPromptSubmit
+//! hook says so. `atlas --server-check` is that notice alone, for a setup
+//! whose hooks are still `mcp_tool` hooks.
 //!
 //! The markers live in [`LIVE_DIR`] in the data folder
 //! ([`crate::dirs::data_dir`]), not beside the store, so the hook finds them
@@ -32,6 +34,12 @@ pub const LIVE_DIR: &str = "live-servers";
 /// The server part of the file that holds what the hook last told
 /// (`<owner>.told`): no process tag, so never read as a marker.
 pub const TOLD: &str = "told";
+/// The end of a server's hook socket's name, `<server pid>.sock` beside its
+/// marker ([`crate::hook_socket`]). The name holds the pid alone, not the
+/// start time as a marker's does: a socket's whole path is limited to 103
+/// bytes on macOS (107 on Linux), and the macOS start time is 16 digits. A
+/// live server's marker names the socket, so its pid is enough.
+pub const SOCKET_SUFFIX: &str = ".sock";
 
 /// What the hook found about its session's servers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +61,11 @@ pub fn is_claude_code(name: &str) -> bool {
     version || CLAUDE_CODE.contains(&n.as_str())
 }
 
+/// How many parents [`session_pid`] walks past this process: a wrapper
+/// chain is a few deep, and a loop is cut off. [`owner_here`] reads this
+/// many ancestors.
+pub const WALK_DEPTH: usize = 8;
+
 /// The Claude Code process nearest above `me` in `procs` ((pid, parent pid,
 /// executable name)), past known shells and launchers ([`WRAPPERS`]). The
 /// nearest, not the topmost as [`crate::restart::owner_pid`] takes: a
@@ -62,8 +75,7 @@ pub fn is_claude_code(name: &str) -> bool {
 pub fn session_pid(procs: &[(u32, u32, String)], me: u32, started: impl Fn(u32) -> Option<u64>) -> Option<u32> {
     let row = |pid: u32| procs.iter().find(|p| p.0 == pid);
     let (mut child, mut pid) = (me, row(me)?.1);
-    // A short walk: a wrapper chain is a few deep; a loop is cut off.
-    for _ in 0..8 {
+    for _ in 0..WALK_DEPTH {
         let r = row(pid).filter(|_| pid > 1)?;
         if let (Some(p), Some(c)) = (started(pid), started(child)) {
             if p > c {
@@ -123,20 +135,52 @@ fn tag_of(pid: u32) -> String {
 }
 
 /// The tag of the Claude Code process above this one, or why there is none.
-fn owner_here() -> Result<String, String> {
-    let procs = crate::platform::process::table();
+pub fn owner_here() -> Result<String, String> {
+    let procs = crate::platform::process::lineage(std::process::id(), WALK_DEPTH);
     session_pid(&procs, std::process::id(), crate::platform::process::start_time)
         .map(tag_of)
         .ok_or_else(|| "no Claude Code process above this one".into())
 }
 
+/// The hook socket of the server tagged `server` (`<pid> <start>`), in `dir`.
+pub fn socket_in(dir: &Path, server: &str) -> PathBuf {
+    dir.join(format!("{}{SOCKET_SUFFIX}", server.split_whitespace().next().unwrap_or("")))
+}
+
+/// The hook socket of the server whose marker in `dir` is named `marker`
+/// (`<owner>.<pid>-<start>`).
+pub fn socket_of_marker(dir: &Path, marker: &str) -> Option<PathBuf> {
+    let (_, server) = marker.split_once('.')?;
+    let pid = server.split('-').next()?;
+    pid.parse::<u32>().ok()?;
+    Some(dir.join(format!("{pid}{SOCKET_SUFFIX}")))
+}
+
+/// The server a socket's name names (`<pid>.sock`), as a tag with no start
+/// time (alive is enough), or `None` for another file.
+fn socket_server(name: &str) -> Option<String> {
+    let pid = name.strip_suffix(SOCKET_SUFFIX)?;
+    pid.parse::<u32>().ok()?;
+    Some(format!("{pid} -"))
+}
+
 /// Writes the marker of `server` for `owner` in `dir`, after removing the
-/// markers whose own Claude Code no longer runs. Returns the marker's path.
+/// markers whose own Claude Code no longer runs and the sockets whose server
+/// no longer runs. Returns the marker's path. The folder is the user's own
+/// (0700 on Unix): a socket in it takes hooks.
 pub fn mark_in(dir: &Path, owner: &str, server: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // A folder another user made is left as it is: the socket's own
+        // mode (0600) still keeps others out.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
     for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if owner_of(&name).is_some_and(|o| server_live(&o) == Some(false)) {
+        let gone = |tag: Option<String>| tag.is_some_and(|t| server_live(&t) == Some(false));
+        if gone(owner_of(&name)) || gone(socket_server(&name)) {
             // A removal that fails leaves one stale file; it is retried at
             // the next server start.
             let _ = std::fs::remove_file(e.path());
@@ -147,20 +191,33 @@ pub fn mark_in(dir: &Path, owner: &str, server: &str) -> Result<PathBuf, String>
     Ok(path)
 }
 
+/// This server's hook socket, once [`mark`] wrote its marker.
+static SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// This server's marker ([`mark_in`] in [`live_dir`]), at server start. The
 /// result is the line the server logs.
 pub fn mark() -> String {
     let Some(dir) = live_dir() else { return "off: no data folder".into() };
-    match owner_here().and_then(|owner| mark_in(&dir, &owner, &server_tag())) {
-        Ok(p) => p.display().to_string(),
+    let tag = server_tag();
+    match owner_here().and_then(|owner| mark_in(&dir, &owner, &tag)) {
+        Ok(p) => {
+            let _ = SOCKET.set(socket_in(&dir, &tag));
+            p.display().to_string()
+        }
         Err(e) => format!("off: {e}"),
     }
+}
+
+/// Where this server listens for its session's hooks: beside the marker
+/// [`mark`] wrote, `None` when it wrote none (no hook could find the socket).
+pub fn own_socket() -> Option<PathBuf> {
+    SOCKET.get().cloned()
 }
 
 /// The markers in `dir` of the Claude Code tagged `owner`, each its file
 /// name, sorted, and [`server_live`] of the server it names; `Err` with the
 /// reason when the folder cannot be read.
-fn markers(dir: &Path, owner: &str) -> Result<Vec<(String, Option<bool>)>, String> {
+pub fn markers(dir: &Path, owner: &str) -> Result<Vec<(String, Option<bool>)>, String> {
     let prefix = format!("{}.", part(owner));
     let told = format!("{prefix}{TOLD}");
     let entries = match std::fs::read_dir(dir) {
@@ -171,7 +228,7 @@ fn markers(dir: &Path, owner: &str) -> Result<Vec<(String, Option<bool>)>, Strin
     let mut out = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(&prefix) || name == told {
+        if !name.starts_with(&prefix) || name == told || name.ends_with(SOCKET_SUFFIX) {
             continue;
         }
         match std::fs::read_to_string(e.path()) {
@@ -251,7 +308,8 @@ pub fn hook_output(v: &Verdict) -> Option<String> {
     }
 }
 
-/// `atlas --server-check [--say]`: the UserPromptSubmit hook. It reads and
+/// `atlas --server-check [--say]`: the notice as a hook of its own, for a
+/// setup whose other hooks are `mcp_tool` hooks. It reads and
 /// drops the hook's input, prints the notice when the server is gone and
 /// that was not told yet, and always exits 0, so a prompt is never stopped.
 /// `--say` prints the verdict whatever it is, reads no input and records

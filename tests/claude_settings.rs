@@ -1229,10 +1229,11 @@ fn the_first_session_offers_orchestrated_mode_once() {
     assert_eq!(cs::orchestrate_line(&h3.paths()), None);
 }
 
-/// The live hook drift check (journal ATLAS-V03:0137, review 0141): the
-/// atlas hooks of a user's settings.json are compared with hooks/hooks.json
-/// per event (an event with no atlas hook, and the input fields of an
-/// mcp_tool hook), by `atlas doctor` and at a session's first prompt.
+/// The live hook drift check: the atlas hooks of a user's settings.json are
+/// compared with hooks/hooks.json per event (an event with no atlas hook, an
+/// mcp_tool hook where the plugin runs `atlas --hook`, an atlas hook on an
+/// event the plugin does not hook), by `atlas doctor` and at a session's
+/// first prompt.
 #[test]
 fn live_atlas_hooks_are_checked_against_hooks_json() {
     use atlas::hooks::{HookEvent, Hooks};
@@ -1240,26 +1241,40 @@ fn live_atlas_hooks_are_checked_against_hooks_json() {
     let plugin = json::parse(cs::PLUGIN_HOOKS).unwrap();
     assert_eq!(cs::hook_drift(&plugin), Vec::<String>::new());
     assert_eq!(cs::hook_drift(&json::parse(r#"{"hooks": {"PostToolUse": [{"hooks": [{"type": "command", "command": "node x.js"}]}]}}"#).unwrap()), Vec::<String>::new());
-    // A hand-installed setup: the plugin's hooks under the
-    // server name `atlas`, SessionStart as the installed binary's command hook.
-    let same = cs::PLUGIN_HOOKS.replace("plugin:atlas:atlas", "atlas").replace(r#""\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook""#, r#""\"/opt/atlas/bin/atlas\" --hook""#);
-    assert!(same.contains("/opt/atlas/bin/atlas"), "{same}");
+    // A hand-installed setup: the plugin's hooks as the installed binary's
+    // command hooks.
+    let same = cs::PLUGIN_HOOKS.replace(r#""\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook""#, r#""\"/opt/atlas/bin/atlas\" --hook""#);
+    assert!(same.contains("/opt/atlas/bin/atlas") && !same.contains("CLAUDE_PLUGIN_ROOT"), "{same}");
     assert_eq!(cs::hook_drift(&json::parse(&same).unwrap()), Vec::<String>::new());
-    // Before: four mcp_tool events only, PreToolUse without tool_use_id and
-    // cwd, and a PreCompact field the plugin does not send.
+    // Before: three events not hooked, and two as an earlier release's
+    // mcp_tool hooks.
+    let mcp = |event: &str| json::parse(&format!(r#"[{{"hooks": [{{"type": "mcp_tool", "server": "atlas", "tool": "hook", "input": {{"event": "{event}", "session_id": "${{session_id}}"}}}}]}}]"#)).unwrap();
     let mut before = json::parse(&same).unwrap();
     if let Some(h) = before["hooks"].as_object_mut() {
         for e in ["SessionStart", "SubagentStop", "PostToolUse"] {
             h.remove(e);
         }
+        for e in ["UserPromptSubmit", "PreCompact"] {
+            h.insert(e.into(), mcp(e));
+        }
     }
-    let before = before
-        .to_string()
-        .replace(r#""tool_use_id":"${tool_use_id}","#, "")
-        .replace(r#""cwd":"${cwd}","#, "")
-        .replace(r#""trigger":"${trigger}","#, r#""trigger":"${trigger}","source":"${source}","#);
-    let want = ["SessionStart: no atlas hook", "SubagentStop: no atlas hook", "PreToolUse: missing cwd, tool_use_id", "PostToolUse: no atlas hook", "PreCompact: extra source"];
+    let before = before.to_string();
+    let finding = "an mcp_tool hook, where hooks/hooks.json runs `atlas --hook`; Claude Code reports an error for an mcp_tool hook on every event while atlas's server is not connected";
+    let want = ["SessionStart: no atlas hook".to_string(), format!("UserPromptSubmit: {finding}"), "SubagentStop: no atlas hook".into(), "PostToolUse: no atlas hook".into(), format!("PreCompact: {finding}")];
     assert_eq!(cs::hook_drift(&json::parse(&before).unwrap()), want, "{before}");
+    // An mcp_tool hook beside the command hook is said too.
+    let mut both = json::parse(&same).unwrap();
+    let extra = mcp("Stop")[0]["hooks"][0].clone();
+    if let Some(groups) = both["hooks"]["Stop"].as_array_mut() {
+        groups.push(json::parse(&format!(r#"{{"hooks": [{extra}]}}"#)).unwrap());
+    }
+    assert_eq!(cs::hook_drift(&both), [format!("Stop: {finding}")]);
+    // A non-atlas mcp_tool hook is not atlas's.
+    let mut other = json::parse(&same).unwrap();
+    if let Some(groups) = other["hooks"]["Stop"].as_array_mut() {
+        groups.push(json::parse(r#"{"hooks": [{"type": "mcp_tool", "server": "other", "tool": "hook", "input": {}}]}"#).unwrap());
+    }
+    assert_eq!(cs::hook_drift(&other), Vec::<String>::new());
     // An atlas hook on an event the plugin does not hook.
     let mut odd = json::parse(&same).unwrap();
     let stop = odd["hooks"]["SubagentStop"].clone();
@@ -1267,26 +1282,6 @@ fn live_atlas_hooks_are_checked_against_hooks_json() {
         h.insert("Notification".into(), stop);
     }
     assert_eq!(cs::hook_drift(&odd), ["Notification: an atlas hook on an event hooks/hooks.json does not hook"]);
-    // A legacy setup routing a recalling event to `atlas --hook` reloads the
-    // model per prompt; a command hook on another event is not said.
-    let mut legacy = json::parse(&same).unwrap();
-    let command = legacy["hooks"]["SessionStart"].clone();
-    if let Some(h) = legacy["hooks"].as_object_mut() {
-        h.insert("UserPromptSubmit".into(), command.clone());
-        h.insert("PreCompact".into(), command.clone());
-    }
-    let finding = "a command hook starts a new process per event that reloads the model and record vectors; use the mcp_tool hook";
-    assert_eq!(cs::hook_drift(&legacy), [format!("UserPromptSubmit: {finding}")]);
-    // SubagentStart recalls too: said on its own, and beside UserPromptSubmit.
-    let mut sub = json::parse(&same).unwrap();
-    if let Some(h) = sub["hooks"].as_object_mut() {
-        h.insert("SubagentStart".into(), command.clone());
-    }
-    assert_eq!(cs::hook_drift(&sub), [format!("SubagentStart: {finding}")]);
-    if let Some(h) = legacy["hooks"].as_object_mut() {
-        h.insert("SubagentStart".into(), command);
-    }
-    assert_eq!(cs::hook_drift(&legacy), [format!("UserPromptSubmit: {finding}"), format!("SubagentStart: {finding}")]);
 
     let h = Home::new("cs-drift");
     let doctor = || {
@@ -1298,7 +1293,7 @@ fn live_atlas_hooks_are_checked_against_hooks_json() {
     assert!(ok && out.contains("match hooks/hooks.json"), "{out}");
     std::fs::write(h.settings(), &before).unwrap();
     let (ok, out) = doctor();
-    assert!(!ok && want.iter().all(|w| out.contains(w)), "{out}");
+    assert!(!ok && want.iter().all(|w| out.contains(w.as_str())), "{out}");
 
     // A session's first prompt carries the warning; later prompts do not;
     // a new session hears it again.
@@ -1307,70 +1302,59 @@ fn live_atlas_hooks_are_checked_against_hooks_json() {
     hooks.set_offer_paths(Some(h.paths()));
     let prompt = |hooks: &mut Hooks, session: &str| hooks.handle(&HookEvent { event: "UserPromptSubmit".into(), session_id: session.into(), prompt: "what next?".into(), ..HookEvent::default() }).context;
     let first = prompt(&mut hooks, "s1");
-    assert!(first.contains("differ from the plugin's hooks/hooks.json (SessionStart: no atlas hook; SubagentStop: no atlas hook;"), "{first}");
+    assert!(first.contains("differ from the plugin's hooks/hooks.json (SessionStart: no atlas hook; UserPromptSubmit: an mcp_tool hook"), "{first}");
     assert!(!prompt(&mut hooks, "s1").contains("hooks/hooks.json"));
     assert!(prompt(&mut hooks, "s2").contains("hooks/hooks.json"));
     std::fs::write(h.settings(), &same).unwrap();
     assert!(!prompt(&mut hooks, "s3").contains("hooks/hooks.json"));
 }
 
-/// A legacy setup that routes every atlas hook to `atlas --hook` starts a
-/// new process per prompt, so a prompt cannot tell the drift once: no prompt
-/// tells it, and a new or cleared session's SessionStart tells it once. A
-/// resident setup (an mcp_tool UserPromptSubmit) still hears it at the first
-/// prompt only, and not at SessionStart as well.
+/// Where the drift is told in a setup of command hooks. Off Windows,
+/// `atlas --hook` hands each event to the session's server, which tells it at
+/// the first prompt, so SessionStart (run in its own process) does not. On
+/// Windows every `atlas --hook` is a new process, so no prompt can tell it
+/// once, and a new or cleared session's SessionStart tells it instead.
 #[test]
-fn a_command_hook_setup_hears_the_drift_once_at_session_start() {
+fn a_command_hook_setup_hears_the_drift_once() {
     use atlas::hooks::{HookEvent, Hooks};
     let h = Home::new("cs-drift-command");
-    let same = cs::PLUGIN_HOOKS.replace("plugin:atlas:atlas", "atlas").replace(r#""\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook""#, r#""\"/opt/atlas/bin/atlas\" --hook""#);
-    let mut legacy = json::parse(&same).unwrap();
-    let command = legacy["hooks"]["SessionStart"].clone();
-    if let Some(hooks) = legacy["hooks"].as_object_mut() {
-        let events: Vec<String> = hooks.keys().cloned().collect();
-        for e in events {
-            hooks.insert(e, command.clone());
-        }
+    let same = cs::PLUGIN_HOOKS.replace(r#""\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook""#, r#""\"/opt/atlas/bin/atlas\" --hook""#);
+    let mut drifted = json::parse(&same).unwrap();
+    if let Some(hooks) = drifted["hooks"].as_object_mut() {
+        hooks.remove("SubagentStop");
     }
-    std::fs::write(h.settings(), legacy.to_string()).unwrap();
+    std::fs::write(h.settings(), drifted.to_string()).unwrap();
     let s = atlas::memory::settings::Settings::from_config(None, &h.atlas().join("state").join("index.sqlite")).unwrap();
-    // Each `atlas --hook` run is a fresh state.
-    let run = |event: &str, source: &str, command: bool| {
+    // An `atlas --hook` run in its own process is a fresh state.
+    let run = |event: &str, source: &str| {
         let mut hooks = Hooks::open(s.clone()).unwrap();
-        if command {
-            hooks.set_command_hook();
-        }
+        hooks.set_command_hook();
         hooks.set_offer_paths(Some(h.paths()));
         hooks.handle(&HookEvent { event: event.into(), session_id: "s1".into(), source: source.into(), prompt: "what next?".into(), ..HookEvent::default() }).context
     };
     let told = |ctx: &str| ctx.matches("differ from the plugin's hooks/hooks.json").count();
     for _ in 0..2 {
-        let ctx = run("UserPromptSubmit", "", true);
-        assert_eq!(told(&ctx), 0, "a prompt in a new process: {ctx}");
+        let ctx = run("UserPromptSubmit", "");
+        assert_eq!(told(&ctx), 0, "a prompt in its own process: {ctx}");
     }
-    let start = run("SessionStart", "startup", true);
-    assert_eq!(told(&start), 1, "{start}");
-    assert!(start.contains("UserPromptSubmit: a command hook starts a new process per event that reloads the model and record vectors"), "{start}");
-    assert!(!start.contains("tool_use_id"), "the command finding has its own reason: {start}");
-    assert_eq!(told(&run("SessionStart", "clear", true)), 1);
+    let at_start = if cfg!(windows) { 1 } else { 0 };
+    let start = run("SessionStart", "startup");
+    assert_eq!(told(&start), at_start, "{start}");
+    assert_eq!(told(&run("SessionStart", "clear")), at_start);
     for source in ["resume", "compact"] {
-        let ctx = run("SessionStart", source, true);
+        let ctx = run("SessionStart", source);
         assert_eq!(told(&ctx), 0, "{source}: the same session: {ctx}");
     }
-    // Resident: the plugin's hooks with SubagentStart as a command hook.
-    let mut resident = json::parse(&same).unwrap();
-    if let Some(hooks) = resident["hooks"].as_object_mut() {
-        hooks.insert("SubagentStart".into(), command);
+    if !cfg!(windows) {
+        // The session's server, where `atlas --hook` hands its prompts.
+        let mut hooks = Hooks::open(s.clone()).unwrap();
+        hooks.set_offer_paths(Some(h.paths()));
+        let mut prompt = || hooks.handle(&HookEvent { event: "UserPromptSubmit".into(), session_id: "s1".into(), prompt: "what next?".into(), ..HookEvent::default() }).context;
+        let first = prompt();
+        assert_eq!(told(&first), 1, "{first}");
+        assert!(first.contains("SubagentStop: no atlas hook"), "{first}");
+        assert_eq!(told(&prompt()), 0);
     }
-    std::fs::write(h.settings(), resident.to_string()).unwrap();
-    assert_eq!(told(&run("SessionStart", "startup", true)), 0, "the first prompt tells it");
-    let mut hooks = Hooks::open(s.clone()).unwrap();
-    hooks.set_offer_paths(Some(h.paths()));
-    let mut prompt = || hooks.handle(&HookEvent { event: "UserPromptSubmit".into(), session_id: "s1".into(), prompt: "what next?".into(), ..HookEvent::default() }).context;
-    let first = prompt();
-    assert_eq!(told(&first), 1, "{first}");
-    assert!(first.contains("SubagentStart: a command hook"), "{first}");
-    assert_eq!(told(&prompt()), 0);
 }
 
 /// `atlas doctor` says what it checked: "match" only for real hooks that match,

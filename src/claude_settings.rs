@@ -3423,23 +3423,28 @@ pub fn offer_interactive(config: Option<&Path>, db: &Path, user_state: Option<&P
 /// input is checked against.
 pub const PLUGIN_HOOKS: &str = include_str!("../hooks/hooks.json");
 
-/// An atlas hook as declared: an `mcp_tool` hook on atlas's `hook` tool (a
-/// server named `atlas` or `plugin:...:atlas`) with its input fields, or a
-/// command hook running `atlas --hook` (`None`: it gets the whole event).
-fn atlas_hook(h: &Value) -> Option<Option<std::collections::BTreeSet<String>>> {
+/// How an atlas hook is declared: a command hook running `atlas --hook`
+/// (it gets the whole event on stdin), or an `mcp_tool` hook on atlas's
+/// `hook` tool (a server named `atlas` or `plugin:...:atlas`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HookForm {
+    Command,
+    McpTool,
+}
+
+/// The form of an atlas hook; `None` for a hook that is not atlas's.
+fn atlas_hook(h: &Value) -> Option<HookForm> {
     let s = |k: &str| h.get(k).and_then(Value::as_str).unwrap_or("");
     let server = s("server");
     match s("type") {
-        "mcp_tool" if s("tool") == "hook" && (server == "atlas" || server.ends_with(":atlas")) => {
-            Some(Some(h.get("input").and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default()))
-        }
-        "command" if s("command").contains("atlas") && s("command").contains("--hook") => Some(None),
+        "mcp_tool" if s("tool") == "hook" && (server == "atlas" || server.ends_with(":atlas")) => Some(HookForm::McpTool),
+        "command" if s("command").contains("atlas") && s("command").contains("--hook") => Some(HookForm::Command),
         _ => None,
     }
 }
 
 /// Every atlas hook of a settings value, by event, in file order.
-fn atlas_hooks(settings: &Value) -> Vec<(String, Option<std::collections::BTreeSet<String>>)> {
+fn atlas_hooks(settings: &Value) -> Vec<(String, HookForm)> {
     let mut out = Vec::new();
     let Some(events) = settings.get("hooks").and_then(Value::as_object) else { return out };
     for (event, groups) in events {
@@ -3456,12 +3461,10 @@ fn atlas_hooks(settings: &Value) -> Vec<(String, Option<std::collections::BTreeS
 
 /// How the atlas hooks in a Claude Code settings value differ from
 /// `hooks/hooks.json`, one line per finding: an event the plugin hooks with
-/// no live atlas hook, an `mcp_tool` hook whose input fields differ (the
-/// missing and extra fields), and an atlas hook on an event the plugin does
-/// not hook. A command hook is compared by its event only, and said on
-/// UserPromptSubmit or SubagentStart, where each event starts a new process
-/// that reloads the model and record vectors. Empty when they match or the settings hold no atlas hook (the
-/// plugin's own hooks are then the ones in use).
+/// no live atlas hook, an `mcp_tool` hook where the plugin runs
+/// `atlas --hook`, and an atlas hook on an event the plugin does not hook.
+/// Empty when they match or the settings hold no atlas hook (the plugin's own
+/// hooks are then the ones in use).
 pub fn hook_drift(settings: &Value) -> Vec<String> {
     let live = atlas_hooks(settings);
     if live.is_empty() {
@@ -3475,31 +3478,11 @@ pub fn hook_drift(settings: &Value) -> Vec<String> {
             continue;
         }
         events.push(event);
-        let here: Vec<&Option<std::collections::BTreeSet<String>>> = live.iter().filter(|(e, _)| e == event).map(|(_, f)| f).collect();
+        let here: Vec<HookForm> = live.iter().filter(|(e, _)| e == event).map(|(_, f)| *f).collect();
         if here.is_empty() {
             out.push(format!("{event}: no atlas hook"));
-            continue;
-        }
-        let Some(want) = want else { continue };
-        // A command hook is one process per event: on a recalling event it
-        // reloads the model and every record vector each time.
-        if matches!(event.as_str(), "UserPromptSubmit" | "SubagentStart") && here.iter().any(|f| f.is_none()) {
-            out.push(format!("{event}: {COMMAND_FINDING}"));
-        }
-        for fields in here.into_iter().flatten() {
-            let missing: Vec<&str> = want.difference(fields).map(String::as_str).collect();
-            let extra: Vec<&str> = fields.difference(want).map(String::as_str).collect();
-            if missing.is_empty() && extra.is_empty() {
-                continue;
-            }
-            let mut line = format!("{event}:");
-            if !missing.is_empty() {
-                line.push_str(&format!(" missing {}", missing.join(", ")));
-            }
-            if !extra.is_empty() {
-                line.push_str(&format!("{} extra {}", if missing.is_empty() { "" } else { ";" }, extra.join(", ")));
-            }
-            out.push(line);
+        } else if *want == HookForm::Command && here.contains(&HookForm::McpTool) {
+            out.push(format!("{event}: {MCP_TOOL_FINDING}"));
         }
     }
     for (event, _) in &live {
@@ -3511,19 +3494,24 @@ pub fn hook_drift(settings: &Value) -> Vec<String> {
     out
 }
 
-/// The [`hook_drift`] finding for a command hook on a recalling event.
-const COMMAND_FINDING: &str = "a command hook starts a new process per event that reloads the model and record vectors; use the mcp_tool hook";
+/// The [`hook_drift`] finding for an `mcp_tool` hook, with its reason.
+const MCP_TOOL_FINDING: &str = "an mcp_tool hook, where hooks/hooks.json runs `atlas --hook`; Claude Code reports an error for an mcp_tool hook on every event while atlas's server is not connected";
 
 /// Whether the hook drift is told at SessionStart rather than at a
-/// session's first prompt: the live UserPromptSubmit or SubagentStart is a
-/// command hook (`atlas --hook`, a new process per prompt, which cannot tell
-/// once), and no UserPromptSubmit is an `mcp_tool` hook (a resident server
-/// tells it at the first prompt, so it is not told twice).
+/// session's first prompt. Only on Windows, where `atlas --hook` runs in a
+/// new process per event and so cannot tell it once: when the live
+/// UserPromptSubmit or SubagentStart is a command hook and no
+/// UserPromptSubmit is an `mcp_tool` hook (a resident server tells it at the
+/// first prompt). Elsewhere `atlas --hook` hands the event to the session's
+/// server, which tells it at the first prompt.
 pub fn drift_told_at_session_start(p: &Paths) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
     let Ok(d) = load(&p.settings()) else { return false };
     let live = atlas_hooks(&d.value);
     let recalling = |e: &str| e == "UserPromptSubmit" || e == "SubagentStart";
-    live.iter().any(|(e, f)| recalling(e) && f.is_none()) && !live.iter().any(|(e, f)| e == "UserPromptSubmit" && f.is_some())
+    live.iter().any(|(e, f)| recalling(e) && *f == HookForm::Command) && !live.iter().any(|(e, f)| e == "UserPromptSubmit" && *f == HookForm::McpTool)
 }
 
 /// The drift of the live user settings' atlas hooks, read from `path`
@@ -3562,13 +3550,7 @@ pub fn hook_drift_line(p: &Paths, ideas_on: bool, asks_on: bool) -> Option<Strin
         d.push("PostToolUse: the matcher leaves out AskUserQuestion".to_string());
     }
     (!d.is_empty()).then(|| {
-        // A command hook's finding carries its own reason; the others share
-        // this one.
-        let why = match d.iter().all(|l| l.ends_with(COMMAND_FINDING)) {
-            true => "",
-            false => "; a hook missing a field gives atlas less to go on (a PreToolUse without tool_use_id once made the agent cap count agents twice)",
-        };
-        format!("atlas: the atlas hooks in {} differ from the plugin's hooks/hooks.json ({}){why}. Tell the user; `atlas doctor` lists it.", p.settings().display(), d.join("; "))
+        format!("atlas: the atlas hooks in {} differ from the plugin's hooks/hooks.json ({}). Tell the user; `atlas doctor` lists it.", p.settings().display(), d.join("; "))
     })
 }
 

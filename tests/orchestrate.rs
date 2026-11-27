@@ -2424,7 +2424,7 @@ fn a_disk_full_result_among_parallel_results_reads_as_disk_full() {
     assert_eq!(running_ids(&o, &s, min(11)), ["answered"]);
 }
 
-/// A SubagentStop as the plugin's `mcp_tool` hook sends it: every field is
+/// A SubagentStop as an `mcp_tool` hook sends it: every field is
 /// text, and `background_tasks` is the array's JSON text (or the
 /// unsubstituted `${background_tasks}` when the input lacks it).
 fn stop_input(s: &Session, id: &str, tasks: Option<&str>) -> HookEvent {
@@ -2438,7 +2438,8 @@ fn stop_input(s: &Session, id: &str, tasks: Option<&str>) -> HookEvent {
 /// #222 R2: an agent that stops while its own background work runs keeps
 /// its lane and slot (no finish is filed); an empty, absent or
 /// unsubstituted `background_tasks` files the finish as before. The
-/// plugin's SubagentStop hook passes the field.
+/// plugin's SubagentStop hook, a command hook, gets the field as an array on
+/// its stdin; the `mcp_tool` hook it replaced named it.
 #[test]
 fn a_stop_with_background_work_of_its_own_keeps_the_slot() {
     for (tasks, held) in [(Some("[\"bash-1\"]"), true), (Some("[]"), false), (None, false), (Some("${background_tasks}"), false)] {
@@ -2456,7 +2457,13 @@ fn a_stop_with_background_work_of_its_own_keeps_the_slot() {
     }
     let plugin = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("hooks").join("hooks.json")).unwrap();
     let v = atlas::json::parse(&plugin).unwrap();
-    let input = v.pointer("/hooks/SubagentStop/0/hooks/0/input").cloned().unwrap_or(Value::Null);
+    let hook = v.pointer("/hooks/SubagentStop/0/hooks/0").cloned().unwrap_or(Value::Null);
+    assert_eq!(hook.get("type").and_then(Value::as_str), Some("command"), "{hook}");
+    let stdin = json!({"hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "b1", "background_tasks": ["bash-1"]});
+    let ev = HookEvent::from_value(&atlas::hook_socket::job_args(stdin));
+    assert_eq!(ev.background_tasks, json!(["bash-1"]));
+    let old = atlas::json::parse(include_str!("golden/hooks-mcp-tool.json")).unwrap();
+    let input = old.pointer("/hooks/SubagentStop/0/hooks/0/input").cloned().unwrap_or(Value::Null);
     assert_eq!(input.get("background_tasks").and_then(Value::as_str), Some("${background_tasks}"), "{input}");
 }
 

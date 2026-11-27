@@ -51,6 +51,7 @@ pub mod handles;
 pub mod hidden;
 pub mod hook_budget;
 pub mod hook_gate;
+pub mod hook_socket;
 pub mod hook_hits;
 pub mod hook_rewrite;
 pub mod hooks;

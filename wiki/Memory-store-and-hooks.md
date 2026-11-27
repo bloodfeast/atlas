@@ -98,14 +98,17 @@ the answer does not depend on which snapshots have been folded.
 
 ## Hooks
 
-`hooks/hooks.json` wires Claude Code `mcp_tool` hooks to the plugin's own server, so no process starts per hook; the
-server answers `hook` calls on a worker thread of their own, never behind a slow tool call. `atlas --hook` answers the
-same events as a command hook (the event JSON on stdin), one process per event, with one exception: a subagent's
-brief (the Agent call's prompt) is held by the server between the `PreToolUse` that carries it and the
-`SubagentStart` that injects its recall, so as a command hook `SubagentStart` has no brief and injects no lane
-recall. Use the `mcp_tool` hooks for subagent recall. For clients other than Claude Code (Codex runs command hooks),
-SessionStart and UserPromptSubmit are a pinned contract, on [[Other MCP clients]]; every other event is not stable
-outside Claude Code.
+`hooks/hooks.json` runs `atlas --hook` for every event, as a command hook (the event JSON on stdin). That short
+process hands the event to the session's own server over a Unix socket (`<pid>.sock` in the data folder's
+`live-servers/`, beside the server's marker), and the server answers it on a worker thread of its own, never behind
+a slow tool call. What the server keeps between events stays in one process: a subagent's brief (the Agent call's
+prompt), held between the `PreToolUse` that carries it and the `SubagentStart` that injects its recall, the
+session's caps, and what it already said. SessionStart and SessionEnd run in the hook's own process: they come
+before a server is marked and after it is gone. When every server of the session has stopped, the hook does
+nothing, and the `UserPromptSubmit` hook says once per loss that atlas is off. On Windows, and where a running
+server's socket cannot be reached, the hook runs in its own process: it works, but `SubagentStart` has no brief
+there and injects no lane recall. For clients other than Claude Code (Codex runs command hooks), SessionStart and
+UserPromptSubmit are a pinned contract, on [[Other MCP clients]]; every other event is not stable outside Claude Code.
 
 A subagent's launch is named by the tool use id in its meta file (`agent-<id>.meta.json`), but Claude Code writes
 that file only after `SubagentStart` answers. So the start takes a launch only when that is unambiguous: exactly one
@@ -254,7 +257,7 @@ lacks gets nothing in every session, fresh or not; that is the gate, not the per
   boundary closed, without waiting on the tool call's budget; a card the hook watchdog dropped is owed again.
   Every record of a subagent's own transcript is marked `isSidechain`, and there those are read as its own.
   Every subagent PreCompact is a `compact:subagent` hook-log row. The owed card and the boundaries seen are held
-  by the serving process only, so this needs the `mcp_tool` hooks: under `atlas --hook` (a process per event)
+  by the serving process only, so this needs the server's hook socket: where a hook runs in its own process
   PreCompact still writes the agent's checkpoint, but no card follows, and a compaction with no PreCompact is
   not seen. Persisting that state would put a store write on every subagent tool call's path.
 - **The live agents and their PRs:** the `agents` line names each agent of the session the host lists as running,

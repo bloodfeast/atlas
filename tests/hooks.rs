@@ -3250,14 +3250,20 @@ mod subagent_window {
 }
 
 /// Review S4 of #192: the plugin's PreCompact hook passes the agent_id, as
-/// the other subagent-aware hooks do.
+/// the other subagent-aware hooks do. It is a command hook, whose stdin
+/// carries every field of the event; the `mcp_tool` hook it replaced
+/// (tests/golden/hooks-mcp-tool.json) named the field.
 #[test]
 fn the_plugin_passes_the_agent_id_to_pre_compact() {
     let hooks = json::parse(atlas::claude_settings::PLUGIN_HOOKS).unwrap();
-    let input = &hooks["hooks"]["PreCompact"][0]["hooks"][0]["input"];
+    let hook = &hooks["hooks"]["PreCompact"][0]["hooks"][0];
+    assert_eq!(hook["type"].as_str(), Some("command"), "{hook}");
+    let old = json::parse(include_str!("golden/hooks-mcp-tool.json")).unwrap();
+    let input = &old["hooks"]["PreCompact"][0]["hooks"][0]["input"];
     assert_eq!(input["agent_id"].as_str(), Some("${agent_id}"), "{input}");
-    let e = HookEvent::from_value(&json!({"hook_event_name": "PreCompact", "session_id": "s", "agent_id": "a9", "trigger": "auto", "transcript_path": "t.jsonl"}));
-    assert_eq!((e.agent_id.as_str(), e.trigger.as_str()), ("a9", "auto"));
+    let stdin = json!({"hook_event_name": "PreCompact", "session_id": "s", "agent_id": "a9", "trigger": "auto", "transcript_path": "t.jsonl"});
+    let e = HookEvent::from_value(&atlas::hook_socket::job_args(stdin));
+    assert_eq!((e.event.as_str(), e.agent_id.as_str(), e.trigger.as_str()), ("PreCompact", "a9", "auto"));
 }
 
 /// Seconds since the Unix epoch, as `YYYY-MM-DDTHH:MM:SS` (UTC).

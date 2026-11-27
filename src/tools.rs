@@ -545,7 +545,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "hook",
-        description: "Hook entry point for Claude Code mcp_tool hooks; not for models.",
+        description: "Hook entry point for older setups' mcp_tool hooks; not for models.",
         read_only: false,
         schema: || {
             obj(

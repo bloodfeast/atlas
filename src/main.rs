@@ -115,7 +115,7 @@ Modes:
   --rescan               re-index every vault and source, then exit
   --hook                 a Claude Code command hook: the event JSON on stdin, the answer on stdout
   --statusline           the update badge for a Claude Code status line (reads the update state file only; prints nothing when no update is pending)
-  --server-check [--say] the UserPromptSubmit hook that tells the user when this session's atlas server is not running (no configuration read; --say prints the verdict)
+  --server-check [--say] tell the user when this session's atlas server is not running, for hooks that are still mcp_tool hooks (--hook says it too; no configuration read; --say prints the verdict)
   --recall-check [--phrase TEXT ...]   every identifier and phrase is found by lookup
   --token-report         the token ledger in about 15 lines: the measured ratio, credit, cost and net, the savings by source, the last 7 days
   --token-report --verbose   the full report: what atlas answered against what reading would cost, every block
@@ -731,6 +731,20 @@ fn run() -> Result<ExitCode, String> {
     if argv.first().is_some_and(|w| w == "--server-check") {
         return Ok(atlas::server_check::cli(&argv[1..]));
     }
+    // A command hook goes to this session's server over its socket when one
+    // runs (`atlas::hook_socket`), before any configuration is read; else
+    // it runs here, on the input already read.
+    let mut hook_stdin: Option<String> = None;
+    if argv.len() == 1 && argv[0] == "--hook" {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut io::stdin(), &mut input).map_err(|e| e.to_string())?;
+        if let Some(out) = atlas::hook_socket::command_hook(&input) {
+            print!("{out}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            return Ok(ExitCode::SUCCESS);
+        }
+        hook_stdin = Some(input);
+    }
     // File tools that need no configuration, run before one is looked for.
     if argv.first().is_some_and(|w| w == "doctor") {
         // `config_path`, not `ensure_config`: the doctor writes nothing.
@@ -930,8 +944,14 @@ fn run() -> Result<ExitCode, String> {
     // A command hook's event names the session's folder, which picks the
     // project; it is read before the configuration for that reason.
     let hook_input = if matches!(mode, Mode::Hook) {
-        let mut input = String::new();
-        std::io::Read::read_to_string(&mut io::stdin(), &mut input).map_err(|e| e.to_string())?;
+        let input = match hook_stdin {
+            Some(i) => i,
+            None => {
+                let mut input = String::new();
+                std::io::Read::read_to_string(&mut io::stdin(), &mut input).map_err(|e| e.to_string())?;
+                input
+            }
+        };
         Some(atlas::json::parse(&input).map_err(|e| format!("hook input: {e}"))?)
     } else {
         None
@@ -1023,8 +1043,9 @@ fn run() -> Result<ExitCode, String> {
             let log = atlas::serve_log::Log::new(atlas::serve_log::path_for(&db));
             log.start();
             log.install_panic_hook();
-            // The marker the prompt hook reads to tell the user when this
-            // server is gone (`atlas --server-check`). Logged, not printed.
+            // The marker `atlas --hook` finds this server's socket by, and
+            // reads to tell the user when the server is gone. Logged, not
+            // printed.
             let _ = std::io::Write::write_fmt(&mut io::stderr(), format_args!("atlas live marker: {}\n", atlas::server_check::mark()));
             match serve_mode(&setup, loaded.as_ref(), &models, calib_plan) {
                 Ok((why, code)) => {
@@ -1132,10 +1153,10 @@ fn run() -> Result<ExitCode, String> {
             // A store a newer atlas made is told to the user and the model (a
             // failing command hook shows only in verbose mode). The notice
             // belongs to this process, and each `--hook` run is its own: the
-            // shipped hooks route only SessionStart and SessionEnd (on a
-            // /clear) here, so a session is
-            // told once, but a legacy settings file that routes
-            // UserPromptSubmit or PostToolUse here tells it on every event.
+            // other events come here only when no running server's socket
+            // answers them (`atlas::hook_socket`), so a session is told once
+            // per SessionStart, but on every event while its server has no
+            // socket.
             let refuse = |e: atlas::Error| -> Result<ExitCode, String> {
                 print!("{}", atlas::hooks::RefusalNotice::default().answer(&e, &ev));
                 let _ = std::io::Write::flush(&mut std::io::stdout());
