@@ -382,6 +382,50 @@ pub fn is_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// A checkout of a git repository, as [`checkout`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkout {
+    /// The checkout's top folder (the one holding `.git`), canonical.
+    pub top: PathBuf,
+    /// The repository's common git folder, as a [`path_key`]: one value for
+    /// every worktree of one repository.
+    pub common: String,
+}
+
+/// The checkout holding a folder: the nearest folder at or above it that
+/// holds `.git`, with its repository's common git folder. Read from git's
+/// own files; git is never run.
+///
+/// - A `.git` folder is the common folder.
+/// - A `.git` file names a git folder (`gitdir:`). When that folder holds
+///   `commondir`, the checkout is a linked worktree and `commondir` names the
+///   common folder, provided the folder's `gitdir` names this `.git` file
+///   back: `None` otherwise (a worktree moved by hand, until `git worktree
+///   repair`). Without `commondir` the named folder is the common one (a
+///   `--separate-git-dir` checkout, or a submodule: its own repository).
+///
+/// A relative link is resolved against the folder holding it, and links are
+/// compared as [`path_key`]s.
+pub fn checkout(dir: &Path) -> Option<Checkout> {
+    let dir = crate::paths::canonical(dir);
+    let top = dir.ancestors().find(|a| a.join(".git").exists())?.to_path_buf();
+    let gd = git_dir(&top)?;
+    let common = match std::fs::read_to_string(gd.join("commondir")) {
+        Ok(c) => {
+            let dot = top.join(".git");
+            if dot.is_file() {
+                let back = std::fs::read_to_string(gd.join("gitdir")).ok()?;
+                if path_key(&absolute(&gd, Path::new(back.trim()))) != path_key(&dot) {
+                    return None;
+                }
+            }
+            absolute(&gd, Path::new(c.trim()))
+        }
+        Err(_) => gd,
+    };
+    Some(Checkout { top, common: path_key(&common) })
+}
+
 /// A repository's remote URL as `.git/config` states it (`origin`, else the
 /// first remote), read from the file: git is never run and nothing is
 /// fetched. A worktree's `.git` file is followed to the shared config.

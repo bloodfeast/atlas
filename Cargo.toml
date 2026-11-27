@@ -61,6 +61,7 @@ ed25519-compact = { version = "2.6", default-features = false }
 # `owned-sqlite` when that backend is the one asked for; the backend
 # comes from the command line alone.
 atlas = { path = ".", default-features = false, features = ["test-seams"] }
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 
 # The public CI's tests (.github/workflows/ci.yml): a debug build without
 # debug information, so its ~75 test binaries link and land quickly, with
