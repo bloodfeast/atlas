@@ -664,6 +664,382 @@ fn a_stale_but_stable_root_is_indexed_again() {
     assert!(ix.wait_reports(2, Duration::from_secs(20)), "the stale root was not indexed again: {:?}", ix.status());
 }
 
+/// Files in linked git worktrees of a root's repository. The index holds no row
+/// for them: the walk never enters a dot folder such as Claude Code's
+/// `.claude/worktrees/`, and a worktree beside the root is outside it. A read
+/// there is annotated from a scan of the file's own bytes, and nothing is
+/// written. The git layouts are the files `git worktree add` writes, made by
+/// hand so that no git runs.
+mod worktrees {
+    use super::*;
+
+    /// The index database's connection.
+    type Db = atlas::db::Connection;
+
+    fn db(f: &Fixture) -> Db {
+        Db::open(&f.db).unwrap()
+    }
+
+    /// Indexes the fixture's root by the line scan.
+    fn scan_index(f: &Fixture, code: &CodeSetup) {
+        drop(atlas::store::Store::open(&f.db, vaults(&f.db)).unwrap());
+        code_index::index_root(code, &mut db(f), &code.roots[0], &RustSource::ScanOnly("test".into())).unwrap();
+    }
+
+    /// The fixture's root as a repository's main checkout (`app/.git` a
+    /// folder), indexed by the line scan.
+    fn repo(tag: &str) -> (Fixture, Db) {
+        let f = fixture(tag);
+        fs::create_dir_all(f.root.join(".git")).unwrap();
+        scan_index(&f, &setup(&f));
+        let conn = db(&f);
+        (f, conn)
+    }
+
+    /// Makes `top` a linked worktree, named `name`, of the repository whose
+    /// git folder is `git`: `top/.git` names the admin folder
+    /// `git/worktrees/NAME`, which holds `commondir` (`../..`) and `gitdir`,
+    /// naming `top/.git` back.
+    fn link_worktree(git: &Path, top: &Path, name: &str) {
+        let admin = git.join("worktrees").join(name);
+        fs::create_dir_all(&admin).unwrap();
+        write(&top.join(".git"), &format!("gitdir: {}\n", admin.display()));
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::write(admin.join("gitdir"), format!("{}\n", top.join(".git").display())).unwrap();
+    }
+
+    /// A file's item labels, or `None` when it is not covered.
+    fn labels(conn: &Db, path: &Path) -> Option<Vec<String>> {
+        code::file_items(conn, &path.to_string_lossy()).unwrap().map(|v| v.iter().map(code::Item::label).collect())
+    }
+
+    fn some(labels: &[&str]) -> Option<Vec<String>> {
+        Some(labels.iter().map(|l| l.to_string()).collect())
+    }
+
+    /// Every row the per-edit re-index can change, for comparing before and
+    /// after.
+    fn rows(conn: &Db) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT printf('%s|%s|%s|%s|%s', id, root, path, lang, indexed) FROM code_files ORDER BY 1",
+            "SELECT printf('%s|%s|%s|%s|%s|%s|%s|%s|%s|%s', name, sect, file, line, col, ord, kind, container, within, end_line) FROM code_occ ORDER BY 1",
+            "SELECT printf('%s|%s|%s', file, line, text) FROM code_lines ORDER BY 1",
+            "SELECT printf('%s|%s|%s|%s|%s', name, root, defs, refs, impls) FROM code_counts ORDER BY 1",
+        ] {
+            let mut st = conn.prepare(sql).unwrap();
+            out.extend(st.query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap));
+        }
+        out
+    }
+
+    /// A worktree under the root's dot folder, as Claude Code keeps them. A
+    /// file whose item moved down on the worktree's branch is annotated at the
+    /// worktree's lines. An edit there writes nothing: the checkout's rows stay
+    /// as they were. `symbol` still answers the checkout's lines.
+    #[test]
+    fn a_worktree_file_gets_the_items_of_its_own_bytes() {
+        let f = fixture("code-worktree");
+        fs::create_dir_all(f.root.join(".git")).unwrap();
+        write(&f.root.join("src/wt_probe.rs"), "pub fn wt_probe() -> u32 {\n    1\n}\n");
+        let wt = f.root.join(".claude/worktrees/feature");
+        link_worktree(&f.root.join(".git"), &wt, "feature");
+        write(&wt.join("src/wt_probe.rs"), "// moved down on the worktree's branch\n\n\n\npub fn wt_probe() -> u32 {\n    2\n}\n");
+        scan_index(&f, &setup(&f));
+        let mut conn = db(&f);
+        let main = f.root.join("src/wt_probe.rs");
+        assert_eq!(labels(&conn, &main), some(&["fn wt_probe 1-3"]));
+        let in_wt = wt.join("src/wt_probe.rs");
+        assert_eq!(labels(&conn, &in_wt), some(&["fn wt_probe 5-7"]));
+        let before = rows(&conn);
+        assert_eq!(code::reindex_file(&mut conn, &in_wt.to_string_lossy()).unwrap(), code::Reindexed::NotCovered);
+        assert_eq!(rows(&conn), before, "an edit in a worktree writes nothing");
+        assert_eq!(labels(&conn, &main), some(&["fn wt_probe 1-3"]));
+        let a = code::symbol(&conn, "wt_probe", Limits { defs: 5, refs: 5, impls: 5 }).unwrap();
+        let defs: Vec<(String, u32)> = a.hits.iter().filter(|h| h.sect == code::SECT_DEF).map(|h| (h.path.clone(), h.line)).collect();
+        assert_eq!(defs, [("src/wt_probe.rs".to_string(), 1)]);
+    }
+
+    /// An unchanged copy in a worktree gets the checkout's items, and a read's
+    /// scan gives what the per-edit re-index writes for the same bytes: Rust,
+    /// WGSL and a scanner language alike.
+    #[test]
+    fn a_worktree_copy_gets_the_items_the_checkout_has() {
+        let f = fixture("code-wt-copy");
+        fs::create_dir_all(f.root.join(".git")).unwrap();
+        let wt = f.root.join(".claude/worktrees/w");
+        link_worktree(&f.root.join(".git"), &wt, "w");
+        let files = ["src/lib.rs", "src/shapes.rs", "shaders/common.wgsl", "shaders/main.wgsl"];
+        for rel in files {
+            write(&wt.join(rel), &fs::read_to_string(f.root.join(rel)).unwrap());
+        }
+        scan_index(&f, &setup(&f));
+        let mut conn = db(&f);
+        for rel in files {
+            let main = labels(&conn, &f.root.join(rel));
+            assert!(main.as_ref().is_some_and(|v| !v.is_empty()), "{rel}: {main:?}");
+            assert_eq!(labels(&conn, &wt.join(rel)), main, "{rel}, against the full run's rows");
+        }
+        // A scanner language, written after the run: the re-index writes the
+        // checkout's rows, and the worktree's copy is scanned on read.
+        let py = "class Tool:\n    def run(self):\n        return 1\n\n\ndef helper():\n    return 2\n";
+        write(&f.root.join("src/tool.py"), py);
+        write(&wt.join("src/tool.py"), py);
+        for rel in ["src/lib.rs", "shaders/common.wgsl", "src/tool.py"] {
+            assert!(matches!(code::reindex_file(&mut conn, &f.root.join(rel).to_string_lossy()).unwrap(), code::Reindexed::Rows(_)), "{rel}");
+            let main = labels(&conn, &f.root.join(rel));
+            assert!(main.as_ref().is_some_and(|v| !v.is_empty()), "{rel}: {main:?}");
+            assert_eq!(labels(&conn, &wt.join(rel)), main, "{rel}, against the re-index's rows");
+        }
+    }
+
+    /// A worktree moved with a plain `mv` keeps an admin folder that names its
+    /// old place: it is not mapped until `git worktree repair` writes the
+    /// back-link again.
+    #[test]
+    fn a_worktree_whose_admin_folder_does_not_name_it_back_is_not_mapped() {
+        let (f, conn) = repo("code-wt-moved");
+        let t = f.root.parent().unwrap();
+        let wt = t.join("moved");
+        link_worktree(&f.root.join(".git"), &wt, "w");
+        write(&wt.join("src/lib.rs"), LIB);
+        let back = f.root.join(".git/worktrees/w/gitdir");
+        fs::write(&back, format!("{}\n", t.join("before-the-move/.git").display())).unwrap();
+        assert_eq!(labels(&conn, &wt.join("src/lib.rs")), None);
+        fs::write(&back, format!("{}\n", wt.join(".git").display())).unwrap();
+        assert!(labels(&conn, &wt.join("src/lib.rs")).is_some(), "repaired");
+    }
+
+    /// A submodule's `.git` file names a folder of the superproject's git
+    /// folder that holds no `commondir`: another repository, not mapped.
+    #[test]
+    fn a_submodule_style_git_file_is_not_mapped() {
+        let (f, conn) = repo("code-wt-submodule");
+        let sub = f.root.parent().unwrap().join("vendored");
+        let modules = f.root.join(".git/modules/vendored");
+        fs::create_dir_all(&modules).unwrap();
+        write(&sub.join(".git"), &format!("gitdir: {}\n", modules.display()));
+        write(&sub.join("src/lib.rs"), LIB);
+        assert_eq!(labels(&conn, &sub.join("src/lib.rs")), None);
+    }
+
+    /// A worktree beside the root, outside its folder, is mapped, and so is a
+    /// file added on its branch. A file under the worktree's `target/` is not,
+    /// as in the checkout.
+    #[test]
+    fn a_worktree_beside_the_root_is_mapped_with_its_added_files() {
+        let (f, conn) = repo("code-wt-beside");
+        let wt = f.root.parent().unwrap().join("app-feature");
+        link_worktree(&f.root.join(".git"), &wt, "app-feature");
+        write(&wt.join("src/lib.rs"), LIB);
+        let main = labels(&conn, &f.root.join("src/lib.rs")).expect("indexed");
+        assert_eq!(labels(&conn, &wt.join("src/lib.rs")), Some(main));
+        write(&wt.join("src/added.rs"), "pub struct Added;\n\nimpl Added {\n    pub fn new() -> Added {\n        Added\n    }\n}\n");
+        assert_eq!(labels(&conn, &f.root.join("src/added.rs")), None, "not in the checkout");
+        assert_eq!(labels(&conn, &wt.join("src/added.rs")), some(&["struct Added 1-1", "impl Added 3-7", "fn Added::new 4-6"]));
+        write(&wt.join("target/debug/build/gen.rs"), "pub fn generated() {}\n");
+        assert_eq!(labels(&conn, &wt.join("target/debug/build/gen.rs")), None, "the walk skips target/");
+    }
+
+    /// A root below its repository's top maps with its folder as the prefix:
+    /// the worktree's `app/src/lib.rs` is the root's `src/lib.rs`, and a
+    /// worktree file outside `app/` belongs to no root.
+    #[test]
+    fn a_root_below_its_repository_top_maps_with_its_prefix() {
+        let f = fixture("code-wt-prefix");
+        let top = f.root.parent().unwrap().to_path_buf();
+        fs::create_dir_all(top.join(".git")).unwrap();
+        let wt = top.join(".claude/worktrees/w");
+        link_worktree(&top.join(".git"), &wt, "w");
+        write(&wt.join("app/src/lib.rs"), LIB);
+        write(&wt.join("src/lib.rs"), LIB);
+        scan_index(&f, &setup(&f));
+        let conn = db(&f);
+        let main = labels(&conn, &f.root.join("src/lib.rs")).expect("indexed");
+        assert_eq!(labels(&conn, &wt.join("app/src/lib.rs")), Some(main));
+        assert_eq!(labels(&conn, &wt.join("src/lib.rs")), None, "outside the root's folder");
+    }
+
+    /// A bare repository with worktrees: the root is itself a linked worktree
+    /// of `.bare` and keeps its annotations from its rows, and another
+    /// worktree of `.bare` maps to it by the common git folder.
+    #[test]
+    fn worktrees_of_a_bare_repository_map_to_a_root_that_is_one() {
+        let f = fixture("code-wt-bare");
+        let t = f.root.parent().unwrap();
+        let bare = t.join(".bare");
+        link_worktree(&bare, &f.root, "app");
+        let feat = t.join("feat");
+        link_worktree(&bare, &feat, "feat");
+        write(&feat.join("src/shapes.rs"), SHAPES);
+        scan_index(&f, &setup(&f));
+        let conn = db(&f);
+        // A mark only the rows carry shows that the rows are served.
+        conn.execute("UPDATE code_occ SET container = 'from_rows' WHERE sect = 0 AND file = (SELECT id FROM code_files WHERE path = 'src/shapes.rs')", []).unwrap();
+        assert_eq!(labels(&conn, &f.root.join("src/shapes.rs")), some(&["fn from_rows::area 1-1"]));
+        assert_eq!(labels(&conn, &feat.join("src/shapes.rs")), some(&["fn area 1-1"]));
+    }
+
+    /// `git init --separate-git-dir`: the root's own `.git` is a file naming a
+    /// git folder elsewhere, which holds no `commondir`. A worktree of that
+    /// repository maps to the root.
+    #[test]
+    fn a_worktree_of_a_separate_git_dir_repository_is_mapped() {
+        let f = fixture("code-wt-separate");
+        let t = f.root.parent().unwrap();
+        let gd = t.join("app-gitdir");
+        fs::create_dir_all(&gd).unwrap();
+        write(&f.root.join(".git"), &format!("gitdir: {}\n", gd.display()));
+        let wt = t.join("app-wt");
+        link_worktree(&gd, &wt, "app-wt");
+        write(&wt.join("src/lib.rs"), LIB);
+        scan_index(&f, &setup(&f));
+        let conn = db(&f);
+        let main = labels(&conn, &f.root.join("src/lib.rs")).expect("indexed");
+        assert_eq!(labels(&conn, &wt.join("src/lib.rs")), Some(main));
+    }
+
+    /// `git worktree add --relative-paths`: both links are relative, the
+    /// admin's back-link to the admin folder, so they are resolved and compared
+    /// canonically, as is a path read through a link.
+    #[test]
+    fn relative_worktree_links_map() {
+        let (f, conn) = repo("code-wt-relative");
+        let wt = f.root.join(".claude/worktrees/rel");
+        let admin = f.root.join(".git/worktrees/rel");
+        write(&wt.join(".git"), "gitdir: ../../../.git/worktrees/rel\n");
+        write(&admin.join("commondir"), "../..\n");
+        write(&admin.join("gitdir"), "../../../.claude/worktrees/rel/.git\n");
+        write(&wt.join("src/lib.rs"), LIB);
+        let main = labels(&conn, &f.root.join("src/lib.rs")).expect("indexed");
+        assert_eq!(labels(&conn, &wt.join("src/lib.rs")), Some(main.clone()));
+        #[cfg(unix)]
+        {
+            let link = f.root.parent().unwrap().join("rel-link");
+            std::os::unix::fs::symlink(&wt, &link).unwrap();
+            assert_eq!(labels(&conn, &link.join("src/lib.rs")), Some(main));
+        }
+    }
+
+    /// A worktree file over the index's size limit gets no items, as in the
+    /// checkout: it is read through the same check.
+    #[test]
+    fn a_worktree_file_over_the_size_limit_gets_no_items() {
+        let (f, conn) = repo("code-wt-big");
+        let wt = f.root.join(".claude/worktrees/w");
+        link_worktree(&f.root.join(".git"), &wt, "w");
+        let filler = "// filler\n".repeat(code::MAX_FILE as usize / 10 + 1);
+        write(&wt.join("src/big.rs"), &format!("pub fn big() {{}}\n{filler}"));
+        assert_eq!(labels(&conn, &wt.join("src/big.rs")), None);
+        write(&wt.join("src/small.rs"), "pub fn small() {}\n");
+        assert_eq!(labels(&conn, &wt.join("src/small.rs")), some(&["fn small 1-1"]));
+    }
+
+    /// A root's `exclude` globs hold in its worktrees too: a worktree file they
+    /// cover gets no items, as the checkout's own copy gets none.
+    #[test]
+    fn a_worktree_file_the_roots_excludes_cover_gets_no_items() {
+        let f = fixture("code-wt-exclude");
+        fs::create_dir_all(f.root.join(".git")).unwrap();
+        write(&f.root.join("src/gen/made.rs"), "pub fn made() {}\n");
+        let mut code = setup(&f);
+        code.roots[0].exclude = vec!["gen".into()];
+        scan_index(&f, &code);
+        let conn = db(&f);
+        assert_eq!(labels(&conn, &f.root.join("src/gen/made.rs")), None, "excluded in the checkout");
+        let wt = f.root.join(".claude/worktrees/w");
+        link_worktree(&f.root.join(".git"), &wt, "w");
+        write(&wt.join("src/gen/made.rs"), "pub fn made() {}\n");
+        assert_eq!(labels(&conn, &wt.join("src/gen/made.rs")), None, "excluded in the worktree");
+        write(&wt.join("src/kept.rs"), "pub fn kept() {}\n");
+        assert_eq!(labels(&conn, &wt.join("src/kept.rs")), some(&["fn kept 1-1"]));
+    }
+
+    /// The checkout's own files are never mapped: a file the index holds no
+    /// row for stays unannotated, as before worktrees were covered. A database
+    /// without the code tables answers nothing.
+    #[test]
+    fn the_checkouts_own_unindexed_files_stay_unannotated() {
+        let (f, conn) = repo("code-wt-own");
+        write(&f.root.join("src/new.rs"), "pub fn new_here() {}\n");
+        assert_eq!(labels(&conn, &f.root.join("src/new.rs")), None);
+        let wt = f.root.join(".claude/worktrees/w");
+        link_worktree(&f.root.join(".git"), &wt, "w");
+        write(&wt.join("src/lib.rs"), LIB);
+        let empty = Db::open(f.root.parent().unwrap().join("empty.sqlite")).unwrap();
+        assert_eq!(labels(&empty, &wt.join("src/lib.rs")), None);
+    }
+
+    /// Two roots that are checkouts of one repository, here two worktrees of
+    /// a bare one. A file with no row in either root's own checkout stays
+    /// unannotated, though the other root would map it. A third worktree's
+    /// file maps.
+    #[test]
+    fn a_file_in_any_roots_own_checkout_is_never_mapped() {
+        let t = Temp::new("code-wt-two-roots");
+        let bare = t.path().join(".bare");
+        let (a, b, c) = (t.path().join("a"), t.path().join("b"), t.path().join("c"));
+        for (top, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+            link_worktree(&bare, top, name);
+            write(&top.join("src/lib.rs"), LIB);
+        }
+        let db = t.path().join("state/atlas.sqlite");
+        let root = |name: &str, dir: &Path| atlas::config::CodeRootSpec { name: name.into(), root: dir.to_path_buf(), build_scripts: false, scip: Default::default(), exclude: Vec::new() };
+        let spec = atlas::config::CodeSpec { roots: vec![root("a", &a), root("b", &b)], debounce_s: Some(0), ..Default::default() };
+        let code = CodeSetup::from_spec(&spec, &db, false);
+        drop(atlas::store::Store::open(&db, vaults(&db)).unwrap());
+        let mut conn = Db::open(&db).unwrap();
+        for r in &code.roots {
+            code_index::index_root(&code, &mut conn, r, &RustSource::ScanOnly("test".into())).unwrap();
+        }
+        write(&b.join("src/new.rs"), "pub fn new_here() {}\n");
+        assert_eq!(labels(&conn, &b.join("src/new.rs")), None, "b's own checkout");
+        assert!(labels(&conn, &c.join("src/lib.rs")).is_some(), "a third worktree maps");
+    }
+
+    /// The bytes scanned are the given path's, the file the tool read, even
+    /// when the canonical-path cache still names a link's old target.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_moved_since_it_was_cached_scans_the_file_it_names_now() {
+        let (f, conn) = repo("code-wt-link-moved");
+        let t = f.root.parent().unwrap();
+        let (one, two) = (t.join("one"), t.join("two"));
+        link_worktree(&f.root.join(".git"), &one, "one");
+        link_worktree(&f.root.join(".git"), &two, "two");
+        write(&one.join("src/moved.rs"), "pub fn moved() {}\n");
+        write(&two.join("src/moved.rs"), "\n\npub fn moved() {}\n");
+        let link = t.join("link");
+        std::os::unix::fs::symlink(&one, &link).unwrap();
+        assert_eq!(labels(&conn, &link.join("src/moved.rs")), some(&["fn moved 1-1"]));
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&two, &link).unwrap();
+        assert_eq!(labels(&conn, &link.join("src/moved.rs")), some(&["fn moved 3-3"]));
+    }
+
+    /// Which repository a file is in comes from the path as it resolves now,
+    /// not from the canonical-path cache: a link moved to another
+    /// repository's checkout maps to no root, rather than annotating that
+    /// repository's bytes under the root its old target mapped to.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_moved_to_another_repository_maps_to_no_root() {
+        let (f, conn) = repo("code-wt-link-repo");
+        let t = f.root.parent().unwrap();
+        let (one, other) = (t.join("one"), t.join("other"));
+        link_worktree(&f.root.join(".git"), &one, "one");
+        fs::create_dir_all(other.join(".git")).unwrap();
+        write(&one.join("src/moved.rs"), "pub fn moved() {}\n");
+        write(&other.join("src/moved.rs"), "pub fn elsewhere() {}\n");
+        let link = t.join("link");
+        std::os::unix::fs::symlink(&one, &link).unwrap();
+        assert_eq!(labels(&conn, &link.join("src/moved.rs")), some(&["fn moved 1-1"]));
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(labels(&conn, &link.join("src/moved.rs")), None, "another repository's file");
+    }
+}
+
 /// The line of `text` (1-based) that is exactly `want` after trimming its
 /// end, at or after `from`.
 fn line_of(text: &str, want: &str, from: usize) -> u32 {

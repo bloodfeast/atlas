@@ -569,17 +569,32 @@ pub fn clear_canonical_cache() {
 /// so the hooks pay the file system calls once per path. A link created or
 /// moved later is not seen until [`clear_canonical_cache`].
 pub fn canonical(p: &Path) -> PathBuf {
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(d) => d.join(p),
-            Err(_) => return p.to_path_buf(),
-        }
-    };
+    let Some(abs) = absolute(p) else { return p.to_path_buf() };
     if let Some(hit) = canon_cache().lock().ok().and_then(|m| m.get(&abs).cloned()) {
         return hit;
     }
+    resolve_and_cache(abs)
+}
+
+/// [`canonical`] resolved now, not from the cache, whose entry it replaces:
+/// for an identity a link moved since it was cached must not keep, such as
+/// which repository a file is in.
+pub fn canonical_fresh(p: &Path) -> PathBuf {
+    let Some(abs) = absolute(p) else { return p.to_path_buf() };
+    resolve_and_cache(abs)
+}
+
+/// `p` made absolute against the working directory; `None` when that is
+/// unknown.
+fn absolute(p: &Path) -> Option<PathBuf> {
+    if p.is_absolute() {
+        Some(p.to_path_buf())
+    } else {
+        std::env::current_dir().ok().map(|d| d.join(p))
+    }
+}
+
+fn resolve_and_cache(abs: PathBuf) -> PathBuf {
     let out = canonical_uncached(&abs);
     if let Ok(mut m) = canon_cache().lock() {
         if m.len() >= CANON_CAP {

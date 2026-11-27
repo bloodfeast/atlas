@@ -327,6 +327,12 @@ fn exclude_key(root: &str) -> String {
     format!("code_exclude:{root}")
 }
 
+/// Root `root`'s `exclude` globs, as [`record_exclude`] stored them.
+fn root_excludes(conn: &Connection, root: &str) -> Result<Vec<String>> {
+    let x: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [exclude_key(root)], |r| r.get(0)).optional()?;
+    Ok(x.map(|x| x.lines().map(str::to_string).collect()).unwrap_or_default())
+}
+
 /// Records root `root`'s `exclude` globs where [`reindex_file`] reads them.
 ///
 /// # Errors
@@ -2494,27 +2500,132 @@ fn same_path(a: &str, b: &str) -> bool {
     }
 }
 
+/// Every code root with a folder: `(root name, folder, root's last
+/// indexing)`. Empty for a database without the code tables.
+fn code_roots(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut st = match conn.prepare_cached("SELECT root, dir, indexed FROM code_roots WHERE dir != ''") {
+        Ok(st) => st,
+        Err(e) if e.to_string().contains("no such") => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let roots = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+    Ok(roots)
+}
+
 /// The code root holding a file: `(root name, root's last indexing, folder,
 /// path below it)`. The deepest root wins (nested roots).
 fn root_of(conn: &Connection, path: &str) -> Result<Option<(String, String, String, String)>> {
+    Ok(root_in(&code_roots(conn)?, path))
+}
+
+/// [`root_of`] over roots already read.
+fn root_in(roots: &[(String, String, String)], path: &str) -> Option<(String, String, String, String)> {
     let p = path.replace('\\', "/");
-    let mut st = match conn.prepare_cached("SELECT root, dir, indexed FROM code_roots WHERE dir != ''") {
-        Ok(st) => st,
-        Err(e) if e.to_string().contains("no such") => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let roots: Vec<(String, String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
-    let mut best: Option<(String, String, String)> = None;
+    let mut best: Option<(&str, &str, &str)> = None;
     for (root, dir, indexed) in roots {
-        let d = dir.trim_end_matches('/').to_string();
-        if p.len() > d.len() + 1 && p.is_char_boundary(d.len()) && same_path(&p[..d.len()], &d) && p.as_bytes()[d.len()] == b'/' && best.as_ref().is_none_or(|b| d.len() > b.2.len()) {
+        let d = dir.trim_end_matches('/');
+        if p.len() > d.len() + 1 && p.is_char_boundary(d.len()) && same_path(&p[..d.len()], d) && p.as_bytes()[d.len()] == b'/' && best.is_none_or(|b| d.len() > b.2.len()) {
             best = Some((root, indexed, d));
         }
     }
-    Ok(best.map(|(root, indexed, d)| {
-        let rel = p[d.len() + 1..].to_string();
-        (root, indexed, d, rel)
-    }))
+    best.map(|(root, indexed, d)| (root.to_string(), indexed.to_string(), d.to_string(), p[d.len() + 1..].to_string()))
+}
+
+/// The items of a file in another checkout of a code root's repository (a
+/// linked git worktree, or the checkout of a root that is itself one), which
+/// the index holds no row for. They are scanned from the file's own bytes, as
+/// [`reindex_file`] scans them, and nothing is written.
+///
+/// The file maps to a root whose repository has the same common git folder,
+/// when the file's path below its own checkout's top starts with the root
+/// folder's path below the root's; the deepest such folder wins. A file in any
+/// root's own checkout is never mapped: the index's rows are the answer there.
+/// Git's own files decide it ([`crate::project::checkout`]). The mapped path
+/// then meets the root's walk rules ([`relevant`]), its `exclude` globs
+/// ([`excluded`], from `excludes`; a root whose globs cannot be read maps
+/// nothing) and its size limit ([`read_source`]).
+fn worktree_items(roots: &[(String, String, String)], path: &str, excludes: impl Fn(&str) -> Option<Vec<String>>) -> Option<Vec<Item>> {
+    // Only a file the scan reads is worth the walk up to its `.git`.
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if !(name.ends_with(".rs") || name.ends_with(".wgsl") || crate::langs::of_path(name).is_some()) {
+        return None;
+    }
+    // Resolved now: a link moved since the cache saw it may name another
+    // repository, whose file must not map to this one's roots.
+    let file = crate::paths::canonical_fresh(Path::new(path));
+    let here = crate::project::checkout(file.parent()?)?;
+    let here_top = crate::project::path_key(&here.top);
+    let rel = below(&file, &here.top)?;
+    // Every root's checkout first: the file may be in one of them.
+    let mut theirs: Vec<(&str, PathBuf, crate::project::Checkout)> = Vec::new();
+    for (root, dir, _) in roots {
+        let dir = crate::paths::canonical(Path::new(dir));
+        let Some(there) = crate::project::checkout(&dir) else { continue };
+        if crate::project::path_key(&there.top) == here_top {
+            return None;
+        }
+        theirs.push((root, dir, there));
+    }
+    // (the root, its path below the root, the prefix's length)
+    let mut best: Option<(&str, String, usize)> = None;
+    for (root, dir, there) in &theirs {
+        if there.common != here.common {
+            continue;
+        }
+        let Some(prefix) = below(dir, &there.top) else { continue };
+        let mapped = if prefix.is_empty() {
+            rel.clone()
+        } else if rel.len() > prefix.len() + 1 && rel.is_char_boundary(prefix.len()) && same_path(&rel[..prefix.len()], &prefix) && rel.as_bytes()[prefix.len()] == b'/' {
+            rel[prefix.len() + 1..].to_string()
+        } else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|b| prefix.len() > b.2) {
+            best = Some((root, mapped, prefix.len()));
+        }
+    }
+    let (root, rel, _) = best?;
+    if !scannable(&rel) || excluded(&excludes(root)?, &rel) {
+        return None;
+    }
+    // The bytes of the path as given, the file the tool read, through the
+    // size limit. Its identity above is resolved fresh, so these are the
+    // bytes of the file that mapped.
+    let given = Path::new(path);
+    let text = read_source(given.parent()?, &given.file_name()?.to_string_lossy())?;
+    let rows = scan_file(&rel, &text);
+    let lines: Vec<&str> = text.lines().collect();
+    let items = rows
+        .occ
+        .iter()
+        .filter(|o| (o.sect == SECT_DEF || o.sect == SECT_IMPL) && o.kind != "implements")
+        .map(|o| item_of(o.name.clone(), &o.kind, o.container.clone(), o.line, occ_end(&rows, o, &lines), o.sect))
+        .collect();
+    Some(sorted(items))
+}
+
+/// A path below a folder, `/`-separated: `""` for the folder itself, `None`
+/// outside it.
+fn below(path: &Path, dir: &Path) -> Option<String> {
+    let rest = path.strip_prefix(dir).ok()?;
+    Some(rest.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"))
+}
+
+/// The item of a definition row, named with its container, or of an impl
+/// edge row, named by its block (`Trait for Type`).
+fn item_of(name: String, kind: &str, container: String, line: u32, end: u32, sect: i64) -> Item {
+    if sect == SECT_IMPL {
+        Item { name: container, kind: "impl".into(), line, end: end.max(line) }
+    } else {
+        Item { name: if container.is_empty() { name } else { format!("{container}::{name}") }, kind: short_kind(kind), line, end: end.max(line) }
+    }
+}
+
+/// Items sorted by first line, one per line and name.
+fn sorted(mut items: Vec<Item>) -> Vec<Item> {
+    items.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
+    items.dedup_by(|a, b| a.line == b.line && a.name == b.name);
+    items
 }
 
 /// A file's row in `code_files`: its id and when it alone was last
@@ -2533,7 +2644,10 @@ fn file_row(conn: &Connection, root: &str, rel: &str) -> Result<Option<(i64, Str
 ///
 /// `None` when no root holds the file, the file is not indexed, or it
 /// changed after it was last indexed (with its root, or alone by
-/// [`reindex_file`]): its line numbers may have moved.
+/// [`reindex_file`]): its line numbers may have moved. A file the index holds
+/// no row for that is in another checkout of a root's repository (a linked
+/// git worktree) is scanned from its own bytes instead
+/// ([`worktree_items`]); nothing is written.
 ///
 /// # Arguments
 ///
@@ -2545,7 +2659,9 @@ fn file_row(conn: &Connection, root: &str, rel: &str) -> Result<Option<(i64, Str
 /// [`Error::Db`] from SQLite (a database without the code tables answers
 /// `None`).
 pub fn file_items(conn: &Connection, path: &str) -> Result<Option<Vec<Item>>> {
-    let Some((root, _, _, rel)) = root_of(conn, path)? else { return Ok(None) };
+    let roots = code_roots(conn)?;
+    let excludes = |root: &str| root_excludes(conn, root).ok();
+    let Some((root, _, _, rel)) = root_in(&roots, path) else { return Ok(worktree_items(&roots, path, excludes)) };
     // One statement, so one snapshot: a full write committing between two
     // reads could give this file's id to another file, whose rows would then
     // be read as this file's. A covered file with no item still yields one
@@ -2570,30 +2686,17 @@ pub fn file_items(conn: &Connection, path: &str) -> Result<Option<Vec<Item>>> {
         }
         let Some(name) = r.get::<_, Option<String>>(2)? else { continue };
         let kind: String = r.get(3)?;
-        let container: String = r.get(4)?;
-        let line: u32 = r.get(5)?;
-        let end: u32 = r.get(6)?;
-        let sect: i64 = r.get(7)?;
-        items.push(if sect == SECT_IMPL {
-            Item { name: container, kind: "impl".into(), line, end: end.max(line) }
-        } else {
-            Item {
-                name: if container.is_empty() { name } else { format!("{container}::{name}") },
-                kind: short_kind(&kind),
-                line,
-                end: end.max(line),
-            }
-        });
+        items.push(item_of(name, &kind, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?));
     }
-    let Some(indexed) = indexed else { return Ok(None) };
+    // No row: the file may be a worktree's copy (the root's walk never
+    // enters `.claude/worktrees/`). A stale row is never mapped.
+    let Some(indexed) = indexed else { return Ok(worktree_items(&roots, path, excludes)) };
     // A file written after the indexing may have moved its lines.
     let modified = fs::metadata(path).and_then(|m| m.modified()).map(crate::store::utc).unwrap_or_default();
     if modified.is_empty() || modified > indexed {
         return Ok(None);
     }
-    items.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
-    items.dedup_by(|a, b| a.line == b.line && a.name == b.name);
-    Ok(Some(items))
+    Ok(Some(sorted(items)))
 }
 
 /// What [`reindex_file`] did.
@@ -2606,6 +2709,41 @@ pub enum Reindexed {
     Removed,
     /// Its rows were rewritten: definitions, impl edges, lines.
     Rows(usize),
+}
+
+/// True for a file (its path below its root, `/`-separated) that the
+/// single-file scan reads: one the walk would index ([`relevant`]) that is
+/// Rust, WGSL or a language row's source.
+fn scannable(rel: &str) -> bool {
+    relevant(rel) && (rel.ends_with(".rs") || rel.ends_with(".wgsl") || source_lang(rel).is_some())
+}
+
+/// One file's rows from the line scan (Rust), the WGSL scanner or its
+/// language's scanner: what [`reindex_file`] writes, and what a read in a
+/// worktree is annotated from ([`worktree_items`]).
+fn scan_file(rel: &str, text: &str) -> Rows {
+    let one = [(rel.to_string(), text.to_string())];
+    let mut rows = Rows::default();
+    let mut files: HashMap<String, u32> = HashMap::new();
+    if rel.ends_with(".wgsl") {
+        wgsl_rows(&one, &mut rows, &mut files);
+    } else if source_lang(rel).is_some() {
+        lang_rows(&one, &mut rows, &mut files);
+    } else {
+        scan_rows(&one, &mut rows, &mut files);
+    }
+    rows
+}
+
+/// The last line of a scanned definition or impl block: the scanner's own
+/// end when it gave one, else brace matching over the file's lines; 0 for a
+/// reference.
+fn occ_end(rows: &Rows, o: &Occ, lines: &[&str]) -> u32 {
+    match rows.ends.get(&(o.file, o.line)) {
+        Some(&e) if o.sect != SECT_REF => e,
+        _ if o.sect != SECT_REF && o.line >= 1 && (o.line as usize) <= lines.len() => crate::digest::item_end(lines, o.line as usize - 1) as u32,
+        _ => 0,
+    }
 }
 
 /// Re-indexes one file of a code root at once, from the line scan (Rust)
@@ -2631,31 +2769,19 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
         return Ok(Reindexed::NotCovered);
     }
     let Some((root, _, dir, rel)) = root_of(conn, path)? else { return Ok(Reindexed::NotCovered) };
+    if !scannable(&rel) {
+        return Ok(Reindexed::NotCovered);
+    }
+    if excluded(&root_excludes(conn, &root)?, &rel) {
+        return Ok(Reindexed::NotCovered);
+    }
     let wgsl = rel.ends_with(".wgsl");
     let lang = source_lang(&rel);
-    if !relevant(&rel) || !(wgsl || rel.ends_with(".rs") || lang.is_some()) {
-        return Ok(Reindexed::NotCovered);
-    }
-    let exclude: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [exclude_key(&root)], |r| r.get(0)).optional()?;
-    if exclude.is_some_and(|x| excluded(&x.lines().map(str::to_string).collect::<Vec<_>>(), &rel)) {
-        return Ok(Reindexed::NotCovered);
-    }
     // Stamped before the read, so an edit landing after it is not taken as
     // indexed.
     let now = crate::store::utc(SystemTime::now());
     let text = read_source(Path::new(&dir), &rel);
-    let mut rows = Rows::default();
-    let mut files: HashMap<String, u32> = HashMap::new();
-    if let Some(t) = &text {
-        let one = [(rel.clone(), t.clone())];
-        if wgsl {
-            wgsl_rows(&one, &mut rows, &mut files);
-        } else if lang.is_some() {
-            lang_rows(&one, &mut rows, &mut files);
-        } else {
-            scan_rows(&one, &mut rows, &mut files);
-        }
-    }
+    let rows = text.as_deref().map(|t| scan_file(&rel, t)).unwrap_or_default();
     // `begin` refuses a store a newer atlas upgraded since this one opened it.
     let tx = crate::store::begin(conn)?;
     let existing: Option<i64> = file_row(&tx, &root, &rel)?.map(|x| x.0);
@@ -2701,11 +2827,7 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
             let key = (o.name.as_str(), o.sect, o.line, o.col);
             ord = if prev == Some(key) { ord + 1 } else { 0 };
             prev = Some(key);
-            let end = match rows.ends.get(&(o.file, o.line)) {
-                Some(&e) if o.sect != SECT_REF => e,
-                _ if o.sect != SECT_REF && o.line >= 1 && (o.line as usize) <= lines.len() => crate::digest::item_end(&lines, o.line as usize - 1) as u32,
-                _ => 0,
-            };
+            let end = occ_end(&rows, o, &lines);
             st.execute(params![o.name, o.sect, id, o.line, o.col, ord, o.kind, o.container, o.within, end])?;
             names.insert(o.name.clone());
             need.insert(o.line);
@@ -3131,6 +3253,32 @@ mod tests {
         assert!(!relevant("target/debug/build/x.rs"));
         assert!(!relevant(".git/HEAD"));
         assert!(!relevant("README.md"));
+    }
+
+    /// The root holding a path is the deepest one whose folder is a whole
+    /// prefix of it, with something below. A sibling whose name has the same
+    /// length, a folder that only starts like a root's, the root's own folder
+    /// and a path shorter than every root are no file of any root. Through
+    /// `file_items` a wrong root mostly reads as no row and falls back to the
+    /// worktree scan, so the rule is checked here.
+    #[test]
+    fn root_in_takes_the_deepest_root_whose_folder_holds_the_path() {
+        let r = |name: &str, dir: &str| (name.to_string(), dir.to_string(), format!("{name} stamp"));
+        let forward = [r("a", "/t/aa"), r("b", "/t/bb/"), r("long", "/t/bbbbb"), r("outer", "/t/o"), r("inner", "/t/o/in")];
+        let reverse: Vec<_> = forward.iter().rev().cloned().collect();
+        let hit = |root: &str, dir: &str, rel: &str| Some((root.to_string(), format!("{root} stamp"), dir.to_string(), rel.to_string()));
+        for roots in [&forward[..], &reverse[..]] {
+            assert_eq!(root_in(roots, "/t/aa/x.rs"), hit("a", "/t/aa", "x.rs"));
+            assert_eq!(root_in(roots, "/t/bb/x.rs"), hit("b", "/t/bb", "x.rs"));
+            assert_eq!(root_in(roots, "\\t\\bb\\x.rs"), hit("b", "/t/bb", "x.rs"));
+            // The byte after "/t/bbbbb"'s length is a slash here too.
+            assert_eq!(root_in(roots, "/t/aa/cc/x.rs"), hit("a", "/t/aa", "cc/x.rs"));
+            assert_eq!(root_in(roots, "/t/o/in/x.rs"), hit("inner", "/t/o/in", "x.rs"));
+            assert_eq!(root_in(roots, "/t/o/x.rs"), hit("outer", "/t/o", "x.rs"));
+            for none in ["/t/aax/y.rs", "/t/aa", "/t/aa/", "/t", "/u/aa/x.rs"] {
+                assert_eq!(root_in(roots, none), None, "{none}");
+            }
+        }
     }
 }
 

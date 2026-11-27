@@ -133,6 +133,15 @@ Routing is deterministic: hooks decide, not the model. It is on by default; `lea
     is which. `git grep -n` is read like `grep -rn`.
   - A file outside every code root, or written after its root's indexing began, is not annotated.
     `lean.annotate: false` turns this off.
+  - A file in a linked git worktree is the exception (`code::file_items`). When the index holds no row for it
+    and it is in another checkout of a root's repository (Claude Code's `.claude/worktrees/NAME`, which the walk
+    never enters, or a worktree beside the root), it is annotated from its own bytes. They are scanned at the
+    read, as the per-edit re-index scans them, and nothing is written. `project::checkout` reads git's files
+    without running git, and the file maps to the root whose repository has the same common git folder and
+    whose checkout is another one. The root's folder below its checkout's top is the prefix, and the deepest
+    match wins. The mapped path meets the walk's rules and size limit. A worktree whose admin folder does not
+    name it back is not mapped. An edit in a worktree still writes nothing, and `symbol` answers the root's
+    own checkout.
 - **Fail open.** Any routing error leaves the call untouched and records a miss (`tool = "route"`).
 - **Digests** (`src/digest.rs`) have a 600 B budget, or 3.2 KB for an outline. Each digest ends with one
   slice hint line. Without an exit code a verdict says it is inferred and keeps the tail verbatim, so a
