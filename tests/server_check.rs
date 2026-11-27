@@ -4,7 +4,7 @@
 
 mod common;
 
-use atlas::server_check::{check_in, check_once_in, hook_output, is_claude_code, mark_in, session_pid, socket_in, socket_of_marker, tell, verdict, Verdict};
+use atlas::server_check::{check_in, check_once_in, hook_output, is_claude_code, mark_in, origin, refusal, session_pid, socket_in, socket_of_marker, tell, verdict, Origin, Verdict};
 use common::*;
 
 fn procs(rows: &[(u32, u32, &str)]) -> Vec<(u32, u32, String)> {
@@ -53,6 +53,28 @@ fn the_session_is_the_nearest_claude_code_above() {
     // A parent that started after its child took a reused pid.
     let at = |pid: u32| [(30, 50u64), (40, 20)].iter().find(|s| s.0 == pid).map(|s| s.1);
     assert_eq!(session_pid(&procs(&[(30, 1, "claude"), (40, 30, "atlas")]), 40, at), None);
+}
+
+/// A hook is Claude Code's child (or a `sh -c`'s that did not exec); the
+/// model's Bash tool runs `atlas --hook` under the tool's own shell, which
+/// is dropped with a reason. Nothing is judged without a Claude Code above.
+#[test]
+fn a_hook_run_through_the_bash_tools_shell_is_dropped() {
+    // The measured shapes: session (30) -> hook (40); session -> bash -c
+    // (35) -> atlas --hook (45), and a pipe's subshell under it (46 -> 47).
+    let t = procs(&[(1, 0, "systemd"), (30, 1, "2.1.330"), (35, 30, "bash"), (36, 30, "sh"), (40, 30, "atlas"), (45, 35, "atlas"), (46, 35, "bash"), (47, 46, "atlas"), (48, 36, "atlas")]);
+    assert_eq!(origin(&t, 40, |_| None), Origin::Runner);
+    assert_eq!(origin(&t, 48, |_| None), Origin::Runner, "a sh -c that did not exec");
+    assert_eq!(origin(&t, 45, |_| None), Origin::Through("bash".into()));
+    assert_eq!(origin(&t, 47, |_| None), Origin::Through("bash".into()));
+    assert!(refusal(&origin(&t, 45, |_| None)).is_some_and(|w| w.contains("`bash`") && w.contains("dropped")));
+    for me in [40, 48] {
+        assert_eq!(refusal(&origin(&t, me, |_| None)), None, "{me}");
+    }
+    // A test or a terminal: no Claude Code above, so it runs.
+    let term = procs(&[(5, 1, "zsh"), (6, 5, "cargo"), (40, 6, "atlas")]);
+    assert_eq!(origin(&term, 40, |_| None), Origin::NoClaudeCode);
+    assert_eq!(refusal(&Origin::NoClaudeCode), None);
 }
 
 #[test]

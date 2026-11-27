@@ -627,6 +627,29 @@ pub(crate) mod process {
         }
     }
 
+    /// How Claude Code starts a command hook on a system, as far as it has
+    /// been measured there ([`crate::server_check::origin`] reads it).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HookRunner {
+        /// The hook is Claude Code's own child, or the child of a `sh -c`
+        /// of Claude Code's that did not exec its one command.
+        // Named only by the systems measured so far.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        Direct,
+        /// Not measured on this system, so a hook's ancestors are not
+        /// judged.
+        Unmeasured,
+    }
+
+    /// This system's [`HookRunner`]. Linux was measured with Claude Code
+    /// 2.1.330: a hook's parent is Claude Code, a Bash tool call's is the
+    /// tool's shell. Measure another system before naming it here.
+    #[cfg(target_os = "linux")]
+    pub const HOOK_RUNNER: HookRunner = HookRunner::Direct;
+    /// This system's [`HookRunner`]: not measured yet.
+    #[cfg(not(target_os = "linux"))]
+    pub const HOOK_RUNNER: HookRunner = HookRunner::Unmeasured;
+
     /// This process's parent pid, when it can be read.
     pub(crate) fn parent() -> Option<u32> {
         #[cfg(unix)]

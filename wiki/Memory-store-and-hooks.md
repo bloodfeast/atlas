@@ -110,6 +110,13 @@ server's socket cannot be reached, the hook runs in its own process: it works, b
 there and injects no lane recall. For clients other than Claude Code (Codex runs command hooks), SessionStart and
 UserPromptSubmit are a pinned contract, on [[Other MCP clients]]; every other event is not stable outside Claude Code.
 
+atlas cannot tell a hook from the model running `atlas --hook` itself: both are the same binary, run as the same
+user, and the model can also write the store through atlas's tools. It drops only the accidental case. On Linux, a
+hook is Claude Code's own child (or a `sh -c` of Claude Code's), while a Bash tool call runs under the tool's own
+shell, so `atlas --hook` started through another process below Claude Code exits 1 with a line on stderr and does
+nothing. A deliberate run can still look like a hook, for example with `exec`. On macOS and Windows, where how
+Claude Code starts a hook has not been measured, nothing is judged.
+
 A subagent's launch is named by the tool use id in its meta file (`agent-<id>.meta.json`), but Claude Code writes
 that file only after `SubagentStart` answers. So the start takes a launch only when that is unambiguous: exactly one
 launch waiting in the session, or exactly one waiting launch whose `subagent_type` is the start's `agent_type`

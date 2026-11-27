@@ -736,6 +736,10 @@ fn run() -> Result<ExitCode, String> {
     // it runs here, on the input already read.
     let mut hook_stdin: Option<String> = None;
     if argv.len() == 1 && argv[0] == "--hook" {
+        if let Some(why) = atlas::server_check::hook_refusal() {
+            eprintln!("{why}");
+            return Ok(ExitCode::FAILURE);
+        }
         let mut input = String::new();
         std::io::Read::read_to_string(&mut io::stdin(), &mut input).map_err(|e| e.to_string())?;
         if let Some(out) = atlas::hook_socket::command_hook(&input) {
@@ -947,6 +951,10 @@ fn run() -> Result<ExitCode, String> {
         let input = match hook_stdin {
             Some(i) => i,
             None => {
+                if let Some(why) = atlas::server_check::hook_refusal() {
+                    eprintln!("{why}");
+                    return Ok(ExitCode::FAILURE);
+                }
                 let mut input = String::new();
                 std::io::Read::read_to_string(&mut io::stdin(), &mut input).map_err(|e| e.to_string())?;
                 input

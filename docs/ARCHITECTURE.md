@@ -35,7 +35,10 @@ One Rust binary, one dependency (SQLite, bundled), no network at query time.
   hands the event to it over a Unix socket (`src/hook_socket.rs`), so the server's hook worker answers
   every event and what it keeps between them stays in one process. SessionStart and SessionEnd, and
   every event on Windows or with no reachable socket, run in the hook's own process; with every server
-  of the session stopped, the hook does nothing but the once-per-loss notice. Plugin hooks also fire
+  of the session stopped, the hook does nothing but the once-per-loss notice. A hook started through a
+  shell below Claude Code (the Bash tool's shape) exits 1 and does nothing, where the platform's hook
+  runner was measured (`HOOK_RUNNER` in `src/platform/mod.rs`, Linux only so far); this stops an
+  accident, not a deliberate run. Plugin hooks also fire
   inside subagents, with `agent_id` set (measured). The `hook` MCP tool still answers the `mcp_tool`
   hooks of an older plugin. SessionStart's
   only output is the settings offer, once, and these until answered: for a folder atlas does not index, a line asking the

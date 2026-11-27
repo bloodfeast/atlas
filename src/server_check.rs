@@ -134,6 +134,59 @@ fn tag_of(pid: u32) -> String {
     }
 }
 
+/// How `atlas --hook` was started, read from its ancestors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// By Claude Code's hook runner: Claude Code's child, or the child of a
+    /// `sh -c` of Claude Code's that did not exec.
+    Runner,
+    /// Through this other process below Claude Code: the shape of a Bash
+    /// tool call, whose shell runs the command.
+    Through(String),
+    /// No Claude Code above (a test, a person's terminal): not judged.
+    NoClaudeCode,
+}
+
+/// The [`Origin`] of `me` in `procs` ((pid, parent pid, executable name)).
+/// This tells an accidental run from the Bash tool from a hook; it cannot
+/// stop a deliberate one, which can exec or start its own session to look
+/// like a hook.
+pub fn origin(procs: &[(u32, u32, String)], me: u32, started: impl Fn(u32) -> Option<u64>) -> Origin {
+    let Some(cc) = session_pid(procs, me, started) else { return Origin::NoClaudeCode };
+    let row = |pid: u32| procs.iter().find(|p| p.0 == pid);
+    let between: Vec<_> = std::iter::successors(row(me).and_then(|r| row(r.1)), |r| row(r.1))
+        .take_while(|r| r.0 != cc)
+        .take(WALK_DEPTH)
+        .collect();
+    match between.as_slice() {
+        [] => Origin::Runner,
+        [sh] if exe_name(&sh.2) == "sh" => Origin::Runner,
+        [near, ..] => Origin::Through(exe_name(&near.2)),
+    }
+}
+
+/// What `atlas --hook` says on stderr when it drops its event, or `None`
+/// to run it.
+pub fn refusal(origin: &Origin) -> Option<String> {
+    match origin {
+        Origin::Through(name) => Some(format!(
+            "atlas --hook: started through `{name}` under Claude Code, not by its hook runner, so the event is dropped: a hook's event comes from Claude Code alone"
+        )),
+        Origin::Runner | Origin::NoClaudeCode => None,
+    }
+}
+
+/// [`refusal`] for this process, where its system's hook runner was
+/// measured ([`crate::platform::process::HOOK_RUNNER`]); `None` elsewhere.
+pub fn hook_refusal() -> Option<String> {
+    use crate::platform::process::{lineage, start_time, HookRunner, HOOK_RUNNER};
+    if HOOK_RUNNER == HookRunner::Unmeasured {
+        return None;
+    }
+    let me = std::process::id();
+    refusal(&origin(&lineage(me, WALK_DEPTH), me, start_time))
+}
+
 /// The tag of the Claude Code process above this one, or why there is none.
 pub fn owner_here() -> Result<String, String> {
     let procs = crate::platform::process::lineage(std::process::id(), WALK_DEPTH);
