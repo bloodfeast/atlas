@@ -88,11 +88,19 @@ pub fn owner_tag() -> Option<String> {
 /// The shells and launchers [`owner_pid`] walks past between the server
 /// and Claude Code (`cmd /c`, a non-exec `sh -c`, the MSYS bash stub, an
 /// atlas shim), by executable name without `.exe`.
-const WRAPPERS: &[&str] = &["atlas", "bash", "cmd", "dash", "env", "fish", "ksh", "nice", "nohup", "powershell", "pwsh", "sh", "zsh"];
+pub(crate) const WRAPPERS: &[&str] = &["atlas", "bash", "cmd", "dash", "env", "fish", "ksh", "nice", "nohup", "powershell", "pwsh", "sh", "zsh"];
 
 /// The executable names Claude Code runs as: its own binary, or the
 /// JavaScript runtime it ships on.
-const CLAUDE_CODE: &[&str] = &["bun", "claude", "node"];
+pub(crate) const CLAUDE_CODE: &[&str] = &["bun", "claude", "node"];
+
+/// An executable name as [`WRAPPERS`] and [`CLAUDE_CODE`] list it: the last
+/// path part, without `.exe`, lower case.
+pub(crate) fn exe_name(n: &str) -> String {
+    let n = n.rsplit(['/', '\\']).next().unwrap_or(n);
+    let n = if n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(".exe") { &n[..n.len() - 4] } else { n };
+    n.to_ascii_lowercase()
+}
 
 /// The Claude Code process above `me` in `procs` ((pid, parent pid,
 /// executable name), [`owner_tag`], #389 review S2): walking up past known
@@ -108,11 +116,7 @@ const CLAUDE_CODE: &[&str] = &["bun", "claude", "node"];
 /// `node` editor server above a shell) is taken instead: the safe side,
 /// since it only keeps slots held longer.
 pub fn owner_pid(procs: &[(u32, u32, String)], me: u32, started: impl Fn(u32) -> Option<u64>) -> Option<u32> {
-    let name = |n: &str| {
-        let n = n.rsplit(['/', '\\']).next().unwrap_or(n);
-        let n = if n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(".exe") { &n[..n.len() - 4] } else { n };
-        n.to_ascii_lowercase()
-    };
+    let name = exe_name;
     let row = |pid: u32| procs.iter().find(|p| p.0 == pid);
     let (mut child, mut pid) = (me, row(me)?.1);
     let mut found = None;

@@ -8,6 +8,7 @@
        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook", "timeout": 10}]}
     ],
     "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --server-check", "timeout": 5}]},
       {"hooks": [{"type": "mcp_tool", "server": "plugin:atlas:atlas", "tool": "hook",
                   "input": {"event": "UserPromptSubmit", "session_id": "${session_id}", "prompt": "${prompt}", "transcript_path": "${transcript_path}"}}]}
     ],

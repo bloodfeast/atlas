@@ -72,10 +72,17 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
     ];
     let mut hook_ids = Vec::new();
     let mut commands = Vec::new();
+    let mut checks = Vec::new();
     let mut id = 10;
     for (event, entries) in hooks["hooks"].as_object().unwrap().iter() {
         for e in entries.as_array().unwrap() {
             for h in e["hooks"].as_array().unwrap() {
+                if h["type"] == "command" && h["command"] == "\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --server-check" {
+                    // The check that says when the server is gone runs
+                    // without it (tests/server_check.rs).
+                    checks.push(event.clone());
+                    continue;
+                }
                 if h["type"] == "command" {
                     // Claude Code runs no mcp_tool hook at SessionStart (measured:
                     // "no MCP client context"), so that one is `atlas --hook`.
@@ -93,6 +100,7 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
     }
     let events: Vec<&str> = hook_ids.iter().map(|(_, e)| e.as_str()).chain(commands.iter().map(String::as_str)).collect();
     assert_eq!(commands, ["SessionStart", "SessionEnd"]);
+    assert_eq!(checks, ["UserPromptSubmit"]);
     for e in ["SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop", "PreToolUse", "PostToolUse", "PreCompact"] {
         assert!(events.contains(&e), "hooks.json wires {e}");
     }

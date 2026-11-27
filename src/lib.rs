@@ -89,6 +89,7 @@ pub mod regex;
 pub mod report;
 pub mod restart;
 pub mod restart_warn;
+pub mod server_check;
 pub mod resume;
 pub mod reviews;
 pub mod registry;

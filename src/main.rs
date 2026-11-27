@@ -115,6 +115,7 @@ Modes:
   --rescan               re-index every vault and source, then exit
   --hook                 a Claude Code command hook: the event JSON on stdin, the answer on stdout
   --statusline           the update badge for a Claude Code status line (reads the update state file only; prints nothing when no update is pending)
+  --server-check [--say] the UserPromptSubmit hook that tells the user when this session's atlas server is not running (no configuration read; --say prints the verdict)
   --recall-check [--phrase TEXT ...]   every identifier and phrase is found by lookup
   --token-report         the token ledger in about 15 lines: the measured ratio, credit, cost and net, the savings by source, the last 7 days
   --token-report --verbose   the full report: what atlas answered against what reading would cost, every block
@@ -725,6 +726,11 @@ fn run() -> Result<ExitCode, String> {
     if argv.first().is_some_and(|w| w == "taskjudge-time") {
         return taskjudge_time(&argv[1..]);
     }
+    // The prompt hook that says when this session's server is gone: no
+    // configuration, no store, so it works whatever state those are in.
+    if argv.first().is_some_and(|w| w == "--server-check") {
+        return Ok(atlas::server_check::cli(&argv[1..]));
+    }
     // File tools that need no configuration, run before one is looked for.
     if argv.first().is_some_and(|w| w == "doctor") {
         // `config_path`, not `ensure_config`: the doctor writes nothing.
@@ -1017,6 +1023,9 @@ fn run() -> Result<ExitCode, String> {
             let log = atlas::serve_log::Log::new(atlas::serve_log::path_for(&db));
             log.start();
             log.install_panic_hook();
+            // The marker the prompt hook reads to tell the user when this
+            // server is gone (`atlas --server-check`). Logged, not printed.
+            let _ = std::io::Write::write_fmt(&mut io::stderr(), format_args!("atlas live marker: {}\n", atlas::server_check::mark()));
             match serve_mode(&setup, loaded.as_ref(), &models, calib_plan) {
                 Ok((why, code)) => {
                     log.exit(why);
