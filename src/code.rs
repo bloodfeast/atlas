@@ -396,9 +396,13 @@ pub struct CodeSetup {
     pub watch: bool,
     /// Seconds between safety-net fingerprint walks of a watched root.
     pub rescan_interval: Duration,
-    /// Which SCIP indexers of [`crate::langs`] run (rust-analyzer is
-    /// chosen apart, see [`crate::code_index::RustSource`]).
+    /// Which SCIP indexers and language servers of [`crate::langs`] run
+    /// (rust-analyzer is chosen apart, see
+    /// [`crate::code_index::RustSource`]).
     pub indexers: Indexers,
+    /// runq's state root (`orchestrate.runq_root`): background runs defer
+    /// while runq holds a heavy compile. `None`: runq is not read.
+    pub runq_root: Option<PathBuf>,
 }
 
 /// Which SCIP indexers of the language table ([`crate::langs::Driver`])
@@ -453,6 +457,7 @@ impl CodeSetup {
                 Some(None) => Indexers::Off("indexers are off (code.indexers is false)".into()),
                 Some(Some(list)) => Indexers::Chosen(list.clone()),
             },
+            runq_root: None,
         }
     }
 }
@@ -832,6 +837,8 @@ pub struct RowStats {
     pub scip_defs: usize,
     /// Definitions from the line scan, absent from SCIP.
     pub scan_defs: usize,
+    /// Definitions a language server gave ([`crate::lsp`]).
+    pub lsp_defs: usize,
     /// References from SCIP.
     pub scip_refs: usize,
     /// References into dependencies, not stored.
@@ -2056,6 +2063,9 @@ pub struct WriteStats {
 /// * `units` - the root's units (`code_units`); `code_roots.rust` gets
 ///   their [`units_note`].
 /// * `elapsed_ms` - how long the indexing took.
+/// * `indexed_at` - when the walk began ([`crate::store::utc`]): the stamp
+///   [`file_items`] compares mtimes with, so a file changed during the run is
+///   not served from its rows.
 ///
 /// # Errors
 ///
@@ -2070,6 +2080,7 @@ pub fn write_root(
     fingerprint: &str,
     units: &[Unit],
     elapsed_ms: u64,
+    indexed_at: &str,
 ) -> Result<WriteStats> {
     ensure_schema(conn)?;
     // `begin` refuses a store a newer atlas upgraded since this one opened it.
@@ -2181,7 +2192,7 @@ pub fn write_root(
             }
         }
     }
-    let now = crate::store::utc(SystemTime::now());
+    let now = indexed_at;
     {
         let mut st = tx.prepare("INSERT OR REPLACE INTO code_units(root, dir, lang, source, fingerprint, indexed, elapsed_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
         for u in units {
@@ -2391,9 +2402,11 @@ pub fn defined_packages(conn: &Connection, root: &str, own: bool) -> Result<Hash
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// After `root` was written: when the packages it defines changed (`before`
-/// to `after`), every other root whose references go into a changed one has
-/// its fingerprint cleared, so the next walk re-indexes it and its
+/// Before `root`'s new rows are written (so a failure here leaves its old
+/// fingerprint, and its next run marks again): when the packages it
+/// defines changed (`before` to `after`), every other root whose
+/// references go into a changed one has its fingerprint cleared, so the
+/// next walk re-indexes it and its
 /// cross-root references follow. Nothing else is re-indexed: a root's rows
 /// never need another root's run, only its recorded packages.
 ///
@@ -2532,33 +2545,52 @@ fn file_row(conn: &Connection, root: &str, rel: &str) -> Result<Option<(i64, Str
 /// [`Error::Db`] from SQLite (a database without the code tables answers
 /// `None`).
 pub fn file_items(conn: &Connection, path: &str) -> Result<Option<Vec<Item>>> {
-    let Some((root, root_indexed, _, rel)) = root_of(conn, path)? else { return Ok(None) };
-    let Some((file, file_indexed)) = file_row(conn, &root, &rel)? else { return Ok(None) };
-    // A file written after the indexing may have moved its lines.
-    let indexed = root_indexed.max(file_indexed);
-    let modified = fs::metadata(path).and_then(|m| m.modified()).map(crate::store::utc).unwrap_or_default();
-    if modified.is_empty() || modified > indexed {
-        return Ok(None);
-    }
+    let Some((root, _, _, rel)) = root_of(conn, path)? else { return Ok(None) };
+    // One statement, so one snapshot: a full write committing between two
+    // reads could give this file's id to another file, whose rows would then
+    // be read as this file's. A covered file with no item still yields one
+    // row, from the LEFT JOIN.
     // Definitions, and impl blocks (an impl edge row names its block
     // `Trait for Type`; the two rows of one block become one item).
     // An impl edge from a SCIP relationship (kind `implements`) sits on its
     // definition's own line and range: the definition is the item.
-    let mut st = conn.prepare_cached("SELECT name, kind, container, line, end_line, sect FROM code_occ WHERE file = ?1 AND sect IN (0, 2) AND kind <> 'implements'")?;
-    let mut items: Vec<Item> = st
-        .query_map([file], |r| {
-            let name: String = r.get(0)?;
-            let kind: String = r.get(1)?;
-            let container: String = r.get(2)?;
-            let line: u32 = r.get(3)?;
-            let end: u32 = r.get(4)?;
-            let sect: i64 = r.get(5)?;
-            if sect == SECT_IMPL {
-                return Ok(Item { name: container, kind: "impl".into(), line, end: end.max(line) });
+    const SQL: &str = "SELECT r.indexed, f.indexed, o.name, o.kind, o.container, o.line, o.end_line, o.sect
+         FROM code_files f JOIN code_roots r ON r.root = f.root
+         LEFT JOIN code_occ o ON o.file = f.id AND o.sect IN (0, 2) AND o.kind <> 'implements'
+         WHERE f.root = ?1 AND f.path = ?2";
+    let sql = if cfg!(windows) { format!("{SQL} COLLATE NOCASE") } else { SQL.to_string() };
+    let mut st = conn.prepare_cached(&sql)?;
+    let mut indexed: Option<String> = None;
+    let mut items: Vec<Item> = Vec::new();
+    let mut rows = st.query(params![root, rel])?;
+    while let Some(r) = rows.next()? {
+        if indexed.is_none() {
+            let (root_indexed, file_indexed): (String, String) = (r.get(0)?, r.get(1)?);
+            indexed = Some(root_indexed.max(file_indexed));
+        }
+        let Some(name) = r.get::<_, Option<String>>(2)? else { continue };
+        let kind: String = r.get(3)?;
+        let container: String = r.get(4)?;
+        let line: u32 = r.get(5)?;
+        let end: u32 = r.get(6)?;
+        let sect: i64 = r.get(7)?;
+        items.push(if sect == SECT_IMPL {
+            Item { name: container, kind: "impl".into(), line, end: end.max(line) }
+        } else {
+            Item {
+                name: if container.is_empty() { name } else { format!("{container}::{name}") },
+                kind: short_kind(&kind),
+                line,
+                end: end.max(line),
             }
-            Ok(Item { name: if container.is_empty() { name } else { format!("{container}::{name}") }, kind: short_kind(&kind), line, end: end.max(line) })
-        })?
-        .collect::<std::result::Result<_, _>>()?;
+        });
+    }
+    let Some(indexed) = indexed else { return Ok(None) };
+    // A file written after the indexing may have moved its lines.
+    let modified = fs::metadata(path).and_then(|m| m.modified()).map(crate::store::utc).unwrap_or_default();
+    if modified.is_empty() || modified > indexed {
+        return Ok(None);
+    }
     items.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
     items.dedup_by(|a, b| a.line == b.line && a.name == b.name);
     Ok(Some(items))
@@ -2608,6 +2640,9 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
     if exclude.is_some_and(|x| excluded(&x.lines().map(str::to_string).collect::<Vec<_>>(), &rel)) {
         return Ok(Reindexed::NotCovered);
     }
+    // Stamped before the read, so an edit landing after it is not taken as
+    // indexed.
+    let now = crate::store::utc(SystemTime::now());
     let text = read_source(Path::new(&dir), &rel);
     let mut rows = Rows::default();
     let mut files: HashMap<String, u32> = HashMap::new();
@@ -2642,7 +2677,6 @@ pub fn reindex_file(conn: &mut Connection, path: &str) -> Result<Reindexed> {
         tx.commit()?;
         return Ok(Reindexed::Removed);
     };
-    let now = crate::store::utc(SystemTime::now());
     let id = match existing {
         Some(id) => {
             tx.execute("UPDATE code_files SET indexed = ?2 WHERE id = ?1", params![id, now])?;
@@ -2779,6 +2813,7 @@ impl std::fmt::Display for RowStats {
         let all = [
             ("scip defs", self.scip_defs),
             ("scan defs", self.scan_defs),
+            ("lsp defs", self.lsp_defs),
             ("scip refs", self.scip_refs),
             ("external refs", self.external_refs),
             ("cross-root refs", self.xroot_refs),

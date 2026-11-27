@@ -20,16 +20,20 @@
 //! `op read`, a vault) is the harness's job: it resolves the secret into the
 //! named variable before atlas starts (journal:ATLAS-TRACKERS:0002).
 //!
-//! The client is read-only by construction: [`http::Method`] has one
+//! The read client is read-only by construction: [`http::Method`] has one
 //! variant, `GET`, and every path it may send is in [`api::ENDPOINTS`].
-//! Writes stay on the Atlassian MCP route, behind Claude Code's permission
-//! prompts.
+//! Writes (a Jira comment, a transition, a field edit, a Confluence page
+//! update) are [`write`]: a separate module with its own methods and its
+//! own endpoint list, dry-run unless `--apply`, behind a per-project verb
+//! allow-list (`writes`), with a token from variables of its own
+//! (`jira_write_token_env`, `confluence_write_token_env`, `pat_write_env`).
 //!
 //! ```text
 //! atlas track check                 config, variables present or absent, one whoami, write capability
 //! atlas track smoke [--issue KEY] [--page ID] [--jql Q] [--cql Q]   shapes and sizes only
 //! atlas track issue KEY | jql Q [--limit N] | page ID | cql Q [--limit N]   a digest; the raw response kept as a handle
 //! atlas track snapshot ITEM [--status S --assignee A --summary T]   a queue item's ticket snapshot
+//! atlas track comment | transition | edit | page-update ...   writes, dry-run unless --apply
 //! ```
 
 pub mod api;
@@ -37,6 +41,7 @@ pub mod digest;
 pub mod http;
 pub mod plan;
 pub mod snapshot;
+pub mod write;
 
 #[cfg(test)]
 mod fix_tests;
@@ -44,6 +49,8 @@ mod fix_tests;
 mod queue_tests;
 #[cfg(test)]
 mod reads_tests;
+#[cfg(test)]
+mod write_tests;
 
 use std::fmt;
 use std::path::Path;
@@ -87,9 +94,70 @@ impl AuthRef {
     }
 }
 
+/// The Jira verbs a `writes.jira.PROJECT` list may name.
+pub const JIRA_VERBS: &[&str] = &["comment", "transition", "assignee", "labels", "sprint"];
+/// The Confluence verbs a `writes.confluence.SPACE` list may name.
+pub const CONFLUENCE_VERBS: &[&str] = &["page_update"];
+/// The journal lane applied writes go to when nothing names one.
+pub const DEFAULT_WRITE_LANE: &str = "PROJECT-TRACKING";
+
+/// The write side of `project_tracking.atlassian`: the variables the write
+/// token is read from (names, never values) and the allow-list. Empty by
+/// default, which refuses every write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteCfg {
+    /// Cloud: the variable holding the Jira write token (`jira_write_token_env`).
+    pub jira_token_env: Option<String>,
+    /// Cloud: the variable holding the Confluence write token (`confluence_write_token_env`).
+    pub confluence_token_env: Option<String>,
+    /// Data Center: the variable holding the write PAT (`pat_write_env`).
+    pub pat_env: Option<String>,
+    /// `writes.jira`: each project's allowed verbs.
+    pub jira: Vec<(String, Vec<String>)>,
+    /// `writes.confluence`: each space's allowed verbs.
+    pub confluence: Vec<(String, Vec<String>)>,
+    /// `writes.journal_lane`.
+    pub lane: Option<String>,
+}
+
+/// True for a project key, space key or lane name atlas accepts.
+fn key_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'~'))
+}
+
+/// Parses `writes.jira` or `writes.confluence`: a map from a project or space
+/// to a list of verbs from `allowed`.
+fn write_lists(what: &str, v: &Value, allowed: &[&str]) -> std::result::Result<Vec<(String, Vec<String>)>, String> {
+    let m = v.as_object().ok_or_else(|| format!("project_tracking.atlassian.writes.{what} must be an object of project or space keys"))?;
+    let mut out = Vec::new();
+    for (k, list) in m.iter() {
+        if !key_ok(k) {
+            return Err(format!("project_tracking.atlassian.writes.{what}: {k:?} is not a project or space key"));
+        }
+        let items = list.as_array().ok_or_else(|| format!("project_tracking.atlassian.writes.{what}.{k} must be a list of verbs"))?;
+        let mut verbs: Vec<String> = Vec::new();
+        for i in items {
+            let verb = i.as_str().unwrap_or("");
+            if !allowed.contains(&verb) {
+                return Err(format!(
+                    "project_tracking.atlassian.writes.{what}.{k}: unknown verb {verb:?}; the verbs are {}",
+                    allowed.join(", ")
+                ));
+            }
+            if !verbs.iter().any(|x| x == verb) {
+                verbs.push(verb.to_string());
+            }
+        }
+        out.push((k.clone(), verbs));
+    }
+    Ok(out)
+}
+
 /// `project_tracking.atlassian`, read and checked. It holds names, never values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    /// The write token variables and the allow-list.
+    pub write: WriteCfg,
     /// The site (`https://example.atlassian.net`), no trailing slash.
     pub site: String,
     /// Confluence's own site on Data Center, when it is not `site`.
@@ -159,6 +227,10 @@ impl Settings {
                 "pat_env",
                 "confluence_email_env",
                 "confluence_token_env",
+                "jira_write_token_env",
+                "confluence_write_token_env",
+                "pat_write_env",
+                "writes",
                 "timeout_s",
                 "min_interval_ms",
                 "max_retries",
@@ -199,6 +271,38 @@ impl Settings {
                 )
             }
         };
+        // The write variables may name a read variable (a legacy unscoped
+        // token does both, journal:ATLAS-TRACKERS:0054); separate scoped
+        // tokens are what the setup recommends.
+        let write_vars = (env("jira_write_token_env")?, env("confluence_write_token_env")?, env("pat_write_env")?);
+        match (&auth, &write_vars) {
+            (AuthRef::Cloud { .. }, (_, _, Some(_))) => {
+                return Err("project_tracking.atlassian.pat_write_env is for Data Center (with pat_env), not Cloud".into())
+            }
+            (AuthRef::Pat { .. }, (Some(_), _, _) | (_, Some(_), _)) => {
+                return Err(
+                    "project_tracking.atlassian: jira_write_token_env and confluence_write_token_env are for Cloud, not with pat_env".into()
+                )
+            }
+            _ => {}
+        }
+        let mut write = WriteCfg { jira_token_env: write_vars.0, confluence_token_env: write_vars.1, pat_env: write_vars.2, ..WriteCfg::default() };
+        if let Some(w) = f.get("writes") {
+            let wf = crate::config::Fields::new("project_tracking.atlassian.writes", w, &["jira", "confluence", "journal_lane"])
+                .map_err(|e| e.to_string())?;
+            if let Some(j) = wf.get("jira") {
+                write.jira = write_lists("jira", j, JIRA_VERBS)?;
+            }
+            if let Some(c) = wf.get("confluence") {
+                write.confluence = write_lists("confluence", c, CONFLUENCE_VERBS)?;
+            }
+            if let Some(l) = wf.string("journal_lane").map_err(|e| e.to_string())? {
+                if !key_ok(&l) {
+                    return Err("project_tracking.atlassian.writes.journal_lane is a lane name (letters, digits, - and _)".into());
+                }
+                write.lane = Some(l);
+            }
+        }
         let site_of = |k: &str| -> std::result::Result<Option<String>, String> {
             match f.string(k).map_err(|e| e.to_string())? {
                 None => Ok(None),
@@ -213,6 +317,7 @@ impl Settings {
         let num =
             |k: &str, d: u64| -> std::result::Result<u64, String> { Ok(f.uint(k).map_err(|e| e.to_string())?.map_or(d, |n| n as u64)) };
         Ok(Some(Settings {
+            write,
             site,
             confluence_site,
             auth,
@@ -276,6 +381,43 @@ impl Settings {
     /// Jira's.
     pub fn confluence_auth(&self) -> &AuthRef {
         self.confluence_auth.as_ref().unwrap_or(&self.auth)
+    }
+
+    /// The name of the configuration key a product's write token comes from.
+    pub fn write_key(&self, confluence: bool) -> &'static str {
+        match (&self.auth, confluence) {
+            (AuthRef::Pat { .. }, _) => "pat_write_env",
+            (_, true) => "confluence_write_token_env",
+            (_, false) => "jira_write_token_env",
+        }
+    }
+
+    /// The credential variables a product's writes use, or the key that is
+    /// missing: Cloud's email variable (the product's own, else Jira's) with
+    /// the write token variable, or Data Center's write PAT variable.
+    ///
+    /// # Errors
+    ///
+    /// The configuration key that names no variable (a read-only setup).
+    pub fn write_auth(&self, confluence: bool) -> std::result::Result<AuthRef, &'static str> {
+        let key = self.write_key(confluence);
+        match &self.auth {
+            AuthRef::Pat { .. } => self.write.pat_env.clone().map(|pat_env| AuthRef::Pat { pat_env }).ok_or(key),
+            AuthRef::Cloud { email_env, .. } => {
+                let token = if confluence { &self.write.confluence_token_env } else { &self.write.jira_token_env };
+                let email = match (&self.confluence_auth, confluence) {
+                    (Some(AuthRef::Cloud { email_env, .. }), true) => email_env,
+                    _ => email_env,
+                };
+                token.clone().map(|token_env| AuthRef::Cloud { email_env: email.clone(), token_env }).ok_or(key)
+            }
+        }
+    }
+
+    /// The journal lane a write is filed in: `lane` (the command's), else
+    /// `writes.journal_lane`, else [`DEFAULT_WRITE_LANE`].
+    pub fn write_lane(&self, lane: Option<&str>) -> String {
+        lane.map(str::to_string).or_else(|| self.write.lane.clone()).unwrap_or_else(|| DEFAULT_WRITE_LANE.to_string())
     }
 
     /// The per-request timeout.
@@ -492,14 +634,22 @@ pub const USAGE: &str = "usage: atlas track check
        atlas track cql QUERY [--limit N]
        atlas track snapshot ITEM [--status S --assignee A --summary T [--category C]]
        atlas track snapshot --all [--older-than DUR]
+       atlas track comment KEY (--body TEXT | --body-file F) [--again] [--apply] [--lane L]
+       atlas track transition KEY --to NAME|ID [--apply] [--lane L]
+       atlas track edit KEY [--assignee me|none|ACCOUNT_ID|QUERY] [--labels-add a,b] [--labels-remove c]
+                        [--sprint ID|none] [--apply] [--lane L]
+       atlas track page-update ID (--section HEADING [--append] --body-file F | --body-file F | --append --body-file F)
+                        [--title T] [--expect-version N] [--message M] [--apply] [--lane L]
        atlas queue plan --from-jql QUERY [--kind K] [--priority P] [--uses LIST] [--after LIST] [--scope TEXT]
                         [--order-from N] [--lane-from key|fixed:LANE] [--limit N]
 --limit counts every issue read, skipped ones included.
 Project tracking: reads Jira and Confluence directly with the token named by
 project_tracking.atlassian (token_env/email_env on Cloud, with an optional
 confluence_token_env; pat_env on Data Center). An issue handle keeps the whole
-record; a jql handle keeps only the fields asked for. Read-only: writes go
-through the Atlassian MCP connector. Setup: wiki/Project-tracking.md.";
+record; a jql handle keeps only the fields asked for. Writes show the exact
+request and send nothing without --apply; they need jira_write_token_env,
+confluence_write_token_env or pat_write_env and a writes allow-list, and each
+applied write is journaled. Setup: wiki/Project-tracking.md.";
 
 /// What `atlas track` runs with.
 pub struct Ctx<'a> {
@@ -536,6 +686,7 @@ pub fn cli(args: &[String], ctx: &Ctx<'_>) -> std::result::Result<ExitCode, Stri
     let s = ctx.settings.ok_or("atlas track: no project_tracking.atlassian in the configuration (see wiki/Project-tracking.md)")?;
     let mut out = std::io::stdout().lock();
     match word {
+        "comment" | "transition" | "edit" | "page-update" => write::cli(word, &args[1..], ctx, s),
         "check" => api::check(s, ctx, &mut out),
         "smoke" => api::smoke(s, ctx, &mut out, &args[1..]),
         "issue" | "jql" | "page" | "cql" => {

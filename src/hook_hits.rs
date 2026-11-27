@@ -65,7 +65,8 @@ pub struct Injection {
     pub read: usize,
 }
 
-/// Logs one injected key.
+/// Logs one injected key, with the framing it carries (see
+/// [`crate::hooks::Injected::frame`]) in its bytes.
 ///
 /// # Errors
 ///
@@ -74,7 +75,7 @@ pub fn log_injection(conn: &Connection, hook: &str, session: &str, agent: &str, 
     let time = crate::store::utc(SystemTime::now());
     crate::store::guarded(conn, || {
         conn.prepare_cached("INSERT INTO hook_inject(time, session, agent, transcript, hook, key, fts, cos, bytes, read) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)")?
-            .execute(params![time, session, agent, transcript, hook, k.key, k.fts, k.cos.map(f64::from), k.bytes as i64, read as i64])?;
+            .execute(params![time, session, agent, transcript, hook, k.key, k.fts, k.cos.map(f64::from), (k.bytes + k.frame) as i64, read as i64])?;
         Ok(())
     })
 }
@@ -115,22 +116,32 @@ fn injection_at(r: &crate::db::Row<'_>, o: usize) -> crate::db::Result<Injection
 /// rows in any session). Lane (`lane:`) rows are left out: a lane view's
 /// records are not logged one by one, so its key alone would hide the
 /// view and leave its records unmarked. Read only and fail open: a missing
-/// database, table or lock is an empty set.
-pub fn injected_keys(db: &Path, session: &str, agent: &str) -> HashSet<String> {
+/// database, table or lock is (empty, 0).
+///
+/// With them, the bytes the scope's rows sent, lane views included: what it
+/// has spent of `recall.session_budget_tokens` in earlier processes (#267).
+pub fn injected(db: &Path, session: &str, agent: &str) -> (HashSet<String>, usize) {
     if session.is_empty() && agent.is_empty() {
-        return HashSet::new();
+        return (HashSet::new(), 0);
     }
-    let read = || -> crate::db::Result<HashSet<String>> {
+    let read = || -> crate::db::Result<(HashSet<String>, usize)> {
         let conn = Connection::open_with_flags(db, crate::db::OpenFlags::SQLITE_OPEN_READ_ONLY | crate::db::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let mut st = if agent.is_empty() {
-            conn.prepare("SELECT key FROM hook_inject WHERE session = ?1 AND agent = '' AND key NOT LIKE 'lane:%'")?
+            conn.prepare("SELECT key, bytes FROM hook_inject WHERE session = ?1 AND agent = ''")?
         } else {
-            conn.prepare("SELECT key FROM hook_inject WHERE agent = ?1 AND key NOT LIKE 'lane:%'")?
+            conn.prepare("SELECT key, bytes FROM hook_inject WHERE agent = ?1")?
         };
         let id = if agent.is_empty() { session } else { agent };
-        let keys = st.query_map([id], |r| r.get::<_, String>(0))?.collect::<crate::db::Result<HashSet<String>>>()?;
-        Ok(keys)
+        let (mut keys, mut bytes) = (HashSet::new(), 0usize);
+        for row in st.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (key, b) = row?;
+            bytes += usize::try_from(b).unwrap_or(0);
+            if !key.starts_with("lane:") {
+                keys.insert(key);
+            }
+        }
+        Ok((keys, bytes))
     };
     read().unwrap_or_default()
 }

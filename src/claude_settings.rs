@@ -3658,6 +3658,16 @@ fn wide_root_lines(config: Option<&Path>) -> Vec<String> {
     out
 }
 
+/// The doctor's code index lines ([`crate::lsp::doctor_lines`]): what
+/// indexes each language of the configured code roots, or why it is
+/// scanned. No failure: a scanned language is still indexed.
+fn code_lines(config: Option<&Path>) -> Vec<String> {
+    let Some(c) = config.filter(|c| c.is_file()).and_then(|c| crate::config::Config::load(c).ok()) else { return Vec::new() };
+    let Some(spec) = c.code.as_ref() else { return Vec::new() };
+    let db = c.db.clone().unwrap_or_else(crate::dirs::default_db);
+    crate::lsp::doctor_lines(&crate::code::CodeSetup::from_spec(spec, &db, false))
+}
+
 /// The doctor's lines for stores a newer atlas made, which this binary refuses
 /// to open (the memory store, the index store and its code index), read with
 /// read-only opens so nothing is created or changed. The paths come from
@@ -3680,7 +3690,8 @@ fn store_lines(config: Option<&Path>) -> Vec<String> {
 /// atlas hooks against `hooks/hooks.json`, one honest line for each case: no
 /// settings file, a malformed one, no atlas hooks in it, a plugin install
 /// (whose hooks live in the plugin), or real hooks that match or differ. Also
-/// names a project root that is too wide in `config`, and a server Claude Code is
+/// names a project root that is too wide in `config`, what indexes each
+/// language of its code roots (or why it is scanned), a server Claude Code is
 /// holding off, and a store a newer atlas made. Exit 1 when the hooks
 /// differ, when the settings or plugin file could not be read, or when a
 /// store is too new for this binary (the stores at the configured or default
@@ -3735,6 +3746,9 @@ pub fn doctor_cli(args: &[String], config: Option<&Path>) -> Result<ExitCode, St
         }
     }
     for line in wide_root_lines(config) {
+        println!("{line}");
+    }
+    for line in code_lines(config) {
         println!("{line}");
     }
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);

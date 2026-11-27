@@ -179,8 +179,14 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `orchestrate.judge.classifier.weights`
 - `orchestrate.judge.classifier.weights_sha256`
 - `orchestrate.judge.enabled`
+- `orchestrate.judge.explore_every`
 - `orchestrate.judge.log`
 - `orchestrate.judge.mode`
+- `orchestrate.judge.require_brief`
+- `orchestrate.judge.require_header`
+- `orchestrate.judge.speculative`
+- `orchestrate.judge.speculative.enabled`
+- `orchestrate.judge.speculative.pick`
 - `orchestrate.kinds`
 - `orchestrate.kinds.brief-writer`
 - `orchestrate.kinds.brief-writer.models[].handoff`
@@ -244,6 +250,9 @@ Every key of `atlas.json` (and of a project file); the wiki page Configuration-r
 - `pr_events.repos`
 - `project_tracking`
 - `project_tracking.atlassian`
+- `project_tracking.atlassian.writes.confluence`
+- `project_tracking.atlassian.writes.jira`
+- `project_tracking.atlassian.writes.journal_lane`
 - `projects`
 - `projects[].code`
 - `projects[].db`
@@ -348,12 +357,15 @@ Answers are plain text; `format: "json"` gives JSON. A repeated read answers `un
   - op `sweep` runs `question_sweep`
   - op `deferred` runs `deferred_questions`
   - `key` `h:ID` (a digest's handle) reads that stored output: its first page, or one of `lines` (A-B), `item`, `failures`, `grep` (with `context`), `head`, `tail`, `page`, `digest`; a hint line `recall h:ID lines=A-B` is those arguments, and they may also follow the id in `key`; `key` `h:` lists the newest
+  - `key` `memory:SLUG` (or `memory:SLUG.md`) reads the memory record `SLUG`
 - `remember`: Store a memory, rule or decision; revising needs expected_sha; old: supersede.
   - with `old` runs `supersede`
 - `journal`: Append a lane journal entry: lane, entry, text. Review meta: role:, pr:, head:, verdict:.
   - entry `queued` files planned work, as `atlas queue plan` does: the text's first line is the title, the rest its scope; `meta` lines `kind:`, `priority:`, `uses:`, `after:` (queue keys or free text) and `order:` are checked, other lines kept
   - entry `review` files a review for the merge gate (`orchestrate.reviews`): `meta` lines `role:`, `pr:`, `head:` (the sha read), `verdict:` (pass, merge, merge with follow-ups, request changes) and `report:`
   - `amend: KEY` with `expected_sha` (the head's sha) rewrites that entry's title and body as a new version; its lane, entry, meta lines and refs stay (pass the same `lane` and `entry`, no `meta` or `refs`)
+  - a `note` or `commit` whose first line is `queue: KEY done` (more words may follow, but `queue: KEY done when X`, or with once, after, if, until or unless, is a condition and closes nothing), or any entry with ref `closes:KEY`, closes queued KEY: the queue and the resume card stop offering it
+  - a hold: an entry with `meta` lines `held: A, B` (what waits) and `until: TEXT`; once a later entry's key is TEXT or its first line names TEXT whole, as words (any case; a one-word TEXT only from the hold's own lane), the resume card lists it as owed now, until an entry with ref `closes:` the hold's key
 - `handoff`: Write a lane handoff (allowed past the context cap).
 - `note`: Vault notes, read only. op read: the whole note; section is cheaper for one heading. op help: every op and argument.
   - op `read` runs `read_note`
@@ -367,6 +379,7 @@ Answers are plain text; `format: "json"` gives JSON. A repeated read answers `un
   - op `vaults` runs `list_vaults`
   - op `sources` runs `list_sources`
   - op `judge` runs `judge_task`
+  - op `goal` runs `goal`
 - `edit`: Write vault notes; never deletes.
   - op `create` runs `create_note`
   - op `append` runs `append_to_note`
@@ -390,6 +403,7 @@ Answers are plain text; `format: "json"` gives JSON. A repeated read answers `un
   - op `conclude` runs `conclude_discussion`
   - op `unresolved` runs `mark_unresolved`
   - op `decide` runs `record_decision`
+- `track_write`: Jira or Confluence write; dry-run unless apply. Arguments: note op=help.
 - `miss`: Misses: report what atlas did not return, list them, resolve one.
   - op `report` runs `report_miss`
   - op `list` runs `misses`
@@ -481,12 +495,36 @@ Vaults and sources: root, files, sections.
 
 #### judge_task
 
-The task judge's model and effort pick for an agent launch prompt, as a Judge line to paste (orchestrate.judge.cells).
+The task judge's model and effort pick for an agent launch prompt, scored from the brief file it names, as a Judge line to paste (orchestrate.judge).
 
 - `prompt` string, required: The launch prompt.
 - `kind` string (reviewer, builder, research, other)
 - `subagent_type` string
 - `description` string: The launch's description.
+
+#### track_write
+
+Project tracking write: a Jira comment, transition or field edit, or a Confluence page update. Shows the request and sends nothing unless apply is true; refused unless project_tracking.atlassian.writes allows the verb for that project or space; answers one line. (writes)
+
+- `verb` string (comment, transition, edit, page_update), required
+- `target` string, required: Issue key, or page id.
+- `apply` boolean: Send it; without, a dry-run.
+- `body` string: A comment's text, or a page's new content.
+- `body_file` string: A file holding the body (not with body).
+- `again` boolean: Send a comment although the same went within ten minutes.
+- `to` string: A transition: status or transition name, or id.
+- `assignee` string: me, none, an account id, or a name to look up.
+- `labels_add` string: Comma list.
+- `labels_remove` string: Comma list.
+- `sprint` string: A numeric sprint id, or none.
+- `section` string: A page heading whose section is replaced (or extended with append).
+- `append` boolean: Add the body at the end of the page or section.
+- `title` string: A page's new title.
+- `expect_version` integer: Refuse unless the page is at this version.
+- `message` string: The page version's message.
+- `lane` string: The journal lane.
+- `reason` string, required: Why (12+ characters, not a placeholder); logged.
+- `discussion` string: Thread this comes from (vault:D-004).
 
 #### report_miss
 
@@ -845,6 +883,19 @@ Write a lane handoff (allowed past the context cap). A fresh agent starts from r
 - `title` string: One line; default the text's first line.
 - `text` string, required
 - `refs` array: prior:<key>, commit:<hash>, rule:<key>.
+
+#### goal
+
+The project's goal record goal:<slug> (one active). action show (default): version, state, text, amendments, spec, each gate and aim evaluated from measurement metric lines; set: a new goal (slug, lane, text verbatim, spec optional); amend: a new version (expected_sha; text an AMENDED paragraph, spec, or both); pause, resume, drop; done is refused until the met check lands. A spec write also journals a goal entry. (writes)
+
+- `action` string (show, set, amend, pause, resume, done, drop)
+- `slug` string: The goal's slug: goal:<slug>. show without it: the active goal.
+- `lane` string: With set: the lane that carries the goal's journal.
+- `text` string: With set: the goal verbatim. With amend: one paragraph `AMENDED <date> (<who>): <text>`, verbatim.
+- `spec` string: gate, aim, report, lane, step, cadence and stall lines (docs/design/atlas-goal.md section 3), stored verbatim; atlas derives none from the text.
+- `expected_sha` string: With amend: the head's sha (show prints it).
+- `reason` string: Why; logged. Default: the action.
+- `discussion` string: Thread this comes from (vault:D-004).
 
 #### journal_status
 

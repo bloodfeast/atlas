@@ -1,0 +1,6 @@
+{"timestamp":"2026-11-25T14:35:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000001","timestamp":"2026-11-25T14:35:00.000Z","cwd":"C:\\path\\to\\project","originator":"codex_cli_rs","cli_version":"0.0.0-synthetic","instructions":null}}
+{"timestamp":"2026-11-25T14:35:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"About the widget cache: why does it evict entries past sixty four widgets?"}]}}
+{"timestamp":"2026-11-25T14:35:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":312000,"cached_input_tokens":0,"output_tokens":900,"reasoning_output_tokens":0,"total_tokens":312900},"model_context_window":400000}}}
+{"timestamp":"2026-11-25T14:35:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The widget cache evicts least recently used entries."}]}}
+{"timestamp":"2026-11-25T14:35:04.000Z","type":"compacted","payload":{"message":"Summary: the widget cache evicts LRU entries. See widget-cache@000000000000 and turn:00000000-1@000000000000."}}
+{"timestamp":"2026-11-25T14:35:05.000Z","type":"event_msg","payload":{"type":"context_compacted"}}

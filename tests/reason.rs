@@ -54,6 +54,8 @@ fn write_calls(sha_of_index: &str) -> Vec<(&'static str, Value)> {
         ("resolve_miss", json!({"id": 1})),
         ("remember", json!({"kind": "decision", "key": "decision:0001", "body": "use the bounded cache"})),
         ("supersede", json!({"old": "decision:0001", "body": "use the unbounded cache after all"})),
+        // Needs a project_tracking configuration to go through; the reason is checked first.
+        ("track_write", json!({"verb": "comment", "target": "PROJ-1", "body": "x"})),
     ]
 }
 
@@ -77,8 +79,9 @@ fn every_write_tool_requires_a_real_reason() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     // Journal entries and handoffs record their entry kind as the reason;
-    // the hook (it writes journal entries: context caps, checkpoints) its event.
-    assert_eq!(self_reasoned, vec!["open_discussion", "post", "journal", "handoff", "hook"]);
+    // the goal tool (note op=goal) its action unless a reason is given; the
+    // hook (it writes journal entries: context caps, checkpoints) its event.
+    assert_eq!(self_reasoned, vec!["open_discussion", "post", "journal", "handoff", "goal", "hook"]);
     let mut writes: Vec<String> = tools
         .iter()
         .filter(|t| t["annotations"]["readOnlyHint"] != json!(true))
@@ -131,7 +134,7 @@ fn every_write_tool_requires_a_real_reason() {
 
     // The same calls with a real reason go through.
     // (Thread tools are exercised with real threads in tests/discussions.rs.)
-    for (tool, args) in calls.into_iter().filter(|(_, a)| a.get("thread").is_none()) {
+    for (tool, args) in calls.into_iter().filter(|(t, a)| a.get("thread").is_none() && *t != "track_write") {
         let mut a = args.clone();
         a["reason"] = json!("checking that every write tool accepts a real reason");
         if tool == "replace_section" {

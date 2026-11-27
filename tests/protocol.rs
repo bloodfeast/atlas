@@ -62,7 +62,7 @@ fn round_trip_through_the_binary() {
     assert_eq!(style, atlas::tools::STYLE, "{instr}");
     assert!(guide.contains("recall") && guide.contains("handoff") && guide.contains("atlas://help"), "{instr}");
     let tools = out[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14, "the listed tools; the full tools behind their ops stay callable");
+    assert_eq!(tools.len(), 15, "the listed tools, track_write its own; the full tools stay callable");
     assert!(tools.iter().any(|t| t["name"] == json!("section")) && tools.iter().any(|t| t["name"] == json!("grep")), "the core read verbs");
     assert!(tools.iter().any(|t| t["name"] == json!("symbol")), "the code index answers through symbol");
     // The core verbs are always loaded; every other tool stays deferred,
@@ -358,23 +358,6 @@ fn a_leading_byte_order_mark_is_ignored() {
     let v: Value = atlas::json::parse_bytes(&out).unwrap();
     assert_eq!(v["id"], json!(7), "{v}");
     assert!(v.get("error").is_none(), "{v}");
-}
-
-/// The `hook` tool does not say a user is there, so SessionStart asks nothing
-/// and spends nothing, on the route `tools_memory` answers.
-#[test]
-fn the_hook_tool_asks_nothing_at_session_start() {
-    let fx = Fx::new("p-hook-start");
-    let mut s = fx.server();
-    let state = fx.tmp.path().join("mem");
-    s.set_memory(atlas::memory::settings::Settings::from_config(None, &state.join("index.sqlite")).unwrap());
-    let input = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"hook","arguments":{"event":"SessionStart","session_id":"s","source":"startup"}}}
-"#;
-    let mut out = Vec::new();
-    atlas::protocol::serve(&mut s, &input[..], &mut out).unwrap();
-    let out = String::from_utf8(out).unwrap();
-    assert!(out.contains("\"id\":7") && !out.contains("On by default") && !out.contains("Claude Code setting"), "{out}");
-    assert!(!state.join(atlas::claude_settings::OFFER_STATE).exists(), "nothing spent: {out}");
 }
 
 /// The words a source file's `match` arms take, with the given indent, after

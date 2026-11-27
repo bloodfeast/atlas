@@ -189,12 +189,32 @@ const TOOLS: &[ToolDef] = &[
     ToolDef { name: "list_sources", description: "Vaults and sources: root, files, sections.", read_only: true, schema: || obj(with_fmt(json!({})), &[]) },
     ToolDef {
         name: "judge_task",
-        description: "The task judge's model and effort pick for an agent launch prompt, as a Judge line to paste (orchestrate.judge.cells).",
+        description: "The task judge's model and effort pick for an agent launch prompt, scored from the brief file it names, as a Judge line to paste (orchestrate.judge).",
         read_only: true,
         schema: || {
             obj(
                 json!({"prompt": s("The launch prompt."), "kind": e(&crate::taskjudge::KINDS), "subagent_type": s(""), "description": s("The launch's description.")}),
                 &["prompt"],
+            )
+        },
+    },
+    ToolDef {
+        name: "track_write",
+        description: "Project tracking write: a Jira comment, transition or field edit, or a Confluence page update. Shows the request and sends nothing unless apply is true; refused unless project_tracking.atlassian.writes allows the verb for that project or space; answers one line.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({
+                    "verb": e(&["comment", "transition", "edit", "page_update"]), "target": s("Issue key, or page id."),
+                    "apply": b("Send it; without, a dry-run."), "body": s("A comment's text, or a page's new content."),
+                    "body_file": s("A file holding the body (not with body)."), "again": b("Send a comment although the same went within ten minutes."),
+                    "to": s("A transition: status or transition name, or id."), "assignee": s("me, none, an account id, or a name to look up."),
+                    "labels_add": s("Comma list."), "labels_remove": s("Comma list."), "sprint": s("A numeric sprint id, or none."),
+                    "section": s("A page heading whose section is replaced (or extended with append)."), "append": b("Add the body at the end of the page or section."),
+                    "title": s("A page's new title."), "expect_version": n("Refuse unless the page is at this version."),
+                    "message": s("The page version's message."), "lane": s("The journal lane.")
+                }),
+                &["verb", "target"],
             )
         },
     },
@@ -481,6 +501,25 @@ const TOOLS: &[ToolDef] = &[
         schema: || obj(json!({"lane": s(""), "title": s("One line; default the text's first line."), "text": s(""), "refs": strs("prior:<key>, commit:<hash>, rule:<key>.")}), &["lane", "text"]),
     },
     ToolDef {
+        name: "goal",
+        description: "The project's goal record goal:<slug> (one active). action show (default): version, state, text, amendments, spec, each gate and aim evaluated from measurement metric lines; set: a new goal (slug, lane, text verbatim, spec optional); amend: a new version (expected_sha; text an AMENDED paragraph, spec, or both); pause, resume, drop; done is refused until the met check lands. A spec write also journals a goal entry.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({
+                    "action": e(&["show", "set", "amend", "pause", "resume", "done", "drop"]),
+                    "slug": s("The goal's slug: goal:<slug>. show without it: the active goal."),
+                    "lane": s("With set: the lane that carries the goal's journal."),
+                    "text": s("With set: the goal verbatim. With amend: one paragraph `AMENDED <date> (<who>): <text>`, verbatim."),
+                    "spec": s("gate, aim, report, lane, step, cadence and stall lines (docs/design/atlas-goal.md section 3), stored verbatim; atlas derives none from the text."),
+                    "expected_sha": s("With amend: the head's sha (show prints it)."),
+                    "reason": s("Why; logged. Default: the action.")
+                }),
+                &[],
+            )
+        },
+    },
+    ToolDef {
         name: "journal_status",
         description: "Active lanes (an open question, a queued entry or a record in the last 14 days): entries, last entry, last commit, open questions, handoffs; then +N idle lanes. all lists every lane.",
         read_only: true,
@@ -635,7 +674,7 @@ const DISCUSSION_DESC: &str = "Thread this comes from (vault:D-004).";
 
 /// Write tools whose post body serves as the audit reason, so they take no
 /// `reason` argument.
-const SELF_REASONED: &[&str] = &["open_discussion", "post", "journal", "handoff", "hook"];
+const SELF_REASONED: &[&str] = &["open_discussion", "post", "journal", "handoff", "hook", "goal"];
 /// Write tools that act on a thread, so the thread is their `discussion`.
 const THREAD_WRITES: &[&str] = &["open_discussion", "post", "conclude_discussion", "mark_unresolved", "record_decision", "remember", "supersede", "journal", "handoff"];
 
@@ -708,13 +747,26 @@ impl Server {
                 .ok_or_else(|| Error::InvalidArgument(format!("kind {k:?}; use {}", crate::taskjudge::KINDS.join(", "))))?,
             None => crate::taskjudge::launch_kind(prompt, opt_str(a, "subagent_type")?.unwrap_or(""), opt_str(a, "description")?.unwrap_or("")),
         };
+        // A prompt that names a brief file is judged on that file: a missing
+        // file is an error, not a fallback to the pointer (TASK-JUDGE 0268).
+        // With neither the classifier nor the speculative rule on, nothing
+        // reads the brief, so a read error is not an error (S5).
+        let brief = match crate::taskjudge::read_brief(prompt) {
+            Err(_) if !s.classifier.enabled && s.speculative.is_none() => None,
+            r => r.map_err(|e| Error::NotFound(format!("the task judge cannot read the named {e}")))?,
+        };
         let p = crate::taskjudge::judge(&cells, prompt, kind);
+        let rule_a = json!({"line": crate::taskjudge::line(&p), "scope": p.scope, "unknowns": p.unknowns, "model": p.model, "effort": p.effort, "split": p.split, "source": p.source});
         let mut out = json!({
             "line": crate::taskjudge::line(&p), "kind": kind, "scope": p.scope, "unknowns": p.unknowns,
             "model": p.model, "effort": p.effort, "split": p.split, "source": p.source,
         });
-        // The work classifier, when on: its score and pick ride along; off,
-        // the answer is unchanged.
+        if let (Some(b), Some(o)) = (&brief, out.as_object_mut()) {
+            o.insert("brief".into(), json!(b.path.display().to_string().replace('\\', "/")));
+        }
+        // The work classifier, when on: its pick is the answer and rule A the
+        // labelled fallback; when it cannot score, the answer says why
+        // (never silent). Off, the answer is rule A's alone.
         if s.classifier.enabled {
             // The launch hook's scoring (same function, same cache): the
             // encoder loads only on a cache miss.
@@ -722,13 +774,60 @@ impl Server {
             let cache = store.as_deref().and_then(crate::taskjudge::score_cache);
             let mut scratch = crate::embed::bert::Scratch::default();
             let c = crate::taskjudge::classify_with(&s.classifier, prompt, kind, cache.as_deref(), &mut |text| {
-                let m = crate::embed::Model::load(model_path.as_deref()?).ok()?;
-                (m.id == crate::taskjudge::CLASSIFIER_MODEL && m.dim == crate::taskjudge::CLASSIFIER_DIM)
-                    .then(|| crate::taskjudge::input_vector(&m, text, &mut scratch))
+                crate::taskjudge::embed_file(model_path.as_deref(), text, &mut scratch)
             });
-            if let (Some(c), Some(o)) = (c, out.as_object_mut()) {
-                let line = crate::taskjudge::class_line(&c);
-                o.insert("classifier".into(), json!({"line": line, "score": c.score, "source": c.source, "model": c.model, "effort": c.effort}));
+            let mut fresh = Map::new();
+            let o = out.as_object_mut().unwrap_or(&mut fresh);
+            match c {
+                Ok(Some(c)) => {
+                    o.insert(
+                        "classifier".into(),
+                        json!({"line": crate::taskjudge::class_line(&c), "score": c.score, "source": c.source, "model": c.model, "effort": c.effort}),
+                    );
+                    o.insert("line".into(), json!(crate::taskjudge::judge_line(&c)));
+                    o.insert("model".into(), json!(c.model));
+                    o.insert("effort".into(), json!(c.effort));
+                    o.insert("score".into(), json!(c.score));
+                    o.insert("source".into(), json!(format!("classifier ({})", c.source)));
+                    for k in ["scope", "unknowns", "split"] {
+                        o.remove(k);
+                    }
+                    o.insert("fallback".into(), rule_a);
+                }
+                Ok(None) => {}
+                Err(why) => {
+                    o.insert("line".into(), json!(crate::taskjudge::unavailable_line(&why, &p)));
+                    o.insert("source".into(), json!("rule A (fallback: classifier unavailable)"));
+                    o.insert("classifier".into(), json!({"unavailable": why}));
+                }
+            }
+        }
+        // The speculative rule, when configured: a builder brief that names
+        // no acceptance tests goes to its pick; a specified build never does.
+        if let (Some((m, e)), Some(b), "builder") = (&s.speculative, &brief, kind) {
+            if b.header.speculative() {
+                if let Some(o) = out.as_object_mut() {
+                    let was = format!("{}/{}", o["model"].as_str().unwrap_or(""), o["effort"].as_str().unwrap_or(""));
+                    o.insert(
+                        "line".into(),
+                        json!(format!(
+                            "Judge: speculative (Acceptance: none named) -> {m}, {e} (atlas speculative rule; the pick was {was})."
+                        )),
+                    );
+                    o.insert("model".into(), json!(m));
+                    o.insert("effort".into(), json!(e));
+                    o.insert("speculative".into(), json!(true));
+                }
+            }
+        }
+        // A pick that is Brandon's call (fable/max, any xhigh/max effort) is
+        // suggested, never launched without him (TASK-JUDGE 0306).
+        if let Some(o) = out.as_object_mut() {
+            let picked = (o["model"].as_str().unwrap_or("").to_string(), o["effort"].as_str().unwrap_or("").to_string());
+            if let Some(suffix) = crate::judge_enforce::suggest_suffix(&picked) {
+                let line = format!("{}{suffix}", o["line"].as_str().unwrap_or(""));
+                o.insert("line".into(), json!(line));
+                o.insert("needs_brandon".into(), json!(true));
             }
         }
         Ok(out)
@@ -743,6 +842,23 @@ fn all_tools() -> impl Iterator<Item = &'static ToolDef> {
 /// rescan the vaults).
 fn is_package_tool(name: &str) -> bool {
     lean_tools::TOOLS.iter().chain(intake_tools::TOOLS).any(|t| t.name == name)
+}
+
+impl Server {
+    /// `track_write` (a listed tool of its own, ruling journal:ATLAS-TRACKERS:0062): the function behind `atlas track
+    /// comment|transition|edit|page-update`, dry-run unless `apply` is true.
+    fn track_write(&mut self, a: &Map) -> Result<Value> {
+        let m = self.memory.as_ref().ok_or_else(|| Error::NotFound("project tracking needs the memory settings".into()))?;
+        let s = m.settings.trackers.as_ref().ok_or_else(|| Error::NotFound("no project_tracking.atlassian in the configuration".into()))?;
+        let env = |n: &str| std::env::var(n).ok();
+        let ctx = crate::trackers::Ctx { settings: Some(s), db: &m.settings.index_db, lean: m.settings.lean.as_ref(), store: &m.settings.store, env: &env };
+        let r = crate::trackers::write::run_map(&ctx, s, a).map_err(Error::InvalidArgument)?;
+        if r.code == 0 {
+            Ok(Value::String(r.text))
+        } else {
+            Err(Error::InvalidArgument(r.text))
+        }
+    }
 }
 
 fn arg_str<'a>(a: &'a Map, k: &str) -> Result<&'a str> {
@@ -1290,6 +1406,7 @@ impl Server {
             "read_note" => self.read_note(a),
             "find_by_frontmatter" => self.find_by_frontmatter(a),
             "judge_task" => self.judge_task(a),
+            "track_write" => self.track_write(a),
             "backlinks" | "outlinks" => self.links(a, name == "backlinks"),
             "broken_links" => self.broken_links(a),
             "write_log" => self.write_log(a),

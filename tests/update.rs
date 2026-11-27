@@ -770,6 +770,8 @@ fn a_source_build_asks_nothing_and_shows_nothing() {
             .arg(&cfg)
             .args(args)
             .env("ATLAS_HOME", &home)
+            // Not the developer's own Claude settings: SessionStart points their status line at this binary.
+            .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
             .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .env_remove("ATLAS_UNATTENDED")

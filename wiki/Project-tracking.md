@@ -4,9 +4,11 @@ request is made, keeps it in memory for that one command, and never writes it an
 handles, errors, hook output or tool answers). The reads are digested at the source, the same way large tool output
 is (see [[Handles and digests]]): you get a short digest, and the full response is kept as a handle for 7 days.
 
-The client is read-only by construction: it sends `GET` and nothing else, to a fixed list of read endpoints (the JQL
-and CQL searches are `GET`s too). Creating, editing, transitioning, commenting and deleting stay with the Atlassian
-MCP connector, behind Claude Code's permission prompts.
+The read client is read-only by construction: it sends `GET` and nothing else, to a fixed list of read endpoints (the
+JQL and CQL searches are `GET`s too). Four writes live in a separate module with their own endpoint list: a Jira
+comment, a transition, a field edit (assignee, labels, sprint) and a Confluence page update (see [Writes](#writes)).
+They are off until you give them a write token of their own and a per-project allow-list, and every one is a dry-run
+until `--apply`. Creating and deleting issues or pages stay with the Atlassian MCP connector.
 
 ## Setup
 
@@ -127,7 +129,20 @@ Tick: `read:page:confluence` and `read:content-details:confluence`. One token ca
 together, so if a CQL search with the granular scope alone comes back thin, add `search:confluence` and
 `read:confluence-user`.
 
-Write scopes arrive with writes; until then atlas reads only, and a token with read scopes only is all it needs.
+Reads need nothing more. For writes, create a second token per product with the write scopes below, and name its
+variable in `jira_write_token_env` / `confluence_write_token_env`; fine-grained tokens are recommended at setup, so a
+leaked write token reaches only what the scopes list. The write token is used for the write request alone; the pre-reads
+(current status, transitions, the page's version) use the read token.
+
+| Write | Jira classic | Confluence granular |
+|---|---|---|
+| comment, transition, edit | `write:jira-work` and `read:jira-work` (to read the status, transitions and field list), `read:jira-user` (assignee `me` or a name) | |
+| page update | | `read:page:confluence`, `write:page:confluence`, and `read:space:confluence` when the allow-list names a space by key rather than by id |
+
+Tick for Jira writes: `write:jira-work`, `read:jira-work`, `read:jira-user`. Tick for Confluence writes:
+`read:page:confluence`, `write:page:confluence` (plus `read:space:confluence` for a keyed allow-list). On Data Center
+and Server a personal access token has no scopes: make it a low-permission user's, with only the projects and spaces
+you list in `writes`.
 
 ### Not yet verified on a real site
 
@@ -135,6 +150,11 @@ Write scopes arrive with writes; until then atlas reads only, and a token with r
 - A CQL search with the granular `read:content-details:confluence` alone may return hits without some fields.
 - The v2 page body (`body-format=storage`) is assumed covered by `read:page:confluence`.
 - The granular names are marked beta by Atlassian and have been renamed before.
+- The write calls (the ADF comment body, the transition and edit payloads, the v2 page PUT with `version.number`, a
+  sprint set through the field list) are built from the documented shapes and tested against fixtures and a local
+  socket server only; none has been run against a real site. Try the dry-run, then one `--apply` on a test issue and
+  page, and report what the site says.
+- Whether the write scopes above are sufficient, and the exact granular names, are unconfirmed in the same way.
 
 ## Commands
 
@@ -147,6 +167,12 @@ atlas track page ID
 atlas track cql QUERY [--limit N]
 atlas track snapshot ITEM [--status S --assignee A --summary T [--category C]]
 atlas track snapshot --all [--older-than DUR]
+atlas track comment KEY (--body TEXT | --body-file F) [--again] [--apply] [--lane L]
+atlas track transition KEY --to NAME|ID [--apply] [--lane L]
+atlas track edit KEY [--assignee me|none|ACCOUNT_ID|QUERY] [--labels-add a,b] [--labels-remove c]
+                 [--sprint ID|none] [--apply] [--lane L]
+atlas track page-update ID (--section HEADING [--append] --body-file F | --body-file F | --append --body-file F)
+                 [--title T] [--expect-version N] [--message M] [--apply] [--lane L]
 atlas queue plan --from-jql QUERY [--kind K] [--priority P] [--uses LIST] [--after LIST] [--scope TEXT]
                  [--order-from N] [--lane-from key|fixed:LANE] [--limit N]
 ```
@@ -279,6 +305,87 @@ atlas queue plan --from-jql 'sprint in openSprints() AND assignee = currentUser(
 - One line per issue, then a summary: `from-jql: 2 planned, 1 skipped (an open item tracks them), 0 failed`. The exit
   code is 1 when an item could not be filed. It needs the direct read; without a token it prints the per-issue
   fallback and exits 2.
+
+## Writes
+
+Four writes, each the same through the command line and the MCP tool `track_write` (`verb` is `comment`,
+`transition`, `edit` or `page_update`; the other flags are fields of the same names; `apply` is false unless set):
+a Jira comment, a transition, an edit of assignee, labels and sprint, and a Confluence page update. Nothing creates or
+deletes.
+
+`track_write` is a tool of its own, marked as a write (no `readOnlyHint`), so a client asks before it runs unless its
+permissions allow `track_write` by name; `note` stays read only. A client that allows `track_write` without asking lets
+an agent send with `apply: true`, and then the `writes` allow-list below is the only gate: allow it per project only
+where that is what you want.
+
+Turn them on with a write token of its own and an allow-list (nothing is allowed by default):
+
+```json
+{"project_tracking": {"atlassian": {
+  "jira_write_token_env": "ATLASSIAN_WRITE_TOKEN",
+  "confluence_write_token_env": "CONFLUENCE_WRITE_TOKEN",
+  "writes": {
+    "jira": {"PROJ": ["comment", "transition", "assignee", "labels", "sprint"]},
+    "confluence": {"4456": ["page_update"]},
+    "journal_lane": "PROJECT-TRACKING"
+  }
+}}}
+```
+
+Data Center and Server use `pat_write_env` instead. The write variable may name the same variable as the read one, but
+a separate, narrowly scoped token is the recommendation: atlas reads the write variable only when `--apply` sends, so
+a read-only setup never touches it. A set write variable that is empty or unset is named in the refusal, never its value.
+
+- **Allow-list.** A verb on a project (Jira) or space (Confluence) outside `writes` is refused with nothing sent, and an
+  `edit` naming one disallowed field (say `labels` without `labels` allowed) sends nothing at all. A Jira key's prefix
+  is not trusted: a moved issue keeps answering to its old key, so before every Jira write atlas reads the issue once
+  (`GET issue/{key}?fields=project,status`, read token) and checks the list against `fields.project.key`; a key whose
+  typed prefix is not listed is refused before that read. The dry-run shows the project it read. A Confluence
+  allow-list entry is a space id; a space key also works and costs one read (`GET /api/v2/spaces/{id}`, scope
+  `read:space:confluence`).
+- **Dry-run first.** Without `--apply` atlas reads what it needs, prints the exact request (method, URL, body, header
+  redacted) and sends nothing. The output of `--apply` is one line, the outcome and the journal key.
+- **Journaled.** Every applied write is journaled once, to `writes.journal_lane` (default `PROJECT-TRACKING`, or
+  `--lane`), with the target and what changed, never the body.
+- **Idempotent.** A comment identical to one sent in the last ten minutes is refused unless `--again`. A transition to the
+  status the issue is already in sends nothing. A 429 is retried for every write. After a 5xx or a dropped connection
+  a comment is never sent again (it says to check), a transition re-reads the status before a retry, and a page update
+  re-reads the version. An `edit` retries a 5xx without a re-read: its body sets fields and adds or removes labels, so
+  sending it twice leaves the issue as sending it once does.
+- **A page is never overwritten blind.** `page-update` reads the page's version, sends version + 1 with the body, and
+  refuses on a 409 or when `--expect-version` is stale. `--section HEADING` replaces what follows that heading up to the
+  next heading of the same or a higher level in the same element (the heading is kept), `--append` adds to the end of
+  the section or page, and a missing or repeated heading is refused with the count. A heading inside a layout column,
+  a table cell or a macro body ends its section at that element's close, so neither a replace nor an append crosses into
+  the next column or cell; a heading in a code macro's CDATA or a comment is not a heading. A page body or a new section
+  whose tags do not nest cannot be scoped and is refused with the reason. The body is Confluence storage format. The
+  model sends only the section, which is most of the saving against the Atlassian MCP; the request to Confluence still
+  carries the whole page body (atlas reads the page and splices the section in).
+- **Errors do not assume a 403.** The refusal names the HTTP status and what it usually means (token scopes, the
+  project's permission, the allow-list) without claiming one cause. Refusals and failures print to stderr; a success to
+  stdout.
+
+## Cost against the Atlassian MCP
+
+The Atlassian MCP tool replies are the whole resource (the comment with its author and avatar URLs, the issue, the full
+page body) and an update takes the whole page in. atlas replies with one line, and for a section update the model
+sends only the section (atlas still PUTs the whole page to Confluence). Measured per write, with the model's tokens estimated by `cargo xtask write-cost` (xtask/src/bpe.rs):
+
+| write | atlas sends | MCP sends | atlas dry-run reply | atlas --apply reply | MCP reply |
+|---|---|---|---|---|---|
+| comment | 157 B / 62 tok | 204 B / 101 tok | 450 B / 194 tok | 57 B / 32 tok | 2534 B / 1369 tok |
+| transition | 48 B / 19 tok | 175 B / 111 tok | 305 B / 132 tok | 57 B / 31 tok | 5709 B / 2943 tok (assumed) |
+| edit | 101 B / 44 tok | 192 B / 111 tok | 422 B / 199 tok | 84 B / 44 tok | 4094 B / 2111 tok (assumed) |
+| page_update | 663 B / 265 tok | 6085 B / 2182 tok | 553 B / 226 tok | 77 B / 39 tok | 6091 B / 2177 tok |
+
+Basis: documented response shapes as synthetic fixtures; swap in recorded replies from a live run when Brandon has them.
+The MCP reply for a transition and an edit is assumed (marked so in the table): the REST calls behind both answer
+`204 No Content`, and whether the Atlassian MCP returns the whole issue there is unverified until a live run. A
+dry-run and then `--apply` costs both: the model sends the write twice and reads both replies (the comment row:
+62 + 194 + 62 + 32 = 350 tokens, against 101 + 1369 = 1470 for the MCP).
+The atlas replies are the real output of the write code against fixtures (the golden is checked by a test), the MCP
+side is `fixtures/atlassian/mcp-replies/`. A transition through the MCP is two calls (list transitions, then
+transition), both counted. The page row uses `--section` on a 6 KB page with a 600-byte section.
 
 ## Being polite to the site
 

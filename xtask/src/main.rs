@@ -122,6 +122,7 @@ mod usage;
 mod verify_macos;
 mod version;
 mod wiki;
+mod write_cost;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -154,6 +155,7 @@ const USAGE: &str = "usage: cargo xtask calibrate-baseline --config CONFIG --tra
        cargo xtask restore-clipped --store FILE --from JSON
        cargo xtask resume-eval --store FILE --transcript PATH --now TIME --questions FILE [--source clear|startup] [--max-tokens N] [--rows]
        cargo xtask token-ratio FILE ... [--bench]
+       cargo xtask write-cost
        cargo xtask compact-live --transcripts DIR --work DIR [--atlas-bin EXE --atlas-config FILE] [--claude EXE] [--sessions N] [--per-session N] [--thresholds T,T] [--per-threshold N] [--samples N] [--calibrate DIR] [--index-newer-ok] [--stop-at TOKENS] [--only JOB,JOB] [--dry-run | --score | --spend | --measure]
            --only runs the jobs whose names start with one of JOB, on a fresh or a resumed plan; run.json keeps every job.
            --stop-at is checked only before each job, never mid-job, against the input tokens of finished jobs (cache
@@ -179,6 +181,7 @@ fn main() -> ExitCode {
         "clipped" => clipped(args),
         "restore-clipped" => restore_clipped(args),
         "resume-eval" => resume_eval(args),
+        "write-cost" => write_cost::run(),
         "token-ratio" => {
             let bench = args.iter().any(|a| a == "--bench");
             let files: Vec<String> = args.into_iter().filter(|a| a != "--bench").collect();

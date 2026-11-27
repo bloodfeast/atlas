@@ -2,8 +2,25 @@
 //! root's rows ([`index_root`]) and the background indexer thread
 //! ([`Indexer`]) that keeps them current.
 //!
-//! rust-analyzer is the one program atlas starts, and only here, never on
-//! the query path:
+//! The programs atlas starts, only here and never on the query path:
+//!
+//! * rust-analyzer, for Rust roots (below);
+//! * the SCIP indexers of the language table ([`crate::langs::Driver`]:
+//!   scip-go, scip-typescript, scip-dotnet, scip-python, scip-java), one per
+//!   unit, the same way;
+//! * the language servers of the table ([`crate::langs::LspServer`]:
+//!   gopls, basedpyright-langserver, pyright-langserver), for a unit whose
+//!   SCIP indexer is missing or failed ([`crate::lsp`]): asked
+//!   `textDocument/documentSymbol` per file over stdio, at most 8 requests
+//!   in flight, a file's answer cached until it changes, shut down at the
+//!   end of the unit and killed 5 s after `exit` or at the timeout.
+//!
+//! Each is found as configured (`code.indexers`, by tool name), else on
+//! `PATH` or in its usual install folder, and must answer its version
+//! argument; each runs at below-normal priority, is killed when it passes
+//! `code.timeout_s`, and waits while a foreign `cargo` runs (or, with
+//! `orchestrate.runq_root` set, while runq holds a heavy compile).
+//! rust-analyzer is:
 //!
 //! * found as configured, else as `rust-analyzer` on `PATH`, else in a
 //!   rustup toolchain's `bin` folder (default toolchain first); each
@@ -32,7 +49,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -75,6 +92,29 @@ pub fn answers(launch: &crate::langs::Launch, arg: &str) -> bool {
     c.status().is_ok_and(|s| s.success())
 }
 
+/// What a program prints given one argument, when it exits with success
+/// (a language server's version); `None` when it is still running after
+/// `timeout` (it is killed).
+pub fn answer_text(launch: &crate::langs::Launch, arg: &str, timeout: Duration) -> Option<String> {
+    let mut c = Command::new(&launch.program);
+    c.args(&launch.pre).arg(arg).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    no_window(&mut c);
+    let child = c.spawn().ok()?;
+    let pid = child.id();
+    // The waiter owns the child; the timer is a channel receive.
+    let (tx, rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let out = child.wait_with_output();
+        let _ = tx.send(());
+        out
+    });
+    if rx.recv_timeout(timeout).is_err() {
+        crate::platform::process::terminate(pid);
+    }
+    let out = waiter.join().ok()?.ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// npm's global package folder (`npm root -g`), asked once per process.
 pub(crate) fn npm_root() -> Option<PathBuf> {
     static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -101,7 +141,7 @@ pub(crate) fn no_window(c: &mut Command) {
 pub(crate) fn no_window(_c: &mut Command) {}
 
 #[cfg(windows)]
-fn below_normal(c: &mut Command) {
+pub(crate) fn below_normal(c: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
@@ -109,7 +149,7 @@ fn below_normal(c: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn below_normal(_c: &mut Command) {}
+pub(crate) fn below_normal(_c: &mut Command) {}
 
 /// Finds a working rust-analyzer.
 ///
@@ -275,6 +315,9 @@ pub struct IndexReport {
     pub write_ms: f64,
     /// Everything, milliseconds.
     pub total_ms: f64,
+    /// The fingerprint the run stored: its walk's, taken before any file was
+    /// read.
+    pub fingerprint: String,
 }
 
 fn decode_mem(ix: &scip::Index<'_>, file: usize) -> usize {
@@ -308,9 +351,12 @@ fn decode_mem(ix: &scip::Index<'_>, file: usize) -> usize {
 /// is written from the line scan and the report says why.
 pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rust: &RustSource) -> Result<IndexReport> {
     let t0 = Instant::now();
+    // The rows are as current as the walk: a file changed after it began is
+    // not served from them (`code::file_items` compares mtimes with this).
+    let started = crate::store::utc(SystemTime::now());
     let walk = root.walk()?;
     let fingerprint = walk.fingerprint_with(&root.scip.configured());
-    let mut rep = IndexReport { root: root.name.clone(), ..IndexReport::default() };
+    let mut rep = IndexReport { root: root.name.clone(), fingerprint: fingerprint.clone(), ..IndexReport::default() };
     let mut scip_bytes: Option<Vec<u8>> = None;
     let has_manifest = root.root.join("Cargo.toml").is_file();
     // A root of another language's code alone (a Go service) has no Rust
@@ -463,8 +509,13 @@ pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rus
         rep.units.insert(0, code::Unit { dir: String::new(), lang: "rust".into(), source: rep.rust.clone() });
     }
     rep.rust = code::units_note(&rep.units);
-    let elapsed = t0.elapsed().as_millis() as u64;
-    rep.write = code::write_root(conn, &root.name, &root.root, &rows, &text_of, &fingerprint, &rep.units, elapsed)?;
+    // The other roots this run makes stale are marked before its own rows
+    // and fingerprint are written. A failure here then leaves the old
+    // fingerprint, so the root is run again and its before-state (read from
+    // the store) still differs, and the marks are made then. Marked after
+    // the write, a failed mark was lost: the root read as current, and its
+    // next run saw no change to mark. A failed write after the marks costs
+    // the marked roots one extra run.
     if own_rpcs != own_before {
         // The other roots' call sites of this root's rpcs are stale: their
         // fingerprints are cleared, so the next walk re-indexes them.
@@ -475,6 +526,8 @@ pub fn index_root(setup: &CodeSetup, conn: &mut Connection, root: &CodeRoot, rus
     // The roots referring to a package this root started or stopped
     // defining: their stored cross-root references are stale.
     code::mark_package_users(conn, &root.name, &packages_before, &rows.pkg_defs)?;
+    let elapsed = t0.elapsed().as_millis() as u64;
+    rep.write = code::write_root(conn, &root.name, &root.root, &rows, &text_of, &fingerprint, &rep.units, elapsed, &started)?;
     rep.write_ms = t1.elapsed().as_secs_f64() * 1e3;
     rep.total_ms = t0.elapsed().as_secs_f64() * 1e3;
     Ok(rep)
@@ -535,22 +588,9 @@ fn index_units(
         if mine.is_empty() && !loose {
             continue;
         }
-        let driver: std::result::Result<(&crate::langs::Driver, crate::langs::Launch), String> = match (&setup.indexers, &lang.driver) {
-            _ if mine.is_empty() => Err(String::new()),
-            (_, None) => Err(format!("no SCIP indexer for {}", lang.name)),
-            (code::Indexers::Off(why), _) => Err(why.clone()),
-            (code::Indexers::Search, Some(d)) => d.find().map(|p| (d, p)),
-            (code::Indexers::Fixed(list), Some(d)) => list
-                .iter()
-                .find(|(t, _)| t == d.tool)
-                .map(|(_, p)| (d, crate::langs::Launch::configured(p)))
-                .ok_or_else(|| format!("{} is not configured", d.tool)),
-            (code::Indexers::Chosen(list), Some(d)) => match list.iter().find(|(t, _)| t == d.tool) {
-                Some((_, Some(p))) => Ok((d, crate::langs::Launch::configured(p))),
-                Some((_, None)) => Err(format!("{} is off (code.indexers)", d.tool)),
-                None => d.find().map(|p| (d, p)),
-            },
-        };
+        let driver = if mine.is_empty() { Err(String::new()) } else { driver_for(&setup.indexers, lang) };
+        // The row's language server, chosen when a unit first needs it.
+        let mut server: Option<std::result::Result<(&'static crate::langs::LspServer, crate::langs::Launch), String>> = None;
         for (k, u) in mine.iter().enumerate() {
             // A unit is named after the languages it holds: a package of
             // JavaScript alone is a `javascript` unit.
@@ -601,6 +641,31 @@ fn index_units(
                     }
                 }
             };
+            // No SCIP index served the unit (none given, the indexer
+            // missing, failed or timed out): its row's language server,
+            // when one is found, before the scanner.
+            let source = match source.strip_prefix("scan only: ") {
+                Some(why) if !lang.lsp.is_empty() && unread.is_none() && !matches!(setup.indexers, code::Indexers::Off(_)) => {
+                    match server.get_or_insert_with(|| crate::lsp::choose(&setup.indexers, lang.lsp)) {
+                        Ok((s, launch)) => {
+                            let own = walk
+                                .source
+                                .iter()
+                                .filter(|f| crate::langs::of_path(&f.path).and_then(|l| code::unit_of(&units, l.name, &f.path)).is_some_and(|p| p == *u))
+                                .collect();
+                            let run = crate::lsp::UnitRun { setup, root, walk, unit: u, k, files: own };
+                            let note = crate::lsp::index_unit(&run, s, launch, rows, files, covered, runs);
+                            match note.strip_prefix("scan only: ") {
+                                Some(lsp_why) => format!("scan only: {why}; {lsp_why}"),
+                                None => note,
+                            }
+                        }
+                        Err(lsp_why) if lsp_why.is_empty() => source,
+                        Err(lsp_why) => format!("scan only: {why}; {lsp_why}"),
+                    }
+                }
+                _ => source,
+            };
             out.push(code::Unit { dir: u.dir.clone(), lang: word.into(), source });
         }
         if loose && !mine.iter().any(|u| u.dir.is_empty()) {
@@ -617,6 +682,29 @@ fn index_units(
         }
     }
     out
+}
+
+/// The SCIP indexer a row's units run under `code.indexers`, or the note
+/// a unit carries when none does.
+pub(crate) fn driver_for(
+    indexers: &code::Indexers,
+    lang: &'static crate::langs::Lang,
+) -> std::result::Result<(&'static crate::langs::Driver, crate::langs::Launch), String> {
+    match (indexers, &lang.driver) {
+        (_, None) => Err(format!("no SCIP indexer for {}", lang.name)),
+        (code::Indexers::Off(why), _) => Err(why.clone()),
+        (code::Indexers::Search, Some(d)) => d.find().map(|p| (d, p)),
+        (code::Indexers::Fixed(list), Some(d)) => list
+            .iter()
+            .find(|(t, _)| t == d.tool)
+            .map(|(_, p)| (d, crate::langs::Launch::configured(p)))
+            .ok_or_else(|| format!("{} is not configured", d.tool)),
+        (code::Indexers::Chosen(list), Some(d)) => match list.iter().find(|(t, _)| t == d.tool) {
+            Some((_, Some(p))) => Ok((d, crate::langs::Launch::configured(p))),
+            Some((_, None)) => Err(format!("{} is off (code.indexers)", d.tool)),
+            None => d.find().map(|p| (d, p)),
+        },
+    }
 }
 
 /// Runs one unit's indexer and adds its rows.
@@ -941,6 +1029,10 @@ pub fn defer_reason(setup: &CodeSetup) -> Option<String> {
     if setup.defer_on_cargo && crate::platform::process::foreign_cargo_running() {
         return Some("a cargo process is running".into());
     }
+    // runq's state is read only when `orchestrate.runq_root` is set.
+    if setup.runq_root.as_deref().is_some_and(crate::restart::runq_heavy_held) {
+        return Some("runq holds a heavy compile".into());
+    }
     None
 }
 
@@ -949,10 +1041,16 @@ pub type Status = HashMap<String, RootState>;
 
 struct Shared {
     status: Mutex<Status>,
-    /// Signalled whenever a root's state changes.
+    /// Signalled whenever a root's state changes, and when a pass serves a
+    /// check.
     moved: Condvar,
     stop: AtomicBool,
     reports: Mutex<Vec<IndexReport>>,
+    /// The tickets [`Indexer::check`] has handed out.
+    asked: AtomicU64,
+    /// The newest ticket a finished pass took when it began. It changes
+    /// under `status`, and `moved` is notified after.
+    served: AtomicU64,
 }
 
 /// The background indexer: one thread that watches the code roots and
@@ -985,7 +1083,14 @@ impl Indexer {
         let watcher = if setup.watch { Watcher::start(&roots) } else { Watcher::disabled(&roots) };
         let poker = watcher.poker();
         let status: Status = setup.roots.iter().map(|r| (r.name.clone(), RootState::Starting)).collect();
-        let shared = Arc::new(Shared { status: Mutex::new(status), moved: Condvar::new(), stop: AtomicBool::new(false), reports: Mutex::new(Vec::new()) });
+        let shared = Arc::new(Shared {
+            status: Mutex::new(status),
+            moved: Condvar::new(),
+            stop: AtomicBool::new(false),
+            reports: Mutex::new(Vec::new()),
+            asked: AtomicU64::new(0),
+            served: AtomicU64::new(0),
+        });
         let s2 = shared.clone();
         std::thread::Builder::new()
             .name("atlas-code-index".into())
@@ -1008,10 +1113,42 @@ impl Indexer {
     }
 
     /// Asks the thread to compare every root with its fingerprint now.
-    pub fn check(&self) {
+    ///
+    /// # Returns
+    ///
+    /// A ticket for [`Indexer::wait_checked`].
+    pub fn check(&self) -> u64 {
         for i in 0..self.poker.roots() {
             self.poker.poke(i);
         }
+        // After the pokes, so a pass that takes this ticket sees them.
+        let ticket = self.shared.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        // The pokes may have woken the loop already, and that pass may have
+        // ended before the ticket existed: wake it once more, after.
+        self.poker.wake();
+        ticket
+    }
+
+    /// Blocks until `ticket` (from [`Indexer::check`]) is served, or the
+    /// timeout passes (a condition-variable wait). Served means that every
+    /// root was compared with its fingerprint after the check, by the pass
+    /// that took the ticket or by the one running when it was asked, and
+    /// that every run those comparisons started has ended. A root they left
+    /// pending (its lease held elsewhere, a quiet time above zero, a
+    /// deferral) is not resolved yet: [`Indexer::wait_idle`] waits for that.
+    ///
+    /// # Returns
+    ///
+    /// True when the ticket was served.
+    pub fn wait_checked(&self, ticket: u64, timeout: Duration) -> bool {
+        let st = self.shared.status.lock().unwrap_or_else(|p| p.into_inner());
+        let served = &self.shared.served;
+        let (_st, _) = self
+            .shared
+            .moved
+            .wait_timeout_while(st, timeout, |_| served.load(Ordering::SeqCst) < ticket)
+            .unwrap_or_else(|p| p.into_inner());
+        served.load(Ordering::SeqCst) >= ticket
     }
 
     /// The reports of every indexing this indexer ran, oldest first.
@@ -1045,6 +1182,25 @@ impl Indexer {
         let (st, _) = self.shared.moved.wait_timeout_while(st, timeout, busy).unwrap_or_else(|p| p.into_inner());
         !st.values().any(|x| matches!(x, RootState::Starting | RootState::Pending | RootState::Running))
     }
+
+    /// Blocks until root `name`'s state satisfies `want`, or the timeout
+    /// passes: a condition-variable wait on the state, for the integration
+    /// tests.
+    ///
+    /// It sees only a state that still holds when the waiter wakes: a state
+    /// that is set and replaced before then can be missed, and the wait runs
+    /// on to the timeout.
+    ///
+    /// # Returns
+    ///
+    /// True when the state was seen.
+    #[doc(hidden)]
+    pub fn wait_state(&self, name: &str, want: impl Fn(&RootState) -> bool, timeout: Duration) -> bool {
+        let st = self.shared.status.lock().unwrap_or_else(|p| p.into_inner());
+        let (st, _) =
+            self.shared.moved.wait_timeout_while(st, timeout, |s| !s.get(name).is_some_and(&want)).unwrap_or_else(|p| p.into_inner());
+        st.get(name).is_some_and(&want)
+    }
 }
 
 impl Drop for Indexer {
@@ -1067,6 +1223,15 @@ fn log_line(dir: &Path, line: &str) {
     }
 }
 
+/// Marks the checks up to `ticket` served ([`Indexer::wait_checked`]).
+fn serve(shared: &Shared, ticket: u64) {
+    let _st = shared.status.lock().unwrap_or_else(|p| p.into_inner());
+    if shared.served.load(Ordering::SeqCst) < ticket {
+        shared.served.store(ticket, Ordering::SeqCst);
+        shared.moved.notify_all();
+    }
+}
+
 fn set(shared: &Shared, name: &str, s: RootState) {
     let mut st = shared.status.lock().unwrap_or_else(|p| p.into_inner());
     if st.get(name) != Some(&s) {
@@ -1082,7 +1247,13 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
         Ok(p) => RustSource::Analyzer(p),
         Err(why) => RustSource::ScanOnly(why),
     });
-    let holder = format!("pid {}", std::process::id());
+    // One name per indexer, so two indexers in one process do not share the
+    // lease.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let holder = format!("pid {} indexer {}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    // A root due now: quiet for the whole quiet time already. An `Instant`
+    // cannot go back past the clock's start, so shortly after boot it is now.
+    let due_now = || Instant::now().checked_sub(setup.debounce).unwrap_or_else(Instant::now);
     let n = setup.roots.len();
     // Per root: when it last changed, and the fingerprint last walked.
     let mut changed: Vec<Option<Instant>> = vec![None; n];
@@ -1101,19 +1272,57 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
         if shared.stop.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // The newest check this pass serves. It was asked before the pass
+        // began, so its pokes are in the snapshots below.
+        let ticket = shared.asked.load(Ordering::SeqCst);
+        // The events counted before the pass looks at anything. One that
+        // lands during the pass (an edit during a run) then wakes the next
+        // pass at once; counted at the end, it waited for the next event or
+        // the safety-net walk.
+        let seen = watcher.events();
         let stored = code::root_records(&conn)?;
         for (i, r) in setup.roots.iter().enumerate() {
             let snap = watcher.snapshot(i);
             let must_walk = walk_all || !snap.healthy || snap.full;
             if must_walk {
-                let fp = code::root_fingerprint(r).unwrap_or_default();
+                let fp = match code::root_fingerprint(r) {
+                    Ok(fp) => fp,
+                    Err(e) => {
+                        // The root cannot be walked (its folder is gone or
+                        // unreadable): a failure to show, never a current
+                        // index. Read as '', the error would equal a mark.
+                        changed[i] = None;
+                        failed[i] = Some((String::new(), e.to_string()));
+                        seen_fp[i] = String::new();
+                        watcher.clear(i, snap.seq);
+                        set(shared, &r.name, RootState::Failed(e.to_string()));
+                        settled[i] = true;
+                        continue;
+                    }
+                };
                 let indexed = stored.get(&r.name).map(|x| x.fingerprint.as_str());
-                if indexed == Some(fp.as_str()) || failed[i].as_ref().is_some_and(|f| f.0 == fp) {
+                if indexed == Some(fp.as_str()) {
+                    // Current: a root that failed to walk and came back
+                    // unchanged gets no run, so its failure ends here.
+                    changed[i] = None;
+                    failed[i] = None;
+                } else if failed[i].as_ref().is_some_and(|f| f.0 == fp) {
                     changed[i] = None;
                 } else if fp != seen_fp[i] {
                     // Still changing (or first sight): restart the quiet time,
-                    // except at startup, where a stale root goes at once.
-                    changed[i] = Some(if walk_all && seen_fp[i].is_empty() { Instant::now() - setup.debounce } else { Instant::now() });
+                    // except at startup, where a stale root goes at once. A
+                    // file edited during this indexer's own last run lands
+                    // here too: `seen_fp` is the fingerprint that run stored.
+                    changed[i] = Some(if walk_all && seen_fp[i].is_empty() { due_now() } else { Instant::now() });
+                } else if indexed == Some("") && changed[i].is_none() {
+                    // A mark, unchanged since the last look: another root's
+                    // run (its rpcs or packages changed) or a migration
+                    // cleared the fingerprint. It has been quiet, so it goes
+                    // at once. Any other stale fingerprint, unchanged here,
+                    // is another server's write (another configuration or
+                    // version): this indexer settles on it, or two servers
+                    // would take turns re-indexing the root.
+                    changed[i] = Some(due_now());
                 }
                 seen_fp[i] = fp;
             } else if change_wakes(&snap.paths, &r.exclude) {
@@ -1155,6 +1364,29 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                 changed[i] = Some(Instant::now());
                 continue;
             }
+            // Another server may have indexed it since it was scheduled
+            // here: then there is nothing to do. A root that cannot be walked
+            // goes on to the run, which fails and says why.
+            if let Ok(fp) = code::root_fingerprint(r) {
+                // A database error here frees the lease before it is passed
+                // on, so other servers need not wait for the lease to expire.
+                let stored = match code::root_records(&conn) {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        let _ = release_lease(&conn, &holder);
+                        return Err(e);
+                    }
+                };
+                if stored.get(&r.name).is_some_and(|x| x.fingerprint == fp) {
+                    let _ = release_lease(&conn, &holder);
+                    changed[i] = None;
+                    failed[i] = None;
+                    seen_fp[i] = fp;
+                    set(shared, &r.name, RootState::Idle);
+                    settled[i] = true;
+                    continue;
+                }
+            }
             set(shared, &r.name, if settled[i] { RootState::Running } else { RootState::Starting });
             log_line(&setup.dir, &format!("{} indexing", r.name));
             let res = index_root(setup, &mut conn, r, &rust);
@@ -1164,7 +1396,9 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                 Ok(rep) => {
                     log_line(&setup.dir, &format!("{} done: {} in {:.0} ms ({} defs, {} refs, {} impls)", r.name, rep.rust, rep.total_ms, rep.write.defs, rep.write.refs, rep.write.impls));
                     failed[i] = None;
-                    seen_fp[i] = code::root_fingerprint(r).unwrap_or_default();
+                    // The fingerprint the run stored, not today's: a file
+                    // edited during the run then reads as a change.
+                    seen_fp[i] = rep.fingerprint.clone();
                     shared.reports.lock().unwrap_or_else(|p| p.into_inner()).push(rep);
                     set(shared, &r.name, RootState::Idle);
                     settled[i] = true;
@@ -1177,12 +1411,22 @@ fn run(setup: &CodeSetup, db: &Path, rust: Option<RustSource>, shared: &Shared, 
                 }
             }
         }
+        // Every decision of this pass, and every run it started, has
+        // landed: the checks asked before it began are served.
+        serve(shared, ticket);
+        // A check asked during the pass may have had its pokes taken in by
+        // this pass's snapshots, or counted in `seen`. Either way no wake-up
+        // would come for it, so the pass that serves it starts now. A check
+        // whose ticket comes after this look wakes the loop after `seen` was
+        // counted (`check`'s wake).
+        if shared.asked.load(Ordering::SeqCst) > ticket {
+            continue;
+        }
         // Sleep until the next root is due, a change arrives, or the safety
         // net walk is due.
         let next_due = changed.iter().flatten().map(|at| (*at + setup.debounce).saturating_duration_since(Instant::now())).min();
         let net = setup.rescan_interval.saturating_sub(last_walk.elapsed());
         let wait = next_due.map_or(net, |d| d.min(net)).max(Duration::from_millis(10));
-        let seen = watcher.events();
         if !watcher.wait_past(seen, wait) && last_walk.elapsed() >= setup.rescan_interval {
             walk_all = true;
         }
@@ -1219,6 +1463,27 @@ mod tests {
         let ok: Vec<std::ffi::OsString> = ["--list"].iter().map(Into::into).collect();
         let r = run_bounded(&exe, &ok, &dir, &dir.join("log.txt"), Duration::from_secs(60)).unwrap();
         assert_eq!((r.timed_out, r.code), (false, Some(0)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_runq_heavy_compile_defers() {
+        let dir = std::env::temp_dir().join(format!("atlas-runq-defer-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let state = |res: &str, held: &str| format!("runq-state 1\nentry\towner=OTHER-LANE\tres={res}\theld={held}\tchain=1:x\n");
+        let mut setup = CodeSetup::from_spec(&crate::config::CodeSpec::default(), &dir.join("db"), false);
+        setup.defer_on_cargo = false;
+        fs::write(dir.join("state"), state("heavy-compile", "1")).unwrap();
+        // Without orchestrate.runq_root, runq is not read.
+        assert_eq!(defer_reason(&setup), None);
+        setup.runq_root = Some(dir.clone());
+        assert_eq!(defer_reason(&setup).as_deref(), Some("runq holds a heavy compile"));
+        for (res, held) in [("light-compile", "1"), ("heavy-compile", "0")] {
+            fs::write(dir.join("state"), state(res, held)).unwrap();
+            assert_eq!(defer_reason(&setup), None, "{res} {held}");
+        }
+        assert!(crate::restart::runq_heavy_held_in(&state("linux-test,heavy-compile", "1")));
+        assert!(!crate::restart::runq_heavy_held_in("runq-state 2\nentry\tres=heavy-compile\theld=1\n"));
         let _ = fs::remove_dir_all(&dir);
     }
 

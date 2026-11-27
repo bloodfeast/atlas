@@ -199,7 +199,7 @@ fn the_scanner_alone_gives_definitions_and_ranges() {
     let r = atlas::recall::code_check(&conn, &code.roots).unwrap();
     assert_eq!(
         r.langs,
-        [atlas::recall::LangRecall { lang: "python".into(), files: 3, truth: 16, excluded: 1, indexed: 0, scan_only: 16, missing: 0 }],
+        [atlas::recall::LangRecall { lang: "python".into(), files: 3, truth: 16, excluded: 1, indexed: 0, lsp: 0, scan_only: 16, missing: 0 }],
         "`def __init__` lines are held by constructor rows; the `def` in a string is no code"
     );
 }

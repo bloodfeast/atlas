@@ -388,7 +388,7 @@ fn from_source(conn: &Connection, key: &str, t: &str) -> Result<FromSource> {
                 seq: r.get(3)?,
                 time: r.get(4)?,
                 title: r.get(5)?,
-                meta: r.get(6)?,
+                meta: crate::goal::redact_meta(&r.get::<_, String>(1)?, r.get(6)?),
                 body: r.get(7)?,
                 sha: r.get(8)?,
                 superseded: None,

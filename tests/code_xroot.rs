@@ -206,6 +206,29 @@ fn a_reference_into_a_sibling_roots_package_is_stored_with_its_caller() {
     assert_eq!(v["refs"].as_array().map_or(0, |a| a.len()), 0, "{v}");
 }
 
+/// A running indexer acts on the marks, once. The service is indexed first;
+/// the library's first run then marks it (its package, and its rpcs), and the
+/// service is indexed again with its references into the library. Then the
+/// marks settle: no root marks another again, and nothing more runs.
+#[test]
+fn a_running_indexer_reindexes_a_marked_root_once_and_settles() {
+    use std::time::Duration;
+    let t = Temp::new("code-xroot-live");
+    let (mut code, db) = setup(&t);
+    code.rescan_interval = Duration::from_millis(20);
+    let ix = code_index::Indexer::start(code.clone(), db.clone(), Some(RustSource::ScanOnly("test".into())));
+    let roots = |ix: &code_index::Indexer| ix.reports().iter().map(|r| r.root.clone()).collect::<Vec<_>>();
+    assert!(ix.wait_reports(3, Duration::from_secs(30)), "the marked service was not indexed again: {:?}", roots(&ix));
+    // Two more comparisons of every root later, nothing more has run.
+    for _ in 0..2 {
+        let t = ix.check();
+        assert!(ix.wait_checked(t, Duration::from_secs(30)), "the check was never served: {:?}", roots(&ix));
+    }
+    assert_eq!(roots(&ix), ["svc", "lib", "svc"]);
+    assert_ne!(fingerprint(&db, "svc"), "");
+    assert_eq!(ix.reports()[2].rows.xroot_refs, 3, "{:?}", ix.reports()[2].rows);
+}
+
 #[test]
 fn a_package_another_root_stops_defining_marks_its_users() {
     let t = Temp::new("code-xroot-gone");

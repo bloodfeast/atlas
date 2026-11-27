@@ -142,6 +142,23 @@ fn resolve(from: &str, loc: &str) -> Option<String> {
 /// When each site may next be asked (per process).
 static PACE: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 
+/// Waits until `origin` may be asked again ([`Settings::min_interval_ms`]):
+/// reads and writes share one clock per site.
+pub(super) fn pace_site(s: &Settings, origin: &str, sleep: &dyn Fn(Duration)) {
+    let interval = Duration::from_millis(s.min_interval_ms);
+    let wait = {
+        let mut g = PACE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let m = g.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        let next = m.get(origin).map_or(now, |t| *t + interval);
+        m.insert(origin.to_string(), now.max(next));
+        next.saturating_duration_since(now)
+    };
+    if !wait.is_zero() {
+        sleep(wait);
+    }
+}
+
 /// Reads an environment variable.
 type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
 
@@ -238,18 +255,7 @@ impl<'a> Client<'a> {
 
     /// Waits until `origin` may be asked again ([`Settings::min_interval_ms`]).
     fn pace(&self, origin: &str) {
-        let interval = Duration::from_millis(self.s.min_interval_ms);
-        let wait = {
-            let mut g = PACE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let m = g.get_or_insert_with(HashMap::new);
-            let now = Instant::now();
-            let next = m.get(origin).map_or(now, |t| *t + interval);
-            m.insert(origin.to_string(), now.max(next));
-            next.saturating_duration_since(now)
-        };
-        if !wait.is_zero() {
-            (self.sleep)(wait);
-        }
+        pace_site(self.s, origin, self.sleep);
     }
 
     fn err(&self, endpoint: &str, what: &str, status: Option<u16>) -> TrackerError {
@@ -271,7 +277,7 @@ impl<'a> Client<'a> {
             self.pace(&origin(&url));
             self.debug_line(&format!("> {} {url}", e.method.name()));
             self.debug_line(if auth.is_some() { "> Authorization: [redacted]" } else { "> (no Authorization: another origin)" });
-            let req = Request { method: e.method, url: &url, auth, timeout: self.s.timeout(), max_bytes: self.max_bytes };
+            let req = Request { method: e.method, write: None, url: &url, auth, timeout: self.s.timeout(), max_bytes: self.max_bytes };
             let r = self.t.send(&req).map_err(|f| self.err(&shown, &f.describe(self.s.timeout()), None))?;
             self.debug_line(&format!("< {} ({} bytes)", r.status, r.body.len()));
             match r.status {
@@ -717,7 +723,9 @@ pub fn check_with(s: &Settings, ctx: &Ctx<'_>, out: &mut dyn Write, t: &dyn Tran
             }
         }
     }
-    w(out, "note: these are the account's permissions; a scoped token's scopes are not visible to the API, so a read-only scoped token still shows the account's writes here and its writes fail with 401 or 403. atlas itself sends GET only.")?;
+    w(out, &super::write::check_line(s, ctx, false))?;
+    w(out, &super::write::check_line(s, ctx, true))?;
+    w(out, "note: these are the account's permissions; a scoped token's scopes are not visible to the API, so a read-only scoped token still shows the account's writes here and its writes fail with 400, 401 or 404. Reads are GET only; writes (atlas track comment, transition, edit, page-update) show their request and send nothing without --apply.")?;
     Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
@@ -960,7 +968,7 @@ pub(crate) mod tests {
     impl Transport for Script {
         fn send(&self, r: &Request<'_>) -> Result<Response, Failure> {
             self.seen.borrow_mut().push((
-                r.method.name().to_string(),
+                r.write.map_or(r.method.name(), |w| w.method.name()).to_string(),
                 r.url.to_string(),
                 r.auth.is_some(),
                 crate::trackers::http::curl_config(r),
@@ -983,6 +991,7 @@ pub(crate) mod tests {
 
     pub(crate) fn settings(site: &str, cloud: bool) -> Settings {
         Settings {
+            write: Default::default(),
             site: site.into(),
             confluence_site: None,
             auth: if cloud {

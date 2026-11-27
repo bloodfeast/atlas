@@ -384,7 +384,8 @@ pub fn gated(store: &MemoryStore, query: &str, budget: usize, g: &Gate, sem: Opt
 }
 
 /// A lane's state, in the order a fresh agent needs it: the latest handoff,
-/// the brief, open questions, the latest next step, the newest launch brief
+/// every entry newer than it (newest first, whole, else by header and
+/// title), the rulings of other lanes that name this one, the brief, open questions, the latest next step, the newest launch brief
 /// atlas filed (`launch`), then decisions,
 /// measurements and commits newest first; anything past the byte budget is
 /// counted on a `+N more` line.
@@ -413,7 +414,10 @@ pub struct LaneView {
 
 /// The sections of a lane view that are its state and are always sent
 /// whole: the handoff, the brief, open questions and the next step.
-const LANE_STATE: &[&str] = &["handoff", "brief", "open questions", "next"];
+const LANE_STATE: &[&str] = &["handoff", SINCE, "brief", "open questions", "next"];
+
+/// The lane view's section of the entries newer than its newest handoff.
+const SINCE: &str = "since the handoff";
 
 /// A lane's open questions, by the store's one test
 /// (`memory::OPEN_QUESTION_SQL`), as the resume card and `lanes()` count them.
@@ -502,11 +506,22 @@ pub fn lane_with(
     }
     let open = open_in(store, lane)?;
     let sub = |s: &str| -> Vec<&Head> { all.iter().rev().filter(|h| h.kind == "journal" && h.sub == s).collect() };
+    // What came after the newest handoff, newest first, before any older
+    // material, and the rulings of other lanes that name this one
+    // (journal:ATLAS-RESUME:0003, 0004).
+    let newer: Vec<&Head> = super::since::after_handoff(&all).map(|(_, a)| a.into_iter().rev().collect()).unwrap_or_default();
+    // Only the recent ones, after the lane's own state: the live window
+    // before the lane's newest record (the store's time, not the clock's).
+    let newest = all.iter().map(|h| h.time.as_str()).max().unwrap_or("");
+    let since = crate::checkpoint::epoch_secs(newest).map(|s| crate::discussion::civil(s - crate::resume::LIVE_DAYS * 86_400)).unwrap_or_default();
+    let rulings = store.rulings_naming(lane, &since)?;
     let order: Vec<(&str, Vec<&Head>)> = vec![
         ("handoff", newest_handoff(&all).into_iter().collect()),
+        (SINCE, newer),
         ("brief", sub("brief").into_iter().take(1).collect()),
         ("open questions", sub("question").into_iter().filter(|h| open.contains(&h.key)).collect()),
         ("next", sub("next").into_iter().take(1).collect()),
+        ("rulings from other lanes", rulings.iter().rev().collect()),
         // atlas's record of the newest agent launch (only with `launches`):
         // a dead agent is relaunched from it (#220).
         ("launch", sub("launch").into_iter().take(1).collect()),
@@ -518,6 +533,7 @@ pub fn lane_with(
     let mut out = format!("lane {lane}: {} entries\n", all.len());
     let mut more = 0usize;
     let mut skipped = 0usize;
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut v = LaneView::default();
     for (title, hs) in order {
         if hs.is_empty() {
@@ -527,6 +543,11 @@ pub fn lane_with(
         let mut added = 0;
         let cut = trim.filter(|_| !LANE_STATE.contains(&title));
         for h in hs {
+            // Shown once: an entry newer than the handoff is not repeated
+            // in its kind's section.
+            if !seen.insert(h.key.as_str()) {
+                continue;
+            }
             if covered.contains(&h.key) {
                 skipped += 1;
                 continue;
@@ -554,8 +575,17 @@ pub fn lane_with(
                 None => one = whole,
             }
             if out.len() + section.len() + one.len() > budget {
-                more += 1;
-                continue;
+                // An entry newer than the handoff is named by its header
+                // and title at least.
+                let mut named = String::new();
+                if title == SINCE {
+                    frame(&mut named, &header(h), Some(h.title.trim_end()), "");
+                }
+                if named.is_empty() || out.len() + section.len() + named.len() > budget {
+                    more += 1;
+                    continue;
+                }
+                one = named;
             }
             section.push_str(&one);
             v.keys.push(h.key.clone());
@@ -578,6 +608,33 @@ pub fn lane_with(
     }
     v.text = out;
     Ok(v)
+}
+
+/// The key `recall key=K` reads: `K` itself when a record has it, else
+/// a `memory:<slug>` (or `memory:<slug>.md`, the import's provenance form)
+/// read as the bare slug the memory record is keyed by.
+///
+/// # Errors
+///
+/// [`crate::Error::Db`].
+pub fn resolve_key(store: &MemoryStore, k: &str) -> Result<String> {
+    if store.head_no_body(k)?.is_some() {
+        return Ok(k.to_string());
+    }
+    // `memory:<slug>@hash`: the slug's version.
+    if let Some((base, hash)) = k.rsplit_once('@').filter(|(b, h)| b.starts_with("memory:") && !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())) {
+        let r = resolve_key(store, base)?;
+        if r != base {
+            return Ok(format!("{r}@{hash}"));
+        }
+    }
+    if let Some(slug) = k.strip_prefix("memory:") {
+        let slug = slug.strip_suffix(".md").unwrap_or(slug);
+        if store.head_no_body(slug)?.is_some() {
+            return Ok(slug.to_string());
+        }
+    }
+    Ok(k.to_string())
 }
 
 #[cfg(test)]

@@ -64,6 +64,32 @@ Keep it lean. A brief is a work order, not a copy of the rulebook.
    the resources the configuration lists can hold a launch back; any other word (`blender`, unless it is
    configured) only adds a note when a running agent uses it too. atlas schedules on declared lines;
    it only warns on what it infers. A planned item's brief adds `Queue: <key>` so its launch takes it off the queue.
+   **With the task judge's classifier on, a builder's brief is a file:** write it to a `BRIEF_<NAME>.md` file
+   and name its rooted path in the launch prompt; the launch is denied otherwise (`orchestrate.judge.require_brief`),
+   even with a `Judge: brandon-named` line (that exempts the model pick only). `note op=judge` reads and scores that file (and any brief its `Builds on:` line
+   names), so judge the launch prompt before the launch. With `orchestrate.judge.require_header` on, the brief
+   also carries the judge header: `Acceptance:` (the named tests, or `none named`), `Deliverables: N`,
+   `Captures: yes/no`, `Art: yes/no`, and optionally `Builds on: <brief>`. Give every builder launch a `Kind:`
+   line: the brief rule and the enforced judge hold a launch that is a builder by its `Kind:` line, its agent
+   type or a worktree, never one that is a builder only by the default kind. In enforced mode an explore launch
+   names its pair: `Judge: explore <model>/<effort>` (any valid pair but the pick, up, down or sideways, when
+   due; one every `orchestrate.judge.explore_every` routed launches, default 5). A fix-round climb after a
+   failed run says `Judge: climb <model>/<effort>`: allowed only at exactly one rung above the lane's last dogfood
+   row on the ladder haiku/medium < sonnet/medium < sonnet/high < opus/medium < opus/high < fable/medium <
+   fable/high (after a failed explore below the pick, or a failed continue of one: back at the pick, at most
+   fable/high; a brandon-named row is a base like any other), logged as a climb, never counted, so a
+   due explore stays due; the launch needs a `Lane:` line and a prior row for the lane. fable/high is the top:
+   fable/max and any xhigh/max effort are Brandon's call, never a climb or an explore. When the judge suggests
+   one, ask Brandon (multiple choice), then launch with `Judge: brandon-named <model>/<effort>`. A continuation
+   after a context-cap or infra stop (not a failure) says `Judge: continue` (optionally `after <run>`) and is
+   re-judged: the brief is the leftover work, the classifier scores it, and the launch runs at that pick, below,
+   at or above the continued run's pair (fable/high the cap; a user-tier pick still needs `Judge: brandon-named`).
+   It needs a prior row for the lane, is never an explore and never counted, and a failed continuation climbs
+   one rung from its own pair (back to the pick when it continues an explore below the pick and ran below it
+   too); its row logs `continue` true plus `continued_pair` and `continued_run`. With the classifier
+   unavailable a continuation runs only at the continued run's pair. Outside a continuation, a move down or
+   sideways is a due explore or brandon-named. A marker whose pair does
+   not parse is denied.
 3. **The rulings that apply,** named by their recall key, a heading or a line hint, never pasted whole. "Read
    the whole rulebook" costs tens of thousands of tokens before any work starts. The agent pulls exactly what it
    needs with `recall`, `lookup` or `search`. Write the brief as compact Gherkin: a Context line, Given

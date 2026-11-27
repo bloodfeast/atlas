@@ -723,11 +723,26 @@ fn parse_orchestrate(v: &Value, base: &Path) -> Result<crate::orchestrate::Orche
         }
     }
     if let Some(jv) = f.get("judge") {
-        let g = Fields::new("orchestrate.judge", jv, &["enabled", "cells", "classifier", "mode", "log"])?;
+        let g = Fields::new("orchestrate.judge", jv, &["enabled", "cells", "classifier", "mode", "log", "require_brief", "require_header", "speculative", "explore_every"])?;
         o.judge_enabled = g.boolean("enabled")?;
         o.judge_cells = g.string("cells")?.map(PathBuf::from);
         o.judge_mode = named(&g, "mode", crate::taskjudge::JudgeMode::parse, "off, advisory or enforced")?;
         o.judge_log = g.string("log")?.map(PathBuf::from);
+        o.judge_require_brief = g.boolean("require_brief")?;
+        o.judge_require_header = g.boolean("require_header")?;
+        o.judge_explore_every = match g.uint("explore_every")? {
+            Some(n) if n < 2 => return Err(g.bad("explore_every", "a whole number of at least 2 (one explore launch every N routed launches)")),
+            n => n,
+        };
+        if let Some(sv) = g.get("speculative") {
+            let h = Fields::new("orchestrate.judge.speculative", sv, &["enabled", "pick"])?;
+            let pick = match h.string("pick")? {
+                Some(p) => crate::taskjudge::parse_pick(&p)
+                    .ok_or_else(|| Error::InvalidArgument(format!("orchestrate.judge.speculative.pick {p:?}: use model/effort")))?,
+                None => ("fable".to_string(), "high".to_string()),
+            };
+            o.judge_speculative = h.boolean("enabled")?.unwrap_or(false).then_some(pick);
+        }
         if let Some(cv) = g.get("classifier") {
             o.judge_classifier = parse_classifier(cv)?;
         }
@@ -869,7 +884,9 @@ fn indexers_spec(f: &Fields<'_>, base: &Path) -> Result<Option<Option<IndexerPat
         None | Some(Value::Bool(true)) => Ok(None),
         Some(Value::Bool(false)) => Ok(Some(None)),
         Some(Value::Object(m)) => {
-            let known: Vec<&str> = crate::langs::LANGS.iter().filter_map(|l| l.driver.as_ref().map(|d| d.tool)).collect();
+            // The SCIP indexers, then the language servers.
+            let mut known: Vec<&str> = crate::langs::LANGS.iter().filter_map(|l| l.driver.as_ref().map(|d| d.tool)).collect();
+            known.extend(crate::langs::LANGS.iter().flat_map(|l| l.lsp.iter().map(|s| s.tool)));
             let mut out = Vec::new();
             for (tool, v) in m.iter() {
                 if !known.contains(&tool.as_str()) {
@@ -1487,6 +1504,17 @@ mod tests {
         assert!(scip("3").unwrap_err().to_string().contains("code.roots[0].scip must be"));
         let none = Config::parse(r#"{"code": {"roots": [{"name": "a", "root": "r"}]}}"#, Path::new("b")).unwrap();
         assert_eq!(none.code.unwrap().roots[0].scip, Prebuilt::Convention);
+    }
+
+    #[test]
+    fn an_unknown_server_name_is_refused() {
+        let code = |v: &str| Config::parse(&format!(r#"{{"code": {{"indexers": {v}}}}}"#), Path::new("b")).map(|c| c.code.unwrap().indexers);
+        assert_eq!(
+            code(r#"{"pyright-langserver": "PATH", "gopls": false}"#).unwrap(),
+            Some(Some(vec![("pyright-langserver".to_string(), Some(Path::new("b").join("PATH"))), ("gopls".to_string(), None)]))
+        );
+        let e = code(r#"{"pyright": "x"}"#).unwrap_err().to_string();
+        assert!(e.contains("unknown indexer \"pyright\"") && e.contains("gopls, basedpyright-langserver, pyright-langserver"), "{e}");
     }
 
     #[test]

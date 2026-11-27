@@ -1,8 +1,10 @@
-## Fourteen listed tools, every full tool behind them
+## Fifteen listed tools, every full tool behind them
 
-`tools/list` names 14 tools (about 1,510 tokens; it was 47 tools and 5,930 tokens). `lookup`, `search`,
-`section`, `grep`, `symbol`, `recall`, `remember`, `journal`, `handoff` and `hook` keep their names; the rest
-of the surface sits behind four tools with an `op` argument:
+`tools/list` names 15 tools (about 1,625 tokens; it was 47 tools and 5,930 tokens). `lookup`, `search`,
+`section`, `grep`, `symbol`, `recall`, `remember`, `journal`, `handoff`, `track_write` and `hook` keep their names;
+the rest of the surface sits behind four tools with an `op` argument. `track_write` (project tracking writes to Jira
+and Confluence, dry-run unless `apply` is true: [[Project tracking]]) is a tool of its own rather than a `note` op,
+so `note` stays read only (ruling journal:ATLAS-TRACKERS:0062):
 
 | Listed tool | `op` | Runs |
 |---|---|---|

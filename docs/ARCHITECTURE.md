@@ -131,7 +131,7 @@ Routing is deterministic: hooks decide, not the model. It is on by default; `lea
     move the folder, and Git Bash paths (`/c/...`) map to drive paths. Any other part (an assignment,
     `||`, a redirect, `$(`) leaves the whole command unread, so an annotation never guesses which output
     is which. `git grep -n` is read like `grep -rn`.
-  - A file outside every code root, or written after its root was indexed, is not annotated.
+  - A file outside every code root, or written after its root's indexing began, is not annotated.
     `lean.annotate: false` turns this off.
 - **Fail open.** Any routing error leaves the call untouched and records a miss (`tool = "route"`).
 - **Digests** (`src/digest.rs`) have a 600 B budget, or 3.2 KB for an outline. Each digest ends with one
@@ -147,6 +147,15 @@ line comes from brace matching over its file, so `symbol` answers `path:start-en
 innermost fn inside an impl, else the impl. The scan finds impl blocks too, and gives a method inside one its
 type as container. Reindexing runs on its own thread
 when a root changes, never on the query path.
+
+Every server on a machine shares one index database, and one lease lets one run at a time. A root is indexed
+again when its files change, including an edit during the server's own last run: the server remembers the
+fingerprint that run stored, its walk's. It is also indexed again, at once, when its stored fingerprint is a
+mark (`''`), which another root's run (its rpcs or packages changed) or a migration leaves. Any other stale
+fingerprint, with the files unchanged, is another server's write, from another configuration or version, and
+the server settles on it: re-indexing it would make two servers take turns forever. A server that gets the
+lease for a root first rechecks it: when another server has indexed it since, it stands down, so one change
+costs one run.
 
 An Edit, Write or MultiEdit re-indexes the file it changed at once (R7). The hook worker queues the path,
 sends the hook's answer, then does the work, so the edit never waits:

@@ -25,6 +25,12 @@
 //! Without `--scip`, the language's indexer is found as atlas finds it and
 //! run at the root into a scratch folder (it may fetch modules).
 //!
+//! `--driver lsp` adds the row's language server ([`atlas::lsp`]; found as
+//! atlas finds it, or `--server TOOL=PATH`) with the SCIP indexer off:
+//! its rows against the grep truth, and its definitions against SCIP's by
+//! `(path, line, name)` with their item ends. `--driver scan` is the
+//! scanner against the grep truth alone.
+//!
 //! Nothing is written outside a scratch folder under the system temp
 //! folder, removed at the end.
 
@@ -36,7 +42,7 @@ use atlas::code::{self, CodeRoot, CodeSetup, Indexers, Rows};
 use atlas::code_index::{self, RustSource};
 use atlas::scip;
 
-pub const USAGE: &str = "usage: cargo xtask langs-bench --lang LANG --root DIR [--scip FILE]";
+pub const USAGE: &str = "usage: cargo xtask langs-bench --lang LANG --root DIR [--scip FILE] [--driver scip|lsp|scan] [--server TOOL=PATH]";
 
 /// The pinned corpus: language, repository, commit (shallow clones of
 /// public, permissively licensed repositories).
@@ -54,12 +60,18 @@ const CORPUS: &[(&str, &str, &str)] = &[
 /// Runs the bench and prints its report.
 pub fn run(args: Vec<String>) -> Result<(), String> {
     let (mut lang, mut root, mut scip_file) = (None, None, None);
+    let (mut driver, mut server) = ("scip".to_string(), None);
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match (a.as_str(), it.next()) {
             ("--lang", Some(v)) => lang = Some(v),
             ("--root", Some(v)) => root = Some(PathBuf::from(v)),
             ("--scip", Some(v)) => scip_file = Some(PathBuf::from(v)),
+            ("--driver", Some(v)) if ["scip", "lsp", "scan"].contains(&v.as_str()) => driver = v,
+            ("--server", Some(v)) => match v.split_once('=') {
+                Some((tool, path)) => server = Some((tool.to_string(), PathBuf::from(path))),
+                None => return Err(USAGE.into()),
+            },
             _ => return Err(USAGE.into()),
         }
     }
@@ -75,7 +87,11 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     let row = atlas::langs::by_name(&lang).ok_or_else(|| format!("no language row {lang:?}"))?;
     let scratch = std::env::temp_dir().join(format!("atlas-langs-bench-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-    let r = bench(row, &root, scip_file.as_deref(), &scratch);
+    let r = match driver.as_str() {
+        "scan" => bench_scan(row, &root, format!("langs-bench {} at {} (scanner only)\n", row.name, root.display())),
+        "lsp" => bench(row, &root, scip_file.as_deref(), &scratch, Some(server.as_ref())),
+        _ => bench(row, &root, scip_file.as_deref(), &scratch, None),
+    };
     let _ = std::fs::remove_dir_all(&scratch);
     print!("{}", r?);
     Ok(())
@@ -98,7 +114,15 @@ fn shape(kind: &str) -> &'static str {
     }
 }
 
-fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>, scratch: &Path) -> Result<String, String> {
+/// `lsp`: with `--driver lsp`, the server to configure (`--server
+/// TOOL=PATH`), or `None` to find the row's as atlas does.
+fn bench(
+    row: &'static atlas::langs::Lang,
+    root: &Path,
+    scip_file: Option<&Path>,
+    scratch: &Path,
+    lsp: Option<Option<&(String, PathBuf)>>,
+) -> Result<String, String> {
     let mut out = String::new();
     let head = std::process::Command::new("git")
         .arg("-C")
@@ -122,6 +146,15 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
     // against the grep truth alone, unless a SCIP file is given.
     if scip_file.is_none() && row.unindexed.is_some() {
         return bench_scan(row, root, out);
+    }
+    // A language server with no SCIP index to compare with (its indexer
+    // is not on this machine): the scanner and the server against the grep
+    // truth alone.
+    if let Some(server) = lsp {
+        let owner = row.units_of.and_then(atlas::langs::by_name).unwrap_or(row);
+        if scip_file.is_none() && owner.driver.as_ref().is_none_or(|d| d.find().is_err()) {
+            return bench_lsp_truth(row, root, scratch, server, out);
+        }
     }
     // The SCIP file: given, or written by the language's indexer.
     let scip_path = match scip_file {
@@ -280,11 +313,21 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
     }
 
     // The atlas pipeline: SCIP rows, then the scanner alone, each against
-    // the grep truth of the recall check.
-    for (label, rust, indexers) in [
+    // the grep truth of the recall check; with `--driver lsp`, then the
+    // row's language server (its SCIP indexer off).
+    let mut arms = vec![
         ("SCIP rows", RustSource::File(scip_path.clone()), Indexers::Off("bench".into())),
         ("scanner alone", RustSource::ScanOnly("bench".into()), Indexers::Off("bench".into())),
-    ] {
+    ];
+    if let Some(server) = lsp {
+        let owner = row.units_of.and_then(atlas::langs::by_name).unwrap_or(row);
+        let mut list: Vec<(String, Option<PathBuf>)> = owner.driver.iter().map(|d| (d.tool.to_string(), None)).collect();
+        if let Some((tool, path)) = server {
+            list.push((tool.clone(), Some(path.clone())));
+        }
+        arms.push(("LSP rows", RustSource::ScanOnly("bench".into()), Indexers::Chosen(list)));
+    }
+    for (label, rust, indexers) in arms {
         let db = scratch.join(format!("{}.sqlite", label.replace(' ', "-")));
         let spec = atlas::config::CodeSpec {
             roots: vec![atlas::config::CodeRootSpec {
@@ -329,6 +372,13 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
         if label == "SCIP rows" {
             out.push_str(&truth_split(&conn, row, root, &docs)?);
         }
+        if label == "LSP rows" {
+            for (unit, r) in &rep.runs {
+                out.push_str(&format!("  server run ({unit}) {:.1} s{}\n", r.seconds, if r.timed_out { ", timed out" } else { "" }));
+            }
+            out.push_str(&format!("  by a language server: {} of {} indexed\n", l.lsp, l.indexed));
+            out.push_str(&lsp_vs_scip(&conn, &truth, &encl, &in_corpus)?);
+        }
         for m in c.misses.iter().filter(|m| m.lang == row.name).take(10) {
             out.push_str(&format!("  miss {} {} at {}:{}\n", m.keyword, m.name, m.path, m.line));
         }
@@ -348,6 +398,102 @@ fn bench(row: &'static atlas::langs::Lang, root: &Path, scip_file: Option<&Path>
         for m in list.iter().take(show) {
             out.push_str(&format!("  {m}\n"));
         }
+    }
+    Ok(out)
+}
+
+/// `--driver lsp` without a SCIP index: the scanner alone, then the row's
+/// language server (its SCIP indexer off), each indexed into a scratch
+/// database and held to the grep truth of the recall check.
+fn bench_lsp_truth(
+    row: &'static atlas::langs::Lang,
+    root: &Path,
+    scratch: &Path,
+    server: Option<&(String, PathBuf)>,
+    mut out: String,
+) -> Result<String, String> {
+    out.push_str("no SCIP index to compare with: the grep truth alone\n");
+    let owner = row.units_of.and_then(atlas::langs::by_name).unwrap_or(row);
+    let mut list: Vec<(String, Option<PathBuf>)> = owner.driver.iter().map(|d| (d.tool.to_string(), None)).collect();
+    if let Some((tool, path)) = server {
+        list.push((tool.clone(), Some(path.clone())));
+    }
+    for (label, indexers) in [("scanner alone", Indexers::Off("bench".into())), ("LSP rows", Indexers::Chosen(list))] {
+        let db = scratch.join(format!("{}.sqlite", label.replace(' ', "-")));
+        let spec = atlas::config::CodeSpec {
+            roots: vec![atlas::config::CodeRootSpec { name: "bench".into(), root: root.to_path_buf(), build_scripts: false, scip: Default::default(), exclude: Vec::new() }],
+            dir: Some(scratch.join("code")),
+            ..Default::default()
+        };
+        let mut setup = CodeSetup::from_spec(&spec, &db, false);
+        setup.indexers = indexers;
+        setup.defer_on_cargo = false;
+        let mut conn = atlas::db::Connection::open(&db).map_err(|e| e.to_string())?;
+        let rep = code_index::index_root(&setup, &mut conn, &setup.roots[0], &RustSource::ScanOnly("bench".into())).map_err(|e| e.to_string())?;
+        let c = atlas::recall::code_check(&conn, &setup.roots).map_err(|e| e.to_string())?;
+        let l = c.langs.iter().find(|l| l.lang == row.name).cloned().unwrap_or_default();
+        out.push_str(&format!(
+            "{label} against the grep truth: {} indexed ({} by a language server), {} scanner only, {} missing of {} ({} in comments); units: {}\n",
+            pct(l.indexed, l.truth),
+            l.lsp,
+            l.scan_only,
+            l.missing,
+            l.truth,
+            l.excluded,
+            rep.rust
+        ));
+        for (unit, r) in &rep.runs {
+            out.push_str(&format!("  server run ({unit}) {:.1} s{}\n", r.seconds, if r.timed_out { ", timed out" } else { "" }));
+        }
+        for m in c.misses.iter().filter(|m| m.lang == row.name).take(10) {
+            out.push_str(&format!("  miss {} {} at {}:{}\n", m.keyword, m.name, m.path, m.line));
+        }
+    }
+    Ok(out)
+}
+
+/// The language server's definition rows (not the scanner's fills) against
+/// SCIP's, matched by `(path, line, name)` over the files the index has:
+/// recall, precision, and item ends equal to SCIP's enclosing range.
+fn lsp_vs_scip(
+    conn: &atlas::db::Connection,
+    truth: &HashMap<(String, u32, String), &str>,
+    encl: &HashMap<(String, u32), u32>,
+    in_corpus: &HashSet<&str>,
+) -> Result<String, String> {
+    let mut st = conn
+        .prepare("SELECT f.path, o.line, o.name, o.end_line, o.kind FROM code_occ o JOIN code_files f ON f.id = o.file WHERE f.root = 'bench' AND o.sect = 0")
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?, r.get::<_, u32>(3)?, r.get::<_, String>(4)?)))
+        .map_err(|e| e.to_string())?;
+    let mut lsp: HashMap<(String, u32, String), u32> = HashMap::new();
+    for r in rows {
+        let (p, l, n, end, kind) = r.map_err(|e| e.to_string())?;
+        if !kind.ends_with("(scan)") && in_corpus.contains(p.as_str()) {
+            lsp.insert((p, l, n), end);
+        }
+    }
+    let hit = truth.keys().filter(|k| lsp.contains_key(*k)).count();
+    let right = lsp.keys().filter(|k| truth.contains_key(*k)).count();
+    let (mut same, mut n) = (0, 0);
+    for ((p, line, name), s) in truth {
+        let (Some(&got), Some(&want)) = (lsp.get(&(p.clone(), *line, name.clone())), encl.get(&(p.clone(), *line))) else { continue };
+        if *s != "term" {
+            n += 1;
+            same += usize::from(got == want);
+        }
+    }
+    let mut misses: Vec<String> = truth.iter().filter(|(k, _)| !lsp.contains_key(*k)).map(|((p, l, n), s)| format!("{s} {n} at {p}:{l}")).collect();
+    misses.sort();
+    let mut out = format!(
+        "  LSP against SCIP definitions: recall {}, precision {}; item ends equal to SCIP's (types and callables) {}\n",
+        pct(hit, truth.len()),
+        pct(right, lsp.len()),
+        pct(same, n)
+    );
+    for m in misses.iter().take(10) {
+        out.push_str(&format!("  LSP lacks {m}\n"));
     }
     Ok(out)
 }

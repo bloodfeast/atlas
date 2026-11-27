@@ -12,7 +12,12 @@ use atlas::json;
 /// Raised to 1518 for #406's three enum values (`recall` ops `sweep` and
 /// `deferred`, `journal` entry `defer`): about 1,517 tokens. Raised to 1520
 /// for the `journal` entry `reopen` (#413 review: a false close needs an undo).
-const BUDGET_TOKENS: f64 = 1520.0;
+/// Raised to 1524 for ATLAS-GOAL build step 1's two enum values (`note` op
+/// `goal`, `journal` entry `goal`): about 1,523 tokens.
+/// Raised to 1630 (1,628 tokens, measured with both) for the listed tool `track_write`
+/// (project tracking writes, its own tool by ruling journal:ATLAS-TRACKERS:0062 so `note`
+/// stays read only: about 105 tokens).
+const BUDGET_TOKENS: f64 = 1630.0;
 
 #[test]
 fn tools_list_fits_its_budget() {
@@ -26,6 +31,21 @@ fn tools_list_fits_its_budget() {
     let tokens = whole as f64 / atlas::tokens::DEFAULT_BYTES_PER_TOKEN;
     eprintln!("tools/list: {whole} bytes, {tokens:.0} tokens, {} tools", rows.len());
     assert!(tokens <= BUDGET_TOKENS, "tools/list is {tokens:.0} tokens; the budget is {BUDGET_TOKENS}");
+}
+
+/// Ruling journal:ATLAS-TRACKERS:0062 ("Own tool: track_write"): the
+/// project tracking writes are a listed tool of their own, not a `note` op,
+/// so a client that allows `note` as a read tool does not allow a write.
+#[test]
+fn note_stays_read_only_and_track_write_is_its_own_tool() {
+    let tools = atlas::tools::tool_list();
+    let hint = |name: &str| {
+        let t = tools.iter().find(|t| t["name"] == json!(name)).unwrap_or_else(|| panic!("{name} is not listed"));
+        (t["annotations"]["readOnlyHint"].as_bool(), t["annotations"]["destructiveHint"].as_bool())
+    };
+    assert_eq!(hint("note"), (Some(true), None), "note is read only");
+    assert_eq!(hint("track_write"), (None, Some(false)), "track_write writes");
+    assert!(atlas::tools::ops().all(|(tool, _, runs)| runs != "track_write" || tool == "track_write"), "no other tool's op runs track_write");
 }
 
 mod common;
@@ -69,7 +89,7 @@ fn every_listed_argument_is_taken_by_an_op_of_its_tool() {
         match name {
             "lookup" => runs.extend(["lookup", "ids"]),
             "remember" => runs.extend(["remember", "supersede"]),
-            "recall" | "search" | "section" | "grep" | "symbol" | "journal" | "handoff" | "hook" => runs.push(name),
+            "recall" | "search" | "section" | "grep" | "symbol" | "journal" | "handoff" | "hook" | "track_write" => runs.push(name),
             _ => {}
         }
         assert!(!runs.is_empty(), "{name} runs nothing");

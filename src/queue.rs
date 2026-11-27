@@ -61,13 +61,16 @@ pub fn meta_value<'a>(meta: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The waiting launches, oldest first, meta and titles only (bodies are
-/// empty: a refused launch's body is its whole brief).
+/// empty: a refused launch's body is its whole brief). A key a later
+/// `queue: KEY done` note or commit, or a `closes:KEY` ref, closed is not
+/// waiting ([`MemoryStore::queue_closed`]).
 ///
 /// # Errors
 ///
 /// [`crate::Error::Db`].
 pub fn waiting(store: &MemoryStore) -> Result<Vec<Head>> {
-    store.active_entries_no_body(ENTRY)
+    let closed = store.queue_closed()?;
+    Ok(store.active_entries_no_body(ENTRY)?.into_iter().filter(|h| !closed.contains(&h.key)).collect())
 }
 
 /// The launch's kind, from its meta (`kind: builder`).

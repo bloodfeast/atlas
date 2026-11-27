@@ -103,7 +103,9 @@ server answers `hook` calls on a worker thread of their own, never behind a slow
 same events as a command hook (the event JSON on stdin), one process per event, with one exception: a subagent's
 brief (the Agent call's prompt) is held by the server between the `PreToolUse` that carries it and the
 `SubagentStart` that injects its recall, so as a command hook `SubagentStart` has no brief and injects no lane
-recall. Use the `mcp_tool` hooks for subagent recall.
+recall. Use the `mcp_tool` hooks for subagent recall. For clients other than Claude Code (Codex runs command hooks),
+SessionStart and UserPromptSubmit are a pinned contract, on [[Other MCP clients]]; every other event is not stable
+outside Claude Code.
 
 A subagent's launch is named by the tool use id in its meta file (`agent-<id>.meta.json`), but Claude Code writes
 that file only after `SubagentStart` answers. So the start takes a launch only when that is unambiguous: exactly one
@@ -132,7 +134,8 @@ or `"off"`.
   the prompt's first `recall.query_tokens` (32) tokens must also clear `recall.cos_floor` (0.53), and a cosine at or above
   `recall.cos_alone` passes on meaning alone. Without the model the floor is `recall.fts_floor`. Records are
   embedded once per version on a background thread (cached in the store's `rec_vec` table); until a record has a
-  vector it is judged lexically. Nothing clears the gate: nothing is injected. A record is injected once per
+  vector it is judged lexically. Nothing clears the gate: nothing is injected (a short prompt with a word the record
+lacks gets nothing in every session, fresh or not; that is the gate, not the per-session dedupe). A record is injected once per
   session (or per subagent), across server restarts and compactions: a session's earlier injections are read
   back from the `hook_inject` log, so a command hook's process per event does not repeat them either (a lane's
   journal can come again after a restart). A main-session prompt gets at most `recall.prompt_pointers` (2) pointers, the rest counted in

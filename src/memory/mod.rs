@@ -34,6 +34,7 @@ pub mod recall;
 pub mod rules;
 pub mod select;
 pub mod settings;
+pub mod since;
 pub mod sync;
 pub mod tree;
 pub mod vectors;
@@ -304,10 +305,9 @@ const SURE_SCAN: usize = 64;
 /// Placement ords are spaced so a record can be put between two others.
 pub const ORD_STEP: i64 = 1 << 16;
 
-/// Record kinds the tools accept.
-pub const KINDS: &[&str] = &["memory", "rule", "section", "block", "handoff", "journal", "decision"];
-
-/// Journal entry kinds (`records.sub` for kind `journal`).
+/// Journal entry kinds the journal tool writes (`records.sub` for kind
+/// `journal`). Not `goal`: that entry is written with its goal version by
+/// `goal::append_entry` only (atlas-goal design 2.1).
 pub const ENTRIES: &[&str] = &["brief", "decision", "measurement", "commit", "question", "answered", "next", "note", "cap", "checkpoint", "queued", "review", "idea", "defer", "reopen"];
 
 /// Where an imported text came from.
@@ -353,7 +353,8 @@ pub struct Head {
     pub rid: i64,
     /// The stable key.
     pub key: String,
-    /// The kind (see [`KINDS`]).
+    /// The kind: `memory`, `rule`, `section`, `block`, `handoff`,
+    /// `journal`, `decision`, `goal`, or a tool's own (`intent`, ...).
     pub kind: String,
     /// The sub-kind: a journal entry kind or a memory type.
     pub sub: String,
@@ -704,7 +705,8 @@ fn head_row(row: &crate::db::Row<'_>) -> crate::db::Result<Head> {
         seq: row.get(6)?,
         time: row.get(7)?,
         title: row.get(8)?,
-        meta: row.get(9)?,
+        // A goal's issued met token reads `issued` (crate::goal::redact_meta).
+        meta: crate::goal::redact_meta(&row.get::<_, String>(2)?, row.get(9)?),
         body: row.get(10)?,
         sha: row.get(11)?,
         chain: row.get(12)?,
@@ -1210,7 +1212,7 @@ impl MemoryStore {
                     seq: r.get(4)?,
                     time: r.get(5)?,
                     title: r.get(6)?,
-                    meta: r.get(7)?,
+                    meta: crate::goal::redact_meta(&r.get::<_, String>(2)?, r.get(7)?),
                     body: r.get(8)?,
                     sha: r.get(9)?,
                     chain: r.get(10)?,
