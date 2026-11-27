@@ -3,6 +3,7 @@
 **Getting started**
 - [[Overview]]
 - [[Install and setup]]
+- [[Other MCP clients]]
 - [[Configuration reference]]
 - [[Reference configuration]]
 - [[Projects and multi-repo]]

@@ -43,10 +43,9 @@ what atlas cuts. Measured:
 
 | What | Measured | Turned on by | Method |
 |---|---|---|---|
-| Lookups | 6.1x fewer tokens than grep and file reads (ratio of sums over 8,639 answers on one store; 10.3x median), at v0.10.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
-| Memory questions | 100 of 100 answered, median 506 tokens each, on the 100-question memory eval, at v0.10.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Memory questions | 100 of 100 answered, median 506 tokens each, on the 100-question memory eval, at v0.12.0 | on by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
 | The tool list, in every session | 14 tools in 6,042 bytes (about 1,510 tokens), down from 47 tools and 5,930 tokens; a test holds the budget | always | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
-| Recall on each prompt | 1 of 30 off-topic prompts gets a record; about 50 tokens injected per prompt over a 303-prompt replay, at v0.10.0 | `recall.budget_tokens` 600, `recall.cos_floor` 0.53 and `recall.inject_floor` 0.60, the defaults | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
+| Recall on each prompt | 1 of 30 off-topic prompts gets a record; about 50 tokens injected per prompt over a 303-prompt replay, at v0.12.0 | `recall.budget_tokens` 600, `recall.cos_floor` 0.53 and `recall.inject_floor` 0.60, the defaults | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
 | Subagent start | about 210 tokens against 649 for the default, informing 18 needs against 1 on 30 real launches, at v0.11.0 | `"recall": {"subagent_context": "binding"}`, off by default | [Headline figures](https://github.com/bloodfeast/atlas/wiki/Token-savings-and-method#headline-figures) |
 
 `atlas --token-report` measures your own store the same way, against your Claude Code transcripts from before
@@ -70,6 +69,7 @@ The wiki is the full manual.
 
 - **Getting started:** [Overview](https://github.com/bloodfeast/atlas/wiki/Overview) ·
   [Install and setup](https://github.com/bloodfeast/atlas/wiki/Install-and-setup) ·
+  [Other MCP clients](https://github.com/bloodfeast/atlas/wiki/Other-MCP-clients) ·
   [Configuration reference](https://github.com/bloodfeast/atlas/wiki/Configuration-reference) ·
   [Reference configuration](https://github.com/bloodfeast/atlas/wiki/Reference-configuration) ·
   [Projects and multi-repo](https://github.com/bloodfeast/atlas/wiki/Projects-and-multi-repo)

@@ -1844,7 +1844,7 @@ fn context_selection_collapses_trims_and_keeps_lane_state_whole() {
     }
     // Every `Hooks` below asks in session ids of its own. A `Hooks` meeting
     // a session for the first time starts from the keys already pointed to
-    // in it, read from `hook_inject` (src/hooks.rs, the `injected_keys`
+    // in it, read from `hook_inject` (src/hooks.rs, the `injected`
     // seed in the selection loop), and those rows are written by the other
     // live `Hooks`' log thread at a time of its own (it is joined only on
     // drop). A session shared between two live `Hooks` made the second
@@ -1931,6 +1931,8 @@ fn command_hook_rows_reach_the_token_log_before_the_process_exits() {
             .arg("--hook")
             // Not a budget test: a loaded machine does not cut its answer.
             .env("ATLAS_HOOK_BUDGET_OFF", "1")
+            // Not the developer's own Claude settings: SessionStart points their status line at this binary.
+            .env("CLAUDE_CONFIG_DIR", t.path().join("claude"))
             .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .env_remove("ATLAS_UNATTENDED")
@@ -2049,6 +2051,453 @@ fn precompact_returns_no_instructions_without_a_card() {
     atlas::db::Connection::open(&s.store).unwrap().execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE records").unwrap();
     let a = h.handle(&HookEvent { trigger: "manual".into(), transcript_path: tp.to_string_lossy().into_owned(), ..ev("PreCompact") });
     assert!(a.block.is_none() && a.to_json("PreCompact").is_empty());
+}
+
+// The hook contract for other clients (#267, wiki/Other-MCP-clients.md "The
+// hook contract"). Codex and any client that can run a command hook rely on
+// these tests: a change to what they send or assert is a contract change for
+// other clients, and the wiki page changes with it.
+
+/// A store for the contract tests: one recallable memory (`widget-cache`)
+/// and its neighbours from [`seed`], no model, no watcher. `extra` is merged
+/// into the `recall` section.
+fn other_client_store(dir: &Path, name: &str, extra: Value) -> PathBuf {
+    write(&dir.join("vault").join("Index.md"), "# Index\n");
+    let mut recall = json!({"fts_floor": 0.0});
+    for (k, v) in extra.as_object().into_iter().flatten() {
+        recall.as_object_mut().unwrap().insert(k.clone(), v.clone());
+    }
+    let cfg = dir.join(name);
+    write(&cfg, &format!("{}", json!({"db": "state/index.sqlite", "vaults": [{"name": "v", "path": "vault"}], "watch": false, "recall": recall, "models": {"auto_download": false, "files": []}})));
+    cfg
+}
+
+/// A hook input as Codex CLI 0.172.0 sends it (L2 smoke,
+/// journal:ATLAS-ANYWHERE:0024): `transcript_path` is null under `codex
+/// exec`, and `turn_id`, `model` and `permission_mode` are fields atlas does
+/// not need. `more` adds `prompt` (UserPromptSubmit) or `source` (SessionStart).
+fn codex_event(event: &str, session: &str, cwd: &Path, more: Value) -> Value {
+    let mut v = json!({
+        "session_id": session,
+        "turn_id": "01a21322-455c-7062-aef3-c4c405b72b84",
+        "transcript_path": null,
+        "cwd": cwd.to_string_lossy().into_owned(),
+        "hook_event_name": event,
+        "model": "gpt-codex",
+        "permission_mode": "bypassPermissions",
+    });
+    for (k, x) in more.as_object().into_iter().flatten() {
+        v.as_object_mut().unwrap().insert(k.clone(), x.clone());
+    }
+    v
+}
+
+/// `atlas --hook` as another client runs it: `ev` on stdin, with
+/// `ATLAS_UNATTENDED=1` and none of Claude Code's variables. (exit success,
+/// stdout, stderr).
+fn command_hook(cfg: &Path, dir: &Path, ev: &Value, env: &[(&str, &str)]) -> (bool, String, String) {
+    let mut c = Command::new(bin());
+    c.arg("--config")
+        .arg(cfg)
+        .arg("--hook")
+        // Not a budget test: a loaded machine does not cut its answer.
+        .env("ATLAS_HOOK_BUDGET_OFF", "1")
+        .env("ATLAS_UNATTENDED", "1")
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
+        .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_HOOK_TIMINGS")
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(ev.to_string().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), String::from_utf8(out.stdout).unwrap(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The `hook` MCP tool over the real binary's stdio, one server for all of
+/// `calls` (each the tool's arguments): each reply's content.
+fn tool_hook(cfg: &Path, dir: &Path, calls: &[Value]) -> Vec<Value> {
+    let mut child = Command::new(bin())
+        .arg("--config")
+        .arg(cfg)
+        .env("ATLAS_HOOK_BUDGET_OFF", "1")
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
+        .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_UNATTENDED")
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let mut i = child.stdin.take().unwrap();
+        writeln!(i, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "t"}}})).unwrap();
+        for (n, a) in calls.iter().enumerate() {
+            writeln!(i, "{}", json!({"jsonrpc": "2.0", "id": n + 2, "method": "tools/call", "params": {"name": "hook", "arguments": a}})).unwrap();
+        }
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let replies: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().map(|l| json::parse(l).unwrap()).collect();
+    (0..calls.len()).map(|n| replies.iter().find(|r| r["id"].as_i64() == Some(n as i64 + 2)).unwrap()["result"]["content"].clone()).collect()
+}
+
+const WIDGET_PROMPT: &str = "why does the widget cache evict entries past sixty four widgets";
+const NOTHING_PROMPT: &str = "what is the weather like on the coast";
+
+/// A UserPromptSubmit answer that injects: exactly one JSON object, holding
+/// exactly `hookSpecificOutput` with exactly `hookEventName` and
+/// `additionalContext`. Returns the context.
+#[track_caller]
+fn pinned_ups_answer(out: &str) -> String {
+    let v = match json::parse(out) {
+        Ok(v) => v,
+        Err(e) => panic!("not one JSON object ({e}): {out:?}"),
+    };
+    let top: Vec<&String> = v.as_object().unwrap().keys().collect();
+    assert_eq!(top, ["hookSpecificOutput"], "{out}");
+    let inner = v["hookSpecificOutput"].as_object().unwrap();
+    let mut names: Vec<&String> = inner.keys().collect();
+    names.sort();
+    assert_eq!(names, ["additionalContext", "hookEventName"], "{out}");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit", "{out}");
+    v["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string()
+}
+
+/// The pinned contract on the command form: a Codex-shaped UserPromptSubmit
+/// gets one `hookSpecificOutput` object naming the record's key; a prompt
+/// nothing clears gets empty stdout and exit 0; an unattended SessionStart on
+/// a fresh store prints nothing (no offer), where an attended one prints the
+/// offers in one pinned `hookSpecificOutput` object; fields atlas does not read and a
+/// null `transcript_path` are accepted, and the four fields recall needs are
+/// enough. A change here is a contract change for other clients.
+#[test]
+fn the_hook_contract_for_other_clients_is_pinned_command() {
+    let t = Temp::new("hook-contract-cmd");
+    let cfg = other_client_store(t.path(), "atlas.json", json!({}));
+    seed(&settings(t.path()));
+    let dir = t.path();
+    // The Codex shape: the record's key, exit 0, nothing on stderr.
+    let (ok, out, err) = command_hook(&cfg, dir, &codex_event("UserPromptSubmit", "codex-1", dir, json!({"prompt": WIDGET_PROMPT})), &[]);
+    assert!(ok, "{err}");
+    let ctx = pinned_ups_answer(&out);
+    assert!(ctx.contains("widget-cache"), "{ctx}");
+    assert!(!ctx.contains("garden"), "{ctx}");
+    assert!(!ctx.contains(" more: recall"), "every record that passed is pointed to: no more line: {ctx}");
+    assert_eq!(err, "", "nothing on stderr unless timings are asked for");
+    // Only event, session_id, prompt and cwd: the same recall.
+    let minimal = json!({"hook_event_name": "UserPromptSubmit", "session_id": "codex-2", "prompt": WIDGET_PROMPT, "cwd": dir.to_string_lossy().into_owned()});
+    let (ok, out2, _) = command_hook(&cfg, dir, &minimal, &[]);
+    assert!(ok);
+    assert_eq!(pinned_ups_answer(&out2), ctx, "the minimal fields recall the same");
+    // `event` in place of `hook_event_name` (the tool's name for it) too.
+    let as_tool = json!({"event": "UserPromptSubmit", "session_id": "codex-3", "prompt": WIDGET_PROMPT, "cwd": dir.to_string_lossy().into_owned()});
+    let (ok, out3, _) = command_hook(&cfg, dir, &as_tool, &[]);
+    assert!(ok);
+    assert_eq!(pinned_ups_answer(&out3), ctx);
+    // Nothing clears the gate: the "nothing" answer.
+    let (ok, out, err) = command_hook(&cfg, dir, &codex_event("UserPromptSubmit", "codex-4", dir, json!({"prompt": NOTHING_PROMPT})), &[]);
+    assert!(ok, "{err}");
+    assert_eq!(out, "", "nothing is empty stdout");
+    // SessionStart unattended on a fresh store: nothing, no offer.
+    let fresh = t.path().join("fresh");
+    let fcfg = other_client_store(&fresh, "atlas.json", json!({}));
+    for source in ["startup", "resume", "clear", "compact"] {
+        let (ok, out, err) = command_hook(&fcfg, &fresh, &codex_event("SessionStart", "codex-5", &fresh, json!({"source": source})), &[]);
+        assert!(ok, "{source}: {err}");
+        assert_eq!(out, "", "{source}: unattended SessionStart prints nothing on a fresh store");
+    }
+    // The control: the same store and events attended (`0`, or the variable
+    // unset, as a hook run by hand) print the first-session offers, so the
+    // empty answers above are the flag's doing. The shape is pinned: one
+    // object, exactly `hookSpecificOutput` with exactly `hookEventName`
+    // (SessionStart) and `additionalContext`. A resume or a compaction asks
+    // nothing, attended or not.
+    for (n, (source, flag)) in [("startup", Some("0")), ("clear", Some("0")), ("startup", None)].into_iter().enumerate() {
+        let ev = codex_event("SessionStart", &format!("codex-6-{n}"), &fresh, json!({"source": source}));
+        let out = match flag {
+            Some(f) => command_hook(&fcfg, &fresh, &ev, &[("ATLAS_UNATTENDED", f)]),
+            None => command_hook_attended(&fcfg, &fresh, &ev),
+        };
+        assert!(out.0, "{source} {flag:?}: {}", out.2);
+        let v = json::parse(&out.1).unwrap_or_else(|e| panic!("{source} {flag:?}: not one JSON object ({e}): {:?}", out.1));
+        let top: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(top, ["hookSpecificOutput"], "{}", out.1);
+        let mut names: Vec<&String> = v["hookSpecificOutput"].as_object().unwrap().keys().collect();
+        names.sort();
+        assert_eq!(names, ["additionalContext", "hookEventName"], "{}", out.1);
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart", "{}", out.1);
+        let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(ctx.contains("orchestrated mode is offered"), "{source} {flag:?}: attended gets the offer: {ctx}");
+    }
+    for source in ["resume", "compact"] {
+        let (ok, out, _) = command_hook(&fcfg, &fresh, &codex_event("SessionStart", "codex-7", &fresh, json!({"source": source})), &[("ATLAS_UNATTENDED", "0")]);
+        assert!(ok);
+        assert_eq!(out, "", "{source}: no question on a resume or compaction");
+    }
+}
+
+/// [`command_hook`] with `ATLAS_UNATTENDED` unset: a user is assumed.
+fn command_hook_attended(cfg: &Path, dir: &Path, ev: &Value) -> (bool, String, String) {
+    let mut c = Command::new(bin());
+    c.arg("--config")
+        .arg(cfg)
+        .arg("--hook")
+        .env("ATLAS_HOOK_BUDGET_OFF", "1")
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
+        .env_remove("ATLAS_UNATTENDED")
+        .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("ATLAS_HOOK_TIMINGS")
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(ev.to_string().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), String::from_utf8(out.stdout).unwrap(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The same contract on the `hook` MCP tool (`event`, `session_id`,
+/// `prompt`, `cwd`): the reply text is the hook JSON the command form
+/// prints, character for character, and "nothing" is empty text. A change
+/// here is a contract change for other clients.
+#[test]
+fn the_hook_contract_for_other_clients_is_pinned_tool() {
+    let t = Temp::new("hook-contract-tool");
+    let cfg = other_client_store(t.path(), "atlas.json", json!({}));
+    seed(&settings(t.path()));
+    let dir = t.path();
+    let cwd = dir.to_string_lossy().into_owned();
+    let (ok, command, _) = command_hook(&cfg, dir, &codex_event("UserPromptSubmit", "cmd-1", dir, json!({"prompt": WIDGET_PROMPT})), &[]);
+    assert!(ok);
+    let replies = tool_hook(
+        &cfg,
+        dir,
+        &[
+            json!({"event": "UserPromptSubmit", "session_id": "tool-1", "prompt": WIDGET_PROMPT, "cwd": cwd}),
+            json!({"event": "UserPromptSubmit", "session_id": "tool-2", "prompt": NOTHING_PROMPT, "cwd": cwd}),
+            // Codex's `mcp_tool` handler sends its template fields; unknown ones are accepted.
+            json!({"event": "UserPromptSubmit", "session_id": "tool-3", "turn_id": "t-1", "model": "gpt-codex", "permission_mode": "default", "transcript_path": null, "prompt": WIDGET_PROMPT, "cwd": cwd}),
+        ],
+    );
+    let text = |c: &Value| -> String {
+        assert_eq!(c.as_array().map(Vec::len), Some(1), "{c}");
+        assert_eq!(c[0]["type"], "text", "{c}");
+        c[0]["text"].as_str().unwrap().to_string()
+    };
+    let hook = text(&replies[0]);
+    let ctx = pinned_ups_answer(&hook);
+    assert!(ctx.contains("widget-cache"), "{ctx}");
+    assert_eq!(hook, command, "the tool's reply text is the command hook's stdout");
+    assert_eq!(text(&replies[1]), "", "nothing is empty text");
+    assert_eq!(text(&replies[2]), command);
+    // SessionStart through the tool on a fresh store: nothing.
+    let fresh = t.path().join("fresh");
+    let fcfg = other_client_store(&fresh, "atlas.json", json!({}));
+    let fcwd = fresh.to_string_lossy().into_owned();
+    let starts = tool_hook(&fcfg, &fresh, &[json!({"event": "SessionStart", "session_id": "tool-4", "source": "startup", "cwd": fcwd})]);
+    assert_eq!(text(&starts[0]), "");
+}
+
+/// The command hook runs a process per event: the second process of a
+/// session points to nothing the first pointed to, and what the first sent
+/// counts against `recall.session_budget_tokens` in the second.
+#[test]
+fn dedupe_and_budget_hold_across_command_hook_processes() {
+    let t = Temp::new("hook-contract-procs");
+    let dir = t.path();
+    let cfg = other_client_store(dir, "atlas.json", json!({}));
+    seed(&settings(dir));
+    let ups = |session: &str, prompt: &str| codex_event("UserPromptSubmit", session, dir, json!({"prompt": prompt}));
+    let (ok, first, _) = command_hook(&cfg, dir, &ups("procs", WIDGET_PROMPT), &[]);
+    assert!(ok);
+    let sent = pinned_ups_answer(&first);
+    assert!(sent.contains("widget-cache"), "{sent}");
+    let (ok, second, _) = command_hook(&cfg, dir, &ups("procs", WIDGET_PROMPT), &[]);
+    assert!(ok);
+    assert!(!second.contains("widget-cache"), "pointed to once per session: {second}");
+    // A session budget with room for either answer alone and a few bytes
+    // more, not both: the next process of that session has too little left for the
+    // gadget rule, while a fresh session under the same cap gets it.
+    let gadget = "how does the gadget exporter write its files with temp files and renames";
+    let (ok, probe, _) = command_hook(&cfg, dir, &ups("procs-probe", gadget), &[]);
+    assert!(ok);
+    let alone = pinned_ups_answer(&probe);
+    assert!(alone.contains("rules:r00001"), "{alone}");
+    let s = settings(dir);
+    // A pointer needs 32 bytes of room past its own (`Hooks::recall`).
+    let cap = (1..).find(|n| s.bytes_for(*n) >= sent.len().max(alone.len()) + 40).unwrap();
+    let capped = other_client_store(dir, "capped.json", json!({"session_budget_tokens": cap}));
+    let (ok, fresh, _) = command_hook(&capped, dir, &ups("procs-fresh", gadget), &[]);
+    assert!(ok);
+    assert!(pinned_ups_answer(&fresh).contains("rules:r00001"), "the cap alone leaves room: {fresh}");
+    let (ok, spent, _) = command_hook(&capped, dir, &ups("procs", gadget), &[]);
+    assert!(ok);
+    assert!(!spent.contains("rules:r00001"), "the first process's bytes count in the next: {spent}");
+}
+
+/// The bytes the `hook_inject` rows of a main session charge.
+fn charged(dir: &Path, session: &str) -> i64 {
+    let conn = atlas::db::Connection::open(dir.join("state").join("index.sqlite")).unwrap();
+    conn.query_row("SELECT COALESCE(SUM(bytes), 0) FROM hook_inject WHERE session = ?1 AND agent = ''", [session], |r| r.get(0)).unwrap()
+}
+
+/// A command-hook process charges the session budget from the rows earlier
+/// processes logged, and the server from what it sent: the rows hold every
+/// byte sent, the pointer header and the "+N more" line included, so the
+/// two count the same.
+#[test]
+fn a_command_hook_charges_what_the_server_charges() {
+    let t = Temp::new("hook-contract-charge");
+    let dir = t.path();
+    // One pointer a prompt: the rest is the "+N more" line.
+    let cfg = other_client_store(dir, "atlas.json", json!({"prompt_pointers": 1}));
+    seed(&settings(dir));
+    let both = "why does the widget cache evict entries, and how does the gadget exporter write its files with temp files and renames";
+    let (ok, out, _) = command_hook(&cfg, dir, &codex_event("UserPromptSubmit", "charge-cmd", dir, json!({"prompt": both})), &[]);
+    assert!(ok);
+    let ctx = pinned_ups_answer(&out);
+    assert!(ctx.contains(atlas::hooks::POINTER_HEAD) && ctx.contains(" more: recall"), "a header and a more line: {ctx}");
+    assert_eq!(charged(dir, "charge-cmd"), ctx.len() as i64, "the rows charge what was sent: {ctx}");
+    // The server's answer, logged by its own thread, charges the same.
+    let cwd = dir.to_string_lossy().into_owned();
+    let replies = tool_hook(&cfg, dir, &[json!({"event": "UserPromptSubmit", "session_id": "charge-tool", "prompt": both, "cwd": cwd})]);
+    let hook = replies[0][0]["text"].as_str().unwrap().to_string();
+    assert_eq!(pinned_ups_answer(&hook), ctx);
+    assert_eq!(charged(dir, "charge-tool"), ctx.len() as i64);
+}
+
+/// The MCP server over stdio, answering one call at a time, so another
+/// process can run between two of its calls.
+struct Server {
+    child: std::process::Child,
+    out: std::io::BufReader<std::process::ChildStdout>,
+    id: i64,
+}
+
+impl Server {
+    fn start(cfg: &Path, dir: &Path) -> Server {
+        let mut child = Command::new(bin())
+            .arg("--config")
+            .arg(cfg)
+            .env("ATLAS_HOOK_BUDGET_OFF", "1")
+            .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
+            .env_remove("CLAUDE_CODE_SESSION_ATTENDED")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
+            .env_remove("ATLAS_UNATTENDED")
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut s = Server { child, out, id: 1 };
+        s.send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "t"}}}));
+        s
+    }
+
+    fn send(&mut self, msg: Value) -> Value {
+        use std::io::BufRead;
+        let id = msg["id"].as_i64().unwrap();
+        writeln!(self.child.stdin.as_mut().unwrap(), "{msg}").unwrap();
+        loop {
+            let mut line = String::new();
+            assert!(self.out.read_line(&mut line).unwrap() > 0, "the server closed");
+            let v = json::parse(&line).unwrap();
+            if v["id"].as_i64() == Some(id) {
+                return v;
+            }
+        }
+    }
+
+    /// The `hook` tool's reply text.
+    fn hook(&mut self, args: Value) -> String {
+        self.id += 1;
+        let r = self.send(json!({"jsonrpc": "2.0", "id": self.id, "method": "tools/call", "params": {"name": "hook", "arguments": args}}));
+        r["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+/// A server that has answered a session already reads, at each prompt, what
+/// a command-hook process pointed to in that session since: a record the
+/// other process sent is not pointed to again (its bytes are read with its
+/// keys, as [`dedupe_and_budget_hold_across_command_hook_processes`] checks
+/// for a process's first read).
+#[test]
+fn the_server_reads_what_a_command_hook_sent_since() {
+    let t = Temp::new("hook-contract-mixed");
+    let dir = t.path();
+    let cfg = other_client_store(dir, "atlas.json", json!({}));
+    seed(&settings(dir));
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut server = Server::start(&cfg, dir);
+    // The server sees the session first: nothing clears this prompt.
+    assert_eq!(server.hook(json!({"event": "UserPromptSubmit", "session_id": "mixed", "prompt": NOTHING_PROMPT, "cwd": cwd})), "");
+    // A command hook of the same session points to the widget record.
+    let (ok, out, _) = command_hook(&cfg, dir, &codex_event("UserPromptSubmit", "mixed", dir, json!({"prompt": WIDGET_PROMPT})), &[]);
+    assert!(ok);
+    assert!(pinned_ups_answer(&out).contains("widget-cache"), "{out}");
+    let again = server.hook(json!({"event": "UserPromptSubmit", "session_id": "mixed", "prompt": WIDGET_PROMPT, "cwd": cwd}));
+    assert!(!again.contains("widget-cache"), "pointed to once per session, whichever process sent it: {again}");
+}
+
+/// A transcript that is not Claude Code's (a Codex rollout) is ignored, not
+/// parsed: no compaction report, nothing on stderr, no compact_log or
+/// transcript rows, exit 0.
+#[test]
+fn a_codex_transcript_is_ignored_not_parsed() {
+    let t = Temp::new("hook-contract-codex-tp");
+    let dir = t.path();
+    let cfg = other_client_store(dir, "atlas.json", json!({}));
+    seed(&settings(dir));
+    let tp = dir.join("rollout-2026-11-25T14-35-00-00000000-0000-7000-8000-000000000001.jsonl");
+    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join("hooks").join("codex-rollout.jsonl"), &tp).unwrap();
+    let tps = tp.to_string_lossy().into_owned();
+    let events = [
+        codex_event("SessionStart", "codex-tp", dir, json!({"source": "compact", "transcript_path": tps})),
+        codex_event("UserPromptSubmit", "codex-tp", dir, json!({"prompt": NOTHING_PROMPT, "transcript_path": tps})),
+    ];
+    // PreCompact is not part of the contract: on a rollout it writes a
+    // checkpoint whose card says the transcript was unread (the wiki page).
+    for ev in &events {
+        let (ok, out, err) = command_hook(&cfg, dir, ev, &[]);
+        assert!(ok, "{ev}: {err}");
+        assert_eq!(err, "", "{ev}");
+        assert_eq!(out, "", "{ev}: no report, no card");
+    }
+    let conn = atlas::db::Connection::open(dir.join("state").join("index.sqlite")).unwrap();
+    let rows = |table: &str| -> i64 {
+        let has: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [table], |r| r.get(0)).unwrap();
+        if has == 0 {
+            return 0;
+        }
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(rows("compact_log"), 0, "the rollout is no compaction");
+    assert_eq!(rows("turns_seen"), 0, "the rollout is not indexed as turns");
+    assert_eq!(std::fs::read(&tp).unwrap(), std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/hooks/codex-rollout.jsonl")).unwrap(), "left as it was");
+    // Asked for, the timings are all stderr says.
+    let (ok, _, err) = command_hook(&cfg, dir, &events[0], &[("ATLAS_HOOK_TIMINGS", "1")]);
+    assert!(ok);
+    assert!(!err.is_empty() && err.lines().all(|l| l.starts_with("atlas hook timings")), "{err}");
 }
 
 /// The hook tool writes journal entries (context caps, checkpoints), so it
@@ -3228,6 +3677,24 @@ fn a_main_prompt_gets_one_capped_lane_view_and_heads_for_the_rest() {
     assert!(alpha.len() <= 2048 + 160, "{} bytes: {alpha}", alpha.len());
     assert!(alpha.contains("# decisions"), "{alpha}");
     assert!(c.contains("lane BETA: 3 entries, 0 open; recall lane=BETA\n") && !c.contains("lane BETA: 3 entries\n"), "{c}");
+}
+
+/// The head line a capped main prompt sends for another lane is logged as
+/// `lane-head:X`, the key its dedupe marks: logged as `lane:X`, another
+/// process reading the session's rows back skips `lane:` rows and sends the
+/// head again.
+#[test]
+fn a_capped_lane_head_is_logged_under_its_dedupe_key() {
+    let t = Temp::new("bo2-main-cap-key");
+    let mut s = settings(t.path());
+    long_lane(&s, "ALPHA", 12);
+    long_lane(&s, "BETA", 3);
+    s.recall.main_lane_bytes = 2048;
+    let mut h = Hooks::open(s).unwrap();
+    h.handle(&HookEvent { prompt: "Lane: ALPHA\nCompare it with what BETA decided.".into(), ..ev("UserPromptSubmit") });
+    let logged: Vec<&str> = h.last_injected().iter().map(|k| k.key.as_str()).collect();
+    assert!(logged.contains(&"lane-head:BETA") && !logged.contains(&"lane:BETA"), "{logged:?}");
+    assert!(logged.contains(&"lane:ALPHA"), "{logged:?}");
 }
 
 // ---- #188 review: the harness order (start, then the meta file, then the

@@ -396,6 +396,31 @@ pub fn runq_holders_in(text: &str, parent: Option<u32>) -> Vec<String> {
     out
 }
 
+/// True when runq's state file text `text` has a held entry of any
+/// session whose `res` is `heavy-compile` (the code index defers its runs
+/// meanwhile). Another version of the format gives false, as for
+/// [`runq_holders_in`].
+pub fn runq_heavy_held_in(text: &str) -> bool {
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some(RUNQ_STATE) {
+        return false;
+    }
+    lines.any(|l| {
+        let mut f = l.split('\t');
+        if f.next() != Some("entry") {
+            return false;
+        }
+        let kv: HashMap<&str, &str> = f.filter_map(|x| x.split_once('=')).collect();
+        kv.get("held") == Some(&"1") && kv.get("res").is_some_and(|r| r.split(',').any(|x| x.trim() == "heavy-compile"))
+    })
+}
+
+/// [`runq_heavy_held_in`] for the state file under runq root `root`;
+/// false when it is missing or unreadable.
+pub fn runq_heavy_held(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("state")).is_ok_and(|t| runq_heavy_held_in(&t))
+}
+
 /// The runq holders in the state file under runq root `root`; none when it
 /// is missing or unreadable.
 pub fn runq_holders_at(root: &Path) -> Vec<String> {

@@ -317,3 +317,31 @@ fn atlas_unattended_is_documented_and_the_only_door() {
     }
     assert_eq!(readers, ["src/claude_settings.rs"], "only claude_settings.rs reads the attended variables");
 }
+
+/// #267: the Other MCP clients page states the hook contract the pin tests in
+/// tests/hooks.rs hold: every field they send, the output shape, the two test
+/// names, and that every other event is not stable. Its snippets carry
+/// placeholder paths only (a URL is not a path).
+#[test]
+fn the_other_clients_page_names_the_pinned_hook_fields() {
+    let page = read(&root().join("wiki").join("Other-MCP-clients.md"));
+    let contract = page.split("\n## The hook contract\n").nth(1).expect("a section The hook contract");
+    let spans: BTreeSet<String> = code_spans(contract).into_iter().collect();
+    // What the pin tests send (`codex_event` and the tool's arguments), and what they assert comes back.
+    let sent = ["hook_event_name", "event", "session_id", "prompt", "cwd", "source", "transcript_path", "turn_id", "model", "permission_mode"];
+    let back = ["hookSpecificOutput", "hookEventName", "additionalContext", "SessionStart", "UserPromptSubmit", "ATLAS_UNATTENDED=1"];
+    let tests = ["the_hook_contract_for_other_clients_is_pinned_command", "the_hook_contract_for_other_clients_is_pinned_tool"];
+    let missing: Vec<&&str> = sent.iter().chain(&back).chain(&tests).filter(|f| !spans.contains(**f)).collect();
+    assert!(missing.is_empty(), "The hook contract on Other-MCP-clients.md leaves out: {missing:?}");
+    // In any words, as long as it says which are not.
+    assert!(contract.to_lowercase().contains("not stable"), "the unpinned events are named as such");
+    for name in tests {
+        assert!(read(&root().join("tests").join("hooks.rs")).contains(&format!("fn {name}()")), "{name} is not in tests/hooks.rs");
+    }
+    for (n, block) in page.split("```").enumerate().filter(|(n, _)| n % 2 == 1) {
+        // A URL is not a path on someone's disk.
+        let url = |s: &str| s.contains("http://") || s.contains("https://");
+        let paths: Vec<&str> = block.split(['\'', '"', ' ', '\n', '\t', '(', ')', '<', '>']).filter(|s| (s.contains(":\\") || s.contains(":/")) && !url(s)).collect();
+        assert!(paths.iter().all(|p| p.contains("path\\to") || p.contains("path\\\\to") || p.contains("path/to")), "block {n} has a real path: {paths:?}");
+    }
+}

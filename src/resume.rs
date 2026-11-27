@@ -8,11 +8,23 @@
 //! - the live lanes (a work record, `LaneStatus::last_work`, within
 //!   [`LIVE_DAYS`]; `session:` and `agent:` scopes and the queue lane are not
 //!   lanes), each with its open question count and newest handoff;
+//! - the holds owed now: an entry with `held:` and `until:` meta whose
+//!   release a later entry's title met, and that nothing closed;
 //! - the live lanes' open questions for the user, as keys;
 //! - after a `/clear` only, the agents still running from the previous
 //!   session (a new process has none: its agents ended with the old one);
 //! - the work queue: how many wait, the batch that can start now and the
-//!   next one waiting;
+//!   next one waiting (before the next two lines, Brandon 2026-11-24,
+//!   journal:ATLAS-RESUME:0010);
+//! - after the handoffs: per live lane, its own entries newer than its
+//!   newest handoff, then at most one recent ruling of another lane that
+//!   names it and that it has not named back, by key, kind and title,
+//!   decisions, answers, reviews and launches first
+//!   ([`crate::memory::since`]); the line's room is split between the lanes;
+//! - in a new process only, "orphaned by restart?": the previous session's
+//!   agents that never finished, read from its subagent transcripts, else
+//!   (no transcripts) the last day's launches with nothing after them in
+//!   their lane but launches, newest first;
 //! - the newest handoffs within [`LIVE_DAYS`] the lanes line does not
 //!   already name;
 //! - the pending ideas, when `memory.ideas` is on (see [`crate::ideas`]);
@@ -20,7 +32,11 @@
 //!
 //! Then the handoff the question names (the newest live lane's, else the
 //! newest other one): its key, title and next step, each clipped (Brandon's
-//! ruling of 2026-11-16, journal:ATLAS-RELEASE:0036). Then one instruction:
+//! ruling of 2026-11-16, journal:ATLAS-RELEASE:0036); a next step that a
+//! later entry names done is marked "(superseded by KEY)". Before it, when
+//! the goal line is shown, the active goal record's newest `AMENDED`
+//! paragraph (a memory record keyed `active-goal...`), reserved like the
+//! goal line. Then one instruction:
 //! ask the user, as multiple choice, whether to resume that handoff or the
 //! queue, change the plan, or do something more pressing first.
 //!
@@ -65,6 +81,18 @@ const MAX_START: usize = 5;
 const MAX_HANDOFFS: usize = 3;
 /// A title is clipped to this many characters.
 const TITLE_CHARS: usize = 60;
+/// Items listed per lane after its handoff, at most.
+const MAX_AFTER: usize = 3;
+/// An after-the-handoff item's title is clipped to this many characters.
+const AFTER_TITLE_CHARS: usize = 28;
+/// The after-the-handoffs line's bytes at most, cut at an item boundary.
+const AFTER_BYTES: usize = 260;
+/// Launches older than this many hours are not flagged as orphaned.
+const ORPHAN_HOURS: i64 = 24;
+/// Orphaned launches listed at most.
+const MAX_ORPHANS: usize = 3;
+/// The active goal record's amendment is clipped to this many characters.
+const AMENDMENT_CHARS: usize = 120;
 /// The longest goal the card shows whole; a longer one is named by where it
 /// is, never cut.
 pub const GOAL_CHARS: usize = 300;
@@ -107,6 +135,10 @@ pub fn card_with(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now
 pub fn card_stale_after(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, cleared: bool, ideas: Option<&str>, stale_days: i64) -> Result<Option<String>> {
     build(store, orch, transcript, now, cleared, Opts { ideas, stale_days, budget: CARD_BYTES })
 }
+
+#[cfg(test)]
+#[path = "resume_slips_tests.rs"]
+mod slips_tests;
 
 /// The card's tunables.
 struct Opts<'a> {
@@ -171,6 +203,37 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
         lines.push(format!("- live lanes{}: {}", more(live.len(), MAX_LANES), shown.join("; ")));
     }
 
+    // What came after each live lane's newest handoff, its launches with
+    // nothing after them, and the holds whose release came
+    // (journal:ATLAS-RESUME:0001 to 0004; see `crate::memory::since`).
+    let since_time = crate::checkpoint::epoch_secs(now).map(|s| crate::discussion::civil(s - LIVE_DAYS * 86_400)).unwrap_or_default();
+    let after = after_handoffs(store, &live, &since_time)?;
+    // Brandon 2026-11-24 (journal:ATLAS-RESUME:0010): the work queue line
+    // goes before these, so they never push it off the card.
+    let mut late: Vec<String> = Vec::new();
+    if !after.lanes.is_empty() {
+        // Held to its share of the card, split between the lanes, so the
+        // other handoffs still have room and no lane crowds the rest off.
+        late.push(after_line(&after.lanes, AFTER_BYTES));
+    }
+    // A new process only: a cleared session's agents may still run.
+    if !cleared {
+        let (from, orphans) = orphans(store, orch, prev.as_deref(), now)?;
+        if !orphans.is_empty() {
+            let n = orphans.len();
+            let shown: Vec<&str> = orphans.iter().rev().take(MAX_ORPHANS).map(String::as_str).collect();
+            late.push(format!("- orphaned by restart? ({from}){}: {}", more(n, MAX_ORPHANS), shown.join(", ")));
+        }
+    }
+    let owed: Vec<String> = store
+        .owed_holds(&since_time)?
+        .into_iter()
+        .map(|o| format!("{} (released by {}): {}", o.hold, o.release, o.held.join(", ")))
+        .collect();
+    if !owed.is_empty() {
+        lines.push(format!("- owed now: {}", owed.join("; ")));
+    }
+
     if !questions.is_empty() || deferred > 0 {
         // Only a stale question carries its age: the line is as it was when
         // none is stale or deferred.
@@ -232,6 +295,7 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
         }
         lines.push(q);
     }
+    lines.extend(late);
 
     // The handoff the closing question names: the newest live lane's, else
     // the newest recent one the lanes line does not name.
@@ -245,6 +309,9 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
             let mut l = format!("- to resume: {k} \"{}\"", one_line(t));
             if let Some(step) = store.head(k)?.and_then(|h| next_step(&h.body)) {
                 l.push_str(&format!(", next: {}", one_line(&step)));
+                if let Some((_, by)) = after.superseded.iter().find(|(h, _)| h == k) {
+                    l.push_str(&format!(" (superseded by {by})"));
+                }
             }
             l + "\n"
         }
@@ -262,7 +329,18 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
     }
 
     let goal_line = prev.as_deref().and_then(|p| goal_within(p, GOAL_TAIL_BYTES).map(|(g, from)| goal_line(&g, from, p))).unwrap_or_default();
-    if lines.is_empty() && goal_line.is_empty() && resume.is_empty() {
+    // The active goal record's newest amendment, reserved with the goal
+    // line: a goal restated without it is the old goal. Only with a goal
+    // line (an active /goal): alone it only takes the other lines' room.
+    let goals = if goal_line.is_empty() { Vec::new() } else { store.goal_records()? };
+    let amended = goals
+        .into_iter()
+        .find_map(|g| {
+            let a = crate::memory::since::amendment(&g.body)?;
+            Some(format!("- active goal record {} (v{} {}): {}\n", g.key, g.seq, g.time.get(..10).unwrap_or(&g.time), clip_to(&a, AMENDMENT_CHARS)))
+        })
+        .unwrap_or_default();
+    if lines.is_empty() && goal_line.is_empty() && resume.is_empty() && amended.is_empty() {
         return Ok(None);
     }
     lines.extend(ideas.map(str::to_string));
@@ -273,8 +351,140 @@ fn build(store: &MemoryStore, orch: &OrchSettings, transcript: &str, now: &str, 
         (None, false) => "resume the work queue".to_string(),
     };
     // The resume line is reserved with the ask, so a full card still shows it.
-    let ask = format!("{goal_line}{resume}Before other work, ask the user one multiple-choice question: (1) {first}, (2) change it first, or (3) do something more pressing.\n");
+    let ask = format!("{goal_line}{amended}{resume}Before other work, ask the user one multiple-choice question: (1) {first}, (2) change it first, or (3) do something more pressing.\n");
     Ok(Some(fit(&lines, &ask, budget)))
+}
+
+/// What came after the live lanes' handoffs, for the card.
+struct After {
+    /// Per lane (the first [`MAX_LANES`]), in the card's lane order.
+    lanes: Vec<LaneAfter>,
+    /// (handoff key, the entry that names its next step done).
+    superseded: Vec<(String, String)>,
+}
+
+/// One lane's part of the after-the-handoffs line.
+struct LaneAfter {
+    /// Its newest handoff's key.
+    handoff: String,
+    /// How many items it has in all.
+    total: usize,
+    /// Its first [`MAX_AFTER`] items: (key, sub, short title).
+    items: Vec<(String, String, String)>,
+}
+
+impl LaneAfter {
+    /// `handoff:X:N then (k of n): KEY sub "title", ...` with the first `k`
+    /// items, titled or (`titled` false) not.
+    fn render(&self, k: usize, titled: bool) -> String {
+        let items: Vec<String> =
+            self.items.iter().take(k).map(|(key, sub, t)| if titled { format!("{key} {sub} \"{t}\"") } else { format!("{key} {sub}") }).collect();
+        format!("{} then{}: {}", self.handoff, more(self.total, k), items.join(", "))
+    }
+
+    /// The most of it that fits `share` bytes: the most titled items, else
+    /// the most untitled ones, and never less than its first item untitled.
+    fn fit(&self, share: usize) -> String {
+        for titled in [true, false] {
+            for k in (1..=self.items.len()).rev() {
+                let s = self.render(k, titled);
+                if s.len() <= share {
+                    return s;
+                }
+            }
+        }
+        self.render(1, false)
+    }
+}
+
+/// The after-the-handoffs line in at most `max` bytes, the room split
+/// between the lanes (journal:ATLAS-RESUME:0010): the shortest parts are
+/// placed first, and the room one leaves goes to the rest, so every lane
+/// names its first entry before any lane names a third. A line still over
+/// `max` is cut at an item boundary.
+fn after_line(lanes: &[LaneAfter], max: usize) -> String {
+    const PREFIX: &str = "- after the handoffs: ";
+    let mut left = max.saturating_sub(PREFIX.len() + 2 * lanes.len().saturating_sub(1));
+    let mut order: Vec<usize> = (0..lanes.len()).collect();
+    order.sort_by_key(|&i| lanes[i].render(MAX_AFTER, true).len());
+    let mut parts = vec![String::new(); lanes.len()];
+    for (n, &i) in order.iter().enumerate() {
+        let share = left / (lanes.len() - n);
+        parts[i] = lanes[i].fit(share);
+        left = left.saturating_sub(parts[i].len());
+    }
+    cut_at_item(&format!("{PREFIX}{}", parts.join("; ")), max)
+}
+
+/// The previous session's agents that never finished, for a new process:
+/// read from its subagent transcripts (`prev`'s folder) as a cleared
+/// session reads its running agents, idle at most [`ORPHAN_HOURS`] at
+/// `now`. Without that folder, the journal's guess
+/// ([`MemoryStore::orphaned_launches`], the last [`ORPHAN_HOURS`]). Returns
+/// what the list was read from, for the line, and the items.
+fn orphans(store: &MemoryStore, orch: &OrchSettings, prev: Option<&Path>, now: &str) -> Result<(&'static str, Vec<String>)> {
+    let dir = prev.map(|p| crate::orchestrate::subagents_dir(&p.to_string_lossy())).filter(|d| d.is_dir());
+    if let Some(dir) = dir {
+        let mut o = orch.clone();
+        o.stale = std::time::Duration::from_secs(ORPHAN_HOURS.unsigned_abs() * 3_600);
+        let at = crate::queue::system_time(now).unwrap_or_else(SystemTime::now);
+        let gone = crate::orchestrate::Agents::new(None).running(&o, &dir, Some(store), at).unwrap_or_default();
+        let shown = gone
+            .iter()
+            .map(|r| {
+                let id: String = r.id.chars().take(8).collect();
+                if r.description.is_empty() { format!("{id} ({})", r.kind.name()) } else { format!("{} ({id}, {})", short(&r.description), r.kind.name()) }
+            })
+            .collect();
+        return Ok(("never finished", shown));
+    }
+    let day = crate::checkpoint::epoch_secs(now).map(|s| crate::discussion::civil(s - ORPHAN_HOURS * 3_600)).unwrap_or_default();
+    let shown = store.orphaned_launches(&day)?.iter().filter(|o| is_lane(&o.scope)).map(|o| format!("{} \"{}\"", o.key, short(&o.title))).collect();
+    Ok(("nothing after", shown))
+}
+
+/// [`After`] for the `live` lanes, newest first; only the first
+/// [`MAX_LANES`] are read. A lane's items are its own entries after its
+/// newest handoff first (decisions, answers, reviews and launches first,
+/// then newest first), then at most one ruling of another lane that names
+/// it and that none of its records names back (the newest), placed before
+/// the last of the [`MAX_AFTER`] items shown so a lane with many entries
+/// still shows it. `since_time` is the live window's start in the store's
+/// time form.
+fn after_handoffs(store: &MemoryStore, live: &[(String, String)], since_time: &str) -> Result<After> {
+    use crate::memory::since;
+    let mut out = After { lanes: Vec::new(), superseded: Vec::new() };
+    for (lane, _) in live.iter().take(MAX_LANES) {
+        let all = store.lane_family(lane)?;
+        let Some((h, after)) = since::after_handoff(&all) else { continue };
+        if let Some(by) = next_step(&h.body).and_then(|s| since::superseding(&s, &after)) {
+            out.superseded.push((h.key.clone(), by.key.clone()));
+        }
+        let rulings = store.rulings_naming(lane, since_time)?;
+        // A ruling of another lane counts until the lane names its key: it
+        // may predate the handoff that missed it (TASK-JUDGE:0266 did).
+        let unread = |r: &&crate::memory::Head| !all.iter().any(|e| e.title.contains(&r.key) || e.body.contains(&r.key));
+        let ruling = rulings.iter().rev().find(unread);
+        let mut shown: Vec<&crate::memory::Head> = after;
+        shown.sort_by(|a, b| since::rank(&a.sub).cmp(&since::rank(&b.sub)).then_with(|| since::at(b).cmp(&since::at(a))));
+        if let Some(r) = ruling {
+            shown.insert(shown.len().min(MAX_AFTER - 1), r);
+        }
+        if shown.is_empty() {
+            continue;
+        }
+        let items = shown.iter().take(MAX_AFTER).map(|e| (e.key.clone(), e.sub.clone(), short(&e.title))).collect();
+        out.lanes.push(LaneAfter { handoff: h.key.clone(), total: shown.len(), items });
+    }
+    Ok(out)
+}
+
+/// A title for an after-the-handoff item: one line, a `launch: ` prefix
+/// dropped (the sub says it), clipped to [`AFTER_TITLE_CHARS`].
+fn short(title: &str) -> String {
+    let t = title.trim();
+    let t = t.strip_prefix("launch: ").unwrap_or(t);
+    clip_to(&t.split_whitespace().collect::<Vec<_>>().join(" ").replace("; ", ", ").replace('"', "'"), AFTER_TITLE_CHARS)
 }
 
 /// The card's goal line, ending in a newline: the goal whole, or, past
@@ -330,6 +540,21 @@ fn fit(lines: &[String], tail: &str, budget: usize) -> String {
     out
 }
 
+/// `line` in at most `max` bytes: whole, or cut at its last item boundary
+/// (`; ` or `, `) with ` ...`.
+fn cut_at_item(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let mut end = max.saturating_sub(4);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &line[..end];
+    let cut = head.rfind("; ").into_iter().chain(head.rfind(", ")).max().unwrap_or(end);
+    format!("{} ...", &line[..cut])
+}
+
 fn more(n: usize, max: usize) -> String {
     if n > max { format!(" ({max} of {n})") } else { String::new() }
 }
@@ -380,12 +605,17 @@ fn unmark(line: &str) -> &str {
 }
 
 fn clip(s: &str) -> String {
+    clip_to(s, TITLE_CHARS)
+}
+
+/// `s` trimmed, cut to `max` characters with `...`.
+fn clip_to(s: &str, max: usize) -> String {
     let s = s.trim();
-    if s.chars().count() <= TITLE_CHARS {
+    if s.chars().count() <= max {
         return s.to_string();
     }
     // A cut that lands on a space would show "gate ..."; drop the trailing space.
-    let mut c: String = s.chars().take(TITLE_CHARS).collect::<String>().trim_end().to_string();
+    let mut c: String = s.chars().take(max).collect::<String>().trim_end().to_string();
     c.push_str("...");
     c
 }

@@ -70,7 +70,9 @@ lines and `refs` holds record keys. The kinds:
 
 - `brief`: the lane's work order and launch lines.
 - `decision`: what was decided and by whom, in their words where a user ruled.
-- `measurement`: a number with the machine state and the command that made it.
+- `measurement`: a number with the machine state and the command that made it. A number that feeds a goal's
+  gate or aim also goes on its own line, in the form "metric: METRIC VALUE UNIT [arm ARM] @COMMIT quiet|contended"
+  (atlas-goal design section 3); a malformed one is refused.
 - `commit`: a commit, merge or PR, by hash or number.
 - `question`: an open question; `answered` closes one, with `answers:<key>` in `refs`.
 - `next`: a step owed. A checkpoint lists the `next` entries no `commit` has followed.

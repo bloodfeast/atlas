@@ -39,6 +39,62 @@ pub struct JudgeSettings {
     /// `orchestrate.judge.log`: the dogfood log (JSONL), one row per
     /// admitted builder launch in enforced mode (default none).
     pub log: Option<PathBuf>,
+    /// `orchestrate.judge.require_brief`: deny a builder launch that names
+    /// no brief file or whose brief is missing (default: on exactly when
+    /// the classifier is on; TASK-JUDGE 0269).
+    pub require_brief: Option<bool>,
+    /// `orchestrate.judge.require_header`: also deny a builder launch whose
+    /// brief lacks the judge header ([`HEADER_FIELDS`]; default false until
+    /// the header is approved).
+    pub require_header: bool,
+    /// `orchestrate.judge.speculative`: when set, a builder brief whose
+    /// header says `Acceptance: none named` is picked at this model/effort
+    /// (TASK-JUDGE 0266 proposes fable/high; default none).
+    pub speculative: Option<(String, String)>,
+    /// `orchestrate.judge.explore_every`: every this-many routed builder
+    /// launches, one is the explore launch (default
+    /// [`crate::judge_enforce::EXPLORE_EVERY`], at least 2).
+    pub explore_every: Option<usize>,
+}
+
+impl JudgeSettings {
+    /// The explore cadence: `explore_every`, else the default 5.
+    pub fn explore_every(&self) -> usize {
+        self.explore_every.unwrap_or(crate::judge_enforce::EXPLORE_EVERY)
+    }
+
+    /// Whether builder launches must name a readable brief.
+    pub fn brief_required(&self) -> bool {
+        self.require_brief.unwrap_or(self.classifier.enabled)
+    }
+}
+
+/// The brief rule at a builder launch (TASK-JUDGE 0269): `Err` with the
+/// deny text when the launch names no brief file, its brief is missing, or
+/// (with `header`) its brief lacks the judge header. A Brandon-named launch
+/// is held to it too; it is exempt from the pick only.
+///
+/// # Errors
+///
+/// The deny text, naming what is missing and how to fix it.
+pub fn check_brief(prompt: &str, header: bool) -> std::result::Result<Brief, String> {
+    let brief = match read_brief(prompt) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return Err("atlas judge: a builder launch must name its brief file. Write the brief to a BRIEF_<NAME>.md file and name its rooted path in the prompt (for example `Your brief is Z:/scratch/briefs/BRIEF_X.md; read it.`); the judge scores that file.".into());
+        }
+        Err(e) => return Err(format!("atlas judge: the builder launch's {e}. Write the brief file first (or fix the path), then launch.")),
+    };
+    let missing = brief.header.missing();
+    if header && !missing.is_empty() {
+        return Err(format!(
+            "atlas judge: brief {} lacks the judge header field{} {}. Add these lines near its top:\n{HEADER_TEMPLATE}",
+            brief.path.display(),
+            if missing.len() == 1 { "" } else { "s" },
+            missing.join(", ")
+        ));
+    }
+    Ok(brief)
 }
 
 /// How the judge acts at a launch (`orchestrate.judge.mode`).
@@ -339,21 +395,24 @@ fn tier_of(model: &str) -> Option<usize> {
     MODELS.iter().position(|t| m.contains(t))
 }
 
-/// The advisory line for a launch, when its asked model or its `Judge:`
-/// line differs from the pick by a tier; `None` when they agree or there
-/// is nothing to compare.
-pub fn note(p: &Pick, asked_model: &str, prompt: &str) -> Option<String> {
-    let pm = tier_of(p.model);
+/// The advisory line for a launch, when its asked model differs from the
+/// primary pick `(model, effort)` by a tier or its `Judge:` line differs
+/// from it; `None` when they agree or there is nothing to compare. `shown`
+/// is the pick's own `Judge:` line (the classifier's when it scored, else
+/// rule A's).
+pub fn note(pick: (&str, &str), shown: &str, asked_model: &str, prompt: &str) -> Option<String> {
+    let (model, effort) = pick;
+    let pm = tier_of(model);
     let mut why = Vec::new();
     if let Some(t) = tier_of(asked_model).filter(|t| Some(*t) != pm) {
         why.push(format!("the launch asks {}", MODELS[t]));
     }
     if let Some((m, e)) = stated(prompt) {
-        if m != p.model || e != p.effort {
+        if m != model || e != effort {
             why.push(format!("its Judge line says {m}, {e}"));
         }
     }
-    (!why.is_empty()).then(|| format!("atlas judge (advisory): {}; the pick is {}, {}. {}", why.join(" and "), p.model, p.effort, line(p)))
+    (!why.is_empty()).then(|| format!("atlas judge (advisory): {}; the pick is {model}, {effort}. {shown}", why.join(" and ")))
 }
 
 // The work classifier (rule C): an ordinal demand score 0-5 per brief from a
@@ -523,6 +582,115 @@ fn rooted(w: &str) -> bool {
     drive || (b.len() > 1 && b[0] == b'/')
 }
 
+/// A named brief, read: the text the judge scores and the header it states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Brief {
+    /// The brief file the prompt names.
+    pub path: PathBuf,
+    /// The brief's text, then the text of each brief its `Builds on:` line
+    /// names, in that order.
+    pub text: String,
+    /// The judge header of the named brief itself.
+    pub header: Header,
+}
+
+/// The brief a launch prompt names, read from disk (TASK-JUDGE 0268: the
+/// judge scores the brief, not a three-line pointer to it). `Ok(None)`
+/// when the prompt names no brief file.
+///
+/// # Errors
+///
+/// A named brief, or a brief its `Builds on:` line names, that cannot be
+/// read: a missing file is an error, never a fallback to the prompt.
+pub fn read_brief(prompt: &str) -> std::result::Result<Option<Brief>, String> {
+    let Some(path) = brief_path(&strip_judge(prompt)) else { return Ok(None) };
+    let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("brief {}: {e}", p.display()));
+    let own = read(&path)?;
+    let header = Header::parse(&own);
+    let mut text = own;
+    for b in &header.builds_on {
+        let p = PathBuf::from(b);
+        if p != path {
+            text.push_str("\n\n");
+            text.push_str(&read(&p).map_err(|e| format!("{e} (named on the Builds on: line of {})", path.display()))?);
+        }
+    }
+    Ok(Some(Brief { path, text, header }))
+}
+
+/// The judge header a brief states (TASK-JUDGE item 8, proposed): one line
+/// each, anywhere in the brief, `Key: value`, the first of each key wins.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Header {
+    /// `Acceptance:` the named tests, or `none named` (speculative).
+    pub acceptance: Option<String>,
+    /// `Deliverables: N`.
+    pub deliverables: Option<usize>,
+    /// `Captures: yes/no`.
+    pub captures: Option<bool>,
+    /// `Art: yes/no`.
+    pub art: Option<bool>,
+    /// `Builds on:` the rooted `.md` paths of the briefs it continues.
+    pub builds_on: Vec<String>,
+}
+
+/// The header's required fields, in the order a deny message names them.
+pub const HEADER_FIELDS: [&str; 4] = ["Acceptance", "Deliverables", "Captures", "Art"];
+
+impl Header {
+    /// Reads the header lines of a brief (a leading `-`, `*` or `**` and the
+    /// key's case are ignored).
+    pub fn parse(text: &str) -> Header {
+        let mut h = Header::default();
+        for l in text.lines() {
+            let l = l.trim().trim_start_matches(['-', '*', ' ']);
+            let Some((k, v)) = l.split_once(':') else { continue };
+            let v = v.trim().trim_start_matches('*').trim();
+            let yes_no =
+                |v: &str| match v.split_whitespace().next().unwrap_or("").trim_end_matches(['.', ',']).to_ascii_lowercase().as_str() {
+                    "yes" | "true" => Some(true),
+                    "no" | "none" | "false" => Some(false),
+                    _ => None,
+                };
+            match k.trim().trim_end_matches('*').to_ascii_lowercase().as_str() {
+                "acceptance" if h.acceptance.is_none() && !v.is_empty() => h.acceptance = Some(v.to_string()),
+                "deliverables" if h.deliverables.is_none() => {
+                    h.deliverables = v.split_whitespace().next().and_then(|n| n.trim_end_matches(['.', ',']).parse().ok())
+                }
+                "captures" if h.captures.is_none() => h.captures = yes_no(v),
+                "art" if h.art.is_none() => h.art = yes_no(v),
+                "builds on" if h.builds_on.is_empty() => {
+                    h.builds_on = v
+                        .split(|c: char| c.is_whitespace() || "\"'`<>|*?,;()[]".contains(c))
+                        .map(|w| w.trim_end_matches(['.', ':', '!']))
+                        .filter(|w| rooted(w) && w.to_ascii_lowercase().ends_with(".md"))
+                        .map(str::to_string)
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        h
+    }
+
+    /// The required fields this header lacks (or states in a form that does
+    /// not parse), in [`HEADER_FIELDS`] order.
+    pub fn missing(&self) -> Vec<&'static str> {
+        let have = [self.acceptance.is_some(), self.deliverables.is_some(), self.captures.is_some(), self.art.is_some()];
+        HEADER_FIELDS.iter().zip(have).filter(|(_, h)| !h).map(|(f, _)| *f).collect()
+    }
+
+    /// A speculative task (TASK-JUDGE 0266): its brief cannot name its
+    /// acceptance tests up front, written `Acceptance: none named`.
+    pub fn speculative(&self) -> bool {
+        self.acceptance.as_deref().is_some_and(|a| a.to_ascii_lowercase().starts_with("none"))
+    }
+}
+
+/// The header template a deny message shows.
+pub const HEADER_TEMPLATE: &str =
+    "Acceptance: <the named tests, or none named>\nDeliverables: <N>\nCaptures: <yes|no>\nArt: <yes|no>\nBuilds on: <brief path, optional>";
+
 /// A classifier pick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassPick {
@@ -536,49 +704,92 @@ pub struct ClassPick {
     pub effort: String,
 }
 
-/// The classifier's pick for a launch, or `None` when it is off, the launch
-/// names no readable brief, or (source head) the weights or the encoder do
-/// not load or match. Never an error. `model` is the loaded encoder, if any.
+/// The classifier's pick for a launch: `Ok(None)` only when it is off;
+/// `Err` with the reason when it is on but cannot score (see
+/// [`classify_with`]). `model` is the loaded encoder, if any.
+///
+/// # Errors
+///
+/// As [`classify_with`].
 pub fn classify(
     s: &ClassifierSettings,
     prompt: &str,
     kind: &str,
     model: Option<&crate::embed::Model>,
     scratch: &mut crate::embed::bert::Scratch,
-) -> Option<ClassPick> {
+) -> std::result::Result<Option<ClassPick>, String> {
     classify_with(s, prompt, kind, None, &mut |text| {
-        let model = model.filter(|m| m.id == CLASSIFIER_MODEL && m.dim == CLASSIFIER_DIM)?;
-        Some(input_vector(model, text, scratch))
+        let model = model.ok_or_else(|| "no encoder is loaded".to_string())?;
+        encoder_fits(model)?;
+        Ok(input_vector(model, text, scratch))
     })
+}
+
+/// `Ok` when `m` is the encoder the head was trained on, else the reason.
+///
+/// # Errors
+///
+/// The encoder's id and width against [`CLASSIFIER_MODEL`] and
+/// [`CLASSIFIER_DIM`].
+pub fn encoder_fits(m: &crate::embed::Model) -> std::result::Result<(), String> {
+    if m.id == CLASSIFIER_MODEL && m.dim == CLASSIFIER_DIM {
+        return Ok(());
+    }
+    Err(format!("the encoder is {} (dim {}), the head needs {CLASSIFIER_MODEL} (dim {CLASSIFIER_DIM})", m.id, m.dim))
+}
+
+/// The input vector of `text` from the encoder file at `path`, loaded for
+/// this call: the embed `note op=judge` passes to [`classify_with`].
+///
+/// # Errors
+///
+/// No path configured, a file that does not load, or the wrong encoder.
+pub fn embed_file(path: Option<&Path>, text: &str, scratch: &mut crate::embed::bert::Scratch) -> std::result::Result<Vec<f32>, String> {
+    let path = path.ok_or_else(|| "no encoder is configured (semantic.model)".to_string())?;
+    let m = crate::embed::Model::load(path).map_err(|e| format!("the encoder did not load: {e}"))?;
+    encoder_fits(&m)?;
+    Ok(input_vector(&m, text, scratch))
 }
 
 /// The one scoring function `note op=judge` and the launch hook share:
 /// [`classify`], with the brief's input vector from `embed` (called only
 /// on a cache miss) and, when `cache` is given, a JSONL score cache keyed
 /// by the weights, the kind and the brief text, so a launch the
-/// orchestrator judged first is scored again without an embed.
+/// orchestrator judged first is scored again without an embed. The text
+/// scored is the named brief file's ([`read_brief`]), never the prompt's.
+///
+/// `Ok(None)` only when the classifier is off. When it is on, every reason
+/// it cannot score is an `Err` naming it, so a skipped classifier is never
+/// silent (TASK-JUDGE 2026-11-24: dogfood rows 50-59 lost their scores
+/// with no sign of why).
+///
+/// # Errors
+///
+/// No brief named, a named brief (or one it builds on) unreadable, the
+/// weights missing or not matching, or the embed's own reason.
 pub fn classify_with(
     s: &ClassifierSettings,
     prompt: &str,
     kind: &str,
     cache: Option<&Path>,
-    embed: &mut dyn FnMut(&str) -> Option<Vec<f32>>,
-) -> Option<ClassPick> {
+    embed: &mut dyn FnMut(&str) -> std::result::Result<Vec<f32>, String>,
+) -> std::result::Result<Option<ClassPick>, String> {
     if !s.enabled {
-        return None;
+        return Ok(None);
     }
-    let path = brief_path(&strip_judge(prompt))?;
+    let brief = read_brief(prompt)?.ok_or_else(|| NO_BRIEF.to_string())?;
     let (score, source) = match s.source {
         ScoreSource::Kind => (kind_score(kind), "kind"),
         ScoreSource::Head => {
-            let bytes = std::fs::read(s.weights.as_deref()?).ok()?;
-            let head = Head::parse(&bytes, s.weights_sha256.as_deref())?;
-            let text = std::fs::read_to_string(&path).ok()?;
-            let key = score_key(&bytes, kind, &text);
+            let wp =
+                s.weights.as_deref().ok_or_else(|| "no weights file is configured (orchestrate.judge.classifier.weights)".to_string())?;
+            let bytes = std::fs::read(wp).map_err(|e| format!("weights {}: {e}", wp.display()))?;
+            let head = Head::parse(&bytes, s.weights_sha256.as_deref()).ok_or_else(|| weights_reason(wp, &bytes))?;
+            let key = score_key(&bytes, kind, &brief.text);
             match cache.and_then(|c| cached_score(c, &key)) {
                 Some(n) => (n, "head"),
                 None => {
-                    let n = head.score(&embed(&text)?, kind);
+                    let n = head.score(&embed(&brief.text)?, kind);
                     if let Some(c) = cache {
                         store_score(c, &key, n);
                     }
@@ -588,7 +799,20 @@ pub fn classify_with(
         }
     };
     let (m, e) = rules(score, kind, &s.map);
-    Some(ClassPick { score, source, model: m, effort: e })
+    Ok(Some(ClassPick { score, source, model: m, effort: e }))
+}
+
+/// The reason given when a prompt names no brief file.
+pub const NO_BRIEF: &str = "the prompt names no brief file (a rooted path to a BRIEF*.md file)";
+
+/// Why weights that read did not parse: the size, else the sha256.
+fn weights_reason(path: &Path, bytes: &[u8]) -> String {
+    let want = (CLASSIFIER_DIM + KINDS.len() + SCORES - 1) * 4;
+    if bytes.len() == want {
+        format!("weights {}: sha256 {} does not match weights_sha256", path.display(), crate::sha256::hex(bytes))
+    } else {
+        format!("weights {}: {} bytes, the head needs {want}", path.display(), bytes.len())
+    }
 }
 
 /// The score cache's key: the sha256 of the weights, the kind and the brief.
@@ -636,6 +860,22 @@ pub fn score_cache(store: &Path) -> Option<PathBuf> {
 /// The advisory line for a classifier pick.
 pub fn class_line(p: &ClassPick) -> String {
     format!("Classifier: demand score {} ({}) -> {}, {} (atlas rule C; advisory).", p.score, p.source, p.model, p.effort)
+}
+
+/// The `Judge:` line for a classifier pick, to paste into a launch prompt
+/// ([`stated`] reads it back).
+pub fn judge_line(p: &ClassPick) -> String {
+    format!("Judge: demand score {} ({}) -> {}, {} (atlas rule C).", p.score, p.source, p.model, p.effort)
+}
+
+/// The `Judge:` line when the classifier could not score: the reason and
+/// rule A's fallback pick, pasteable ([`stated`] reads the fallback).
+pub fn unavailable_line(why: &str, p: &Pick) -> String {
+    let why = why.replace("->", "to");
+    format!(
+        "Judge: classifier unavailable: {why}; fallback scope {}, unknowns {} -> {}, {} (atlas {}).",
+        p.scope, p.unknowns, p.model, p.effort, p.source
+    )
 }
 
 #[cfg(test)]
@@ -701,21 +941,23 @@ mod tests {
         let p = dir.join("w.f32");
         std::fs::write(&p, &b[..100]).unwrap();
         assert!(Head::load(&p, None).is_none());
-        // Through classify: on, head source, bad weights: no pick, no panic.
+        // Through classify: on, head source, bad weights: no pick, no panic,
+        // and the reason is named.
         let brief = dir.join("BRIEF_X.md");
         std::fs::write(&brief, "x").unwrap();
         let prompt = format!("Read {}", brief.display()).replace('\\', "/");
         let s = ClassifierSettings { enabled: true, source: ScoreSource::Head, weights: Some(p.clone()), ..Default::default() };
         let mut sc = crate::embed::bert::Scratch::default();
-        assert!(classify(&s, &prompt, "builder", None, &mut sc).is_none());
+        let e = classify(&s, &prompt, "builder", None, &mut sc).unwrap_err();
+        assert!(e.contains("100 bytes, the head needs"), "{e}");
         let s = ClassifierSettings { weights: Some(dir.join("absent.f32")), ..s };
-        assert!(classify(&s, &prompt, "builder", None, &mut sc).is_none());
-        // Off: nothing. Kind source: the table. No brief named: nothing.
+        assert!(classify(&s, &prompt, "builder", None, &mut sc).unwrap_err().contains("absent.f32"));
+        // Off: nothing. Kind source: the table. No brief named: the reason.
         let k = ClassifierSettings { enabled: true, ..Default::default() };
-        assert!(classify(&ClassifierSettings::default(), &prompt, "builder", None, &mut sc).is_none());
-        assert_eq!(classify(&k, &prompt, "reviewer", None, &mut sc).map(|p| (p.score, p.source)), Some((0, "kind")));
-        assert_eq!(classify(&k, &prompt, "research", None, &mut sc).map(|p| p.score), Some(2));
-        assert!(classify(&k, "no brief here", "builder", None, &mut sc).is_none());
+        assert_eq!(classify(&ClassifierSettings::default(), &prompt, "builder", None, &mut sc), Ok(None));
+        assert_eq!(classify(&k, &prompt, "reviewer", None, &mut sc).map(|p| p.map(|p| (p.score, p.source))), Ok(Some((0, "kind"))));
+        assert_eq!(classify(&k, &prompt, "research", None, &mut sc).map(|p| p.map(|p| p.score)), Ok(Some(2)));
+        assert_eq!(classify(&k, "no brief here", "builder", None, &mut sc), Err(NO_BRIEF.to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -858,6 +1100,7 @@ mod tests {
         let cells = Cells::parse(CELLS).unwrap();
         let prompt = "Kind: builder\nJudge: scope large, unknowns unknown -> opus, xhigh\nSee Z:/w/BRIEF_X.md";
         let p = judge(&cells, prompt, "builder");
+        let note = |p: &Pick, asked: &str, prompt: &str| note((p.model, p.effort), &line(p), asked, prompt);
         assert_eq!(note(&p, "opus", prompt), None, "agrees");
         assert_eq!(note(&p, "", prompt), None, "no model asked");
         let n = note(&p, "sonnet", prompt).unwrap();

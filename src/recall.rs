@@ -319,8 +319,11 @@ pub struct LangRecall {
     pub truth: usize,
     /// Lines the regex matched inside a block comment or multi-line string.
     pub excluded: usize,
-    /// Of `truth`, how many SCIP rows have.
+    /// Of `truth`, how many SCIP or language-server rows have.
     pub indexed: usize,
+    /// Of `indexed`, how many are in a unit a language server indexed
+    /// ([`crate::lsp`]: its note ends `(lsp)`).
+    pub lsp: usize,
     /// Of `truth`, how many only scanner rows have.
     pub scan_only: usize,
     /// Of `truth`, how many the index lacks (listed in
@@ -595,6 +598,14 @@ pub fn code_check(conn: &crate::db::Connection, roots: &[crate::code::CodeRoot])
             // A constructor's own spelling (Python's `__init__`) is stored
             // under its type's name: such a line is held by a `ctor` row.
             let ctors = ctor_rows(conn, &root.name)?;
+            // The folders of this language's units a language server
+            // indexed (`""`: the root).
+            let lsp_dirs: Vec<String> = {
+                let mut st = conn.prepare("SELECT dir FROM code_units WHERE root = ?1 AND lang = ?2 AND source LIKE '%(lsp)'")?;
+                let rows = st.query_map([root.name.as_str(), lang.name], |r| r.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let in_lsp = |p: &str| lsp_dirs.iter().any(|d| d.is_empty() || p.strip_prefix(d.as_str()).is_some_and(|r| r.starts_with('/')));
             let at = match rep.langs.iter().position(|l| l.lang == lang.name) {
                 Some(i) => i,
                 None => {
@@ -622,7 +633,10 @@ pub fn code_check(conn: &crate::db::Connection, roots: &[crate::code::CodeRoot])
                         .get(&(f.path.clone(), i as u32 + 1, name.to_string()))
                         .or_else(|| crate::code::CTORS.contains(&name).then(|| ctors.get(&(f.path.clone(), i as u32 + 1))).flatten());
                     match held {
-                        Some(false) => l.indexed += 1,
+                        Some(false) => {
+                            l.indexed += 1;
+                            l.lsp += usize::from(in_lsp(&f.path));
+                        }
                         Some(true) => l.scan_only += 1,
                         None => {
                             l.missing += 1;

@@ -183,7 +183,7 @@ fn the_scanner_alone_gives_definitions_and_ranges() {
     let r = atlas::recall::code_check(&conn, &setup(&root, &db, Indexers::Search).roots).unwrap();
     assert_eq!(
         r.langs,
-        [atlas::recall::LangRecall { lang: "csharp".into(), files: 1, truth: 7, excluded: 0, indexed: 0, scan_only: 7, missing: 0 }]
+        [atlas::recall::LangRecall { lang: "csharp".into(), files: 1, truth: 7, excluded: 0, indexed: 0, lsp: 0, scan_only: 7, missing: 0 }]
     );
 }
 

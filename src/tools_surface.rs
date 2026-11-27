@@ -56,6 +56,7 @@ const OPS: &[Op] = &[
     op("note", "vaults", "list_vaults"),
     op("note", "sources", "list_sources"),
     op("note", "judge", "judge_task"),
+    op("note", "goal", "goal"),
     op("edit", "create", "create_note"),
     op("edit", "append", "append_to_note"),
     op("edit", "history", "append_history"),
@@ -306,6 +307,17 @@ pub(super) const LISTED: &[ToolDef] = &[
         },
     },
     ToolDef {
+        name: "track_write",
+        description: "Jira or Confluence write; dry-run unless apply. Arguments: note op=help.",
+        read_only: false,
+        schema: || {
+            schema(
+                &[("verb", json!({"type": "string", "enum": ["comment", "transition", "edit", "page_update"]})), ("target", s()), ("body", s()), ("apply", b()), ("reason", reason())],
+                &["verb", "target", "reason"],
+            )
+        },
+    },
+    ToolDef {
         name: "miss",
         description: "Misses: report what atlas did not return, list them, resolve one.",
         read_only: false,
@@ -394,11 +406,11 @@ pub fn help() -> String {
             "lookup" => out.push_str("  - without `id` runs `ids`\n"),
             "remember" => out.push_str("  - with `old` runs `supersede`\n"),
             "recall" => out.push_str(
-                "  - `key` `h:ID` (a digest's handle) reads that stored output: its first page, or one of `lines` (A-B), `item`, `failures`, `grep` (with `context`), `head`, `tail`, `page`, `digest`; a hint line `recall h:ID lines=A-B` is those arguments, and they may also follow the id in `key`; `key` `h:` lists the newest\n",
+                "  - `key` `h:ID` (a digest's handle) reads that stored output: its first page, or one of `lines` (A-B), `item`, `failures`, `grep` (with `context`), `head`, `tail`, `page`, `digest`; a hint line `recall h:ID lines=A-B` is those arguments, and they may also follow the id in `key`; `key` `h:` lists the newest\n  - `key` `memory:SLUG` (or `memory:SLUG.md`) reads the memory record `SLUG`\n",
             ),
             "edit" => out.push_str("  - op `link`: `vault` and `path` are the note the link is written into\n"),
             "journal" => out.push_str(
-                "  - entry `queued` files planned work, as `atlas queue plan` does: the text's first line is the title, the rest its scope; `meta` lines `kind:`, `priority:`, `uses:`, `after:` (queue keys or free text) and `order:` are checked, other lines kept\n  - entry `review` files a review for the merge gate (`orchestrate.reviews`): `meta` lines `role:`, `pr:`, `head:` (the sha read), `verdict:` (pass, merge, merge with follow-ups, request changes) and `report:`\n  - `amend: KEY` with `expected_sha` (the head's sha) rewrites that entry's title and body as a new version; its lane, entry, meta lines and refs stay (pass the same `lane` and `entry`, no `meta` or `refs`)\n",
+                "  - entry `queued` files planned work, as `atlas queue plan` does: the text's first line is the title, the rest its scope; `meta` lines `kind:`, `priority:`, `uses:`, `after:` (queue keys or free text) and `order:` are checked, other lines kept\n  - entry `review` files a review for the merge gate (`orchestrate.reviews`): `meta` lines `role:`, `pr:`, `head:` (the sha read), `verdict:` (pass, merge, merge with follow-ups, request changes) and `report:`\n  - `amend: KEY` with `expected_sha` (the head's sha) rewrites that entry's title and body as a new version; its lane, entry, meta lines and refs stay (pass the same `lane` and `entry`, no `meta` or `refs`)\n  - a `note` or `commit` whose first line is `queue: KEY done` (more words may follow, but `queue: KEY done when X`, or with once, after, if, until or unless, is a condition and closes nothing), or any entry with ref `closes:KEY`, closes queued KEY: the queue and the resume card stop offering it\n  - a hold: an entry with `meta` lines `held: A, B` (what waits) and `until: TEXT`; once a later entry's key is TEXT or its first line names TEXT whole, as words (any case; a one-word TEXT only from the hold's own lane), the resume card lists it as owed now, until an entry with ref `closes:` the hold's key\n",
             ),
             _ => {}
         }

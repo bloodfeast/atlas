@@ -126,7 +126,7 @@ fn the_counter_survives_a_restart_and_is_seeded_from_the_log() {
         log.push_str(&format!("{{\"lane\": \"X\", \"explore\": {explore}, \"brandon_named\": false, \"outcome\": null}}\n"));
         if i == 28 {
             assert_eq!(atlas::judge_enforce::seed(&log), 18);
-            assert!(atlas::judge_enforce::due(18), "row 29 is the explore launch");
+            assert!(atlas::judge_enforce::due(18, 5), "row 29 is the explore launch");
         }
     }
     assert_eq!(atlas::judge_enforce::seed(&log), 1);
@@ -177,9 +177,9 @@ fn the_hook_and_note_judge_share_one_head_score_through_the_cache() {
     let mut calls = 0;
     let first = atlas::taskjudge::classify_with(&s, &prompt, "builder", Some(&cache), &mut |_| {
         calls += 1;
-        Some(vec![0f32; atlas::taskjudge::CLASSIFIER_DIM])
+        Ok(vec![0f32; atlas::taskjudge::CLASSIFIER_DIM])
     });
-    assert_eq!((first.as_ref().map(|p| (p.score, p.source)), calls), (Some((1, "head")), 1));
+    assert_eq!((first.clone().map(|p| p.map(|p| (p.score, p.source))), calls), (Ok(Some((1, "head"))), 1));
     // The second scorer (the launch hook) gets the same pick with no embed.
     let second = atlas::taskjudge::classify_with(&s, &prompt, "builder", Some(&cache), &mut |_| panic!("cache miss"));
     assert_eq!(first, second);

@@ -33,10 +33,43 @@ impl Method {
     }
 }
 
+/// The methods of a write (project tracking writes, [`super::write`]). Apart
+/// from [`Method`] so the read client stays GET-only by construction: a read
+/// builds a [`Request`] with `write: None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMethod {
+    /// `POST`.
+    Post,
+    /// `PUT`.
+    Put,
+}
+
+impl WriteMethod {
+    /// The method's name on the wire.
+    pub fn name(self) -> &'static str {
+        match self {
+            WriteMethod::Post => "POST",
+            WriteMethod::Put => "PUT",
+        }
+    }
+}
+
+/// A write's method and JSON body.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteBody<'a> {
+    /// `POST` or `PUT`.
+    pub method: WriteMethod,
+    /// The JSON text: compact, so it holds no raw line break, and starting
+    /// with `{` so curl never reads it as a file name.
+    pub body: &'a str,
+}
+
 /// One request.
 pub struct Request<'a> {
-    /// Its method.
+    /// Its method for a read; a write's is in `write`.
     pub method: Method,
+    /// The write this request carries, when it is one.
+    pub write: Option<WriteBody<'a>>,
     /// The whole URL.
     pub url: &'a str,
     /// The `Authorization` header value, or none (after a redirect to
@@ -143,7 +176,7 @@ pub(crate) fn curl_config(r: &Request<'_>) -> String {
     let proto = if r.url.starts_with("https://") { "=https" } else { "=http" };
     let mut c = String::new();
     c.push_str("silent\nshow-error\ninclude\ngloboff\n");
-    c.push_str(&format!("request = {}\n", r.method.name()));
+    c.push_str(&format!("request = {}\n", r.write.map_or(r.method.name(), |w| w.method.name())));
     c.push_str(&format!("proto = {}\n", quoted(proto)));
     c.push_str(&format!("connect-timeout = {}\n", r.timeout.as_secs().clamp(1, 30)));
     c.push_str(&format!("max-time = {}\n", r.timeout.as_secs().max(1)));
@@ -151,6 +184,14 @@ pub(crate) fn curl_config(r: &Request<'_>) -> String {
     c.push_str(&format!("url = {}\n", quoted(r.url)));
     c.push_str("header = \"Accept: application/json\"\n");
     c.push_str("header = \"User-Agent: atlas-track\"\n");
+    if let Some(w) = r.write {
+        // The body rides in the same stdin config, never argv or a file; a
+        // leading `@` would make curl read a file, so only JSON objects go.
+        if w.body.starts_with('{') {
+            c.push_str("header = \"Content-Type: application/json\"\n");
+            c.push_str(&format!("data-binary = {}\n", quoted(w.body)));
+        }
+    }
     if let Some(a) = r.auth {
         c.push_str(&format!("header = {}\n", quoted(&format!("Authorization: {}", a.expose()))));
     }
@@ -230,6 +271,7 @@ mod tests {
         let s = Secret::new("Basic a\"b\\c".into());
         let r = Request {
             method: Method::Get,
+            write: None,
             url: "https://x.atlassian.net/rest/api/3/myself",
             auth: Some(&s),
             timeout: Duration::from_secs(5),

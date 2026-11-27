@@ -476,3 +476,101 @@ then **TypeScript/JavaScript** (native, rich, the `node_modules` prerequisite is
 | 8 | Cross-root package references | a two-repo fixture (a Go module used by a sibling service). Done: a reference whose SCIP symbol has no definition in its own index is stored, with its caller, when its package (manager and name; the version is never compared, since a `replace`d sibling module is `.`, the library's own index says its commit and a release its tag) is one another code root defines; other dependencies' references are dropped as before. Each root records the packages its indexes define and use (`code_packages`, schema `code-7`, migrated in place from `code-6` with every root re-indexed once); a root reads the other roots' recorded packages, never their rows or indexers, so each root is indexed on its own; when a root starts or stops defining a package, the roots using it are marked stale (fingerprint cleared) and re-indexed on the next walk. Per-language rules are data: `Packages` in each row (managers, and the name fold: PEP 503 for Python, as written for the rest; a manager no row names, rust-analyzer's `cargo`, compares as written); a package named `.` is never linked (scip-dotnet's own symbols, scip-java's symbols outside a build module), so C# is not linked. Calls into another root's generated gRPC stubs are rpc call sites (the PR 7 deferral): the defining root's definitions under a stub's name in generated files are read when the root has cross-root references. Measured: Go library and service through `replace ../lib` (scip-go 0.2.9): 17 of 17 hand-counted references stored, 0 false; microservices-demo's frontend and checkoutservice with `genproto` moved into a third root (a shared module): 198 and 174 references, exactly the references the same services have into `genproto` when it is their own, 0 false, and the same 19 rpc call sites as in the one-root layout; a TypeScript package used by a sibling through a `file:` dependency (scip-typescript 0.5.2): 22 of 22, 0 false (two constructor parameter properties are parameters, stored by no root). Every language bench, Rust `--recall-check`, `--symbol-bench` (104 tokens per answer) and microservices-demo (one root) unchanged: no reference crosses a root there. Decided by the builder, for Brandon to confirm: versions are ignored; linking spans every configured root, not only one project's, and does not follow `talks_to`. Deferred: C# (no package names), a real rust-analyzer measure (tested on a synthetic index), Python across roots (atlas names a scip-python unit after its folder, which matches the distribution name only when they agree) |
 
 Each PR updates `wiki/Code-index.md`'s language table and states its language's three numbers.
+
+## 15. Language servers: definitions where no SCIP indexer runs (ANYWHERE-LSP)
+
+Brandon 11-25 (journal:ATLAS-ANYWHERE:0012): "part of anywhere should include using LSPs for code symbol lookup
+and indexing (like we do for Rust but for any language with an LSP)". A language server answers
+`textDocument/documentSymbol` for one file at a time: names, kinds, the selection range of the name and the
+range of the whole item. That is what a SCIP index's definitions hold, without references. PR 1 builds the
+generic driver and proves it on Python (scip-python does not run on Windows, so Python was scan-only there)
+with gopls on Go as the cross-check.
+
+### 15.1 Design
+
+- `src/lsp.rs`: a hand-written JSON-RPC client over stdio (Content-Length frames, ids, one reader thread),
+  `crate::json` only, no new crate. `initialize` sends `rootUri`, the row's initialization options,
+  `hierarchicalDocumentSymbolSupport` and `general.positionEncodings` `["utf-8", "utf-16"]`; server requests
+  are answered (`workspace/configuration` with nulls, the rest with null), notifications dropped. Per file:
+  `didOpen`, `documentSymbol`, `didClose`. Both answer shapes are read (`DocumentSymbol[]` trees and flat
+  `SymbolInformation[]`, whose name column is found on the line). UTF-16 columns become bytes.
+- Rows: each symbol is a definition at its selection range's start, its kind word from `SymbolKind` mapped onto
+  the words SCIP rows print (`generic_kind_word`), its container the parent, its end line the range's end.
+  Variables and constants inside a function, method or constructor are dropped (SCIP rows have no locals).
+  gopls names a method `(*T).M`: the receiver becomes the container. The files the server answered join
+  `covered`, so the scanner fills them as it fills SCIP files; no reference rows (LSP-Q1 a).
+- Where a server is named (LSP-Q4 a): `Lang::lsp`, ordered `LspServer` candidates (python:
+  basedpyright-langserver then pyright-langserver, `--stdio`, Node packages; go: gopls). They are found as
+  drivers are (configured path, `PATH`, the npm global root), share Driver's candidate code, and must answer
+  their version argument. `code.indexers` names them by tool: a path runs it, `false` turns it off ("gopls is
+  off (code.indexers)"), an unknown name is refused naming the known ones.
+- Order per unit (LSP-Q3 a): a prebuilt `index.scip`, the SCIP indexer when found, the server when found, the
+  scanner. A SCIP failure or timeout tries the server before scanning. The unit note reads `basedpyright 1.40.2
+  (lsp)` when the server served it, else `scan only: SCIP-why; LSP-why`; a server that answered no file notes
+  `scan only: SERVER answered no file (MSG)`.
+- Cache (LSP-Q6 a): `<root>.<tool>[.k].lsp` in the code dir per unit and server: format version, server
+  version, a signature of the row's stale files (marker, `pyproject.toml`, `requirements*.txt`, `go.mod`), and
+  per file its path, mtime, size and symbols. A full run asks only new or changed files; a stale-file or server
+  version change empties it. No schema bump. Between full runs `reindex_file` stays scanner-only: no server
+  starts on the edit hook path.
+- `atlas doctor` (LSP-Q8 a): one line per language with files in a configured code root, naming the indexer
+  that wins, or, when SCIP and the servers are all missing, what was looked for and the install hint. No server
+  is started; exit is unchanged.
+
+### 15.2 Bounds (LSP-Q5 a)
+
+One server at a time under the existing `code_lease`; at most 8 requests in flight; below-normal priority;
+the whole unit under `code.timeout_s` (killed with `scan only: SERVER passed the N s timeout`, the files
+answered before the kill kept in the cache and used; a watchdog thread kills a server that stops reading its
+input, so a write to it blocks, 5 s past the timeout); killed 5 s after `exit` if still alive; deferred while a
+foreign `cargo` runs and, when `orchestrate.runq_root` is set, while runq holds a heavy compile ("runq holds a
+heavy compile"). The server thread cap of LSP-Q5 a is not applied: neither pyright nor gopls has such a flag.
+
+### 15.3 Measured
+
+Recall (`cargo xtask langs-bench --driver lsp`, the grep truth of section 11; machine contended, provisional):
+
+| Corpus | Server | Grep truth | Held by LSP rows | Filled by the scanner | Missing | LSP vs SCIP definitions recall (precision) | Item ends equal to SCIP's |
+|---|---|---|---|---|---|---|---|
+| flask@49943b5 | basedpyright 1.40.2 | 1,622 | 1,579 | 43 | 0 | 94.7% (96.7%) of 1,928 | 100% of 1,524 |
+| flask@49943b5 | pyright 1.1.414 | 1,622 | 1,579 | 43 | 0 | 94.7% (96.7%) of 1,928 | 100% of 1,524 |
+| gin@0f09c3a | gopls 0.18.1 | 1,553 | 1,553 | 0 | 0 | 99.5% (99.7%) of 1,987 | 100% of 1,512 |
+
+The bar (the LSP rows hold at least the scanner's share and miss nothing it holds) is met on both. Against
+SCIP, the Python misses the bench samples are constructors: SCIP names `def __init__` after its class, the
+server `__init__`, so the `(path, line, name)` match misses them although both hold the line; gopls's are the
+parameters and locals of a function literal assigned to a package variable (which scip-go stores as package
+symbols) and struct fields of an anonymous type in a test. The gin SCIP baseline is scip-go 0.2.10 (go1.26 toolchain).
+
+Index run time (`atlas --code-index` on a scratch configuration, debug build of atlas, one runq quiet take
+that Brandon's use of the PC contaminated, so provisional; peak working set summed over the server's processes,
+sampled every 150 ms or so; requests are the files asked plus `initialize` and `shutdown`):
+
+| Corpus | Server | Files | Cold s | Warm, one file touched, s | Peak MB | Requests cold / warm |
+|---|---|---|---|---|---|---|
+| flask@49943b5 | basedpyright 1.40.2 | 83 | 4.4 | 2.9 | 154 | 85 / 3 |
+| flask@49943b5 | pyright 1.1.414 | 83 | 2.5 | 2.7 | 135 | 85 / 3 |
+| gin@0f09c3a | gopls 0.18.1 | 98 | 16.2 | 5.4 | 269 | 100 / 3 |
+
+Every cold run is far under the 120 s bar. A warm run is mostly the server's start and its workspace load:
+pyright analyses the project before it answers the one file, gopls loads the packages.
+
+What references would cost (LSP-Q1; `src/lsp/refs_spike.rs`, an ignored measurement; the same quiet take):
+200 sampled types and top-level callables per corpus on a warm server, every file open.
+
+| Corpus | Server | Types and top-level callables | references p50 / p95 ms | Sample total s | Projected all s | callHierarchy (prepare + incomingCalls) p50 / p95 ms | Projected all callables s |
+|---|---|---|---|---|---|---|---|
+| flask@49943b5 | basedpyright 1.40.2 | 588 (519 callables) | 2.1 / 18.3 | 1.5 | 4.3 | 13.4 / 178.5 | 24.7 |
+| gin@0f09c3a | gopls 0.18.1 | 1,092 (917 callables) | 6.3 / 9.6 | 2.4 | 13.1 | 6.6 / 8.4 | 4.9 |
+
+gopls's first references call took 9.1 s (building its cross-package index), basedpyright's 15 ms. References
+for every type and top-level callable would add seconds, not minutes, to a full run on these corpora;
+callHierarchy is cheaper than references on gopls and dearer on basedpyright.
+
+### 15.4 Open (journaled, built on option a, awaiting Brandon)
+
+LSP-Q1 references (journal:ATLAS-ANYWHERE:0014; cost measured in the PR), LSP-Q2 first language
+(journal:ATLAS-ANYWHERE:0015), LSP-Q3 driver order (0016), LSP-Q4 where a server is named (0017), LSP-Q5 bounds
+(0018), LSP-Q6 cache (0019), LSP-Q8 doctor lines (0021). LSP-Q7 C/C++ `.h` and skips (0020) belongs to the C/C++
+PR and is not built here. Next PRs: servers on the TypeScript/JavaScript and C# rows; jdtls on Java; clangd on
+C/C++ (#272); references per LSP-Q1's answer.

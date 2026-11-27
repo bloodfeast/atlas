@@ -700,9 +700,22 @@ fn binding_keys(block: &str) -> Vec<Injected> {
         .filter_map(|line| {
             let r = crate::compact::refs_in(line).into_iter().next()?;
             let key = r.text.rsplit_once('@').map_or(r.text.as_str(), |(k, _)| k).to_string();
-            Some(Injected { key, fts: None, cos: None, bytes: line.len(), how: Sel::Whole, full: line.len() })
+            Some(Injected { key, fts: None, cos: None, bytes: line.len(), how: Sel::Whole, full: line.len(), frame: 0 })
         })
         .collect()
+}
+
+/// Whether a launch is held to the brief rule and the enforced judge: a
+/// builder whose kind came from a `Kind:` line, its `subagent_type` or
+/// `isolation: "worktree"`, with the rule that decided it. A builder only
+/// by `orchestrate.default_kind` is not held (forks, web fetches and
+/// general-purpose launches carry no `Kind:` line; TASK-JUDGE 0281 M2).
+fn held_builder(s: &crate::orchestrate::OrchSettings, brief: &str, ty: &str, isolation: &str) -> Option<crate::orchestrate::KindSource> {
+    use crate::orchestrate::{classify_source, Kind, KindSource};
+    match classify_source(s, brief, ty, isolation) {
+        (Kind::Builder, src @ (KindSource::Line | KindSource::Type | KindSource::Worktree)) => Some(src),
+        _ => None,
+    }
 }
 
 /// A tool that hands a subagent's report back to its caller.
@@ -949,6 +962,11 @@ pub struct Injected {
     /// Bytes it would have taken whole (the untrimmed pointer line);
     /// `bytes` when sent whole.
     pub full: usize,
+    /// Bytes of the answer's framing it carries, no record's own: the
+    /// pointer header and the "+N more" line, on a prompt's first pointer.
+    /// Its `hook_inject` row charges `bytes + frame`, so the rows hold
+    /// every byte sent and a later process charges what this one did.
+    pub frame: usize,
 }
 
 /// What context selection did to one injected record.
@@ -1016,6 +1034,9 @@ pub struct Hooks {
     injected: HashMap<String, HashSet<String>>,
     /// Bytes of recall injected per session or subagent (the session budget).
     spent: HashMap<String, usize>,
+    /// Subagents whose start was answered from another launch and undone:
+    /// their `hook_inject` rows are not read back into `injected`/`spent`.
+    undone: HashSet<String>,
     /// Subagents whose launch is checked at their first tool call.
     unsettled: HashMap<String, Unsettled>,
     /// Each subagent's run: its lane, start and the lanes it wrote under.
@@ -1201,6 +1222,7 @@ impl Hooks {
             briefs: HashMap::new(),
             injected: HashMap::new(),
             spent: HashMap::new(),
+            undone: HashSet::new(),
             unsettled: HashMap::new(),
             binding: None,
             agent_lane: HashMap::new(),
@@ -1214,7 +1236,8 @@ impl Hooks {
             log_thread,
             router,
             // Claude Code's live folder only when the caller asks
-            // ([`Hooks::detect_offer_paths`]): a test never reads it.
+            // ([`Hooks::detect_offer_paths`]): a test that reaches it sets its
+            // own `CLAUDE_CONFIG_DIR`.
             offer: None,
             records: None,
             edited: Vec::new(),
@@ -2073,6 +2096,26 @@ impl Hooks {
                 // The enforced judge decides before admission, so a denied
                 // launch takes no slot and writes no row (#412).
                 let mut judged = None;
+                // The brief rule (TASK-JUDGE 0269): with the classifier on, a
+                // builder launch names a readable brief (and, once approved,
+                // one with the judge header), Brandon-named or not.
+                if a.deny.is_none()
+                    && (ev.tool_name == "Agent" || ev.tool_name == "Task")
+                    && self.settings.orchestrate.judge.brief_required()
+                {
+                    let brief = if ev.tool_prompt.is_empty() {
+                        ev.tool_input.get("prompt").and_then(Value::as_str).unwrap_or("")
+                    } else {
+                        &ev.tool_prompt
+                    };
+                    let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
+                    if let Some(source) = held_builder(&self.settings.orchestrate, brief, f("subagent_type"), f("isolation")) {
+                        if let Err(t) = crate::taskjudge::check_brief(brief, self.settings.orchestrate.judge.require_header) {
+                            let why = crate::orchestrate::kind_reason(crate::orchestrate::Kind::Builder, source, f("subagent_type"));
+                            a.deny = Some(format!("{t}\n{why}"));
+                        }
+                    }
+                }
                 if a.deny.is_none() && (ev.tool_name == "Agent" || ev.tool_name == "Task") && self.settings.orchestrate.judge.mode == crate::taskjudge::JudgeMode::Enforced {
                     let brief = if ev.tool_prompt.is_empty() { ev.tool_input.get("prompt").and_then(Value::as_str).unwrap_or("") } else { &ev.tool_prompt };
                     match self.enforce_judge(ev, brief) {
@@ -2101,11 +2144,17 @@ impl Hooks {
                         self.orch.release_last();
                     }
                     self.sync_pending();
+                    let enforced = self.settings.orchestrate.judge.mode == crate::taskjudge::JudgeMode::Enforced;
+                    let scored = if a.deny.is_none() && !enforced && self.settings.orchestrate.judge.classifier.enabled {
+                        self.classify_launch(ev, brief, &mut a)
+                    } else {
+                        None
+                    };
+                    // Enforced: the pick (or the reason) the enforced judge scored.
+                    let scored =
+                        scored.or_else(|| judged.as_ref().map(|j| j.pick.clone().ok_or_else(|| j.unavailable.clone().unwrap_or_default())));
                     if a.deny.is_none() && self.settings.orchestrate.judge.enabled {
-                        self.judge_launch(ev, brief, &mut a);
-                    }
-                    if a.deny.is_none() && self.settings.orchestrate.judge.classifier.enabled {
-                        self.classify_launch(ev, brief, &mut a);
+                        self.judge_launch(ev, brief, scored.as_ref(), &mut a);
                     }
                     if let Some(j) = judged.take().filter(|_| a.deny.is_none()) {
                         self.judge_admitted(ev, brief, &j, &mut a);
@@ -2619,7 +2668,7 @@ impl Hooks {
                 continue;
             }
             if let Some(line) = recall::lane_head(&self.store, &l.lane)? {
-                keys.push(Injected { key: format!("lane-head:{}", l.lane), fts: None, cos: None, bytes: line.len(), how: Sel::Whole, full: line.len() });
+                keys.push(Injected { key: format!("lane-head:{}", l.lane), fts: None, cos: None, bytes: line.len(), how: Sel::Whole, full: line.len(), frame: 0 });
                 out.push_str(&line);
             }
         }
@@ -2630,6 +2679,23 @@ impl Hooks {
         let r = self.settings.recall.clone();
         let mut out = String::new();
         let mut keys = Vec::new();
+        // The scope is the session for a human prompt, else a subagent.
+        let human = scope == self.session;
+        // What was pointed to in the scope, by this process or another (a
+        // server restart, a command hook's process per event, the other
+        // transport), read again at every prompt: each key is pointed to
+        // once per session, and what was sent counts against the session
+        // budget. The rows hold every byte sent, this process's own too once
+        // written, so the larger of the two counts is the spend (one indexed
+        // read, no write). A scope whose start was undone keeps what this
+        // process counts.
+        if !self.undone.contains(scope) {
+            let (session, agent) = if human { (scope, "") } else { (self.session.as_str(), scope) };
+            let (logged, bytes) = crate::hook_hits::injected(&self.settings.index_db, session, agent);
+            self.injected.entry(scope.to_string()).or_default().extend(logged);
+            let spent = self.spent.entry(scope.to_string()).or_default();
+            *spent = (*spent).max(bytes);
+        }
         // The session budget: past it, nothing more is injected.
         let left = match r.session_budget_tokens {
             0 => usize::MAX,
@@ -2638,21 +2704,11 @@ impl Hooks {
         if left == 0 {
             return Ok((out, keys));
         }
-        // The scope is the session for a human prompt, else a subagent.
-        let human = scope == self.session;
         // The records a subagent's brief names (its Gherkin tags, `key@hash`
         // refs and bare keys, as the Binding compiler reads them) are covered
         // (#275): the brief already carries them, so neither the lane view
         // nor a pointer sends them again, and their room goes to the next.
         let covered = if human { HashSet::new() } else { crate::binding::named_keys(&self.store, text)? };
-        // A scope this process has not seen yet starts from what was
-        // pointed to in it before (a server restart, a command hook's
-        // process per event): each key is pointed to once per session.
-        if !self.injected.contains_key(scope) {
-            let (session, agent) = if human { (scope, "") } else { (self.session.as_str(), scope) };
-            let logged = crate::hook_hits::injected_keys(&self.settings.index_db, session, agent);
-            self.injected.insert(scope.to_string(), logged);
-        }
         // A subagent whose own lane's view (or its parent lane's, for a
         // sub-lane) is injected gets no pointers: its brief and lane
         // already say what it needs.
@@ -2675,7 +2731,7 @@ impl Hooks {
                 }
                 if let Some(head) = recall::lane_head(&self.store, &lane)? {
                     out.push_str(&head);
-                    keys.push(Injected { key: format!("lane:{lane}"), fts: None, cos: None, bytes: head.len(), how: Sel::Trimmed, full: head.len() });
+                    keys.push(Injected { key: format!("lane-head:{lane}"), fts: None, cos: None, bytes: head.len(), how: Sel::Trimmed, full: head.len(), frame: 0 });
                 }
                 continue;
             }
@@ -2702,7 +2758,7 @@ impl Hooks {
             }
             let bytes = v.text.len();
             let (how, full) = if v.trimmed > 0 { (Sel::Trimmed, bytes + v.trimmed_full - v.trimmed_sent) } else { (Sel::Whole, bytes) };
-            keys.push(Injected { key: format!("lane:{}", lane), fts: None, cos: None, bytes, how, full });
+            keys.push(Injected { key: format!("lane:{}", lane), fts: None, cos: None, bytes, how, full, frame: 0 });
         }
         // A repository the text names gets its line from the project graph
         // (its path, what it is, what it talks to and depends on, what uses
@@ -2722,7 +2778,7 @@ impl Hooks {
                     let before = out.len();
                     out.push_str(&format!("atlas project {}: {line}\n", g.name));
                     let bytes = out.len() - before;
-                    keys.push(Injected { key: format!("repo:{}", r.name), fts: None, cos: None, bytes, how: Sel::Whole, full: bytes });
+                    keys.push(Injected { key: format!("repo:{}", r.name), fts: None, cos: None, bytes, how: Sel::Whole, full: bytes, frame: 0 });
                 }
             }
         }
@@ -2856,14 +2912,15 @@ impl Hooks {
                 continue;
             }
             lines.push_str(&one);
-            chosen.push(Injected { key: cand.head.key, fts: Some(cand.fts), cos: cand.cos, bytes: one.len(), how, full: whole.len() });
+            chosen.push(Injected { key: cand.head.key, fts: Some(cand.fts), cos: cand.cos, bytes: one.len(), how, full: whole.len(), frame: 0 });
         }
         if !chosen.is_empty() {
+            let more_line = if more > 0 { format!("+{more} more: recall {{query}}\n") } else { String::new() };
             out.push_str(POINTER_HEAD);
             out.push_str(&lines);
-            if more > 0 {
-                out.push_str(&format!("+{more} more: recall {{query}}\n"));
-            }
+            out.push_str(&more_line);
+            // The first pointer's row carries the header and the more line.
+            chosen[0].frame = POINTER_HEAD.len() + more_line.len();
             let seen = self.injected.entry(scope.to_string()).or_default();
             for k in chosen {
                 seen.insert(k.key.clone());
@@ -3070,6 +3127,8 @@ impl Hooks {
             }
             self.injected.insert(agent.to_string(), HashSet::new());
             self.spent.remove(agent);
+            // Its logged rows are the other launch's: not read back.
+            self.undone.insert(agent.to_string());
         }
         let launch = own.as_deref().and_then(|t| self.take_brief(&u.session, Some(t), std::time::Instant::now()));
         let sub_line = self.sub_lane_line(agent, own.as_deref());
@@ -3472,7 +3531,16 @@ impl Hooks {
     /// the launch's model or its `Judge:` line differs from the pick, and a
     /// line in the pick log. Never denies and never changes the input; with
     /// no readable cells file it does nothing.
-    fn judge_launch(&mut self, ev: &HookEvent, brief: &str, a: &mut HookAnswer) {
+    /// `scored` is the classifier's result at this launch, when it ran: its
+    /// score or the reason it could not score goes into the row, so a rule A
+    /// row is never mistaken for a scored pick.
+    fn judge_launch(
+        &mut self,
+        ev: &HookEvent,
+        brief: &str,
+        scored: Option<&std::result::Result<crate::taskjudge::ClassPick, String>>,
+        a: &mut HookAnswer,
+    ) {
         let Some(path) = self.settings.orchestrate.judge.cells.as_deref() else { return };
         let cells = match crate::taskjudge::Cells::load(path) {
             Ok(c) => c,
@@ -3484,13 +3552,23 @@ impl Hooks {
         let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
         let kind = crate::taskjudge::launch_kind(brief, f("subagent_type"), f("description"));
         let pick = crate::taskjudge::judge(&cells, brief, kind);
-        if let Some(line) = crate::taskjudge::note(&pick, f("model"), brief) {
+        // The primary pick: the classifier's when it scored (S1), else rule A.
+        let class = match scored {
+            Some(Ok(p)) => Some(p),
+            _ => None,
+        };
+        let (pm, pe, psource, shown) = match class {
+            Some(p) => (p.model.clone(), p.effort.clone(), format!("classifier ({})", p.source), crate::taskjudge::judge_line(p)),
+            None => (pick.model.to_string(), pick.effort.to_string(), pick.source.to_string(), crate::taskjudge::line(&pick)),
+        };
+        if let Some(line) = crate::taskjudge::note((&pm, &pe), &shown, f("model"), brief) {
             if !a.context.is_empty() {
                 a.context.push('\n');
             }
             a.context.push_str(&line);
         }
         let stated = crate::taskjudge::stated(brief).map(|(m, e)| format!("{m}, {e}")).unwrap_or_default();
+        let asked = crate::judge_enforce::ask(brief);
         let row = crate::json::object(256, |w| {
             w.field("time", crate::memory::now().as_str())
                 .field("tool_use_id", ev.tool_use_id.as_str())
@@ -3498,12 +3576,24 @@ impl Hooks {
                 .field("kind", kind)
                 .field("scope", pick.scope)
                 .field("unknowns", pick.unknowns)
-                .field("model", pick.model)
-                .field("effort", pick.effort)
+                .field("model", pm.as_str())
+                .field("effort", pe.as_str())
                 .field("split", &pick.split)
-                .field("source", pick.source)
+                .field("source", psource.as_str())
+                .field("rule_a", format!("{}/{}", pick.model, pick.effort).as_str())
                 .field("asked_model", f("model"))
-                .field("judge_line", stated.as_str());
+                .field("judge_line", stated.as_str())
+                .field("explore", &asked.explore())
+                .field("climb", &asked.climb());
+            match scored {
+                Some(Ok(p)) => {
+                    w.field("classifier_score", &p.score).field("classifier_pick", format!("{}/{}", p.model, p.effort).as_str());
+                }
+                Some(Err(why)) => {
+                    w.field("classifier_unavailable", why.as_str());
+                }
+                None => {}
+            }
         });
         if let Some(dir) = self.settings.store.parent() {
             let log = dir.join("judge-picks.jsonl");
@@ -3517,21 +3607,36 @@ impl Hooks {
     /// The work classifier at an admitted launch that names a brief: one
     /// advisory context line with the demand score and the rules map's pick.
     /// Never denies and never changes the input. With the head source the
-    /// hook adds nothing: a warm embed of one brief measured far over the
-    /// 500 ms launch budget, so only `judge_task` runs the head.
-    fn classify_launch(&mut self, ev: &HookEvent, brief: &str, a: &mut HookAnswer) {
-        let s = &self.settings.orchestrate.judge.classifier;
-        if s.source == crate::taskjudge::ScoreSource::Head {
-            return;
-        }
+    /// hook scores from the score cache only (`note op=judge` fills it): a
+    /// warm embed of one brief measured far over the 500 ms launch budget.
+    /// When it cannot score, the line says why. Returns the result, `None`
+    /// when the classifier is off.
+    fn classify_launch(
+        &mut self,
+        ev: &HookEvent,
+        brief: &str,
+        a: &mut HookAnswer,
+    ) -> Option<std::result::Result<crate::taskjudge::ClassPick, String>> {
+        let s = self.settings.orchestrate.judge.classifier.clone();
         let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
         let kind = crate::taskjudge::launch_kind(brief, f("subagent_type"), f("description"));
-        if let Some(p) = crate::taskjudge::classify(s, brief, kind, None, &mut crate::embed::bert::Scratch::default()) {
-            if !a.context.is_empty() {
-                a.context.push('\n');
-            }
-            a.context.push_str(&crate::taskjudge::class_line(&p));
+        let cache = crate::taskjudge::score_cache(&self.settings.store);
+        let r = crate::taskjudge::classify_with(&s, brief, kind, cache.as_deref(), &mut |_| {
+            Err("this brief is not in the score cache and the launch hook does not embed; run note op=judge on the launch prompt before the launch".into())
+        })
+        .transpose()?;
+        let line = match &r {
+            Ok(p) => crate::taskjudge::class_line(p),
+            // A launch that is not a builder's and names no brief is not
+            // scored and gets no line (S4); its pick row keeps the reason.
+            Err(why) if why == crate::taskjudge::NO_BRIEF && kind != "builder" => return Some(r),
+            Err(why) => format!("atlas judge: classifier unavailable: {why}."),
+        };
+        if !a.context.is_empty() {
+            a.context.push('\n');
         }
+        a.context.push_str(&line);
+        Some(r)
     }
 
     /// The enforced judge on a launch (#412): `Ok(None)` for a launch that
@@ -3541,7 +3646,7 @@ impl Hooks {
     /// uses, through the same score cache; the encoder loads only on a miss.
     fn enforce_judge(&mut self, ev: &HookEvent, brief: &str) -> std::result::Result<Option<crate::judge_enforce::Admit>, String> {
         let f = |k: &str| ev.tool_input.get(k).and_then(Value::as_str).unwrap_or("");
-        if crate::orchestrate::classify(&self.settings.orchestrate, brief, f("subagent_type"), f("isolation")) != crate::orchestrate::Kind::Builder {
+        if held_builder(&self.settings.orchestrate, brief, f("subagent_type"), f("isolation")).is_none() {
             return Ok(None);
         }
         let s = self.settings.orchestrate.judge.classifier.clone();
@@ -3550,15 +3655,36 @@ impl Hooks {
             self.load_model();
         }
         let mut sem = self.sem.as_mut();
-        let pick = crate::taskjudge::classify_with(&s, brief, "builder", cache.as_deref(), &mut |text| {
-            let sem = sem.as_deref_mut()?;
+        let scored = crate::taskjudge::classify_with(&s, brief, "builder", cache.as_deref(), &mut |text| {
+            let sem = sem.as_deref_mut().ok_or_else(|| "no encoder is loaded (semantic.model)".to_string())?;
             let m = sem.model.clone();
-            (m.id == crate::taskjudge::CLASSIFIER_MODEL && m.dim == crate::taskjudge::CLASSIFIER_DIM)
-                .then(|| crate::taskjudge::input_vector(&m, text, &mut sem.scratch))
+            crate::taskjudge::encoder_fits(&m)?;
+            Ok(crate::taskjudge::input_vector(&m, text, &mut sem.scratch))
         });
         let counter = crate::judge_enforce::Counter::open(&self.settings.store, self.settings.orchestrate.judge.log.as_deref());
         let ask = crate::judge_enforce::ask(brief);
-        crate::judge_enforce::decide(pick, &s.map, &ask, f("model"), f("effort"), counter.since).map(Some)
+        // A launch the classifier could not score is denied with the reason;
+        // a Brandon-named or speculative one is admitted at its pair and
+        // logged with the reason (decide).
+        let scored = scored.and_then(|p| p.ok_or_else(|| "the classifier is off (orchestrate.judge.classifier.enabled)".to_string()));
+        let spec = self
+            .settings
+            .orchestrate
+            .judge
+            .speculative
+            .as_ref()
+            .filter(|_| crate::taskjudge::read_brief(brief).ok().flatten().is_some_and(|b| b.header.speculative()));
+        // The lane's last row is read only for a climb or a continue.
+        let j = &self.settings.orchestrate.judge;
+        let last = match ask {
+            crate::judge_enforce::Ask::Climb(..) | crate::judge_enforce::Ask::Continue(_) => crate::judge_enforce::last_for(
+                brief_lane(brief, &[]).as_deref(),
+                j.log.as_deref(),
+            ),
+            _ => Err("not read".into()),
+        };
+        let ctx = crate::judge_enforce::Ctx { since: counter.since, every: j.explore_every(), last, speculative: spec };
+        crate::judge_enforce::decide(scored, &s.map, &ask, f("model"), f("effort"), &ctx).map(Some)
     }
 
     /// An admitted enforced-judge launch: its context line, one dogfood log

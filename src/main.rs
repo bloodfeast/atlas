@@ -156,11 +156,12 @@ Subcommands:
   atlas settings migrate-projects NAME
   atlas settings orchestrate [--yes [--builders N] [--reviewers N] [--research N] [--mode M] [--handoff N] [--limit N] [--fresh auto|ask] | --no]
   atlas settings on|off update
+  atlas goal seed --from-memory KEY [--spec FILE] [--lane LANE]   one-shot: the goal record goal:<slug> from memory active-goal-<slug>, its spec from FILE
   atlas rules [scan | counts | sitting 1|2 | link | answer KEY | unmark KEY]   which ruling replaces which (experimental, off by default)
   atlas queue [list | show KEY | drop KEY | done KEY | met KEY [CONDITION] | next | release SLOT|AGENT|LANE | add | plan]   the work queue: launches waiting to start, the batch that can start now, and freeing a dead agent's lane
   atlas backlog [--all] [--as-of TIME] [--json] | dismiss ID --because KEY   ruled work that fell off the queue: aging and waiting items (proposed; the written order is unchanged)
   atlas pr-events serve [--port N] [--lane LANE]   run one gh webhook forward per repository, listen on 127.0.0.1 for their signed GitHub PR events, and file each as a journal note
-  atlas track check | smoke [--issue KEY] [--page ID] [--jql Q] [--cql Q] | issue KEY | jql Q [--fields LIST] | page ID | cql Q | snapshot ITEM   project tracking: read Jira and Confluence directly, read-only, with a token from the environment variable project_tracking.atlassian names
+  atlas track check | smoke [--issue KEY] [--page ID] [--jql Q] [--cql Q] | issue KEY | jql Q [--fields LIST] | page ID | cql Q | snapshot ITEM | comment KEY | transition KEY --to S | edit KEY | page-update ID   project tracking: read Jira and Confluence directly with a token from the environment variable project_tracking.atlassian names; the four writes show their request and send only with --apply, behind writes.* in the config
   atlas ideas [list | show ID | file TEXT... | dismiss ID... | answer ID yes|no | convert ID ruling|queue | labels]   ideas caught from prompts, and the questions about them
   atlas worktrees [list | history PATH | backfill | gc [--apply]]   the worktree ownership ledger: open owners, one path's spans, an owner row for each worktree without one, and the cleanup of stale worktrees, their build output and atlas's Docker objects (a dry run without --apply)
 
@@ -585,7 +586,7 @@ fn hook_report(setup: &Setup, transcripts: Option<&std::path::Path>, since: &str
 /// The bare words recognised as `argv[1]`, or after leading
 /// [`LEADING_OPTIONS`].
 const SUBCOMMANDS: &[&str] =
-    &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules", "backlog", "pr-events", "worktrees", "track"];
+    &["run", "slice", "settings", "grammar", "ruling", "entry", "queue", "ideas", "rules", "backlog", "pr-events", "worktrees", "track", "goal"];
 
 /// The usage of a subcommand asked for its help, `None` when it was not: only
 /// the first word after it counts, so `atlas run -- cargo --help` still runs and a
@@ -611,6 +612,7 @@ fn sub_help(word: &str, rest: &[String]) -> Option<&'static str> {
         "backlog" => atlas::backlog::USAGE,
         "pr-events" => atlas::pr_listen::USAGE,
         "track" => atlas::trackers::USAGE,
+        "goal" => atlas::goal::USAGE,
         _ => return None,
     })
 }
@@ -989,7 +991,10 @@ fn run() -> Result<ExitCode, String> {
         // Watching is on unless a configuration turns it off.
         atlas_setup.watch = true;
     }
-    let code = code_spec.as_ref().map(|c| atlas::code::CodeSetup::from_spec(c, &db_path, atlas_setup.watch));
+    let mut code = code_spec.as_ref().map(|c| atlas::code::CodeSetup::from_spec(c, &db_path, atlas_setup.watch));
+    if let Some(c) = code.as_mut() {
+        c.runq_root = loaded.as_ref().and_then(|l| l.orchestrate.as_ref()).and_then(|o| o.runq_root.clone());
+    }
     let semantic_model = model_path.unwrap_or_else(|| atlas::models::semantic_model(loaded.as_ref(), &db_path));
     let models = atlas::models::Models::new(loaded.as_ref().and_then(|c| c.models.as_ref()), &db_path);
     let mut memory = atlas::memory::settings::Settings::from_config(loaded.as_ref(), &db_path).map_err(|e| e.to_string())?;
@@ -1069,6 +1074,10 @@ fn run() -> Result<ExitCode, String> {
                     atlas::records::cli("ruling", a, &mut rules, &setup.memory, config.as_deref())
                 };
                 atlas::ideas::cli::cli(&rest, &mut store, &setup.memory.store, &mut ruling)
+            }
+            "goal" => {
+                let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
+                atlas::goal::cli(&rest, &mut store)
             }
             "rules" => {
                 let mut store = atlas::memory::MemoryStore::open(&setup.memory.store).map_err(|e| e.to_string())?;
@@ -1399,8 +1408,10 @@ fn run() -> Result<ExitCode, String> {
                     c.misses.iter().filter(|m| m.lang == "rust" || m.lang == "wgsl").count()
                 );
                 for l in &c.langs {
+                    // The share a language server gave, when one did.
+                    let lsp = if l.lsp > 0 { format!(" ({} by a language server)", l.lsp) } else { String::new() };
                     println!(
-                        "code recall {}: {} files, {} definitions by grep ({} more in comments or strings): {} indexed, {} from the scanner only, {} missing",
+                        "code recall {}: {} files, {} definitions by grep ({} more in comments or strings): {} indexed{lsp}, {} from the scanner only, {} missing",
                         l.lang, l.files, l.truth, l.excluded, l.indexed, l.scan_only, l.missing
                     );
                 }
@@ -2145,6 +2156,30 @@ fn taskjudge_time(args: &[String]) -> Result<ExitCode, String> {
 
 fn main() -> ExitCode {
     atlas::hook_budget::mark_process_start();
+    // Tests: a scripted language server for the code index's LSP driver
+    // (tests/code_lsp.rs), run as `atlas --stdio` with the script in
+    // ATLAS_TEST_LSP_FAKE. Only with the `test-seams` feature, never in a
+    // shipped build.
+    #[cfg(feature = "test-seams")]
+    if let Ok(script) = std::env::var("ATLAS_TEST_LSP_FAKE") {
+        // Version probes: one that answers and one that never does
+        // (tests/code_lsp_kill.rs).
+        match std::env::args().nth(1).as_deref() {
+            Some("--say") => {
+                println!("fake v1.2.3");
+                return ExitCode::SUCCESS;
+            }
+            Some("--stall") => {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                return ExitCode::SUCCESS;
+            }
+            _ => {}
+        }
+        if std::env::args().nth(1).as_deref() == Some("--stdio") {
+            atlas::lsp::fake::serve(std::io::stdin(), std::io::stdout(), &atlas::lsp::fake::Script::parse(&script));
+            return ExitCode::SUCCESS;
+        }
+    }
     match run() {
         Ok(c) => c,
         Err(e) => {

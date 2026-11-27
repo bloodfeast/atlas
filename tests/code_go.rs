@@ -177,7 +177,7 @@ fn the_scanner_alone_matches_the_indexer_on_definitions_and_ranges() {
     let r = atlas::recall::code_check(&conn, &setup(&root, &db, Indexers::Search).roots).unwrap();
     assert_eq!(
         r.langs,
-        [atlas::recall::LangRecall { lang: "go".into(), files: 2, truth: 6, excluded: 0, indexed: 0, scan_only: 6, missing: 0 }]
+        [atlas::recall::LangRecall { lang: "go".into(), files: 2, truth: 6, excluded: 0, indexed: 0, lsp: 0, scan_only: 6, missing: 0 }]
     );
     assert!(r.misses.is_empty() && r.truth == 0, "no Rust or WGSL here");
 }
@@ -232,12 +232,12 @@ fn a_failing_indexer_leaves_the_unit_to_the_scanner() {
     let bin = stand_in(&t.path().join("bin"), true);
     let db = t.path().join("state/atlas.sqlite");
     let (rep, mut s) = indexed(&root, &db, Indexers::Fixed(vec![("scip-go".into(), bin)]));
-    assert_eq!(rep.units, [Unit { dir: String::new(), lang: "go".into(), source: "scan only: scip-go exited with Some(1)".into() }]);
+    assert_eq!(rep.units, [Unit { dir: String::new(), lang: "go".into(), source: "scan only: scip-go exited with Some(1); no gopls is configured".into() }]);
     let (defs, _) = answer(&mut s, "Total");
     assert_eq!(defs, ["shapes.go:20 fn (scan) shapes"]);
     // A tool the setup does not list never runs.
     let (rep, _) = indexed(&root, &t.path().join("state2/atlas.sqlite"), Indexers::Fixed(Vec::new()));
-    assert_eq!(rep.units[0].source, "scan only: scip-go is not configured");
+    assert_eq!(rep.units[0].source, "scan only: scip-go is not configured; no gopls is configured");
 }
 
 #[test]

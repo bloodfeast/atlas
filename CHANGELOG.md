@@ -14,6 +14,141 @@ Sections are not written here by hand. Each pull request adds a fragment, `chang
 and section, and `cargo xtask version` folds the pending fragments into one section for the next release, in
 the order above, and sets the version by replaying them in merge order (`changes/README.md`).
 
+## v0.12.0
+
+### Highlights
+
+- **`atlas track` can write to Jira and Confluence.** Comments, transitions, edits and page updates, each a dry-run
+  until `--apply`, behind a write token and an allow-list of its own. Replies are one line: on the synthetic
+  fixtures in the wiki, a comment as dry-run then apply costs the model 350 tokens against 1470 for the Atlassian
+  MCP (a comment row of `cargo xtask write-cost`; the transition and edit MCP replies are assumed, not measured).
+- **Goals are atlas records with gates that are checked.** A goal's gates and aims are evaluated from `metric:`
+  lines in measurement journal entries, and a gate with no measurement reads "not measured", never met.
+- **The task judge is tunable and follows a fix round.** `orchestrate.judge.explore_every` sets the explore
+  cadence, a fix-round climb goes up one rung from the run that failed, and a continuation is re-judged on the
+  work that is left.
+- **Python and Go get definitions from their language servers** where no SCIP indexer runs, and the session
+  budget now binds command-hook clients too, with set-up for Codex (verified), Zed and Claude Desktop.
+
+### Features
+
+- **The task judge never drops its classifier silently.** When the classifier is on but cannot score a launch,
+  `note op=judge` and the launch hook say `classifier unavailable: <reason>` (no brief named, a missing brief,
+  the weights or the encoder), and rule A's pick is labelled as the fallback. When it scores, its pick is the
+  answer. The judge scores the brief file a launch prompt names (and any brief on its `Builds on:` line), not the
+  prompt; a missing brief is an error.
+- **Builder launches name their brief.** With the classifier on, a builder launch whose prompt names no
+  `BRIEF*.md` file, or a missing one, is denied with how to fix it (`orchestrate.judge.require_brief`);
+  `orchestrate.judge.require_header` also asks for the judge header (`Acceptance:`, `Deliverables:`,
+  `Captures:`, `Art:`), and `orchestrate.judge.speculative` routes a brief that names no acceptance tests to its
+  own pick. `require_header` and `speculative` are off by default.
+- **The enforced judge follows the speculative rule and named explores.** In enforced mode a speculative brief
+  is admitted at the speculative pick (logged, not counted); `Judge: explore <model>/<effort>` admits any valid
+  pair but the pick when the explore launch is due, and `Judge: climb <model>/<effort>` admits a fix-round
+  climb only above the pick (model, then effort), after the speculative and no-pick rules, logged as a climb
+  and not counted, so a due explore stays due. A malformed explore or climb line is
+  denied with the expected form, and string explores in the dogfood log seed the explore counter (legacy `"climb ..."` strings are skipped). The brief rule and the enforced judge hold only launches that are
+  builders by a `Kind:` line, agent type or worktree, so forks and web fetches are not denied. The judge's
+  answer line is a pasteable `Judge:` line, the advisory note compares with the classifier's pick, and a
+  Brandon-named launch logs why the classifier could not score.
+- **Goals are atlas records.** A goal is a record `goal:<slug>` (kind `goal`) in the lane that carries its
+  journal: the text verbatim, each `AMENDED` paragraph verbatim, and a ```` ```goal ```` spec block of `gate`,
+  `aim`, `report`, `lane`, `step`, `cadence` and `stall` lines that atlas checks for grammar and stores as sent,
+  never deriving one from the text. `note op=goal action=show|set|amend|pause|resume|drop` reads and writes it
+  (one active goal per project; `done` is refused until the met check lands); a spec write also appends a
+  `goal` journal entry with the version's sha. `atlas goal seed --from-memory KEY [--spec FILE]` copies a
+  memory's quoted goal text and its amendments into the record once. A goal's issued met token reads `issued`
+  on every store read.
+- **The task judge's explore cadence is a setting.** `orchestrate.judge.explore_every` (default 5, at least 2)
+  sets how many routed builder launches pass between explore launches; a value below 2 is a config error that
+  names the key.
+- **A fix-round climb goes up one rung from the run that failed.** `Judge: climb <model>/<effort>` is admitted
+  only at the next rung above the lane's last dogfood row on the ladder haiku/medium < sonnet/medium <
+  sonnet/high < opus/medium < opus/high < fable/medium < fable/high (after a failed explore below the pick, or a
+  failed continue of one: back at the pick, at most fable/high). A `Judge: brandon-named` row is a climb base like any
+  row: the climb goes one rung above the pair the user named. fable/high is the top rung. Any other climb, or a climb with no prior row for the lane, is denied
+  and the denial names the allowed pair.
+- **fable/max and any xhigh or max effort are the user's call.** The judge may suggest one (`note op=judge` says
+  to ask, and its answer carries `needs_brandon: true`). A launch at one is admitted only with
+  `Judge: brandon-named`, and without it the launch may run at the top rung under it.
+- **`Judge: continue` resumes a lane after a context-cap or infra stop** at exactly its last row's pair. It is
+  logged with `continue` true and never counted toward the explore.
+- **`atlas track` writes to Jira and Confluence: a comment, a transition, an edit (assignee, labels, sprint) and a
+  page update**, also as the MCP tool `track_write` (its own tool, marked as a write; `note` stays read only). Every
+  write is a dry-run that shows the exact request until `--apply`; it needs a write token of its own
+  (`jira_write_token_env`, `confluence_write_token_env`, `pat_write_env`) and a per-project or per-space verb
+  allow-list (`writes`), checked for Jira against the issue's real project (one read before each write, so a moved
+  issue's old key is not trusted); an applied write is journaled once. A comment is not sent twice within ten minutes
+  without `--again`, a transition to the current status sends nothing, and a page update reads the version first,
+  never overwrites, and with `--section HEADING` edits only that section, scoped to its layout column or table cell;
+  the model sends only the section. Replies are one line. `cargo xtask write-cost` measures them against the
+  Atlassian MCP's replies (`wiki/Project-tracking.md`).
+- **Goals are evaluated from metric lines.** A `measurement` journal entry may carry lines
+  `metric: <metric> <value> <unit> [arm <arm>] @<commit> <quiet|contended>`; the journal tool refuses a
+  malformed one with the reason, and warns when another entry kind carries them (they feed nothing there).
+  `goal::evaluate` reads them for a goal's gates and aims: a `quiet` gate skips contended lines, a gate over
+  arms takes the newest commit with every arm and its worst (or median) arm, a newer partial set is reported, not
+  used, a gate never fed is "not measured" and never met, and aims never decide met. It also gives the met
+  counts, the work-order step, each serving lane's last entry time and deltas against the goal's last
+  checkpoint. The journal tool no longer writes `entry=goal` (only a goal version does), and the goal seed reads
+  CRLF memory bodies and applies `set`'s checks to what it copies.
+- **Language servers index definitions where no SCIP indexer runs.** When a unit's SCIP indexer is missing or
+  fails, the code index asks the language's server, when one is found, for each file's definitions
+  (`textDocument/documentSymbol`) at index time, never at query time: Python's basedpyright-langserver then
+  pyright-langserver, Go's gopls. The order per unit is a prebuilt `index.scip`, the SCIP indexer, the server,
+  the scanner, which still fills what the server leaves out. A server gives definitions and item ranges, no
+  references. Answers are cached per file in the code dir, so a later run asks only the files that changed; the
+  edit hook never starts a server. One server runs at a time, at below-normal priority, at most 8 requests in
+  flight, killed at `code.timeout_s` (a watchdog kills one that stops reading its input 5 s later); with `orchestrate.runq_root` set, indexing waits while runq holds a heavy
+  compile. `code.indexers` names a server by its tool name (a path, or `false` to turn it off), the unit note
+  reads `basedpyright 1.40.2 (lsp)`, `atlas --recall-check` counts the definitions a server gave, and `atlas doctor`
+  says per language which indexer wins or what it looked for. On Windows, Python is no longer scanner-only
+  when basedpyright or pyright is installed.
+- **A `Judge: continue` launch is re-judged on the leftover work.** The continuation brief is scored by the
+  classifier like a routed launch and the launch is admitted at that pick, below, at or above the run it
+  continues (fable/high is the cap; a user-tier pick still needs `Judge: brandon-named`). It still needs a prior
+  row for the lane, accepts `after <run>` (the word `after` in any case), is never an explore and never counted.
+  A failed continuation climbs one rung from its own pair, except when it continues an explore below the pick
+  and also ran below the pick: then the climb goes back to the pick, as after the explore itself. With the
+  classifier unavailable a continuation is admitted only at the continued run's pair, as before. Its dogfood
+  row logs `continue` true, `continued_pair` and `continued_run`.
+
+### Fixes
+
+- **The code index no longer serves a file's old item ranges as current.** A file edited while the index runs
+  is no longer reported as indexed by that run, and it is indexed again as soon as the run ends, not at the next
+  safety-net walk or after a restart. Servers that share one index no longer take turns re-indexing a root, and
+  one change costs one run, not one per server.
+  Thanks to @serkankose (#21).
+- **A code root whose folder is missing or was removed now shows Failed, not Idle.**
+  Thanks to @serkankose (#21).
+- **No test points the developer's own status line at a test binary.** The hook and update tests no longer touch
+  the developer's status-line setting.
+  Thanks to @serkankose (#26).
+- **The resume card no longer trusts a handoff over what came after it.** For each live lane it names the entries
+  written after the lane's newest handoff first, then at most one recent ruling of another lane that names it (by
+  ref, a `lanes:` meta, or the lane's name as a whole word; a key such as `GOAL:0034` cites a record and does not
+  count), with the line's room split between the lanes. It marks a next step a later merge, commit or approving
+  review finished as superseded (a review asking for changes does not), shows the active goal record's newest
+  amendment beside an active `/goal`, and lists held launches whose release came as owed now. In a new session it
+  flags the previous session's agents that never finished, read from its subagent transcripts, as "orphaned by
+  restart?" (the journal's launches with nothing after them when the transcripts are gone). The work queue line
+  comes before these lines, so they no longer push it off the card.
+- **`recall lane=X` shows every entry newer than the lane's handoff first**, whole or by title, and the recent
+  rulings of other lanes that name the lane or supersede its records after the lane's own state.
+- **A note or commit whose first line is `queue: KEY done`, or a `closes:KEY` ref, closes a queued key**;
+  `queue: KEY done when X` is a condition and closes nothing.
+- **A hold's `until:` must be met whole, as words**; a one-word condition only from the hold's own lane.
+- **`recall key=memory:SLUG` reads the memory record `SLUG`**, also as `memory:SLUG@hash`.
+- **The session budget binds command hooks too.** `recall.session_budget_tokens` now counts what earlier
+  `atlas --hook` processes of the same session injected, so a client that runs a process per event (Codex, any
+  command-hook setup) is capped per session as the plugin's hooks are, not per prompt. Each logged injection now
+  holds every byte its answer sent (the pointer header and "+N more" line too), and the server re-reads a session's
+  injections at every prompt, so a server and command hooks sharing a session dedupe and charge alike. The SessionStart and
+  UserPromptSubmit hook contract for clients other than Claude Code is pinned by tests and documented on the new
+  wiki page Other MCP clients, with set-up for Codex (verified), Zed and Claude Desktop (from their documentation,
+  not yet run against atlas).
+
 ## v0.11.0
 
 ### Highlights

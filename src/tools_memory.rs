@@ -34,7 +34,7 @@ const LEAD_RATIO: f64 = 0.8;
 const LEAD_BODIES: usize = 2;
 
 /// The tools answered here (no vault rescan first).
-pub(super) const MEMORY_TOOLS: &[&str] = &["remember", "recall", "supersede", "journal", "handoff", "journal_status", "memory_log", "question_sweep", "deferred_questions", "hook"];
+pub(super) const MEMORY_TOOLS: &[&str] = &["remember", "recall", "supersede", "journal", "handoff", "journal_status", "memory_log", "question_sweep", "deferred_questions", "hook", "goal"];
 
 /// The memory store and hook state of a server, opened on first use.
 pub struct MemState {
@@ -265,8 +265,36 @@ impl Server {
                 Ok(Answer::Text(out))
             }
             "remember" | "supersede" => self.memory_write(name, a).map(Answer::Text),
+            "goal" => self.goal(a).map(Answer::Text),
             _ => Err(Error::NotFound(format!("tool {name:?}"))),
         }
+    }
+
+    /// `note op=goal`: the goal record's actions ([`crate::goal`]).
+    fn goal(&mut self, a: &Map) -> Result<String> {
+        use crate::goal::{Action, Who};
+        let action = opt_str(a, "action")?.unwrap_or("show").to_string();
+        let client = self.client.clone();
+        let reason = opt_str(a, "reason")?.map_or_else(|| format!("note op=goal action={action}"), str::to_string);
+        let m = self.mem()?;
+        let store = m.store.as_mut().ok_or_else(|| Error::Db("store".into()))?;
+        let who = Who { author: &client, client: &client, reason: &reason };
+        let written = match action.as_str() {
+            "show" => return crate::goal::show(store, opt_str(a, "slug")?),
+            "set" => crate::goal::set(store, arg_nonblank(a, "slug")?, arg_nonblank(a, "lane")?, arg_nonblank(a, "text")?, opt_str(a, "spec")?, &who)?,
+            "amend" => crate::goal::amend(store, arg_nonblank(a, "slug")?, arg_nonblank(a, "expected_sha")?, opt_str(a, "text")?, opt_str(a, "spec")?, &who)?,
+            "pause" | "resume" | "done" | "drop" => {
+                let act = match action.as_str() {
+                    "pause" => Action::Pause,
+                    "resume" => Action::Resume,
+                    "done" => Action::Done,
+                    _ => Action::Drop,
+                };
+                crate::goal::change(store, arg_nonblank(a, "slug")?, act, &who)?
+            }
+            o => return Err(Error::InvalidArgument(format!("action {o:?}; use show, set, amend, pause, resume, done or drop"))),
+        };
+        Ok(format!("ok {} v{} sha={}{}\n", written.key, written.seq, &written.sha[..16], if written.changed { "" } else { " (unchanged)" }))
     }
 
     fn recall(&mut self, a: &Map) -> Result<String> {
@@ -361,6 +389,8 @@ impl Server {
         let store = m.store.as_ref().ok_or_else(|| Error::Db("store".into()))?;
         let mut out = String::new();
         if let Some(k) = opt_str(a, "key")? {
+            // `memory:<slug>` reads the memory record `<slug>`.
+            let k = &recall::resolve_key(store, k)?;
             // `key@hash`: that exact version, verbatim, or a clear dangling.
             if store.head(k)?.is_none() {
                 if let Some(r) = crate::compact::parse_ref(k) {
@@ -697,6 +727,13 @@ impl Server {
             "journal" => {
                 let lane = arg_nonblank(a, "lane")?;
                 let entry = arg_str(a, "entry")?;
+                // A goal entry is written with its goal version, in one
+                // commit, by goal::append_entry only (design 2.1).
+                if entry == crate::goal::ENTRY {
+                    return Err(Error::InvalidArgument(
+                        "entry goal is written only with a goal version (note op=goal action=set or amend with a spec), never by the journal tool".into(),
+                    ));
+                }
                 if !ENTRIES.contains(&entry) {
                     return Err(Error::InvalidArgument(format!("entry {entry:?}; use one of {}", ENTRIES.join(", "))));
                 }
@@ -720,6 +757,13 @@ impl Server {
                     }
                 }
                 let text = arg_nonblank(a, "text")?;
+                // Metric lines feed goals (atlas-goal section 3): checked at
+                // write, a malformed one refused with the reason.
+                if entry == crate::goal::MEASUREMENT {
+                    crate::goal::check_metric_lines(text)?;
+                } else if !crate::goal::metric_lines(text).is_empty() {
+                    warning.push_str("warning: metric lines feed goals only from a measurement entry; this one feeds none\n");
+                }
                 let (head, rest) = text.split_once('\n').unwrap_or((text, ""));
                 // `amend: KEY` rewrites that entry's title and body as a new
                 // version; its lane and entry must be the ones given, and its

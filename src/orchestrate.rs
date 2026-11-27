@@ -292,6 +292,14 @@ pub struct OrchestrateSpec {
     pub judge_mode: Option<crate::taskjudge::JudgeMode>,
     /// The dogfood log (`orchestrate.judge.log`).
     pub judge_log: Option<std::path::PathBuf>,
+    /// `orchestrate.judge.require_brief` (default: the classifier's `enabled`).
+    pub judge_require_brief: Option<bool>,
+    /// `orchestrate.judge.require_header` (default false).
+    pub judge_require_header: Option<bool>,
+    /// `orchestrate.judge.speculative`'s pick, when enabled.
+    pub judge_speculative: Option<(String, String)>,
+    /// `orchestrate.judge.explore_every` (default 5, at least 2).
+    pub judge_explore_every: Option<usize>,
     /// The work classifier (`orchestrate.judge.classifier`).
     pub judge_classifier: crate::taskjudge::ClassifierSettings,
     /// The folders a `worktree:NAME` resolves under (`orchestrate.worktree_roots`;
@@ -517,6 +525,10 @@ pub fn resolve(
             classifier: o.judge_classifier.clone(),
             mode: o.judge_mode.unwrap_or(if o.judge_enabled.unwrap_or(false) { crate::taskjudge::JudgeMode::Advisory } else { crate::taskjudge::JudgeMode::Off }),
             log: o.judge_log.clone(),
+            require_brief: o.judge_require_brief,
+            require_header: o.judge_require_header.unwrap_or(false),
+            speculative: o.judge_speculative.clone(),
+            explore_every: o.judge_explore_every,
         },
         worktree_roots: o.worktree_roots.clone(),
         runq_root: o.runq_root.clone(),

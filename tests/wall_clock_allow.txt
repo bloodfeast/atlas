@@ -12,6 +12,13 @@
 2 elapsed src/ideas/mod.rs -- a wall-time bound on work (perf claim); to become a count of work done
 1 elapsed src/json.rs -- a wall-time bound on work (perf claim); to become a count of work done
 2 elapsed src/lex/props.rs -- a wall-time bound on work (perf claim); to become a count of work done
+2 sleep src/lsp/fake.rs -- a fake that is slow by sleeping (a server that hangs, killed at the timeout); to become a wait on a signal that never comes
+2 elapsed src/lsp/refs_spike.rs -- an ignored measure that prints times (LSP-Q1 references cost); asserts nothing
+2 elapsed src/lsp/tests.rs -- deadline or budget timed on the real clock (the server is killed at the timeout); to move to an injected clock (virtual time)
+1 timeout src/lsp/tests.rs -- a bounded wait for a finish that must not hang (the watchdog test); to become a signal
+5 elapsed tests/code_lsp_kill.rs -- deadline or budget timed on the real clock (a deaf server killed at the timeout plus grace); to move to an injected clock (virtual time)
+1 sleep tests/code_lsp_kill.rs -- a 500 ms wait to see that a killed server logs no more beats; to become a signal
+1 timeout tests/code_lsp_kill.rs -- a bounded wait for an index run that must not hang; to become a signal
 1 elapsed src/paths.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 1 sleep src/paths.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 1 elapsed src/pr_listen.rs -- deadline or budget timed on the real clock, or a fake that is slow by sleeping; to move to an injected clock (virtual time)
@@ -34,6 +41,7 @@
 1 elapsed tests/code.rs -- a give-up bound on a poll for an event (outcome fixed unless it hangs); to become a readiness signal
 1 sleep tests/code_cs.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 sleep tests/code_go.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
+1 elapsed tests/code_lsp.rs -- deadline or budget timed on the real clock (a lingering server killed 5 s after exit); to move to an injected clock (virtual time)
 1 sleep tests/code_ts.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 4 elapsed tests/concurrency.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
 6 sleep tests/concurrency.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock
@@ -50,6 +58,7 @@
 35 sleep tests/orchestrate.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 elapsed tests/pr_digest.rs -- a time printed for the reader; asserts nothing
 4 elapsed tests/projects.rs -- a wall-time bound on work (perf claim); to become a count of work done
+1 sleep tests/reindex_stamp_fifo.rs -- sleeps to move a file time past a clock tick: the pipe's write past reindex_file's stamp, which is the real clock inside it, so no explicit file time can be placed after it; to become an injected clock
 2 sleep tests/restart.rs -- sleeps to move a file time past a clock tick; to set the time explicitly (File::set_modified)
 1 timeout tests/restart.rs -- a timed receive or wait used as a deadline on the real clock; to become a signal or an injected clock
 1 sleep tests/trackers.rs -- a sleep or poll used to order threads or processes, or a fake that is slow by sleeping; to become a signal, barrier or injected clock

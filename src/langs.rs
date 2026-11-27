@@ -65,6 +65,11 @@ pub struct Lang {
     /// `kw` (the keyword) and `name`. A line inside a block comment or a
     /// multi-line string is not counted.
     pub truth: &'static str,
+    /// The language servers atlas asks for a unit's definitions when no
+    /// SCIP index serves it ([`crate::lsp`]), in order of preference: the
+    /// first one found runs. Asked at index time only, never on the query
+    /// path.
+    pub lsp: &'static [LspServer],
     /// The SCIP indexer atlas runs for a unit, when one is found.
     pub driver: Option<Driver>,
     /// The scanner also adds its definitions on lines of a file the index
@@ -366,6 +371,38 @@ pub struct Driver {
     pub fail_hint: Option<Hint>,
 }
 
+/// A language server atlas starts for a unit that no SCIP index serves, and
+/// asks for each file's symbols (`textDocument/documentSymbol`): definitions
+/// and their item ranges ([`crate::lsp`]). atlas never installs one: it is
+/// used when found, and the unit is scanned meanwhile.
+#[derive(Debug)]
+pub struct LspServer {
+    /// The program's name (`.exe` added on Windows), and for a Node
+    /// package the name of its `bin` entry (`pyright-langserver`); the key
+    /// `code.indexers` names it by.
+    pub tool: &'static str,
+    /// The npm package of a server written for Node: its `bin` script is
+    /// run with `node`, as for [`Driver::node_package`].
+    pub node_package: Option<&'static str>,
+    /// Where to look for it.
+    pub find: &'static [Find],
+    /// The argument it must answer with success to count as found, and
+    /// whose output names its version (`gopls version`); empty for a Node
+    /// server, which answers nothing without a connection: `node` must
+    /// answer `--version` and the package's `package.json` names the
+    /// version.
+    pub version_arg: &'static str,
+    /// Programs that must be on `PATH` for it to run.
+    pub needs: &'static [&'static str],
+    /// Its arguments (`--stdio`); it is run in the unit's folder.
+    pub args: &'static [&'static str],
+    /// The `languageId` of a `textDocument/didOpen`.
+    pub language_id: &'static str,
+    /// The `initializationOptions` sent with `initialize`, as JSON text;
+    /// empty for none.
+    pub init_options: &'static str,
+}
+
 /// A value from a JSON file in a unit's folder or a folder above it (up to
 /// the root), quoted in the note of a failed run.
 #[derive(Debug)]
@@ -501,6 +538,13 @@ fn node_launch(script: PathBuf) -> Launch {
 /// The script a Node package's `package.json` names in `bin` (its only
 /// entry, or the one named after the package's last segment).
 fn package_bin(dir: &Path) -> Option<PathBuf> {
+    package_bin_named(dir, None)
+}
+
+/// [`package_bin`], preferring the `bin` entry named `bin` when given (a
+/// package holding a language server beside its command-line tool:
+/// pyright's `pyright-langserver`).
+fn package_bin_named(dir: &Path, want: Option<&str>) -> Option<PathBuf> {
     let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
     let v = crate::json::parse(&text).ok()?;
     let bin = v.get("bin")?;
@@ -510,7 +554,13 @@ fn package_bin(dir: &Path) -> Option<PathBuf> {
             let o = bin.as_object()?;
             let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let last = name.rsplit('/').next().unwrap_or(name);
-            o.get(last).or_else(|| o.iter().next().map(|(_, v)| v)).and_then(|s| s.as_str())?.to_string()
+            let entry = match want {
+                // A server is that entry or none: never the package's
+                // command-line tool in its place.
+                Some(w) => o.get(w),
+                None => o.get(last).or_else(|| o.iter().next().map(|(_, v)| v)),
+            };
+            entry.and_then(|s| s.as_str())?.to_string()
         }
     };
     let p = dir.join(rel);
@@ -1477,6 +1527,18 @@ pub static LANGS: &[Lang] = &[
             servers: &["{Rpc}"],
             bases: &["{S}Server", "Unimplemented{S}Server"],
         }),
+        // The cross-check of the language-server driver: scip-go runs first
+        // where it is found.
+        lsp: &[LspServer {
+            tool: "gopls",
+            node_package: None,
+            find: &[Find::Path, Find::Env("GOBIN"), Find::EnvJoin("GOPATH", "bin"), Find::Home("go/bin")],
+            version_arg: "version",
+            needs: &["go"],
+            args: &[],
+            language_id: "go",
+            init_options: "",
+        }],
         driver: Some(Driver {
             tool: "scip-go",
             node_package: None,
@@ -1520,6 +1582,7 @@ pub static LANGS: &[Lang] = &[
             servers: &["{rpc}"],
             bases: &["I{S}Server", "{S}Server"],
         }),
+        lsp: &[],
         driver: Some(Driver {
             tool: "scip-typescript",
             node_package: Some("@sourcegraph/scip-typescript"),
@@ -1582,6 +1645,7 @@ pub static LANGS: &[Lang] = &[
             servers: &["{rpc}"],
             bases: &[],
         }),
+        lsp: &[],
         driver: None,
     },
     Lang {
@@ -1615,6 +1679,7 @@ pub static LANGS: &[Lang] = &[
             servers: &["{Rpc}"],
             bases: &["{S}Base"],
         }),
+        lsp: &[],
         driver: Some(Driver {
             tool: "scip-dotnet",
             node_package: None,
@@ -1664,6 +1729,30 @@ pub static LANGS: &[Lang] = &[
             servers: &["{Rpc}"],
             bases: &["{S}Servicer"],
         }),
+        // scip-python does not run on Windows: there a Python unit is
+        // indexed by one of these, else scanned.
+        lsp: &[
+            LspServer {
+                tool: "basedpyright-langserver",
+                node_package: Some("basedpyright"),
+                find: &[Find::Path, Find::NpmRoot],
+                version_arg: "",
+                needs: &["node"],
+                args: &["--stdio"],
+                language_id: "python",
+                init_options: "",
+            },
+            LspServer {
+                tool: "pyright-langserver",
+                node_package: Some("pyright"),
+                find: &[Find::Path, Find::NpmRoot],
+                version_arg: "",
+                needs: &["node"],
+                args: &["--stdio"],
+                language_id: "python",
+                init_options: "",
+            },
+        ],
         driver: Some(Driver {
             tool: "scip-python",
             node_package: Some("@sourcegraph/scip-python"),
@@ -1714,6 +1803,7 @@ pub static LANGS: &[Lang] = &[
             servers: &["{rpc}"],
             bases: &["{S}ImplBase", "AsyncService"],
         }),
+        lsp: &[],
         driver: Some(Driver {
             tool: "scip-java",
             node_package: None,
@@ -1765,6 +1855,7 @@ pub static LANGS: &[Lang] = &[
             servers: &["{rpc}"],
             bases: &["{S}CoroutineImplBase"],
         }),
+        lsp: &[],
         driver: None,
     },
 ];
@@ -1890,44 +1981,62 @@ impl Find {
     }
 }
 
+/// Every place a tool's binary (or, for a Node tool, its package folder)
+/// may be, in the order of `find`. `npm root -g` is asked only when no
+/// place before it holds anything. Shared by [`Driver`] and [`LspServer`].
+fn candidates(tool: &str, node_package: Option<&str>, find: &[Find]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for f in find {
+        if matches!(f, Find::NpmRoot) && out.iter().any(|p| p.exists()) {
+            break;
+        }
+        out.extend(candidates_in(tool, node_package, f));
+    }
+    out
+}
+
+fn candidates_in(tool: &str, node_package: Option<&str>, f: &Find) -> Vec<PathBuf> {
+    let dirs = f.dirs();
+    let Some(pkg) = node_package else {
+        return dirs.iter().map(|d| d.join(exe(tool))).collect();
+    };
+    if matches!(f, Find::NpmRoot) {
+        return dirs.iter().map(|d| d.join(pkg)).collect();
+    }
+    // A folder holding the tool's shim: npm's global prefix on Windows
+    // (packages in `node_modules` beside it), its `bin` elsewhere
+    // (`../lib/node_modules`), or a project's `node_modules/.bin`.
+    let shims = [tool.to_string(), format!("{tool}.cmd")];
+    let mut out = Vec::new();
+    for d in dirs.iter().filter(|d| shims.iter().any(|s| d.join(s).is_file())) {
+        out.push(d.join("node_modules").join(pkg));
+        if let Some(up) = d.parent() {
+            out.push(up.join("lib").join("node_modules").join(pkg));
+            if d.file_name().is_some_and(|n| n == ".bin") {
+                out.push(up.join(pkg));
+            }
+        }
+    }
+    out
+}
+
+/// How a candidate of [`candidates`] is started: a Node package's `bin`
+/// script (`bin` the entry of that name, else the package's own) with
+/// `node`, or a binary as it is; `None` when the candidate is not there.
+fn launch_of(p: PathBuf, node_package: Option<&str>, bin: Option<&str>) -> Option<Launch> {
+    match node_package {
+        Some(_) if p.is_dir() => package_bin_named(&p, bin).map(node_launch),
+        None if p.is_file() => Some(Launch::program(p)),
+        _ => None,
+    }
+}
+
 impl Driver {
     /// Every place this driver's binary (or, for a Node tool, its package
     /// folder) may be, in search order. `npm root -g` is asked only when
     /// no place before it holds anything.
     pub fn candidates(&self) -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = Vec::new();
-        for f in self.find {
-            if matches!(f, Find::NpmRoot) && out.iter().any(|p| p.exists()) {
-                break;
-            }
-            out.extend(self.candidates_in(f));
-        }
-        out
-    }
-
-    fn candidates_in(&self, f: &Find) -> Vec<PathBuf> {
-        let dirs = f.dirs();
-        let Some(pkg) = self.node_package else {
-            return dirs.iter().map(|d| d.join(exe(self.tool))).collect();
-        };
-        if matches!(f, Find::NpmRoot) {
-            return dirs.iter().map(|d| d.join(pkg)).collect();
-        }
-        // A folder holding the tool's shim: npm's global prefix on Windows
-        // (packages in `node_modules` beside it), its `bin` elsewhere
-        // (`../lib/node_modules`), or a project's `node_modules/.bin`.
-        let shims = [self.tool.to_string(), format!("{}.cmd", self.tool)];
-        let mut out = Vec::new();
-        for d in dirs.iter().filter(|d| shims.iter().any(|s| d.join(s).is_file())) {
-            out.push(d.join("node_modules").join(pkg));
-            if let Some(up) = d.parent() {
-                out.push(up.join("lib").join("node_modules").join(pkg));
-                if d.file_name().is_some_and(|n| n == ".bin") {
-                    out.push(up.join(pkg));
-                }
-            }
-        }
-        out
+        candidates(self.tool, self.node_package, self.find)
     }
 
     /// Finds the tool: the first candidate that exists and answers
@@ -1945,14 +2054,7 @@ impl Driver {
             return Err(format!("{} needs {missing} on PATH", self.tool));
         }
         for p in self.candidates() {
-            let launch = match self.node_package {
-                Some(_) if p.is_dir() => match package_bin(&p) {
-                    Some(script) => node_launch(script),
-                    None => continue,
-                },
-                None if p.is_file() => Launch::program(p),
-                _ => continue,
-            };
+            let Some(launch) = launch_of(p, self.node_package, None) else { continue };
             if crate::code_index::answers(&launch, self.version_arg) {
                 return Ok(launch);
             }
@@ -1974,6 +2076,133 @@ impl Driver {
             })
             .collect()
     }
+}
+
+/// The first of a row's servers found ([`LspServer::find`]), in order.
+///
+/// # Returns
+///
+/// The server and how to start it, or the note a scanned unit carries
+/// (`no basedpyright-langserver or pyright-langserver on PATH, npm root
+/// -g`); `Err("")` for a row without servers.
+pub fn find_server(servers: &[&'static LspServer]) -> Result<(&'static LspServer, Launch), String> {
+    let mut needs = Vec::new();
+    for s in servers.iter().copied() {
+        match s.find() {
+            Ok(l) => return Ok((s, l)),
+            Err(Some(why)) => needs.push(why),
+            Err(None) => {}
+        }
+    }
+    if servers.is_empty() {
+        return Err(String::new());
+    }
+    let names: Vec<&str> = servers.iter().map(|s| s.tool).collect();
+    let mut places: Vec<String> = Vec::new();
+    for f in servers.iter().flat_map(|s| s.find.iter()) {
+        let l = f.label();
+        if !places.contains(&l) {
+            places.push(l);
+        }
+    }
+    let mut note = format!("no {} on {}", names.join(" or "), places.join(", "));
+    for n in needs {
+        note.push_str(&format!("; {n}"));
+    }
+    Err(note)
+}
+
+impl LspServer {
+    /// How the unit notes and the cache name the server: its npm package
+    /// (`basedpyright`), else its tool.
+    pub fn label(&self) -> &'static str {
+        self.node_package.unwrap_or(self.tool)
+    }
+
+    /// Finds the server: the first candidate that exists and answers
+    /// ([`LspServer::version_arg`]), with every program it needs on
+    /// `PATH`.
+    ///
+    /// # Returns
+    ///
+    /// How to start it; `Err(None)` when it is not there, `Err(Some(why))`
+    /// when a program it needs is missing.
+    pub fn find(&self) -> Result<Launch, Option<String>> {
+        if let Some(missing) = self.needs.iter().find(|n| on_path(n).is_none()) {
+            return Err(Some(format!("{} needs {missing} on PATH", self.tool)));
+        }
+        for p in candidates(self.tool, self.node_package, self.find) {
+            let Some(launch) = launch_of(p, self.node_package, Some(self.tool)) else { continue };
+            if self.answers(&launch) {
+                return Ok(launch);
+            }
+        }
+        Err(None)
+    }
+
+    /// True when a found launch runs: its program answers
+    /// [`LspServer::version_arg`], or for a Node server `node` answers
+    /// `--version`.
+    fn answers(&self, launch: &Launch) -> bool {
+        if self.version_arg.is_empty() {
+            crate::code_index::answers(&Launch::program(launch.program.clone()), "--version")
+        } else {
+            crate::code_index::answers(launch, self.version_arg)
+        }
+    }
+
+    /// A configured path (`code.indexers`): a Node package's folder runs
+    /// its [`LspServer::tool`] script, anything else as
+    /// [`Launch::configured`] runs it.
+    pub fn configured(&self, p: &Path) -> Launch {
+        if p.is_dir() {
+            if let Some(script) = package_bin_named(p, Some(self.tool)) {
+                return node_launch(script);
+            }
+        }
+        Launch::configured(p)
+    }
+
+    /// The server's version: a Node server's `package.json` `version`,
+    /// else the first word of [`LspServer::version_arg`]'s output that
+    /// starts with a digit (`v` dropped: `gopls v0.18.1` is `0.18.1`);
+    /// empty when neither says or the program runs past `timeout`.
+    pub fn version(&self, launch: &Launch, timeout: std::time::Duration) -> String {
+        if let Some(script) = launch.pre.first() {
+            let mut dir = Path::new(script).parent();
+            for _ in 0..3 {
+                let Some(d) = dir else { break };
+                if let Some(v) = std::fs::read_to_string(d.join("package.json"))
+                    .ok()
+                    .and_then(|t| crate::json::parse(&t).ok())
+                    .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(str::to_string))
+                {
+                    return v;
+                }
+                dir = d.parent();
+            }
+            return String::new();
+        }
+        if self.version_arg.is_empty() {
+            return String::new();
+        }
+        crate::code_index::answer_text(launch, self.version_arg, timeout).as_deref().map(version_word).unwrap_or_default()
+    }
+
+    /// Its arguments for one run.
+    pub fn args_for(&self) -> Vec<std::ffi::OsString> {
+        self.args.iter().map(std::ffi::OsString::from).collect()
+    }
+}
+
+/// The first word of a version command's output that is a version number
+/// (`golang.org/x/tools/gopls v0.18.1`: `0.18.1`).
+pub fn version_word(text: &str) -> String {
+    text.split_whitespace()
+        .map(|w| w.strip_prefix('v').unwrap_or(w))
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or("")
+        .to_string()
 }
 
 impl Prereq {
@@ -2197,6 +2426,41 @@ mod tests {
                 crate::regex::Regex::new(r.re).unwrap_or_else(|e| panic!("{}: {}: {e}", l.name, r.re));
             }
         }
+    }
+
+    #[test]
+    fn finds_the_first_server_that_answers() {
+        const fn server(tool: &'static str, version_arg: &'static str) -> LspServer {
+            LspServer { tool, node_package: None, find: &[Find::Path], version_arg, needs: &[], args: &[], language_id: "x", init_options: "" }
+        }
+        static MISSING: LspServer = server("atlas-no-such-server", "--version");
+        // On PATH, but it does not answer this argument.
+        static MUTE: LspServer = server("cargo", "--atlas-no-such-flag");
+        static CARGO: LspServer = server("cargo", "--version");
+        let (s, launch) = find_server(&[&MISSING, &MUTE, &CARGO]).unwrap();
+        assert!(std::ptr::eq(s, &CARGO));
+        assert!(!CARGO.version(&launch, std::time::Duration::from_secs(60)).is_empty());
+        assert_eq!(find_server(&[&MISSING]).unwrap_err(), "no atlas-no-such-server on PATH");
+        assert_eq!(find_server(&[]).unwrap_err(), "");
+        static NEEDY: LspServer =
+            LspServer { tool: "x-server", node_package: None, find: &[Find::Path, Find::NpmRoot], version_arg: "", needs: &["atlas-no-such-runtime"], args: &[], language_id: "x", init_options: "" };
+        assert_eq!(find_server(&[&MISSING, &NEEDY]).unwrap_err(), "no atlas-no-such-server or x-server on PATH, npm root -g; x-server needs atlas-no-such-runtime on PATH");
+        // A configured Node package runs the server's own `bin` entry, and
+        // its `package.json` names the version.
+        let dir = std::env::temp_dir().join(format!("atlas-lsp-pkg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name": "pyright", "version": "1.1.414", "bin": {"pyright": "index.js", "pyright-langserver": "langserver.index.js"}}"#).unwrap();
+        std::fs::write(dir.join("index.js"), "").unwrap();
+        std::fs::write(dir.join("langserver.index.js"), "").unwrap();
+        let py = by_name("python").unwrap().lsp;
+        let launch = py[1].configured(&dir);
+        assert_eq!(launch.pre, vec![dir.join("langserver.index.js").into_os_string()]);
+        assert_eq!(py[1].version(&launch, std::time::Duration::from_secs(60)), "1.1.414");
+        // basedpyright's entry is not in pyright's package: no server.
+        assert_eq!(package_bin_named(&dir, Some("basedpyright-langserver")), None);
+        assert_eq!(version_word("golang.org/x/tools/gopls v0.18.1\n    golang.org/x/tools/gopls@v0.18.1"), "0.18.1");
+        assert_eq!(version_word("no version"), "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

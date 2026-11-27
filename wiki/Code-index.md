@@ -304,7 +304,7 @@ annotated again.
 | Discussions, the work queue (`next_id`, the decision queue) | any |
 | Projects and multi-repo, the repository graph | any |
 | Hooks: recall, handoffs, the context cap, routing to handles | any |
-| `symbol`: definitions, references, callers, impl edges | Rust, WGSL, Protocol Buffers, Go (scip-go when found), TypeScript and JavaScript (scip-typescript when found), C# (scip-dotnet when found), Python (scip-python when found, not on Windows), Java (scip-java when found, not on Windows); any of them from a prebuilt `index.scip`; else definitions only from the scanner, and always for Kotlin; any language with a SCIP indexer, from a `.scip` file given with `--code-index --scip FILE` (tested with scip-go, scip-typescript, scip-dotnet, scip-python and scip-java output) |
+| `symbol`: definitions, references, callers, impl edges | Rust, WGSL, Protocol Buffers, Go (scip-go when found, else definitions from gopls), TypeScript and JavaScript (scip-typescript when found), C# (scip-dotnet when found), Python (scip-python when found, not on Windows; else definitions from basedpyright-langserver or pyright-langserver), Java (scip-java when found, not on Windows); any of them from a prebuilt `index.scip`; else definitions only from the scanner, and always for Kotlin; any language with a SCIP indexer, from a `.scip` file given with `--code-index --scip FILE` (tested with scip-go, scip-typescript, scip-dotnet, scip-python and scip-java output) |
 | Item ranges on Read and shell reads, Grep annotations | Rust, WGSL, Protocol Buffers, Go, TypeScript, JavaScript, C#, Python, Java, Kotlin; the languages of a `--scip` file until one of their files changes |
 | rpcs: generated stubs, exact callers and server implementations (`symbol` of an rpc) | Go, TypeScript, JavaScript, C#, Python, Java, Kotlin (stubs and calls through them from a SCIP index; implementations from SCIP impl edges or the scanner's type headers); word call sites in any language's source files where no index resolved the call |
 | References from one code root into another (a package another root defines) | any language whose SCIP indexer names its packages: Go, TypeScript, JavaScript, Python, Java, Rust; calls into another root's generated gRPC stubs as rpc call sites. Not C# (scip-dotnet writes no package name for a project's own symbols) and not scanner-only roots |
@@ -369,3 +369,25 @@ indexer, so it is measured against its grep truth alone: the misses are local fu
 function's body), the members of an object expression opened inside a call (`listOf(object : X() {`) and a
 class nested in classes with backticked names, and the scanner's 362 definitions outside the truth are what the truth does not count
 (properties without a modifier, enum entries, constructors).
+
+### Language servers
+
+Where a unit's SCIP indexer is missing or fails, atlas asks the row's language server, when one is found, for
+each file's definitions (`textDocument/documentSymbol`) at index time, never at query time: Python's
+basedpyright-langserver then pyright-langserver (Node packages; `npm i -g basedpyright`), Go's gopls. The order
+per unit is a prebuilt `index.scip`, the SCIP indexer, the server, the scanner; the scanner fills what the
+server leaves out. A server gives definitions and item ranges, no references. Its answers are cached per file
+in the code dir, so a later full run asks only the files that changed; the edit hook never starts one. One
+server runs at a time, at below-normal priority, at most 8 requests in flight, killed at `code.timeout_s` (a server that stops reading its input, so that a write to it blocks, is killed by a watchdog 5 s later; the version probe is cut at `code.timeout_s` too).
+`code.indexers` names a server by its tool name (`{"pyright-langserver": "C:/tools/pyright"}`, `{"gopls":
+false}`), and `atlas doctor` says, per language, which indexer wins or what was looked for.
+
+| Corpus | Server | Grep truth held by its rows | Filled by the scanner | Missing | Definitions against SCIP's: recall (precision) | Item ends equal to SCIP's |
+|---|---|---|---|---|---|---|
+| pallets/flask at 49943b5 | basedpyright 1.40.2 | 1,579 of 1,622 | 43 | 0 | 94.7% (96.7%) | 100% of 1,524 |
+| pallets/flask at 49943b5 | pyright 1.1.414 | 1,579 of 1,622 | 43 | 0 | 94.7% (96.7%) | 100% of 1,524 |
+| gin-gonic/gin at 0f09c3a | gopls 0.18.1 | 1,553 of 1,553 | 0 | 0 | 99.5% (99.7%) | 100% of 1,512 |
+
+A full index run (provisional, a busy machine): flask with basedpyright 4.4 s cold, 2.9 s with one file
+touched (154 MB peak); with pyright 2.5 s and 2.7 s (135 MB); gin with gopls 16.2 s cold, 5.4 s with one
+file touched (269 MB). The design and the open questions are in `docs/design/langs.md`, section 15.
