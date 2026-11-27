@@ -317,17 +317,19 @@ fn interleaved_agents_under_load_keep_their_own_calls() {
     assert!(fails.is_empty(), "{} of {} runs failed", fails.len(), runs * threads);
 }
 
-/// Every `mcp_tool` input the plugin's hooks/hooks.json sends, for every
-/// event and every tool its matcher covers, is taken by the `hook` tool's
-/// schema through `tools/call` (bloodfeast/atlas-dev#104: an undeclared
+/// Every `mcp_tool` input the plugin's hooks/hooks.json sent before its hooks
+/// became `atlas --hook` (kept in tests/golden/hooks-mcp-tool.json), for every
+/// event and every tool its matcher covers, is still taken by the `hook`
+/// tool's schema through `tools/call`: a Claude Code that has not reloaded
+/// the plugin sends them (bloodfeast/atlas-dev#104: an undeclared
 /// `tool_use_id` failed every PreToolUse hook). PreToolUse stays on `*`:
 /// the context cap blocks every tool but the handoff in a capped agent.
 #[test]
-fn every_hooks_json_input_is_taken_by_the_hook_tool() {
-    let fx = Fx::new("surface-hooks-json");
+fn every_mcp_tool_hook_input_is_taken_by_the_hook_tool() {
+    let fx = Fx::new("surface-hooks-mcp-tool");
     let mut s = fx.server();
     s.set_memory(atlas::memory::settings::Settings::from_config(None, &fx.db).unwrap());
-    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/hooks/hooks.json")).unwrap();
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/hooks-mcp-tool.json")).unwrap();
     let v = atlas::json::parse(&text).unwrap();
     let cwd = fx.tmp.path().to_string_lossy().to_string();
     // The PreToolUse consumers: routing (Bash, PowerShell), the review gate
@@ -376,6 +378,68 @@ fn every_hooks_json_input_is_taken_by_the_hook_tool() {
                     let msg = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "hook", "arguments": args}});
                     let r = atlas::protocol::handle(&mut s, &msg).unwrap();
                     assert!(r.get("error").is_none() && r["result"]["isError"] != json!(true), "{event} {tool}: {r}");
+                    sent += 1;
+                }
+            }
+        }
+    }
+    assert!(sent >= 20, "{sent} hook inputs sent");
+}
+
+/// Every hook in the plugin's hooks/hooks.json is `atlas --hook`, and the
+/// event Claude Code writes on its stdin, for every event and every tool
+/// its matcher covers, reaches the hook worker whole: its event, tool and
+/// the tool's input and response, as the server's socket hands it over
+/// (`atlas::hook_socket::job_args`). PreToolUse stays on `*`: the context
+/// cap blocks every tool but the handoff in a capped agent.
+#[test]
+fn every_hooks_json_event_reaches_the_hook_worker_whole() {
+    let fx = Fx::new("surface-hooks-json");
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/hooks/hooks.json")).unwrap();
+    let v = atlas::json::parse(&text).unwrap();
+    let cwd = fx.tmp.path().to_string_lossy().to_string();
+    // The PreToolUse consumers: routing (Bash, PowerShell), the review gate
+    // (Bash), the agent cap (every tool), the orchestrator (Agent, Task,
+    // SendMessage), the report backstop (SubagentHandback), the lane journal
+    // and dedup (mcp__atlas__*), and any other server's tools.
+    let any = ["Bash", "PowerShell", "Read", "Grep", "Agent", "Task", "SendMessage", "SubagentHandback", "mcp__atlas__journal", "mcp__atlas__note", "mcp__other__tool"];
+    let mut sent = 0;
+    let mut id = 0;
+    for (event, groups) in v["hooks"].as_object().unwrap() {
+        for g in groups.as_array().unwrap() {
+            let matcher = g.get("matcher").and_then(atlas::json::Value::as_str).unwrap_or("");
+            let tools: Vec<&str> = match matcher {
+                "" => vec![""],
+                "*" => any.to_vec(),
+                m => m.split('|').collect(),
+            };
+            for h in g["hooks"].as_array().unwrap() {
+                assert_eq!(h["type"], json!("command"), "{event}");
+                assert!(h["command"].as_str().unwrap().ends_with("/bin/atlas\" --hook"), "{event}: {h}");
+                for tool in &tools {
+                    let tool_input = match *tool {
+                        "Bash" | "PowerShell" => json!({"command": "git status", "description": "d"}),
+                        "Agent" | "Task" => json!({"prompt": "Lane: X\nbuild it", "description": "d"}),
+                        _ => json!({"file_path": "a.rs"}),
+                    };
+                    // The event as Claude Code writes it on a command hook's
+                    // stdin, as the server's socket hands it to the worker.
+                    let stdin = json!({
+                        "hook_event_name": event, "session_id": "S", "transcript_path": format!("{cwd}/none.jsonl"),
+                        "cwd": cwd, "permission_mode": "default", "tool_name": tool, "tool_input": tool_input,
+                        "tool_use_id": format!("tu-{id}"), "tool_response": {"stdout": "ok", "stderr": ""},
+                        "prompt": "build it", "stop_hook_active": false, "agent_id": "ag-1", "agent_type": "general-purpose",
+                        "source": "startup", "reason": "other", "trigger": "auto"
+                    });
+                    let ev = atlas::hooks::HookEvent::from_value(&atlas::hook_socket::job_args(stdin));
+                    assert_eq!((ev.event.as_str(), ev.tool_name.as_str(), ev.tool_input.clone()), (event.as_str(), *tool, tool_input.clone()), "{event} {tool}");
+                    assert_eq!(ev.tool_response, json!({"stdout": "ok", "stderr": ""}), "{event} {tool}");
+                    assert_eq!(ev.tool_use_id, format!("tu-{id}"), "{event} {tool}");
+                    assert!(!ev.tool_use, "a hook, never a model's tool call: {event} {tool}");
+                    if matches!(*tool, "Agent" | "Task") {
+                        assert_eq!(ev.tool_prompt, "Lane: X\nbuild it", "{event} {tool}");
+                    }
+                    id += 1;
                     sent += 1;
                 }
             }

@@ -344,11 +344,12 @@ pub fn serve_with_hooks(
     input: impl BufRead + Send + 'static,
     output: impl Write + Send + 'static,
 ) -> io::Result<()> {
-    serve_with_hooks_every(server, hooks, index, input, output, crate::restart::REFRESH_EVERY)
+    serve_with_hooks_every(server, hooks, index, input, output, crate::restart::REFRESH_EVERY, crate::server_check::own_socket())
 }
 
 /// [`serve_with_hooks`] with the restart point refreshed every `every`
-/// (tests use a short one).
+/// (tests use a short one), taking command hooks on the Unix socket at
+/// `socket` too ([`crate::hook_socket`]; `None` takes none).
 ///
 /// # Errors
 ///
@@ -361,7 +362,9 @@ pub fn serve_with_hooks_every(
     input: impl BufRead + Send + 'static,
     output: impl Write + Send + 'static,
     every: std::time::Duration,
+    socket: Option<std::path::PathBuf>,
 ) -> io::Result<()> {
+    use crate::hook_socket::{Job, Reply};
     use std::sync::{mpsc, Arc, Mutex};
     let out = Arc::new(Mutex::new(output));
     let (main_tx, main_rx) = mpsc::channel::<(Incoming, u64)>();
@@ -370,6 +373,7 @@ pub fn serve_with_hooks_every(
     // is dropped (a hook waits behind the one before it).
     let watch = hooks.as_ref().filter(|_| crate::hook_budget::enforced()).map(|s| Watchdog::start(s.hook_budget, out.clone()));
     let watch_reader = watch.as_ref().map(|w| (w.pending.clone(), w.limit));
+    let budget = hooks.as_ref().filter(|_| crate::hook_budget::enforced()).map(|s| s.hook_budget);
     let (hook_tx, hook_worker) = match hooks {
         Some(settings) => {
             // `None` is the warm-up signal: the main thread sends it once its
@@ -377,7 +381,7 @@ pub fn serve_with_hooks_every(
             // thread is idle (opening both at start measured +8 ms on the first
             // answer from SQLite busy waits; opening on the first hook, 22 ms
             // on that hook).
-            let (tx, rx) = mpsc::channel::<Option<(Value, Value, std::time::Instant)>>();
+            let (tx, rx) = mpsc::channel::<Option<Job>>();
             let o = out.clone();
             let pending = watch.as_ref().map(|w| w.pending.clone());
             // A larger stack than the 2 MiB default, as a backstop: a hook
@@ -454,7 +458,7 @@ pub fn serve_with_hooks_every(
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
                     open(&mut hooks, &mut failed);
-                    let Some((id, args, arrived)) = msg else { continue };
+                    let Some(Job { args, arrived, reply }) = msg else { continue };
                     let ev = crate::hooks::HookEvent::from_value(&args);
                     // A tool call the watchdog answered while it waited in the
                     // queue is not worked (#416): its answer is out, and the
@@ -463,8 +467,13 @@ pub fn serve_with_hooks_every(
                     // a subagent, retries included).
                     // Gated calls only (every subagent call but the handoff):
                     // any other answer the watchdog gave is the worker's own.
-                    let stale = crate::hooks::gated(&ev) && pending.as_ref().is_some_and(|p| Watchdog::answered(p, &id));
-                    crate::hook_gate::begin(&id.to_string(), format!("{} {}", ev.event, ev.tool_name).trim_end());
+                    // A socket's hook was answered when its connection gave up on it.
+                    let answered = match &reply {
+                        Reply::Rpc(id) => pending.as_ref().is_some_and(|p| Watchdog::answered(p, id)),
+                        Reply::Socket(_, a) => a.late(),
+                    };
+                    let stale = crate::hooks::gated(&ev) && answered;
+                    crate::hook_gate::begin(&reply.key(), format!("{} {}", ev.event, ev.tool_name).trim_end());
                     // Tests: a hook slower than its budget.
                     #[cfg(test)]
                     if !stale && ev.tool_name == tests::SLOW_TOOL {
@@ -481,15 +490,27 @@ pub fn serve_with_hooks_every(
                     if panicked {
                         hooks = None;
                     }
+                    // Tests: a hook held between its work and its answer.
+                    #[cfg(test)]
+                    tests::hold(&ev);
                     // Answered already when the watchdog took it.
-                    let won = !stale && pending.as_ref().is_none_or(|p| Watchdog::claim(p, &id));
-                    if won {
-                        let r = ok(id, content(text.clone(), false));
-                        if let Ok(mut w) = o.lock() {
-                            let _ = write_line(&mut *w, &r);
-                        }
-                    } else if let Some(h) = hooks.as_mut().filter(|_| !stale) {
-                        // Refused by the watchdog: what this answer let in is undone.
+                    let won = !stale
+                        && match reply {
+                            Reply::Rpc(id) => {
+                                let won = pending.as_ref().is_none_or(|p| Watchdog::claim(p, &id));
+                                if won {
+                                    let r = ok(id, content(text.clone(), false));
+                                    if let Ok(mut w) = o.lock() {
+                                        let _ = write_line(&mut *w, &r);
+                                    }
+                                }
+                                won
+                            }
+                            Reply::Socket(_, a) => a.give(text.clone()),
+                        };
+                    if let Some(h) = hooks.as_mut().filter(|_| !won && !stale) {
+                        // Refused by the watchdog, or given up on by its
+                        // socket's connection: what this answer let in is undone.
                         h.answer_lost(&ev);
                     }
                     crate::hook_gate::end();
@@ -535,6 +556,20 @@ pub fn serve_with_hooks_every(
         None => (None, None),
     };
     let mut warm_tx = hook_tx.clone();
+    // Command hooks on this session's socket go to the same worker.
+    #[cfg(unix)]
+    let listener = match (&socket, &hook_tx) {
+        (Some(path), Some(tx)) => match crate::hook_socket::listen(path, tx.clone(), server.announcer(), budget, WATCH_GRACE) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("atlas hook socket {}: {e}", path.display());
+                None
+            }
+        },
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let _ = (&socket, budget);
     // The reader notes each hook as it reads it, before any call it
     // announces can reach the main thread, and sends every other message
     // with the mark of the hooks read before it: a call sees exactly the
@@ -562,7 +597,7 @@ pub fn serve_with_hooks_every(
                             Watchdog::expect(p, &call.0, &call.1, arrived, *limit);
                         }
                         let id = call.0.clone();
-                        if tx.send(Some((call.0, call.1, arrived))).is_ok() {
+                        if tx.send(Some(Job { args: call.1, arrived, reply: Reply::Rpc(call.0) })).is_ok() {
                             announcer.hook(&args);
                             continue;
                         }
@@ -612,6 +647,9 @@ pub fn serve_with_hooks_every(
     result?;
     drop(warm_tx);
     let read = reader.join().unwrap_or_else(|_| Err(io::Error::other("reader thread panicked")));
+    // Its queue is taken first, so the worker's ends.
+    #[cfg(unix)]
+    drop(listener);
     if let Some(w) = hook_worker {
         let _ = w.join();
     }
@@ -646,7 +684,7 @@ struct Watchdog {
 
 /// After its deadline, the worker has this long to answer before the
 /// watchdog does (the worker answers right after a phase it cut).
-const WATCH_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const WATCH_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl Watchdog {
     fn start<W: Write + Send + 'static>(limit: std::time::Duration, out: std::sync::Arc<std::sync::Mutex<W>>) -> Watchdog {
@@ -881,6 +919,110 @@ mod tests {
     pub(crate) const KILL_TOOL: &str = "atlas_test_kill_worker";
     /// Set as the worker dies of [`KILL_TOOL`].
     pub(crate) static KILLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// The tool call id of a hook the worker holds after its work, before
+    /// its answer: it tells [`HOLD`]'s sender it got there, then waits for
+    /// its receiver.
+    pub(crate) const HOLD_ID: &str = "atlas-test-hold";
+    pub(crate) static HOLD: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> =
+        std::sync::Mutex::new(None);
+
+    pub(crate) fn hold(ev: &crate::hooks::HookEvent) {
+        if ev.tool_use_id != HOLD_ID {
+            return;
+        }
+        let Some((reached, release)) = HOLD.lock().unwrap().take() else { return };
+        let _ = reached.send(());
+        let _ = release.recv();
+    }
+
+    /// Input that runs its step at the first read, then ends.
+    #[cfg(unix)]
+    struct OnRead(Option<Box<dyn FnOnce() + Send>>);
+
+    #[cfg(unix)]
+    impl Read for OnRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            if let Some(step) = self.0.take() {
+                step();
+            }
+            Ok(0)
+        }
+    }
+
+    /// A command hook's stdin sent on the hook socket at `sock`, and the
+    /// server's answer.
+    #[cfg(unix)]
+    fn ask_socket(sock: &std::path::Path, stdin: &Value) -> String {
+        use std::io::Write as _;
+        let mut c = std::os::unix::net::UnixStream::connect(sock).unwrap();
+        c.write_all(stdin.to_string().as_bytes()).unwrap();
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        s
+    }
+
+    /// Launches over the hook socket share the worker's state, as `mcp_tool`
+    /// hooks did: at a builder cap of one, the second launch is the cap's
+    /// own refusal. A launch the worker admitted but answered only after its
+    /// connection gave up on it (refused it, past the budget) is undone: it
+    /// holds no slot. Once the input ends, the server stops and removes its
+    /// socket.
+    #[cfg(unix)]
+    #[test]
+    fn socket_hooks_share_the_workers_state_and_a_late_answer_is_undone() {
+        if !crate::hook_budget::enforced() {
+            return;
+        }
+        use crate::orchestrate::{Kind, KindSpec, OrchestrateSpec};
+        let (dir, mut server, mut settings) = served("hook-socket");
+        settings.hook_budget = std::time::Duration::from_millis(1_000);
+        settings.snapshot_secs = 0;
+        let one = KindSpec { max: Some(1), ..Default::default() };
+        let spec = OrchestrateSpec { enabled: Some(true), kinds: vec![(Kind::Builder, one)], ..Default::default() };
+        settings.orchestrate = crate::orchestrate::resolve(Some(&spec), None, None, |_| None);
+        let transcript = dir.join("proj").join("sess.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        let tp = transcript.to_string_lossy().into_owned();
+        // As Claude Code writes a command hook's stdin.
+        let launch = move |id: &str| {
+            let brief = "Kind: builder\nBuild the widget cache.";
+            let input = crate::json!({"description": "d", "subagent_type": "general-purpose", "prompt": brief});
+            crate::json!({"hook_event_name": "PreToolUse", "session_id": "S", "tool_name": "Agent", "tool_use_id": id, "transcript_path": tp, "tool_input": input})
+        };
+        let sock = dir.join("h.sock");
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *HOLD.lock().unwrap() = Some((reached_tx, release_rx));
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (g, s) = (got.clone(), sock.clone());
+        let step = move || {
+            // Admitted, then held past its deadline: its connection refuses it.
+            let (s1, l1) = (s.clone(), launch(HOLD_ID));
+            let first = std::thread::spawn(move || ask_socket(&s1, &l1));
+            reached.recv().unwrap();
+            let first = first.join().unwrap();
+            release.send(()).unwrap();
+            // Worked after the held one's answer was lost: its slot is free.
+            let second = ask_socket(&s, &launch("second"));
+            // Over the cap of one: the worker's own refusal.
+            let third = ask_socket(&s, &launch("third"));
+            *g.lock().unwrap() = vec![first, second, third];
+        };
+        let input = io::BufReader::new(OnRead(Some(Box::new(step))));
+        serve_with_hooks_every(&mut server, Some(settings), None, input, Shared::default(), crate::restart::REFRESH_EVERY, Some(sock.clone()))
+            .unwrap();
+        let got = got.lock().unwrap().clone();
+        let [first, second, third] = got.as_slice() else { panic!("{got:?}") };
+        assert!(first.contains("\"permissionDecision\":\"deny\"") && first.contains(crate::hooks::GATE_OVERRUN), "{first}");
+        assert!(!second.contains("deny"), "the late launch held the builder slot: {second}");
+        assert!(third.contains("\"permissionDecision\":\"deny\"") && !third.contains(crate::hooks::GATE_OVERRUN), "{third}");
+        assert!(!sock.exists(), "the stopped server left its socket");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A `gh pr merge` hook (the review merge gate's).
     fn gate_msg(id: &str) -> String {

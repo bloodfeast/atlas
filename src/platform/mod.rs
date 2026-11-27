@@ -531,18 +531,26 @@ pub(crate) mod process {
     /// Every process as (pid, parent pid, executable name), from `/proc`.
     #[cfg(target_os = "linux")]
     fn processes() -> Vec<(u32, u32, String)> {
-        let mut out = Vec::new();
-        for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
-            // `stat` is "pid (comm) state ppid ...": comm may hold spaces
-            // and parentheses, so split at the last ')'.
-            let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else { continue };
-            let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else { continue };
-            let name = stat[open + 1..close].to_string();
-            let ppid = stat[close + 1..].split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-            out.push((pid, ppid, name));
-        }
-        out
+        std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+            .filter_map(stat_row)
+            .collect()
+    }
+
+    /// One process's (pid, parent pid, executable name), from
+    /// `/proc/<pid>/stat`; `None` when it cannot be read.
+    #[cfg(target_os = "linux")]
+    fn stat_row(pid: u32) -> Option<(u32, u32, String)> {
+        // `stat` is "pid (comm) state ppid ...": comm may hold spaces
+        // and parentheses, so split at the last ')'.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (open, close) = (stat.find('(')?, stat.rfind(')')?);
+        let name = stat[open + 1..close].to_string();
+        let ppid = stat[close + 1..].split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        Some((pid, ppid, name))
     }
 
     /// Every process as (pid, parent pid, executable name), from `ps`
@@ -601,6 +609,46 @@ pub(crate) mod process {
     pub(crate) fn table() -> Vec<(u32, u32, String)> {
         processes()
     }
+
+    /// `pid` and up to `depth` of its ancestors, nearest first, as rows of
+    /// [`table`]. On Linux only their own `/proc` entries are read: a hook
+    /// pays this at every event, and reading the whole table costs time
+    /// for every process on the machine.
+    pub(crate) fn lineage(pid: u32, depth: usize) -> Vec<(u32, u32, String)> {
+        #[cfg(target_os = "linux")]
+        {
+            std::iter::successors(stat_row(pid), |r| (r.1 > 1).then(|| stat_row(r.1)).flatten()).take(depth + 1).collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let procs = processes();
+            let row = |p: u32| procs.iter().find(|r| r.0 == p).cloned();
+            std::iter::successors(row(pid), |r| (r.1 > 1).then(|| row(r.1)).flatten()).take(depth + 1).collect()
+        }
+    }
+
+    /// How Claude Code starts a command hook on a system, as far as it has
+    /// been measured there ([`crate::server_check::origin`] reads it).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HookRunner {
+        /// The hook is Claude Code's own child, or the child of a `sh -c`
+        /// of Claude Code's that did not exec its one command.
+        // Named only by the systems measured so far.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        Direct,
+        /// Not measured on this system, so a hook's ancestors are not
+        /// judged.
+        Unmeasured,
+    }
+
+    /// This system's [`HookRunner`]. Linux was measured with Claude Code
+    /// 2.1.330: a hook's parent is Claude Code, a Bash tool call's is the
+    /// tool's shell. Measure another system before naming it here.
+    #[cfg(target_os = "linux")]
+    pub const HOOK_RUNNER: HookRunner = HookRunner::Direct;
+    /// This system's [`HookRunner`]: not measured yet.
+    #[cfg(not(target_os = "linux"))]
+    pub const HOOK_RUNNER: HookRunner = HookRunner::Unmeasured;
 
     /// This process's parent pid, when it can be read.
     pub(crate) fn parent() -> Option<u32> {
@@ -865,6 +913,27 @@ pub(crate) mod process {
             if cfg!(any(windows, target_os = "linux", target_os = "macos")) {
                 let me = std::process::id();
                 assert!(processes().iter().any(|p| p.0 == me));
+            }
+        }
+
+        #[test]
+        fn the_lineage_is_the_walk_up_the_whole_table() {
+            if cfg!(any(windows, target_os = "linux", target_os = "macos")) {
+                let me = std::process::id();
+                let line = lineage(me, 8);
+                let procs = processes();
+                let mut want = Vec::new();
+                let mut pid = me;
+                while let Some(r) = procs.iter().find(|r| r.0 == pid).filter(|_| want.len() < 9) {
+                    want.push(r.clone());
+                    if r.1 <= 1 {
+                        break;
+                    }
+                    pid = r.1;
+                }
+                assert!(line.len() >= 2, "{line:?}");
+                assert_eq!(line, want);
+                assert_eq!(lineage(me, 0), want[..1]);
             }
         }
     }

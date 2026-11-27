@@ -18,10 +18,10 @@ is one the current release accepts. Every key is described in [[Configuration re
 | `.claude/settings.json` | `<WORKSPACE>/.claude/settings.json` | lets the atlas MCP tools run without a permission prompt |
 
 Install atlas as the Claude Code plugin ([[Install and setup]]), not as a bare binary. The plugin brings the
-`mcp_tool` hooks (`hooks/hooks.json`) and the `atlas` and `orchestrate` skills. Recall reaches a session only
-through those hooks: `UserPromptSubmit` in the main session, `SubagentStart` for subagents
-([[Memory store and hooks]]). A command hook (`atlas --hook`) cannot give a subagent its lane recall; use the
-plugin's `mcp_tool` hooks.
+hooks (`hooks/hooks.json`, each `atlas --hook`, which hands its event to the session's server) and the `atlas` and
+`orchestrate` skills. Recall reaches a session only through those hooks: `UserPromptSubmit` in the main session,
+`SubagentStart` for subagents ([[Memory store and hooks]]). A hook that runs in its own process (on Windows, or
+with no reachable server) cannot give a subagent its lane recall.
 
 ## Using atlas as Claude's memory
 

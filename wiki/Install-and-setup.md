@@ -5,7 +5,7 @@ aarch64, and macOS (Apple Silicon and Intel), as the release notes list them; a 
 builds from source (below).
 
 Claude Code version: no minimum is established. The measurements these pages cite were taken on Claude Code
-2.1.316 and 2.1.318; the hooks other than SessionStart are `mcp_tool` hooks, and the always-loaded tool schemas need 2.1.285 or later.
+2.1.316 and 2.1.318; the hooks are command hooks (`atlas --hook`), and the always-loaded tool schemas need 2.1.285 or later.
 An older Claude Code is untested.
 
 1. Add the marketplace and install the plugin, in Claude Code:
@@ -189,8 +189,8 @@ An older Claude Code is untested.
    folder>/bin/atlas --statusline"}`; it reads local files only and prints nothing when there is no news.
    `"update": {"notify": false}` turns the notice off.
 
-   The reconnect line on your next prompt is the `systemMessage` of atlas's `UserPromptSubmit` hook, an
-   `mcp_tool` hook, whose answer Claude Code reads as the same JSON a command hook prints. That it shows
+   The reconnect line on your next prompt is the `systemMessage` of atlas's `UserPromptSubmit` hook, in the
+   JSON the command hook prints. That it shows
    in the transcript has not been checked in a live session yet; the status line badge carries the same
    news.
 

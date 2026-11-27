@@ -288,8 +288,17 @@ fn no_network_code() {
             assert!(code.contains("TcpListener::bind((Ipv4Addr::LOCALHOST, port))"), "{}", path.display());
             assert!(!code.contains("connect(") && !code.contains("UdpSocket") && !code.contains("ToSocketAddrs"), "{}", path.display());
         }
+        // The hook socket (src/hook_socket.rs) is a Unix-domain socket in
+        // the user's own folder, never a network one: its one `std::net` is
+        // the `Shutdown` that ends a connection's writing side.
+        let hook_socket = path.ends_with("hook_socket.rs");
+        if hook_socket {
+            assert_eq!(code.matches("std::net").count(), code.matches("std::net::Shutdown::Write").count(), "{}", path.display());
+            assert!(code.contains("std::os::unix::net::{UnixListener, UnixStream}"), "{}", path.display());
+        }
         for bad in ["std::net", "TcpStream", "TcpListener", "UdpSocket", "ToSocketAddrs", "Command::new", "unsafe "] {
             if (spawns && bad == "Command::new")
+                || (hook_socket && bad == "std::net")
                 || (ffi && bad == "unsafe ")
                 || (listens && matches!(bad, "std::net" | "TcpStream" | "TcpListener"))
             {

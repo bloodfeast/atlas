@@ -1,9 +1,9 @@
 //! The out-of-box install gate, through the binary on this OS: a fresh
 //! home (atlas's folder, Claude Code's folder, HOME), no configuration and
-//! no edits. The server starts as Claude Code starts it (stdio, no
-//! arguments), answers every hook `hooks/hooks.json` wires, offers the
-//! settings once, remembers and recalls; then `atlas settings` and
-//! `atlas --setup` run against the same home. The network is closed (a
+//! no edits. Every hook `hooks/hooks.json` wires is answered by
+//! `atlas --hook`; the server starts as Claude Code starts it (stdio, no
+//! arguments), offers the settings once, remembers and recalls; then
+//! `atlas settings` and `atlas --setup` run against the same home. The network is closed (a
 //! dead proxy), so the background model download fails fast and the
 //! server stays lexical, as it would offline.
 
@@ -32,24 +32,6 @@ fn fresh(c: &mut Command, root: &Path) {
     c.env_remove("NO_PROXY").env_remove("no_proxy");
 }
 
-/// `${name}` placeholders of a hook's input, filled as Claude Code fills
-/// them (objects arrive as their JSON text).
-fn fill(input: &Value, vals: &Value) -> Value {
-    let mut out = json::Map::new();
-    for (k, v) in input.as_object().unwrap().iter() {
-        let x = match v.as_str().and_then(|s| s.strip_prefix("${")).and_then(|s| s.strip_suffix('}')) {
-            Some(name) => match vals.get(name) {
-                Some(Value::String(s)) => Value::String(s.clone()),
-                Some(o) => Value::String(o.to_string()),
-                None => Value::String(String::new()),
-            },
-            None => v.clone(),
-        };
-        out.insert(k.clone(), x);
-    }
-    Value::Object(out)
-}
-
 #[test]
 fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
     let t = Temp::new("install");
@@ -70,32 +52,6 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     ];
-    let mut hook_ids = Vec::new();
-    let mut commands = Vec::new();
-    let mut id = 10;
-    for (event, entries) in hooks["hooks"].as_object().unwrap().iter() {
-        for e in entries.as_array().unwrap() {
-            for h in e["hooks"].as_array().unwrap() {
-                if h["type"] == "command" {
-                    // Claude Code runs no mcp_tool hook at SessionStart (measured:
-                    // "no MCP client context"), so that one is `atlas --hook`.
-                    assert_eq!(h["command"], "\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook", "{event}");
-                    commands.push(event.clone());
-                    continue;
-                }
-                assert_eq!(h["type"], "mcp_tool", "{event}");
-                assert_eq!(h["server"], "plugin:atlas:atlas", "{event}");
-                id += 1;
-                hook_ids.push((id, event.clone()));
-                lines.push(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": h["tool"].as_str().unwrap(), "arguments": fill(&h["input"], &vals)}}));
-            }
-        }
-    }
-    let events: Vec<&str> = hook_ids.iter().map(|(_, e)| e.as_str()).chain(commands.iter().map(String::as_str)).collect();
-    assert_eq!(commands, ["SessionStart", "SessionEnd"]);
-    for e in ["SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop", "PreToolUse", "PostToolUse", "PreCompact"] {
-        assert!(events.contains(&e), "hooks.json wires {e}");
-    }
     lines.push(json!({"jsonrpc": "2.0", "id": 90, "method": "tools/call", "params": {"name": "remember", "arguments": {"kind": "rule", "title": "Cache eviction", "body": "The cache evicts entries by age, oldest first, when it is full.", "reason": "install test"}}}));
     lines.push(json!({"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {"name": "recall", "arguments": {"query": "cache eviction"}}}));
     lines.push(json!({"jsonrpc": "2.0", "id": 92, "method": "tools/call", "params": {"name": "hook", "arguments": {"event": "SessionStart", "session_id": "s2", "source": "startup"}}}));
@@ -120,6 +76,45 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
     // Experimental and off by default: a session never hears of memory rules.
     assert!(!ctx.contains("memory folder") && !ctx.contains("memory-rules"), "{ctx}");
 
+    // Every hook is `atlas --hook` with the event on stdin. No server left
+    // a marker in this home, so none has a socket, and each runs in its own
+    // process.
+    let mut events = Vec::new();
+    for (event, entries) in hooks["hooks"].as_object().unwrap().iter() {
+        for e in entries.as_array().unwrap() {
+            for h in e["hooks"].as_array().unwrap() {
+                assert_eq!(h["type"], "command", "{event}");
+                assert_eq!(h["command"], "\"${CLAUDE_PLUGIN_ROOT}/bin/atlas\" --hook", "{event}");
+                events.push(event.clone());
+            }
+        }
+    }
+    assert_eq!(events, ["SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop", "PreToolUse", "PostToolUse", "PreCompact"]);
+    for event in events.iter().filter(|e| *e != "SessionStart") {
+        let mut input = vals.clone();
+        if let Value::Object(m) = &mut input {
+            m.insert("hook_event_name".into(), Value::String(event.clone()));
+            m.remove("tool_input.prompt");
+        }
+        let mut c = Command::new(bin());
+        fresh(&mut c, root);
+        let mut hook = c.arg("--hook").env("ATLAS_HOOK_BUDGET_OFF", "1").current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        write!(hook.stdin.take().unwrap(), "{input}").unwrap();
+        let ho = hook.wait_with_output().unwrap();
+        let t = String::from_utf8_lossy(&ho.stdout).trim().to_string();
+        assert!(ho.status.success(), "{event}: {}", String::from_utf8_lossy(&ho.stderr));
+        if event == "PreCompact" && !t.is_empty() && !t.starts_with('{') {
+            // Compaction is on by default: its answer is the plain summary
+            // instructions, all of which land in the summarizer's prompt.
+            assert_eq!(t, atlas::claude_settings::COMPACT_INSTRUCTIONS.trim(), "{event}");
+        } else if !t.is_empty() {
+            let h = json::parse(&t).unwrap_or_else(|e| panic!("{event} answered non-JSON {t:?}: {e:?}"));
+            if let Some(name) = h.get("hookSpecificOutput").and_then(|o| o.get("hookEventName")) {
+                assert_eq!(name, event.as_str());
+            }
+        }
+    }
+
     let mut c = Command::new(bin());
     fresh(&mut c, root);
     let mut child = c.current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -140,19 +135,6 @@ fn a_fresh_home_serves_every_hook_and_offers_the_settings() {
         assert!(names.contains(&n.to_string()), "{n} in {names:?}");
     }
     let text = |r: &Value| r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
-    for (id, event) in &hook_ids {
-        let r = by(*id);
-        assert!(r.get("result").is_some() && r["result"]["isError"] != true, "{event}: {r}");
-        let t = text(&r);
-        if event == "PreCompact" && !t.is_empty() {
-            // Compaction is on by default: its reply is the plain summary
-            // instructions, all of which land in the summarizer's prompt.
-            assert_eq!(t, atlas::claude_settings::COMPACT_INSTRUCTIONS, "{event}");
-        } else if !t.is_empty() {
-            let h = json::parse(&t).unwrap_or_else(|e| panic!("{event} answered non-JSON {t:?}: {e:?}"));
-            assert_eq!(h["hookSpecificOutput"]["hookEventName"], event.as_str());
-        }
-    }
     // A recall query answers the best record whole.
     assert!(text(&by(91)).contains("evicts entries by age"), "{}", by(91));
     assert_eq!(text(&by(92)), "", "the first-session questions are the command hook's: a tool call does not say a user is there, so it asks nothing");

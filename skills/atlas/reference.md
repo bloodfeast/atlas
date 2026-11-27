@@ -927,7 +927,7 @@ Deferred questions (journal entry=defer): the due ones first, each with its opti
 
 #### hook
 
-Hook entry point for Claude Code mcp_tool hooks; not for models. (writes)
+Hook entry point for older setups' mcp_tool hooks; not for models. (writes)
 
 - `event` string, required
 - `session_id` string
